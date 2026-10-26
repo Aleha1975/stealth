@@ -77,4 +77,72 @@ contract StealthPayTest is Test {
         vm.prank(payer); vm.expectRevert(abi.encodeWithSelector(StealthPay.NotFresh.selector, address(r)));
         pay.payETH{value: 1 ether}(address(r), key, 0x00);
     }
+
+    // ---- additional checks (internal audit 26.10)
+    function test_phantom_token_without_code_is_refused() public {
+        address eth = pay.ETH();
+        vm.prank(payer); vm.expectRevert(abi.encodeWithSelector(StealthPay.NotAToken.selector, eth));
+        pay.payToken(eth, 1e6, address(0xBEEF), key, 0x00);
+        vm.prank(payer); vm.expectRevert(abi.encodeWithSelector(StealthPay.NotAToken.selector, address(0xC0FFEE)));
+        pay.payToken(address(0xC0FFEE), 1e6, address(0xBEEF), key, 0x00);
+        assertEq(ann.n(), 0, "no announcement for money that did not move");
+    }
+    function testFuzz_token_amount_and_tag(uint96 amount, bytes1 tag, uint160 who) public {
+        vm.assume(amount > 0 && who > 0xFFFF);
+        address s = address(who); vm.assume(s.code.length == 0 && !pay.used(s));
+        tok.mint(payer, amount);
+        uint256 before = tok.balanceOf(payer);
+        vm.prank(payer); pay.payToken(address(tok), amount, s, key, tag);
+        assertEq(tok.balanceOf(s), amount); assertEq(tok.balanceOf(payer), before - amount); assertEq(tok.balanceOf(address(pay)), 0);
+        assertEq(ann.lastMeta(), abi.encodePacked(tag, bytes4(0xa9059cbb), address(tok), uint256(amount)));
+        assertTrue(pay.used(s));
+    }
+    function testFuzz_eth_amount(uint96 wei_, uint160 who) public {
+        vm.assume(wei_ > 0 && who > 0xFFFF);
+        address s = address(who); vm.assume(s.code.length == 0 && !pay.used(s));
+        vm.deal(payer, uint256(wei_));
+        vm.prank(payer); pay.payETH{value: wei_}(s, key, 0x11);
+        assertEq(s.balance, wei_); assertEq(address(pay).balance, 0);
+    }
+    function test_token_returning_false_reverts() public {
+        FalseTok f = new FalseTok();
+        vm.prank(payer); vm.expectRevert(StealthPay.TransferFailed.selector);
+        pay.payToken(address(f), 1, address(0xBEEF), key, 0x00);
+        assertEq(ann.n(), 0);
+    }
+    function test_token_without_return_value_is_accepted() public {
+        NoRetTok f = new NoRetTok(); f.mint(payer, 5); vm.prank(payer); f.approve(address(pay), 5);
+        vm.prank(payer); pay.payToken(address(f), 5, address(0xBEEF), key, 0x00);
+        assertEq(f.balanceOf(address(0xBEEF)), 5); assertEq(ann.n(), 1);
+    }
+    function test_reentrant_token_cannot_reenter_pay() public {
+        ReenterTok r = new ReenterTok(pay); r.mint(payer, 10); vm.prank(payer); r.approve(address(pay), 10);
+        vm.prank(payer); vm.expectRevert(StealthPay.TransferFailed.selector);   // inner call reverts Reentrancy -> transferFrom fails
+        pay.payToken(address(r), 10, address(0xBEEF), key, 0x00);
+    }
+    function test_griefing_front_run_only_costs_a_retry() public {
+        address s = address(0xBEEF);
+        address griefer = address(0xBAD); tok.mint(griefer, 1); vm.prank(griefer); tok.approve(address(pay), 1);
+        vm.prank(griefer); pay.payToken(address(tok), 1, s, key, 0x00);           // 1 unit lands on X first
+        vm.prank(payer); vm.expectRevert(abi.encodeWithSelector(StealthPay.NotFresh.selector, s));
+        pay.payToken(address(tok), 100e6, s, key, 0x00);                            // real payment is refused, nothing lost
+        assertEq(tok.balanceOf(payer), 1_000e6);
+    }
+}
+contract FalseTok { function transferFrom(address, address, uint256) external pure returns (bool) { return false; } }
+contract NoRetTok {
+    mapping(address => uint256) public balanceOf; mapping(address => mapping(address => uint256)) public allowance;
+    function mint(address t, uint256 a) external { balanceOf[t] += a; }
+    function approve(address s, uint256 a) external { allowance[msg.sender][s] = a; }
+    function transferFrom(address f, address t, uint256 a) external { require(allowance[f][msg.sender] >= a && balanceOf[f] >= a); allowance[f][msg.sender] -= a; balanceOf[f] -= a; balanceOf[t] += a; }
+}
+contract ReenterTok {
+    StealthPay p; mapping(address => uint256) public balanceOf; mapping(address => mapping(address => uint256)) public allowance;
+    constructor(StealthPay _p) { p = _p; }
+    function mint(address t, uint256 a) external { balanceOf[t] += a; }
+    function approve(address s, uint256 a) external returns (bool) { allowance[msg.sender][s] = a; return true; }
+    function transferFrom(address, address, uint256) external returns (bool) {
+        p.payToken(address(this), 1, address(0xD00D), hex"02" hex"1111111111111111111111111111111111111111111111111111111111111111", 0x00);
+        return true;
+    }
 }

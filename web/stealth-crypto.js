@@ -35,14 +35,41 @@ function hashedShared(privBytes, pubCompressed) {
   return keccak_256(S);
 }
 
-/** Receiver: keys from one wallet signature (deterministic). spend = keccak(sig || "spend"), view = keccak(sig || "view"), reduced mod n. */
-export function keysFromSignature(sigHex) {
+// ---- key derivation from ONE wallet signature over EIP-712 typed data (domain-labelled in the wallet UI)
+export const KEY_DOMAIN = { name: "DeepYield Stealth", version: "1", chainId: 8453 };
+export const KEY_TYPES = { StealthKeys: [{ name: "purpose", type: "string" }, { name: "account", type: "address" }] };
+export const KEY_PURPOSE = "Derive my private stealth receiving keys. Never sign this on another site.";
+const utf8 = s => new TextEncoder().encode(s);
+const encType = "StealthKeys(string purpose,address account)";
+/** EIP-712 digest of the key-derivation request for `account` (what the wallet signs with eth_signTypedData_v4). */
+export function keyRequestDigest(account) {
+  const domainType = "EIP712Domain(string name,string version,uint256 chainId)";
+  const ds = keccak_256(unhex(hex(keccak_256(utf8(domainType))) + hex(keccak_256(utf8(KEY_DOMAIN.name))).slice(2) + hex(keccak_256(utf8(KEY_DOMAIN.version))).slice(2) + BigInt(KEY_DOMAIN.chainId).toString(16).padStart(64, "0")));
+  const sh = keccak_256(unhex(hex(keccak_256(utf8(encType))) + hex(keccak_256(utf8(KEY_PURPOSE))).slice(2) + account.toLowerCase().replace(/^0x/, "").padStart(64, "0")));
+  return keccak_256(unhex("0x1901" + hex(ds).slice(2) + hex(sh).slice(2)));
+}
+export const keyRequestTypedData = account => JSON.stringify({ types: { EIP712Domain: [{ name: "name", type: "string" }, { name: "version", type: "string" }, { name: "chainId", type: "uint256" }], ...KEY_TYPES },
+  primaryType: "StealthKeys", domain: KEY_DOMAIN, message: { purpose: KEY_PURPOSE, account } });
+/** Receiver keys from the wallet's signature. Refuses anything that is not a plain 65-byte ECDSA signature by `account`
+ *  (smart wallets, passkeys, ERC-1271/6492 wrappers give randomised or wrapped signatures: keys could not be re-derived
+ *  later and incoming money would be lost). Derives from r||s only, so v = 0/1 vs 27/28 cannot change the keys. */
+export function keysFromSignature(sigHex, account) {
   const sig = unhex(sigHex);
-  const tag = s => new TextEncoder().encode(s);
-  const d = (t) => toBytes32(mod(toBig(keccak_256(secp.etc.concatBytes(sig, tag(t)))), N) || 1n);
+  if (sig.length !== 65) throw new Error("This wallet did not return a plain signature (smart wallet or passkey?). Stealth needs an ordinary key-based wallet such as MetaMask.");
+  const rs = sig.slice(0, 64); let v = sig[64]; if (v >= 27) v -= 27;
+  if (v !== 0 && v !== 1) throw new Error("unexpected signature format");
+  const recovered = secp.Signature.fromCompact(rs).addRecoveryBit(v).recoverPublicKey(keyRequestDigest(account));
+  if (addressOf(recovered.toRawBytes(true)).toLowerCase() !== account.toLowerCase()) throw new Error("the signature does not come from the connected account");
+  const d = (t) => toBytes32(mod(toBig(keccak_256(secp.etc.concatBytes(rs, utf8(t)))), N) || 1n);
   const spendPriv = d("deepyield-stealth/spend/v1"), viewPriv = d("deepyield-stealth/view/v1");
   return { spendPriv, viewPriv, spendPub: secp.getPublicKey(spendPriv, true), viewPub: secp.getPublicKey(viewPriv, true) };
 }
+/** Test helper: sign the key request with a raw private key the way an EOA wallet would (65-byte r||s||v). */
+export function signKeyRequestWith(privBytes, account) {
+  const sig = secp.sign(keyRequestDigest(account), privBytes, { lowS: true });
+  return hex(sig.toCompactRawBytes()) + (27 + sig.recovery).toString(16).padStart(2, "0");
+}
+export const addressFromPriv = priv => addressOf(secp.getPublicKey(priv, true));
 /** Meta-address: st:base:0x<P_spend><P_view> (66 bytes). */
 export const metaAddress = (keys, chain = "base") => "st:" + chain + ":" + hex(secp.etc.concatBytes(keys.spendPub, keys.viewPub));
 export function parseMeta(s) {

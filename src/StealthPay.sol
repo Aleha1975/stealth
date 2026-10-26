@@ -11,7 +11,10 @@ pragma solidity ^0.8.26;
 ///         What a fresh address is here: no code at it. A contract cannot be a stealth address (its key is not derived
 ///         from the receiver's keys), and the same stealth address must not be paid twice through this contract: the
 ///         second payment would link two payers and two amounts to one receiver on chain. `used` enforces that for
-///         payments made here; payments made elsewhere are the receiver's own concern.
+///         payments made here; payments made elsewhere are the receiver's own concern. Residual: a watcher who sees a
+///         pending payToken(stealth = X) could pay X one unit first and make the real payment revert with NotFresh; the
+///         payer loses nothing but gas and retries with a new one-time address. Base has no public mempool, so this
+///         needs the sequencer's cooperation; accepted.
 interface IAnnouncer {
     function announce(uint256 schemeId, address stealthAddress, bytes memory ephemeralPubKey, bytes memory metadata) external;
 }
@@ -37,6 +40,7 @@ contract StealthPay {
     error BadKey();
     error TransferFailed();
     error EthFailed();
+    error NotAToken(address token);
 
     constructor(address announcer) {
         if (announcer.code.length == 0) revert BadKey();
@@ -50,6 +54,9 @@ contract StealthPay {
     /// @param viewTag the first byte of the hashed shared secret: lets the receiver skip 255 of 256 announcements
     function payToken(address token, uint256 amount, address stealthAddress, bytes calldata ephemeralPubKey, bytes1 viewTag) external lock {
         if (amount == 0) revert ZeroAmount();
+        // A call to an address without code "succeeds" with empty return data: without this check anyone could publish
+        // announcements of payments that never happened (phantom amounts in the receiver's list) for the price of gas.
+        if (token.code.length == 0) revert NotAToken(token);
         _fresh(stealthAddress, ephemeralPubKey);
         (bool ok, bytes memory r) = token.call(abi.encodeWithSelector(IERC20.transferFrom.selector, msg.sender, stealthAddress, amount));
         if (!ok || (r.length != 0 && !abi.decode(r, (bool)))) revert TransferFailed();

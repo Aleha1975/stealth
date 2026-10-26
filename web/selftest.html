@@ -1,42 +1,7 @@
 <!doctype html>
 <html><head><meta charset="utf-8"><title>Stealth self-test</title></head>
 <body style="font-family:monospace;background:#111;color:#ddd;padding:20px">
-<h3>ERC-5564 scheme 1: browser vs Python reference</h3>
+<h3>ERC-5564 scheme 1: browser vs Python reference, plus key derivation checks</h3>
 <pre id="out">running…</pre>
-<script type="module">
-import { deriveForPayment, checkAnnouncement, parseMeta, metaAddress, keysFromSignature, unhex, hex, secpUtils, decodeMetadata } from "./stealth-crypto.js";
-const out = document.getElementById("out"); const lines = [];
-const say = s => { lines.push(s); out.textContent = lines.join("\n"); };
-try {
-  const vectors = await (await fetch("./erc5564_vectors.json")).json();
-  let ok = 0, bad = 0;
-  for (const v of vectors) {
-    const s = deriveForPayment(v.meta, unhex(v.eph_priv));
-    const keys = { spendPriv: unhex(v.spend_priv), viewPriv: unhex(v.view_priv), spendPub: secpUtils.getPublicKey(unhex(v.spend_priv), true), viewPub: secpUtils.getPublicKey(unhex(v.view_priv), true) };
-    const metaBrowser = metaAddress(keys).split(":")[2];
-    const r = checkAnnouncement(keys, v.eph_pub, v.view_tag);
-    const checks = [
-      ["meta-address", metaBrowser.toLowerCase() === v.meta.toLowerCase()],
-      ["sender stealth", s.stealth.toLowerCase() === v.stealth.toLowerCase()],
-      ["sender ephPub", s.ephPub.toLowerCase() === v.eph_pub.toLowerCase()],
-      ["sender viewTag", s.viewTag.toLowerCase() === v.view_tag.toLowerCase()],
-      ["receiver finds it", !!r && r.stealth.toLowerCase() === v.stealth.toLowerCase()],
-      ["receiver private key", !!r && r.stealthPriv.toLowerCase() === v.stealth_priv.toLowerCase()],
-      ["private key -> address", !!r && (() => { const a = secpUtils.getPublicKey(unhex(r.stealthPriv), true); return hex(a) && true; })()],
-    ];
-    for (const [name, pass] of checks) { pass ? ok++ : bad++; if (!pass) say("FAIL " + (v.fixed ? "fixed" : "random") + " " + name); }
-  }
-  // wrong view tag must be rejected cheaply
-  const v0 = vectors[0]; const keys0 = { spendPriv: unhex(v0.spend_priv), viewPriv: unhex(v0.view_priv), spendPub: secpUtils.getPublicKey(unhex(v0.spend_priv), true), viewPub: secpUtils.getPublicKey(unhex(v0.view_priv), true) };
-  const wrongTag = "0x" + ((parseInt(v0.view_tag, 16) + 1) & 255).toString(16).padStart(2, "0");
-  if (checkAnnouncement(keys0, v0.eph_pub, wrongTag) === null) ok++; else { bad++; say("FAIL wrong view tag accepted"); }
-  // metadata layout decode
-  const md = decodeMetadata("0x20a9059cbb833589fcd6edb6e08f4c7c32d4f71b54bda02913" + (42000000).toString(16).padStart(64, "0"));
-  if (md && md.viewTag === "0x20" && md.token.toLowerCase() === "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913" && md.amount === 42000000n) ok++; else { bad++; say("FAIL metadata decode " + JSON.stringify(md, (k, x) => typeof x === "bigint" ? x.toString() : x)); }
-  // deterministic keys from a signature
-  const sig = "0x" + "ab".repeat(65); const k1 = keysFromSignature(sig), k2 = keysFromSignature(sig);
-  if (hex(k1.spendPriv) === hex(k2.spendPriv) && hex(k1.viewPriv) === hex(k2.viewPriv) && hex(k1.spendPriv) !== hex(k1.viewPriv)) ok++; else { bad++; say("FAIL keysFromSignature"); }
-  say((bad ? "RESULT FAIL " : "RESULT PASS ") + ok + " checks ok, " + bad + " failed, vectors " + vectors.length);
-} catch (e) { say("RESULT ERROR " + (e && e.stack || e)); }
-</script>
+<script type="module" src="./selftest.js"></script>
 </body></html>
