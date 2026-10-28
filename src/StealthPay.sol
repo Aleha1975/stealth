@@ -134,6 +134,7 @@ contract StealthPay {
         if (IERC20(token).balanceOf(address(this)) - before != amount) revert AmountMismatch();
     }
 
+    /// @dev Residual notes (audit v3): I-1/I-3/I-4 remain documented residuals (see the header); I-2 transient lock is intentionally unchanged.
     function _deliver(address token, address stealthAddress, bytes calldata ephemeralPubKey, bytes1 viewTag, uint256 net) private {
         _send(token, stealthAddress, net);
         ANNOUNCER.announce(SCHEME_ID, stealthAddress, ephemeralPubKey, abi.encodePacked(viewTag, SEL_TRANSFER, token, net));
@@ -148,9 +149,12 @@ contract StealthPay {
         if (IERC20(token).balanceOf(stealthAddress) - before != amount) revert AmountMismatch();
     }
 
+    /// @dev Used only by the authorization path. Verifies the recipient's balance grew by exactly `value` (L-1), like _pull.
     function _send(address token, address to, uint256 value) private {
+        uint256 before = IERC20(token).balanceOf(to);
         (bool ok, bytes memory r) = token.call(abi.encodeWithSelector(IERC20.transfer.selector, to, value));
         if (!ok || (r.length != 0 && !abi.decode(r, (bool)))) revert TransferFailed();
+        if (IERC20(token).balanceOf(to) - before != value) revert AmountMismatch();
     }
 
     function _fresh(address stealthAddress, bytes calldata ephemeralPubKey) private {

@@ -18,7 +18,9 @@ contract Tok3009 {
     function setBlocked(address a, bool b) external { blocked[a] = b; }
     function setHook(address to, bytes calldata d, bool onTransfer) external { hookTo = to; hookData = d; hookOnTransfer = onTransfer; }
     function _hook(bool isTransfer) internal { if (hookTo != address(0) && hookOnTransfer == isTransfer) { (bool ok,) = hookTo.call(hookData); hookOk = ok; } }
-    function transfer(address t, uint256 a) external returns (bool) { require(!blocked[t], "blocked"); _hook(true); require(balanceOf[msg.sender] >= a, "balance"); balanceOf[msg.sender] -= a; balanceOf[t] += a; return true; }
+    address public tSkimTo; uint256 public tSkim; // short-delivery on transfer() only, to one recipient
+    function setTransferSkim(address to, uint256 s) external { tSkimTo = to; tSkim = s; }
+    function transfer(address t, uint256 a) external returns (bool) { require(!blocked[t], "blocked"); _hook(true); require(balanceOf[msg.sender] >= a, "balance"); balanceOf[msg.sender] -= a; balanceOf[t] += (t == tSkimTo ? a - tSkim : a); return true; }
     function receiveWithAuthorization(address from, address to, uint256 value, uint256 validAfter, uint256 validBefore, bytes32 nonce, uint8 v, bytes32 r, bytes32 s) external {
         require(msg.sender == to, "caller must be the payee"); _hook(false);
         require(block.timestamp > validAfter && block.timestamp < validBefore, "time");
@@ -61,6 +63,25 @@ contract PayWithAuthorizationTest is Test {
         assertEq(tok.balanceOf(payer), 900e6);
         assertEq(ann.lastMeta(), abi.encodePacked(bytes1(0x2a), bytes4(0xa9059cbb), address(tok), uint256(99.95e6)), "announces what arrives");
         assertEq(ann.lastStealth(), s); assertEq(ann.lastKey(), key); assertTrue(pay.used(s));
+    }
+
+    function test_short_delivery_to_stealth_reverts_and_nothing_moves() public {
+        address s = address(0xBEEF00);
+        StealthPay.Authorization memory a = _sign(pk, 100e6, s, key, 0x2a, 0.05e6, relayer);
+        tok.setTransferSkim(s, 1);
+        vm.prank(relayer); vm.expectRevert(StealthPay.AmountMismatch.selector);
+        pay.payWithAuthorization(address(tok), 100e6, s, key, 0x2a, 0.05e6, relayer, a);
+        assertEq(tok.balanceOf(payer), 1_000e6); assertEq(tok.balanceOf(s), 0); assertEq(tok.balanceOf(relayer), 0); assertEq(tok.balanceOf(address(pay)), 0);
+        assertFalse(pay.used(s));
+    }
+
+    function test_short_delivery_to_fee_recipient_reverts_and_nothing_moves() public {
+        address s = address(0xBEEF00);
+        StealthPay.Authorization memory a = _sign(pk, 100e6, s, key, 0x2a, 0.05e6, relayer);
+        tok.setTransferSkim(relayer, 1);
+        vm.prank(relayer); vm.expectRevert(StealthPay.AmountMismatch.selector);
+        pay.payWithAuthorization(address(tok), 100e6, s, key, 0x2a, 0.05e6, relayer, a);
+        assertEq(tok.balanceOf(payer), 1_000e6); assertEq(tok.balanceOf(s), 0); assertEq(tok.balanceOf(relayer), 0);
     }
 
     function test_anyone_may_submit_and_the_outcome_is_identical() public {
