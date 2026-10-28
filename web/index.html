@@ -115,9 +115,9 @@ footer{padding:26px 0 40px;font-size:13px;color:var(--ink-faint);display:flex;ju
           <div style="flex:1"><label>amount</label><input id="amount" placeholder="25" inputmode="decimal"></div>
           <div style="width:120px"><label>token</label><select id="token"><option value="TOKEN"></option><option value="NATIVE"></option></select></div>
         </div>
-        <button class="btn" id="btn-pay">Pay</button>
+        <div class="row"><button class="btn" id="btn-pay">Pay</button><button class="btn ghost" id="btn-pay-own" title="Two transactions (approve, then pay), you pay the gas">Pay with my own gas</button></div>
         <div class="hint" id="send-hint"></div>
-        <p class="note">Your wallet sends the money to a one-time address derived for this payment and publishes the announcement in the same transaction. Your own address stays visible as the sender, as in any on-chain payment.</p>
+        <p class="note">For the stablecoin you sign once and pay no gas: a relayer submits your signed authorization and keeps a small fee out of the amount (shown before you sign). The money goes to a one-time address derived for this payment and the announcement is published in the same transaction. "Pay with my own gas" and the native coin are sent from your wallet instead. Your own address stays visible as the sender, as in any on-chain payment.</p>
       </div>
     </div>
   </section>

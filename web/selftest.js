@@ -1,4 +1,5 @@
 import { deriveForPayment, checkAnnouncement, metaAddress, keysFromSignature, signKeyRequestWith, addressFromPriv, unhex, hex, secpUtils, decodeMetadata, KEY_DOMAIN, keyRequestTypedData } from "./stealth-crypto.js";
+import { paymentNonce } from "./pay-auth.js";
 import { CHAINS, pickChain, chainOfMeta } from "./chains.js";
 const out = document.getElementById("out"); const lines = [];
 const say = s => { lines.push(s); out.textContent = lines.join("\n"); };
@@ -41,5 +42,7 @@ try {
   check("chain configs", CHAINS.base.chainId === 8453 && CHAINS.base.chainHex === "0x2105" && CHAINS.rh.chainId === 4663 && CHAINS.rh.chainHex === "0x1237" && CHAINS.rh.token.symbol === "USDG" && CHAINS.rh.stealthPay === null);
   check("chain select", pickChain("?chain=rh").key === "rh" && pickChain("").key === "base" && pickChain("?to=st:rh:0xab").key === "rh" && chainOfMeta("st:rh:0x1").key === "rh" && chainOfMeta("0x1") === null);
   check("meta prefix per chain", metaAddress(k1, "rh").startsWith("st:rh:0x") && metaAddress(k1).startsWith("st:base:0x"));
+  // one-signature payment: nonce must equal the value computed by `cast abi-encode` + `cast keccak` (== StealthPay.paymentNonce)
+  check("paymentNonce matches cast", paymentNonce({ chainId: 4663, stealthPay: "0x1111111111111111111111111111111111111111", token: "0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168", stealth: "0x2222222222222222222222222222222222222222", eph: "0x03" + "33".repeat(32), viewTag: "0x2a", fee: 50000n, feeRecipient: "0x4444444444444444444444444444444444444444" }) === "0x59b5c6887352a734851ed214c94808287ce1973432bd9756ff0ce0c95b38879b");
   say((bad ? "RESULT FAIL " : "RESULT PASS ") + ok + " checks ok, " + bad + " failed, vectors " + vectors.length);
 } catch (e) { say("RESULT ERROR " + (e && e.stack || e)); }
