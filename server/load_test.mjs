@@ -51,7 +51,7 @@ try {
   const pub = createPublicClient({ chain, transport: vhttp(RPC) });
   const deployer = createWalletClient({ account: privateKeyToAccount(ANVIL0), chain, transport: vhttp(RPC) });
   const art = JSON.parse(fs.readFileSync(path.join(HERE, "../out/StealthPay.sol/StealthPay.json"), "utf8"));
-  const dh = await deployer.deployContract({ abi: art.abi, bytecode: art.bytecode.object, args: ["0x55649E01B5Df198D18D95b5cc5051630cfD45564"] });
+  const dh = await deployer.deployContract({ abi: art.abi, bytecode: art.bytecode.object, args: ["0x55649E01B5Df198D18D95b5cc5051630cfD45564", TOKEN] });
   const SP = getAddress((await pub.waitForTransactionReceipt({ hash: dh })).contractAddress); console.log("StealthPay on fork:", SP);
   const erc = parseAbi(["function balanceOf(address) view returns (uint256)"]);
   const bal = a => pub.readContract({ address: TOKEN, abi: erc, functionName: "balanceOf", args: [a] });

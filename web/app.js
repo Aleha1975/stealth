@@ -79,23 +79,61 @@ $("btn-keys").addEventListener("click", async () => {
 $("copy-link").addEventListener("click", () => navigator.clipboard.writeText($("paylink").textContent).then(() => say("recv-hint", "Link copied.", "ok")));
 $("copy-meta").addEventListener("click", () => navigator.clipboard.writeText($("meta").textContent).then(() => say("recv-hint", "Meta-address copied.", "ok")));
 
+// ---- history page cache (IndexedDB, key chain|page|manifest.version). Works without storage: every call is wrapped.
+function idb() {
+  return new Promise(res => { try { const q = indexedDB.open("stealth-pages", 1); q.onupgradeneeded = () => q.result.createObjectStore("p"); q.onsuccess = () => res(q.result); q.onerror = () => res(null); q.onblocked = () => res(null); } catch { res(null); } });
+}
+const idbGet = (db, key) => new Promise(res => { try { const q = db.transaction("p").objectStore("p").get(key); q.onsuccess = () => res(q.result || null); q.onerror = () => res(null); } catch { res(null); } });
+const idbPut = (db, key, val) => new Promise(res => { try { const t = db.transaction("p", "readwrite"); t.objectStore("p").put(val, key); t.oncomplete = () => res(); t.onerror = () => res(); t.onabort = () => res(); } catch { res(); } });
+/** Returns k => rows[] for pages 0..full_pages-1; fetches only pages missing from the local cache (6 at a time). */
+async function getPages(man) {
+  const db = await idb(), pages = new Array(man.full_pages), key = k => C.key + "|" + k + "|" + man.version;
+  const need = [];
+  for (let k = 0; k < man.full_pages; k++) { const hit = db ? await idbGet(db, key(k)) : null; if (Array.isArray(hit)) pages[k] = hit; else need.push(k); }
+  let next = 0;
+  const worker = async () => {
+    for (;;) {
+      const i = next++; if (i >= need.length) return; const k = need[i];
+      const r = await fetch(API + "/pages/p" + String(k).padStart(6, "0") + ".json?v=" + man.version);
+      if (!r.ok) throw new Error("history page " + k + " unavailable (" + r.status + ")");
+      const rows = await r.json(); if (!Array.isArray(rows)) throw new Error("bad history page " + k);
+      pages[k] = rows; if (db) await idbPut(db, key(k), rows);
+      if (i % 8 === 0) say("pay-hint", "Downloading history " + (man.full_pages - need.length + i + 1) + "/" + man.full_pages + "…");
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(6, need.length) }, worker));
+  return k => pages[k];
+}
 // ---- payments: scan announcements (indexed by us), check each with the viewing key, balances via our API
 async function scan() {
   if (!keys) { say("pay-hint", "Derive your keys first (Receive tab).", "bad"); return; }
   const head = await api("/head");
   if (head.lag != null && head.lag > 50) say("pay-hint", "Index is " + head.lag + " blocks behind the chain; very recent payments may not show yet.", "warn");
   else say("pay-hint", "Reading announcements on " + C.name + "…");
-  found = []; let since = 0, n = 0;
+  found = []; let n = 0;
+  const check = (id, block, tx, stealth, eph, meta, payer) => {
+    n++;
+    if (!eph || !isHash(tx) || !isAddr(stealth)) return;
+    const md = decodeMetadata(meta) || {};
+    const hit = checkAnnouncement(keys, eph, md.viewTag);          // view-tag filter first, full check only on a tag match
+    if (!hit || hit.stealth.toLowerCase() !== stealth.toLowerCase()) return;
+    found.push({ stealth: hit.stealth, tx, block: Number(block) || 0, token: md.token, amount: md.amount, payer: isAddr(payer) ? payer : null, eph });
+  };
+  let since = 0;
+  // 1) immutable history pages (static files, cached forever locally); 2) only the tail from the indexer. Old indexers (no manifest) -> paged API.
+  let man = null;
+  try { const r = await fetch(API + "/pages/manifest.json", { cache: "no-cache" }); if (r.ok) { const m = await r.json(); if (m && m.chain === C.key && m.page_size === 1024 && Number.isInteger(m.full_pages) && m.full_pages >= 0 && Number.isInteger(m.tail_since_id)) man = m; } } catch {}
+  if (man) {
+    const rowsOf = await getPages(man);
+    for (let k = 0; k < man.full_pages; k++) {
+      for (const r of rowsOf(k)) check(r[0], r[1], r[2], r[3], r[4], r[5], r[6]);
+      if (k % 20 === 19) say("pay-hint", n + " announcements checked…");
+    }
+    since = man.tail_since_id;
+  }
   for (;;) {
     const d = await api("/announcements?since=" + since + "&limit=2000");
-    for (const r of d.rows) {
-      n++;
-      if (r.scheme !== 1 || !r.eph || !isHash(r.tx) || !isAddr(r.stealth)) continue;
-      const md = decodeMetadata(r.meta) || {};
-      const hit = checkAnnouncement(keys, r.eph, md.viewTag);
-      if (!hit || hit.stealth.toLowerCase() !== r.stealth.toLowerCase()) continue;
-      found.push({ stealth: hit.stealth, tx: r.tx, block: Number(r.block) || 0, token: md.token, amount: md.amount, payer: isAddr(r.payer) ? r.payer : null, eph: r.eph });
-    }
+    for (const r of d.rows) { if (r.scheme === 1) check(r.id, r.block, r.tx, r.stealth, r.eph, r.meta, r.payer); }
     if (n % 2000 === 0 && n) say("pay-hint", n + " announcements checked…");
     if (!d.rows.length || d.next === since) break; since = d.next;
   }

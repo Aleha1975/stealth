@@ -9,12 +9,15 @@
 API (127.0.0.1:3873, за nginx как /stealth-api/):
   GET /head                                  -> {head, chain_head, lag, count, ts, start}
   GET /announcements?since=<id>&limit=<n>     -> {rows:[{id,block,tx,scheme,stealth,caller,eph,meta,payer}], next}
+  Статические страницы истории (nginx, не Python): STEALTH_PAGES_DIR/manifest.json + p<k>.json(.gz), по PAGE_SIZE=1024 строк на страницу
+  (id в [k*1024+1, (k+1)*1024]), строка = [id,block,tx,stealth,eph,meta,payer]. Страница пишется только когда полная И все её строки
+  не новее "финального" блока (реорг-страж их уже не тронет); /announcements?since=tail_since_id отдаёт только хвост.
   GET /known?addr=0x..                        -> {known: bool}   (объявлено ЧЕРЕЗ наш StealthPay -- payToken или payWithAuthorization, токен цепи >= MIN_KNOWN_USDC)
   GET /balances?addrs=0x..,0x..               -> {addr: {usdc, eth}} (до 100 адресов, Multicall3 + кэш 15 с; usdc = токен цепи)
   GET /receipt?tx=0x..                        -> {status: 1|0|null}
   GET /usdc-domain                            -> {domain_separator, chain, token}
 """
-import json, os, sqlite3, threading, time, urllib.request
+import gzip, json, os, sqlite3, threading, time, urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
@@ -33,6 +36,9 @@ BACKFILL = int(os.environ.get("STEALTH_BACKFILL", "200000"))
 MODE = os.environ.get("STEALTH_HEAD_MODE", CC["mode"])         # safe | latest
 CONF = int(os.environ.get("STEALTH_CONFIRMATIONS", CC["confirmations"]))
 RECONCILE_EVERY = int(os.environ.get("STEALTH_RECONCILE_EVERY", "60"))
+PAGES_DIR = os.environ.get("STEALTH_PAGES_DIR", "")             # пусто -> страницы не пишем (клиент идёт по старому пути)
+PAGE_SIZE = 1024
+PAGES_MARGIN = int(os.environ.get("STEALTH_PAGES_MARGIN", "200"))   # rh: финал = safe - MARGIN (> окна реконсиляции safe-100)
 DB = os.environ.get("STEALTH_DB", "/opt/stealth/announcements.db")
 PORT = int(os.environ.get("STEALTH_PORT", "3873"))
 MIN_KNOWN_USDC = int(os.environ.get("MIN_KNOWN_USDC", "100000"))     # $0.10: мельче через релеер не выводим
@@ -173,10 +179,11 @@ def reconcile(c, sf, head_done):
     """Реорг-страж (rh): перечитать (safe-100 .. head_done], убрать строки, которых в цепи больше нет (или они в другом блоке), добавить новые."""
     a = max(START, (sf or head_done - 10000) - 100)
     if a > head_done: return
+    # верхняя граница обязательна: иначе строки новее head_done (их уже записал основной цикл за время getLogs) считались бы "пропавшими" и удалялись
     fresh = fetch_range(a, head_done)
     want = {(r["tx"], r["log_index"], r["block"]): r for r in fresh}
     with _lock:
-        have = {(t, li, bl): i for i, t, li, bl in c.execute("SELECT id,tx,log_index,block FROM ann WHERE block>=?", (a,))}
+        have = {(t, li, bl): i for i, t, li, bl in c.execute("SELECT id,tx,log_index,block FROM ann WHERE block>=? AND block<=?", (a, head_done))}
     gone = [i for k, i in have.items() if k not in want]
     if gone:
         with _lock:
@@ -188,6 +195,54 @@ def reconcile(c, sf, head_done):
     if new:
         with _lock: c.commit()
         print("reconcile: added", len(new), "rows", flush=True)
+
+
+def _atomic(path, data):
+    tmp = path + ".tmp%d" % os.getpid()
+    with open(tmp, "wb") as f: f.write(data)
+    os.replace(tmp, path)
+
+
+def _page_name(k): return "p%06d.json" % k
+
+
+def _write_page(c, k):
+    """Записать страницу k (json + json.gz) из БД; вернуть число строк."""
+    rows = c.execute("SELECT id,block,tx,stealth,eph,meta,payer FROM ann WHERE id>? AND id<=? ORDER BY id", (k * PAGE_SIZE, (k + 1) * PAGE_SIZE)).fetchall()
+    raw = json.dumps([list(r) for r in rows], separators=(",", ":")).encode()
+    base = os.path.join(PAGES_DIR, _page_name(k))
+    _atomic(base, raw); _atomic(base + ".gz", gzip.compress(raw, 9, mtime=0))
+    return len(rows)
+
+
+def pages_step(c, final_block):
+    """Дописать новые полные страницы и перезаписать те, где реорг удалил строку. final_block None -> новых страниц нет."""
+    if not PAGES_DIR: return
+    os.makedirs(PAGES_DIR, exist_ok=True)
+    with _lock:
+        g = lambda k: c.execute("SELECT v FROM meta WHERE k=?", (k,)).fetchone()
+        st = json.loads(g("pages")[0]) if g("pages") else {"full": 0, "version": 1, "counts": []}
+        full, ver, counts = st["full"], st["version"], st["counts"]
+        changed = False
+        # 1) уже записанные страницы: число строк должно совпадать (удаление реорга -> перезапись + новая версия)
+        if full and c.execute("SELECT COUNT(*) FROM ann WHERE id<=?", (full * PAGE_SIZE,)).fetchone()[0] != sum(counts):
+            now = dict(c.execute("SELECT (id-1)/?, COUNT(*) FROM ann WHERE id<=? GROUP BY 1", (PAGE_SIZE, full * PAGE_SIZE)).fetchall())
+            bad = [k for k in range(full) if now.get(k, 0) != counts[k]]
+            for k in bad: counts[k] = _write_page(c, k)
+            if bad: ver += 1; changed = True; print("pages: rewrote", bad, "after reorg, version", ver, flush=True)
+        # 2) новые полные финальные страницы
+        mx = c.execute("SELECT COALESCE(MAX(id),0) FROM ann").fetchone()[0]
+        lim = mx
+        if final_block is None: lim = full * PAGE_SIZE
+        else:
+            u = c.execute("SELECT MIN(id) FROM ann WHERE block>?", (final_block,)).fetchone()[0]
+            if u is not None: lim = min(lim, u - 1)
+        while (full + 1) * PAGE_SIZE <= lim:
+            counts.append(_write_page(c, full)); full += 1; changed = True
+        mpath = os.path.join(PAGES_DIR, "manifest.json")
+        if changed or not os.path.exists(mpath):
+            c.execute("INSERT OR REPLACE INTO meta(k,v) VALUES('pages',?)", (json.dumps({"full": full, "version": ver, "counts": counts}),)); c.commit()
+            _atomic(mpath, json.dumps({"chain": CHAIN, "full_pages": full, "page_size": PAGE_SIZE, "version": ver, "tail_since_id": full * PAGE_SIZE}, separators=(",", ":")).encode())
 
 
 def index_loop():
@@ -243,6 +298,7 @@ def index_loop():
                 c.execute("INSERT OR REPLACE INTO meta(k,v) VALUES('chain_head',?)", (str(head),)); c.commit()
             if MODE != "safe" and time.time() - last_rec >= RECONCILE_EVERY:
                 reconcile(c, sf, head_done); last_rec = time.time()
+            pages_step(c, head_done if MODE == "safe" else (sf - PAGES_MARGIN if sf else None))
         except Exception as e:
             print("index error:", str(e)[:200], flush=True)
         time.sleep(POLL)
