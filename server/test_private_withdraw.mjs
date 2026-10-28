@@ -300,9 +300,9 @@ try {
   await R.type("wd-to", recvA); await R.click("#btn-wd");
   await until(async () => await hintBad(), "guard: key wallet", 8000, 100);
   ok("guard: destination == key wallet refused in private mode, no quote requested", /Refused: that is the wallet your keys came from/.test(await R.text("pay-hint")) && mock.quotes.length === q0);
-  await R.type("wd-to", relayerAddr); await R.click("#btn-wd");     // the indexer records tx.from as "payer": for a gasless payment that is the relayer (existing behaviour)
-  await until(async () => /that paid you/.test(await R.text("pay-hint")), "guard: payer", 8000, 100).catch(async e => { console.log("  payer guard: hint=", await R.text("pay-hint"), "| payer field of the found payment:", await R.eval("1") , "| relayer", relayerAddr); throw e; });
-  ok("guard: destination == recorded payer (tx.from) refused in private mode, no quote requested", mock.quotes.length === q0);
+  await R.type("wd-to", payerA); await R.click("#btn-wd");     // the indexer now records the REAL payer (the signer) for a gasless payment, not the relayer (tx.from)
+  await until(async () => /that paid you/.test(await R.text("pay-hint")), "guard: payer", 8000, 100).catch(async e => { console.log("  payer guard: hint=", await R.text("pay-hint"), "| payer field of the found payment:", await R.eval("1") , "| payer", payerA); throw e; });
+  ok("guard: destination == real payer (the signer of the gasless payment, not the relayer) refused in private mode, no quote requested", mock.quotes.length === q0);
 
   // ---- B. preview (dry quote) -> confirm -> relayer -> submit -> status SUCCESS
   const sBefore = await bal(stealthFull), w0 = walletTotal(R), dl0 = R.dialogs.length;
@@ -332,7 +332,7 @@ try {
   ok("hint says Done privately: 4.95 USDG ... Base", /Done privately: 4\.95 USDG sent through NEAR Intents to 0x[0-9a-fA-F]{6}… on Base\./.test(await R.text("pay-hint")), (await R.text("pay-hint")).split("\n")[0]);
   ok("/v0/auth/* was never called", !mock.log.some(l => /AUTH/.test(l)));
 
-  // ---- C. split into 2 random parts from a second payment (relayer may allow one withdrawal per address per day: both outcomes are checked)
+  // ---- C. split into 2 random parts from a second payment (relayer allows up to 3 withdrawals per address per day)
   await pay("5"); await rpc("anvil_mine", ["0x4"]);
   await R.click('[data-pane="payments"]');
   await until(async () => /, 2 are yours/.test(await scan()), "second payment visible", 40000, 500);
@@ -348,9 +348,7 @@ try {
   const fin = await until(async () => { const h = await R.text("pay-hint"); return (/^Done privately:/.test(h) && /announcements scanned/.test(h)) || (await hintBad()) ? h : null; }, "split finished", 120000, 300);
   const deps = Object.keys(mock.deposits).slice(depsBefore); const got = await Promise.all(deps.map(bal)); const parts = mock.quotes.filter(x => !x.dry).slice(rqBefore).map(x => BigInt(x.amount));
   console.log("  split hint:", fin.split("\n")[0].slice(0, 200), "| quotes:", parts.join("+"), "| deposits got:", got.join("+"), "| took", Date.now() - tSplit, "ms");
-  const p1ok = got.length >= 1 && got[0] === parts[0] && parts[0] >= 1_000_000n;
-  if (/^Done privately/.test(fin)) ok("split: both parts delivered, sum == 4.95 USDG, each >= 1 USDG and unequal", got.length === 2 && got[0] + got[1] === 4_950_000n && parts.every(p => p >= 1_000_000n) && parts[0] !== parts[1] && /Done privately: 4\.95 USDG/.test(fin));
-  else ok("split: part 1 delivered exactly, part 2 stopped with an explicit message and the rest stays on the stealth address (relayer allows one withdrawal per address per day)", p1ok && /Part 2\/2/.test(fin) && /already withdrew today/.test(fin) && /The rest stays on your stealth address/.test(fin) && /was sent already/.test(fin), fin.split("\n")[0].slice(0, 160));
+  ok("split: both parts delivered through the relayer (3/day per address), sum == 4.95 USDG, each >= 1 USDG and unequal", /^Done privately/.test(fin) && got.length === 2 && got[0] + got[1] === 4_950_000n && parts.every(p => p >= 1_000_000n) && parts[0] !== parts[1] && /Done privately: 4\.95 USDG/.test(fin) && !/already withdrew|limit/.test(fin), fin.split("\n")[0].slice(0, 160));
 
   ok("no JS exceptions / console errors on either page", R.errors.length === 0 && Y.errors.length === 0 && R.console.length === 0 && Y.console.length === 0, [...R.errors, ...Y.errors, ...R.console, ...Y.console].join(" | ").slice(0, 300));
   console.log("wallet calls receiver:", JSON.stringify(R.counts), " payer:", JSON.stringify(Y.counts));

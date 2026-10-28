@@ -22,9 +22,9 @@ async function parent() {
   };
   try {
     if (process.env.ONLY) { run(process.env.ONLY, { STEALTH_RELAY_STUCK_S: "3" }); return; }
-    console.log("== 1. параллельные запросы с одного from -> принят ровно один");
+    console.log("== 1. параллельные запросы с одного from -> принят ровно один (замок in-flight)");
     run("concurrent", { STEALTH_RELAY_GAS_BUDGET_WEI: "1000000000000000000" }, "shared");
-    console.log("== 2. рестарт (новый процесс, тот же файл) -> лимит суток сохранён");
+    console.log("== 2. рестарт (тот же файл) -> счётчик 1 сохранён; ещё 2 подряд принимаются, 4-й отказ (лимит 3/сутки)");
     run("restart", {}, "shared");
     console.log("== 3. резерв бюджета: 4 параллельных заявки с разных from при бюджете ~1.2 транзакции");
     const e = run("budget", {}); const est = BigInt(/EST (\d+)/.exec(e.stdout)[1]);
@@ -61,7 +61,7 @@ async function child(sc) {
     const eth = await rpc("eth_getBalance", [HOLDER, "latest"]); const tb = await bal(HOLDER); if (process.env.DBG) console.log("T: holder eth", eth, "usdg", String(tb));
     const h = await rpc("eth_sendTransaction", [{ from: HOLDER, to: TOKEN, data: encodeFunctionData({ abi: erc, functionName: "transfer", args: [acc.address, usdg] }) }]);
     for (let i = 0; i < 20 && !(await rpc("eth_getTransactionReceipt", [h])); i++) await new Promise(r => setTimeout(r, 200));
-    known.add(acc.address.toLowerCase()); return acc;
+    known.add(acc.address.toLowerCase()); acc.pk = pk; return acc;
   }
   const types = { TransferWithAuthorization: [{ name: "from", type: "address" }, { name: "to", type: "address" }, { name: "value", type: "uint256" }, { name: "validAfter", type: "uint256" }, { name: "validBefore", type: "uint256" }, { name: "nonce", type: "bytes32" }] };
   async function sign(acc, to, value, nonce) {
@@ -75,17 +75,22 @@ async function child(sc) {
   const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 
   if (sc === "concurrent") {
-    const a = await newStealth(); const to = dest();
+    const a = await newStealth(1_000_000n); const to = dest();
     const rs = await Promise.all([0, 1, 2, 3, 4].map(async () => tryRelay(await sign(a, to, 300000n), "2.2.2." + Math.random())));
     show(rs); const okN = rs.filter(r => r.ok).length; out("accepted =", okN, okN === 1 ? "PASS" : "FAIL");
     await sleep(800); out("recipient balance", String(await bal(to)), "state gas wei", String(R.st.gas), "perFrom", JSON.stringify(R.st.perFrom));
-    fs.writeFileSync(path.join(os.tmpdir(), "stealth-t-from.json"), JSON.stringify({ pk: null, from: a.address }));
-    const f = await sign(a, to, 300000n); fs.writeFileSync(path.join(os.tmpdir(), "stealth-t-req.json"), JSON.stringify(f));
+    fs.writeFileSync(path.join(os.tmpdir(), "stealth-t-from.json"), JSON.stringify({ pk: a.pk, from: a.address }));
     out("state file:", fs.readFileSync(process.env.STEALTH_RELAY_STATE, "utf8").slice(0, 200));
   } else if (sc === "restart") {
     out("loaded from file: gas", String(R.st.gas), "perFrom", JSON.stringify(R.st.perFrom));
-    const req = JSON.parse(fs.readFileSync(path.join(os.tmpdir(), "stealth-t-req.json"), "utf8")); known.add(req.from.toLowerCase());
-    const r = await tryRelay(req); show([r]); out("same-from after restart refused =", !r.ok && /already withdrew/.test(r.err) ? "PASS" : "FAIL");
+    const fj = JSON.parse(fs.readFileSync(path.join(os.tmpdir(), "stealth-t-from.json"), "utf8")); const acc = privateKeyToAccount(fj.pk); known.add(acc.address.toLowerCase()); const to = dest();
+    out("persisted count =", String(R.st.perFrom[acc.address]), R.st.perFrom[acc.address] === 1 ? "PASS" : "FAIL");
+    const r2 = await tryRelay(await sign(acc, to, 300000n)); show([r2]); out("2nd sequential accepted =", r2.ok ? "PASS" : "FAIL");
+    const r3 = await tryRelay(await sign(acc, to, 300000n)); show([r3]); out("3rd sequential accepted =", r3.ok ? "PASS" : "FAIL");
+    const r4 = await tryRelay(await sign(acc, to, 100000n)); show([r4]); out("4th refused (limit) =", !r4.ok && /withdrawal limit/.test(r4.err) ? "PASS" : "FAIL");
+    // миграция старого формата: perFrom {addr:true} -> 1
+    fs.writeFileSync(process.env.STEALTH_RELAY_STATE, JSON.stringify({ day: R.st.day, gas: "0", perIp: {}, perFrom: { "0xabc": true, "0xdef": 2, "0xbad": "x" }, perPayer: {} })); R.load();
+    out("migrated perFrom =", JSON.stringify(R.st.perFrom), JSON.stringify(R.st.perFrom) === '{"0xabc":1,"0xdef":2}' ? "PASS" : "FAIL");
   } else if (sc === "budget") {
     const accs = []; for (let i = 0; i < 4; i++) accs.push(await newStealth());
     const probe = await sign(accs[0], dest(), 300000n);

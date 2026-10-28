@@ -1,7 +1,7 @@
 /* E2E на форке Robinhood Chain (anvil): платёж одной подписью через /relay/pay. Запуск: node test_pay_e2e.mjs
    Деплоит StealthPay на форк (ключ anvil #0), плательщику даёт USDG (импёрсонация держателя), подпись делает ТЕМ ЖЕ кодом, что веб
    (web/pay-auth.js), релеер -- отдельный процесс (relayer.mjs) с HTTP, как в бою. В живую цепь ничего не шлётся. */
-import { spawn } from "child_process"; import fs from "fs"; import os from "os"; import path from "path"; import { fileURLToPath } from "url";
+import { spawn, spawnSync } from "child_process"; import fs from "fs"; import os from "os"; import path from "path"; import { fileURLToPath } from "url";
 import { createPublicClient, createWalletClient, http, parseAbi, parseEventLogs, hashTypedData, toHex, getAddress } from "viem";
 import { generatePrivateKey, privateKeyToAccount } from "viem/accounts";
 import { paymentNonce, receiveDigest, receiveTypedData, splitSig } from "../web/pay-auth.js";
@@ -103,6 +103,29 @@ try {
   // replay
   const r2 = await post(body(), "9.9.9.10"); ok("second submit of same payload refused", r2.status === 400, r2.error);
   ok("replay moved nothing", (await bal(d.stealth)) === AMOUNT - FEE && (await relayerNonce()) === n0 + 1);
+  // ---- indexer: payer of a gasless payment must be the SIGNER, not the relayer (tx.from); payToken -> the caller
+  const d2 = deriveForPayment(parseMeta(metaAddress(keys, "rh")));
+  await rpc("anvil_setBalance", [payer.address, toHex(10n ** 18n)]);
+  const payerW = createWalletClient({ account: payer, chain, transport: http(RPC) });
+  await pub.waitForTransactionReceipt({ hash: await payerW.writeContract({ address: TOKEN, abi: parseAbi(["function approve(address,uint256) returns (bool)"]), functionName: "approve", args: [SP, 1_000_000n] }) });
+  const rc2 = await pub.waitForTransactionReceipt({ hash: await payerW.writeContract({ address: SP, abi: art.abi, functionName: "payToken", args: [TOKEN, 1_000_000n, d2.stealth, d2.ephPub, d2.viewTag] }) });
+  ok("payToken mined", rc2.status === "success");
+  await rpc("anvil_mine", ["0x8"]);
+  const IPORT = 3985, IDB = path.join(tmp, "i.db");
+  const iEnv = { ...process.env, STEALTH_CHAIN: "rh", STEALTH_RPC: RPC, STEALTH_DB: IDB, STEALTH_PORT: String(IPORT), STEALTHPAY: SP.toLowerCase(), STEALTH_CONFIRMATIONS: "2", STEALTH_START_BLOCK: String(Number(rc.blockNumber) - 2) };
+  const ip = spawn("python3", ["-B", path.join(HERE, "stealth_indexer.py")], { env: iEnv, stdio: "ignore" }); procs.push(ip);
+  const J = async u => (await fetch("http://127.0.0.1:" + IPORT + u)).json();
+  let rows = []; for (let i = 0; i < 60; i++) { try { rows = (await J("/stealth-api/announcements?since=0&limit=50")).rows; } catch {} if (rows.length >= 2) break; await sleep(500); }
+  const rowOf = st => rows.find(x => x.stealth.toLowerCase() === st.toLowerCase());
+  ok("indexer: gasless payment payer == signer (not relayer)", rowOf(d.stealth)?.payer === payer.address.toLowerCase() && rowOf(d.stealth)?.payer !== relayerAddr.toLowerCase(), String(rowOf(d.stealth)?.payer));
+  ok("indexer: payToken payer == caller", rowOf(d2.stealth)?.payer === payer.address.toLowerCase(), String(rowOf(d2.stealth)?.payer));
+  // --refill-payers: corrupt the stored payer to the relayer (old behaviour), recompute, check
+  ip.kill(); await sleep(800);
+  const py = (code) => spawnSync("python3", ["-I", "-c", code], { encoding: "utf8" });
+  py("import sqlite3;c=sqlite3.connect(%j);c.execute(\"UPDATE ann SET payer=?\",(%j,));c.commit()".replace("%j", JSON.stringify(IDB)).replace("%j", JSON.stringify(relayerAddr.toLowerCase())));
+  const rf = spawnSync("python3", ["-B", path.join(HERE, "stealth_indexer.py"), "--refill-payers"], { env: iEnv, encoding: "utf8" });
+  const got = py("import sqlite3;print(','.join(r[0] for r in sqlite3.connect(%j).execute('SELECT payer FROM ann ORDER BY id')))".replace("%j", JSON.stringify(IDB))).stdout.trim();
+  ok("--refill-payers recomputes existing rows", rf.status === 0 && got === payer.address.toLowerCase() + "," + payer.address.toLowerCase(), rf.stdout.trim() + " | " + got);
   console.log(fails ? "RESULT FAIL " + fails : "RESULT PASS");
   done(fails ? 1 : 0);
 } catch (e) { console.log("ERROR", e && e.stack || e); done(2); }

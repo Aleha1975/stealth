@@ -52,6 +52,7 @@ const MIN_BALANCE_WEI = BigInt(E.STEALTH_RELAY_MIN_BALANCE_WEI || "1000000000000
 const STUCK_S = Number(E.STEALTH_RELAY_STUCK_S || 60);                                           // нет квитанции за N с -> замена
 const BUMP_PCT = BigInt(E.STEALTH_RELAY_BUMP_PCT || "30");
 const GAS_PAD_PCT = 125n;                                                                         // запас к оценке газа для резерва
+const MAX_PER_FROM = Math.max(1, Number(E.STEALTH_RELAY_PER_FROM || 3));
 const INDEXER = E.STEALTH_INDEXER || "http://127.0.0.1:3873";
 const STATE_FILE = E.STEALTH_RELAY_STATE || "/opt/stealth/relayer_state." + CHAIN + ".json";
 const LOG = E.STEALTH_RELAY_LOG || "/opt/stealth/relayer." + CHAIN + ".log";
@@ -70,8 +71,9 @@ const save = () => {
   try { const tmp = STATE_FILE + ".tmp"; fs.writeFileSync(tmp, JSON.stringify({ day: st.day, gas: st.gas.toString(), perIp: st.perIp, perFrom: st.perFrom, perPayer: st.perPayer })); fs.renameSync(tmp, STATE_FILE); }
   catch (e) { log("ALERT state save failed", String(e).slice(0, 80)); }
 };
+const migFrom = (o) => { const r = {}; for (const [k, v] of Object.entries(o || {})) { const n = v === true ? 1 : Number(v); if (Number.isFinite(n) && n > 0) r[k] = Math.floor(n); } return r; };   // старый формат: true -> 1
 export const load = () => {
-  try { const j = JSON.parse(fs.readFileSync(STATE_FILE, "utf8")); if (j.day === day()) st = { day: j.day, gas: BigInt(j.gas), perIp: j.perIp || {}, perFrom: j.perFrom || {}, perPayer: j.perPayer || {} }; } catch {}
+  try { const j = JSON.parse(fs.readFileSync(STATE_FILE, "utf8")); if (j.day === day()) st = { day: j.day, gas: BigInt(j.gas), perIp: j.perIp || {}, perFrom: migFrom(j.perFrom), perPayer: j.perPayer || {} }; } catch {}
 };
 load();
 const roll = () => { if (st.day !== day()) { st = { day: day(), gas: 0n, perIp: {}, perFrom: {}, perPayer: {} }; save(); } };
@@ -133,7 +135,7 @@ async function sendAndTrack(call, gasLimit, reserve, from, tag, onRevert) {
       catch (e) { log("ALERT receipt wait failed", tag, hash, String(e).slice(0, 80)); return; }   // резерв остаётся (консервативно)
     }
     const spent = rc.gasUsed * (rc.effectiveGasPrice || 0n); st.gas += spent - reserve; if (st.gas < 0n) st.gas = 0n;
-    if (rc.status !== "success") { if (onRevert) onRevert(); else if (tag === "main") delete st.perFrom[from]; log("reverted", tag, hash); } else log("mined", tag, hash, "gas", formatEther(spent), "ETH");
+    if (rc.status !== "success") { if (onRevert) onRevert(); else if (tag === "main") { if ((st.perFrom[from] || 0) > 1) st.perFrom[from]--; else delete st.perFrom[from]; } log("reverted", tag, hash); } else log("mined", tag, hash, "gas", formatEther(spent), "ETH");
     save();
   };
   watch().catch(e => log("watch error", String(e).slice(0, 80)));
@@ -154,7 +156,7 @@ export async function relay(b, ip) {
   roll();
   // ---- синхронный блок: проверки суток и замок адреса без await между проверкой и записью
   if ((st.perIp[ip] || 0) >= MAX_PER_IP_PER_DAY) throw new Error("too many requests from this network today");
-  if (st.perFrom[from]) throw new Error("this address already withdrew today; try tomorrow");
+  if ((st.perFrom[from] || 0) >= MAX_PER_FROM) throw new Error("this address reached its withdrawal limit today; try tomorrow");
   if (inflight.has(from)) throw new Error("a withdrawal from this address is already in progress");
   if (st.gas >= GAS_BUDGET_WEI_PER_DAY) throw new Error("relayer gas budget for today is spent");
   inflight.add(from); st.perIp[ip] = (st.perIp[ip] || 0) + 1;
@@ -190,7 +192,7 @@ export async function relay(b, ip) {
       try { hashes[tag] = await sendAndTrack(TRANSFER_CALL(args), lims[i], part, from, tag); }
       catch (e) { if (sent) log("ALERT fee sent but main failed", from, String(e).slice(0, 80)); throw e; }
       sent = true; used += part;
-      if (tag === "main") { st.perFrom[from] = true; save(); }
+      if (tag === "main") { st.perFrom[from] = (st.perFrom[from] || 0) + 1; save(); }
     }
     log("relay", from, "->", to, (Number(value) / 1e6).toFixed(6), CC.token_symbol, hashes.main, fee ? "fee " + (Number(fee.value) / 1e6).toFixed(6) + " " + hashes.fee : "", "ip", ip);
     return fee ? { hash: hashes.main, feeHash: hashes.fee } : { hash: hashes.main };

@@ -17,7 +17,7 @@ API (127.0.0.1:3873, за nginx как /stealth-api/):
   GET /receipt?tx=0x..                        -> {status: 1|0|null}
   GET /usdc-domain                            -> {domain_separator, chain, token}
 """
-import gzip, json, os, sqlite3, threading, time, urllib.request
+import gzip, json, os, sqlite3, sys, threading, time, urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
@@ -146,15 +146,60 @@ def target_head():
     return max(0, lat - CONF), sf
 
 
+TRANSFER_T = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"
+
+
+def _real_payer(rc, stealth):
+    """Настоящий плательщик по квитанции. Токеновый платёж через StealthPay: payWithAuthorization (газless, tx.from = релеер) -> Transfer токена
+    на контракт StealthPay, from = плательщик; payToken -> Transfer токена прямо на stealth-адрес (from = плательщик). payETH/нет логов -> tx.from."""
+    tx_from = (rc.get("from") or "").lower() or None
+    to_sp = to_st = None
+    for lg in rc.get("logs") or []:
+        t = lg.get("topics") or []
+        if (lg.get("address") or "").lower() != USDC or len(t) != 3 or t[0].lower() != TRANSFER_T: continue
+        frm, to = "0x" + t[1][-40:].lower(), "0x" + t[2][-40:].lower()
+        if to == STEALTHPAY and to_sp is None: to_sp = frm
+        elif to == stealth and frm != STEALTHPAY and to_st is None: to_st = frm
+    return to_sp or to_st or tx_from
+
+
+def payer_of(r, cache):
+    """cache: tx -> квитанция (один eth_getTransactionReceipt на tx). Для анонсов не от StealthPay (или без STEALTHPAY) - tx.from через ту же квитанцию."""
+    if r["tx"] not in cache:
+        try: cache[r["tx"]] = rpc("eth_getTransactionReceipt", [r["tx"]], 15) or None
+        except Exception: cache[r["tx"]] = None
+    rc = cache[r["tx"]]
+    if not rc: return None
+    if STEALTHPAY and r["caller"] == STEALTHPAY: return _real_payer(rc, r["stealth"])
+    return (rc.get("from") or "").lower() or None
+
+
 def put_row(c, r, payers):
-    if r["tx"] not in payers:
-        try:
-            txo = rpc("eth_getTransactionByHash", [r["tx"]], 15); payers[r["tx"]] = ((txo or {}).get("from") or "").lower() or None
-        except Exception:
-            payers[r["tx"]] = None
+    payer = payer_of(r, payers)
     with _lock:
         c.execute("INSERT OR IGNORE INTO ann(block,tx,log_index,scheme,stealth,caller,eph,meta,view_tag,payer) VALUES(?,?,?,?,?,?,?,?,?,?)",
-                  (r["block"], r["tx"], r["log_index"], r["scheme"], r["stealth"], r["caller"], r["eph"], r["meta"], r["view_tag"], payers[r["tx"]]))
+                  (r["block"], r["tx"], r["log_index"], r["scheme"], r["stealth"], r["caller"], r["eph"], r["meta"], r["view_tag"], payer))
+
+
+def refill_payers():
+    """Одноразово: пересчитать payer у существующих строк (caller == STEALTHPAY), затем перезаписать страницы и поднять версию манифеста."""
+    if not STEALTHPAY: raise SystemExit("--refill-payers needs STEALTHPAY")
+    c = db(); cache = {}; n = ch = 0
+    for id_, tx, stealth, caller, old in c.execute("SELECT id,tx,stealth,caller,payer FROM ann WHERE caller=? ORDER BY id", (STEALTHPAY,)).fetchall():
+        new = payer_of({"tx": tx, "stealth": stealth, "caller": caller}, cache)
+        n += 1
+        if new and new != old:
+            c.execute("UPDATE ann SET payer=? WHERE id=?", (new, id_)); ch += 1
+        if len(cache) > 500: cache.clear()
+    c.commit()
+    if PAGES_DIR and c.execute("SELECT v FROM meta WHERE k='pages'").fetchone():
+        st = json.loads(c.execute("SELECT v FROM meta WHERE k='pages'").fetchone()[0])
+        for k in range(st["full"]): st["counts"][k] = _write_page(c, k)
+        st["version"] += 1
+        c.execute("INSERT OR REPLACE INTO meta(k,v) VALUES('pages',?)", (json.dumps(st),)); c.commit()
+        _atomic(os.path.join(PAGES_DIR, "manifest.json"), json.dumps({"chain": CHAIN, "full_pages": st["full"], "page_size": PAGE_SIZE, "version": st["version"], "tail_since_id": st["full"] * PAGE_SIZE}, separators=(",", ":")).encode())
+        print("pages rewritten:", st["full"], "version", st["version"], flush=True)
+    print("refill-payers: checked", n, "changed", ch, flush=True)
 
 
 def fetch_range(a, b):
@@ -476,6 +521,8 @@ class H(BaseHTTPRequestHandler):
 if __name__ == "__main__":
     os.makedirs(os.path.dirname(os.path.abspath(DB)), exist_ok=True)
     init_db()
+    if "--refill-payers" in sys.argv:
+        refill_payers(); raise SystemExit(0)
     threading.Thread(target=index_loop, daemon=True).start()
     print("stealth indexer", CHAIN, "mode", MODE, "conf", CONF, "on", PORT, "db", DB, "from block", START if START is not None else "(head-%d)" % BACKFILL, "stealthpay", STEALTHPAY or "(any caller)", flush=True)
     BoundedServer(("127.0.0.1", PORT), H).serve_forever()
