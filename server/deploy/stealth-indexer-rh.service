@@ -1,0 +1,32 @@
+[Unit]
+Description=Stealth indexer (Robinhood Chain)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=stealth
+Group=stealth
+WorkingDirectory=/opt/stealth
+EnvironmentFile=/opt/stealth/rh.env
+ExecStart=/usr/bin/python3 /opt/stealth/stealth_indexer.py
+Restart=always
+RestartSec=5
+StartLimitIntervalSec=0
+StandardOutput=journal
+StandardError=journal
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+ReadWritePaths=/opt/stealth/data-rh
+MemoryMax=512M
+TasksMax=200
+LimitNOFILE=8192
+
+[Install]
+WantedBy=multi-user.target

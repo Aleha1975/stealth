@@ -10,6 +10,7 @@ export const CHAINS = {
     explorer: "https://basescan.org", explorerName: "Basescan",
     stealthPay: "0xc1b372731c1ee68ee89f212a05cb8ac9a7929f76",
     rpc: "https://mainnet.base.org",
+    api: "/stealth-api",
   },
   rh: {
     key: "rh", name: "Robinhood Chain", chainId: 4663, chainHex: "0x1237",
@@ -18,6 +19,7 @@ export const CHAINS = {
     explorer: "https://robinhoodchain.blockscout.com", explorerName: "Blockscout",
     stealthPay: null,                                   // not deployed yet
     rpc: "https://rpc.mainnet.chain.robinhood.com",
+    api: "/stealth-api/rh",                              // nginx: /stealth-api/rh/ -> RH indexer :3883 / relayer :3884
   },
 };
 /** Chain a meta-address was made for (st:<key>:0x...), or null if it has no prefix / unknown prefix. */

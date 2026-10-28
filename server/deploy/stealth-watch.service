@@ -1,0 +1,16 @@
+[Unit]
+Description=Stealth watchdog (indexer lag, relayer balance, alerts)
+
+[Service]
+Type=oneshot
+User=stealth
+Group=stealth
+WorkingDirectory=/opt/stealth
+EnvironmentFile=-/opt/stealth/watch.env
+ExecStart=/usr/bin/python3 /opt/stealth/stealth_watch.py
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/opt/stealth/data-watch
+MemoryMax=128M

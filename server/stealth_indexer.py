@@ -70,6 +70,24 @@ def db():
     return c
 
 
+_tl = threading.local()
+
+
+def rdb():
+    """Соединение для чтения API: одно на поток (раньше -- новое на каждый запрос с PRAGMA journal_mode=WAL). WAL уже выставлен init_db."""
+    c = getattr(_tl, "c", None)
+    if c is None:
+        c = _tl.c = sqlite3.connect(DB, timeout=30, check_same_thread=False)
+        c.execute("PRAGMA query_only=1")
+    return c
+
+
+_ann_cache = {}                 # (since, limit) -> (ts, body bytes): много клиентов листают одни и те же страницы
+_ann_lock = threading.Lock()
+ANN_TTL = float(os.environ.get("STEALTH_ANN_TTL", "1.5"))
+_count = {"t": 0, "n": 0}       # COUNT(*) на большой таблице дорог: кэш 5 с
+
+
 def init_db():
     c = db()
     c.execute("""CREATE TABLE IF NOT EXISTS ann (id INTEGER PRIMARY KEY AUTOINCREMENT, block INTEGER, tx TEXT, log_index INTEGER,
@@ -327,6 +345,10 @@ class BoundedServer(ThreadingHTTPServer):
             except Exception: pass
             self.shutdown_request(request); return
         super().process_request(request, client_address)
+    def handle_error(self, request, client_address):
+        import sys
+        if isinstance(sys.exc_info()[1], (BrokenPipeError, ConnectionResetError, TimeoutError)): return    # клиент ушёл посреди ответа: не шум в журнале
+        super().handle_error(request, client_address)
     def process_request_thread(self, request, client_address):
         try: super().process_request_thread(request, client_address)
         finally: self._sem.release()
@@ -336,23 +358,32 @@ class H(BaseHTTPRequestHandler):
     timeout = SOCK_TIMEOUT          # сокет-таймаут: медленный клиент не держит поток вечно
     def log_message(self, *a): pass
     def _json(self, code, obj):
-        body = json.dumps(obj, separators=(",", ":")).encode()
+        self._raw(code, json.dumps(obj, separators=(",", ":")).encode())
+    def _raw(self, code, body):
         self.send_response(code); self.send_header("Content-Type", "application/json"); self.send_header("Cache-Control", "no-store")
         self.send_header("Content-Length", str(len(body))); self.end_headers(); self.wfile.write(body)
     def do_GET(self):
-        u = urlparse(self.path); q = parse_qs(u.query); c = db()
+        u = urlparse(self.path); q = parse_qs(u.query); c = rdb()
         try:
             if u.path.endswith("/head"):
                 g = lambda k: c.execute("SELECT v FROM meta WHERE k=?", (k,)).fetchone()
                 h, ts, ch = g("head"), g("ts"), g("chain_head")
-                n = c.execute("SELECT COUNT(*) FROM ann").fetchone()[0]
+                if time.time() - _count["t"] > 5: _count["n"] = c.execute("SELECT COUNT(*) FROM ann").fetchone()[0]; _count["t"] = time.time()
+                n = _count["n"]
                 head = int(h[0]) if h else None; chain = int(ch[0]) if ch else None
                 return self._json(200, {"head": head, "chain_head": chain, "lag": (chain - head) if (head and chain) else None, "count": n, "ts": int(ts[0]) if ts else None, "start": START, "chain": CHAIN, "chain_id": CC["id"], "mode": MODE, "confirmations": CONF if MODE != "safe" else None})
             if u.path.endswith("/announcements"):
                 since = int(q.get("since", ["0"])[0]); limit = max(1, min(2000, int(q.get("limit", ["1000"])[0])))
+                key = (since, limit); now = time.time()
+                with _ann_lock: hit = _ann_cache.get(key)
+                if hit and now - hit[0] < ANN_TTL: return self._raw(200, hit[1])
                 rows = c.execute("SELECT id,block,tx,scheme,stealth,caller,eph,meta,payer FROM ann WHERE id>? ORDER BY id LIMIT ?", (since, limit)).fetchall()
                 out = [{"id": r[0], "block": r[1], "tx": r[2], "scheme": r[3], "stealth": r[4], "caller": r[5], "eph": r[6], "meta": r[7], "payer": r[8]} for r in rows]
-                return self._json(200, {"rows": out, "next": out[-1]["id"] if out else since})
+                body = json.dumps({"rows": out, "next": out[-1]["id"] if out else since}, separators=(",", ":")).encode()
+                with _ann_lock:
+                    if len(_ann_cache) > 256: _ann_cache.clear()
+                    _ann_cache[key] = (now, body)
+                return self._raw(200, body)
             if u.path.endswith("/known"):
                 addr = (q.get("addr", [""])[0] or "").lower()
                 if not (addr.startswith("0x") and len(addr) == 42): return self._json(400, {"error": "addr"})
@@ -384,8 +415,6 @@ class H(BaseHTTPRequestHandler):
         except Exception as e:
             print("api error:", str(e)[:200], flush=True)
             return self._json(500, {"error": "temporarily unavailable"})
-        finally:
-            c.close()
 
 
 if __name__ == "__main__":

@@ -13,11 +13,11 @@
    API 127.0.0.1:3874: POST /stealth-api/relay {from,to,value,validAfter,validBefore,nonce,v,r,s[,feeAuth:{value,validAfter,validBefore,nonce,v,r,s}]}
    -> {hash[,feeHash]}; GET /stealth-api/relay/stats */
 import http from "http"; import fs from "fs"; import path from "path"; import { fileURLToPath, pathToFileURL } from "url";
-import { createPublicClient, createWalletClient, http as vhttp, fallback, parseAbi, formatEther, getAddress, defineChain, encodeAbiParameters, keccak256, toHex, recoverTypedDataAddress, isAddress } from "viem";
+import { createPublicClient, createWalletClient, http as vhttp, fallback, parseAbi, formatEther, getAddress, defineChain, encodeAbiParameters, encodeFunctionData, keccak256, toHex, recoverTypedDataAddress, isAddress } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 for (const f of ["/opt/mprhedged/exec/.env", "/opt/stealth/relayer.env"]) {
-  if (!fs.existsSync(f)) continue;
+  if (process.env.STEALTH_ENV_ONLY === "1" || !fs.existsSync(f)) continue;   // ENV_ONLY=1 (rh.env): never fall back to the Base key file
   for (const line of fs.readFileSync(f, "utf8").split("\n")) {
     const m = line.match(/^\s*(?:export\s+)?([A-Z0-9_]+)=["']?([^"'#\n]+)/); if (m && !process.env[m[1]]) process.env[m[1]] = m[2].trim();
   }
@@ -85,11 +85,34 @@ function parseAuth(o, what) {
   return { value: BigInt(o.value), validAfter: BigInt(o.validAfter || 0), validBefore: BigInt(o.validBefore), nonce: o.nonce, v, r: o.r, s: o.s };
 }
 
+// ---- отправка: nonce ведём локально (один getTransactionCount на старте/после ошибки), комиссии кэшируем на 2 с, подписываем сами --
+// под замком остаётся ОДИН RPC (eth_sendRawTransaction) вместо ~4 у writeContract (nonce, fees, chainId, gas): при 100 параллельных заявках
+// очередь на замке в ~4 раза короче. Любая ошибка отправки сбрасывает локальный nonce -> следующая отправка берёт pending-счётчик с узла.
+export const tmStats = { n: 0, wait: 0, maxWait: 0, send: 0 };
+let localNonce = null, feeCache = { t: 0, v: null, p: null };
+async function cachedFees() {
+  if (feeCache.v && Date.now() - feeCache.t < 2000) return feeCache.v;
+  if (feeCache.p) return feeCache.p;
+  feeCache.p = pub.estimateFeesPerGas().then(v => { feeCache = { t: Date.now(), v, p: null }; return v; }, e => { feeCache.p = null; throw e; });
+  return feeCache.p;
+}
+async function submit(call, gasLimit) {
+  try {
+    const fees = await cachedFees();
+    if (localNonce === null) localNonce = await pub.getTransactionCount({ address: account.address, blockTag: "pending" });
+    const tx = { chainId: CC.id, nonce: localNonce, gas: gasLimit, to: call.address, value: 0n, data: encodeFunctionData({ abi: call.abi, functionName: call.functionName, args: call.args }),
+      ...(fees.maxFeePerGas ? { type: "eip1559", maxFeePerGas: fees.maxFeePerGas, maxPriorityFeePerGas: fees.maxPriorityFeePerGas || 0n } : { type: "legacy", gasPrice: fees.gasPrice }) };
+    const hash = await pub.sendRawTransaction({ serializedTransaction: await account.signTransaction(tx) });
+    localNonce++; return hash;
+  } catch (e) { localNonce = null; feeCache.t = 0; throw e; }
+}
 // отправка со сверкой по квитанции; возвращает hash сразу. spent: резерв заменяется фактом по квитанции
 const TRANSFER_CALL = args => ({ address: TOKEN, abi, functionName: "transferWithAuthorization", args });
 async function sendAndTrack(call, gasLimit, reserve, from, tag, onRevert) {
   let hash;
-  await (nonceLock = nonceLock.then(async () => { hash = await wal.writeContract(call); }, () => {}));
+  const tq = Date.now(); let tw = 0;
+  await (nonceLock = nonceLock.then(async () => { tw = Date.now() - tq; hash = await submit(call, gasLimit); }, () => {}));
+  tmStats.n++; tmStats.wait += tw; tmStats.maxWait = Math.max(tmStats.maxWait, tw); tmStats.send += Date.now() - tq - tw;   // lock wait vs send time (see /relay/stats)
   // nonceLock не должен залипать после ошибки одной отправки: ошибка уходит вызывающему через throw ниже
   if (!hash) throw new Error("send failed");
   const watch = async () => {
@@ -149,11 +172,10 @@ export async function relay(b, ip) {
     const calls = list.map(([tag, a, dst]) => [tag, [from, dst, a.value, a.validAfter, a.validBefore, a.nonce, a.v, a.r, a.s]]);
     let gas = 0n; const lims = [];
     for (const [, args] of calls) {
-      await pub.simulateContract({ address: TOKEN, abi, functionName: "transferWithAuthorization", args, account });
       const g = await pub.estimateContractGas({ address: TOKEN, abi, functionName: "transferWithAuthorization", args, account });
       gas += g; lims.push(g * GAS_PAD_PCT / 100n);                  // лимит газа явно: оценка узла бывает впритык (OOG на ecrecover)
     }
-    const fees = await pub.estimateFeesPerGas();
+    const fees = await cachedFees();
     const est = gas * GAS_PAD_PCT / 100n * (fees.maxFeePerGas || fees.gasPrice || 0n);
     // резерв под бюджет суток СИНХРОННО (после последнего await): параллельные заявки видят уже зарезервированное
     if (st.gas + est > GAS_BUDGET_WEI_PER_DAY) throw new Error("relayer gas budget for today is spent");
@@ -206,26 +228,28 @@ export async function relayPay(b, ip) {
   let reserve = 0n, sent = false;
   try {
     const nonce = localPaymentNonce(token, stealth, eph, tag, fee, feeTo);
-    const onchain = await pub.readContract({ address: STEALTHPAY, abi: payAbi, functionName: "paymentNonce", args: [token, stealth, eph, tag, fee, feeTo] });
+    // независимые чтения -- одним залпом (раньше ~6 последовательных RPC на заявку); проверки применяются в прежнем порядке
+    const [onchain, code, bal, used, bw] = await Promise.all([
+      pub.readContract({ address: STEALTHPAY, abi: payAbi, functionName: "paymentNonce", args: [token, stealth, eph, tag, fee, feeTo] }),
+      pub.getCode({ address: stealth }),
+      pub.readContract({ address: TOKEN, abi, functionName: "balanceOf", args: [from] }),
+      pub.readContract({ address: TOKEN, abi, functionName: "authorizationState", args: [from, nonce] }),
+      pub.getBalance({ address: account.address })]);
     if (onchain.toLowerCase() !== nonce.toLowerCase()) throw new Error("payment nonce mismatch");
     const signer = await recoverTypedDataAddress({
       domain: { name: CC.domain.name, version: CC.domain.version, chainId: CC.id, verifyingContract: TOKEN }, types: RECEIVE_TYPES, primaryType: "ReceiveWithAuthorization",
       message: { from, to: STEALTHPAY, value: amount, validAfter: auth.validAfter, validBefore: auth.validBefore, nonce },
       signature: { r: auth.r, s: auth.s, v: BigInt(auth.v) } }).catch(() => null);
     if (!signer || signer !== from) throw new Error("signature does not match the payer");
-    if ((await pub.getCode({ address: stealth }))) throw new Error("destination is a contract");
-    const bal = await pub.readContract({ address: TOKEN, abi, functionName: "balanceOf", args: [from] });
+    if (code) throw new Error("destination is a contract");
     if (bal < amount) throw new Error("the wallet holds less than the amount");
-    if (await pub.readContract({ address: TOKEN, abi, functionName: "authorizationState", args: [from, nonce] })) throw new Error("authorization already used");
+    if (used) throw new Error("authorization already used");
     const now = BigInt(Math.floor(Date.now() / 1000));
     if (auth.validBefore <= now + 30n) throw new Error("authorization expires too soon");
     if (auth.validAfter > now) throw new Error("authorization not valid yet");
-    const bw = await pub.getBalance({ address: account.address });
     if (bw < MIN_BALANCE_WEI) { alertOnce("relayer balance low:", formatEther(bw), "ETH < threshold", formatEther(MIN_BALANCE_WEI)); throw new Error("relayer is out of gas funds, try again later"); }
     const call = { address: STEALTHPAY, abi: payAbi, functionName: "payWithAuthorization", args: [token, amount, stealth, eph, tag, fee, feeTo, auth] };
-    await pub.simulateContract({ ...call, account });
-    const g = await pub.estimateContractGas({ ...call, account });
-    const fees = await pub.estimateFeesPerGas();
+    const [g, fees] = await Promise.all([pub.estimateContractGas({ ...call, account }), cachedFees()]);   // estimateGas reverts iff the tx would revert
     const est = g * GAS_PAD_PCT / 100n * (fees.maxFeePerGas || fees.gasPrice || 0n);
     if (st.gas + est > GAS_BUDGET_WEI_PER_DAY) throw new Error("relayer gas budget for today is spent");
     st.gas += est; reserve = est; save();
@@ -239,7 +263,7 @@ export async function relayPay(b, ip) {
   } finally { inflight.delete(lockKey); }
 }
 
-export const stats = () => { roll(); return { chain: CHAIN, relayer: account.address, gas_spent_today_eth: formatEther(st.gas), gas_budget_eth: formatEther(GAS_BUDGET_WEI_PER_DAY), fee_min: FEE_MIN.toString(), pay_enabled: !!STEALTHPAY, stealthpay: STEALTHPAY, pay_fee: PAY_FEE.toString(), pay_fee_min: PAY_FEE_MIN.toString() }; };
+export const stats = () => { roll(); return { chain: CHAIN, relayer: account.address, gas_spent_today_eth: formatEther(st.gas), gas_budget_eth: formatEther(GAS_BUDGET_WEI_PER_DAY), fee_min: FEE_MIN.toString(), pay_enabled: !!STEALTHPAY, stealthpay: STEALTHPAY, pay_fee: PAY_FEE.toString(), pay_fee_min: PAY_FEE_MIN.toString(), sends: tmStats.n, avg_lock_wait_ms: tmStats.n ? Math.round(tmStats.wait / tmStats.n) : 0, max_lock_wait_ms: tmStats.maxWait, avg_send_ms: tmStats.n ? Math.round(tmStats.send / tmStats.n) : 0 }; };
 
 function serve() {
   http.createServer((req, res) => {

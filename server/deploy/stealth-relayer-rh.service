@@ -1,0 +1,33 @@
+[Unit]
+Description=Stealth relayer (Robinhood Chain)
+After=network-online.target stealth-indexer-rh.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=stealth
+Group=stealth
+WorkingDirectory=/opt/stealth
+# rh.env holds RELAYER_KEY: chmod 600, owner stealth. Base units keep their own /opt/stealth/relayer.env (distinct key file).
+EnvironmentFile=/opt/stealth/rh.env
+ExecStart=/usr/bin/node /opt/stealth/relayer.mjs
+Restart=always
+RestartSec=5
+StartLimitIntervalSec=0
+StandardOutput=journal
+StandardError=journal
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+ReadWritePaths=/opt/stealth/data-rh
+MemoryMax=512M
+TasksMax=200
+LimitNOFILE=8192
+
+[Install]
+WantedBy=multi-user.target
