@@ -1,0 +1,10 @@
+[Unit]
+Description=Daily OFAC SDN refresh (relayers reload evm.json on change, no restart)
+
+[Timer]
+OnCalendar=*-*-* 06:20:00
+RandomizedDelaySec=900
+Persistent=true
+
+[Install]
+WantedBy=timers.target

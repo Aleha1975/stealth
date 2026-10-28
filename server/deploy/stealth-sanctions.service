@@ -1,0 +1,16 @@
+[Unit]
+Description=Refresh OFAC SDN EVM address list for the Stealth relayers
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=stealth
+Group=stealth
+WorkingDirectory=/opt/stealth/sanctions
+ExecStart=/usr/bin/python3 -I /opt/stealth/sanctions/update.py
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/opt/stealth/sanctions

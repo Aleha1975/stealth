@@ -12,6 +12,7 @@
    нужен STEALTHPAY=<адрес>, STEALTH_RELAY_PAY_FEE_MIN/PAY_FEE/PAY_PER_PAYER)
    API 127.0.0.1:3874: POST /stealth-api/relay {from,to,value,validAfter,validBefore,nonce,v,r,s[,feeAuth:{value,validAfter,validBefore,nonce,v,r,s}]}
    -> {hash[,feeHash]}; GET /stealth-api/relay/stats */
+import { makeScreen } from "./sanctions/screen.mjs";
 import http from "http"; import fs from "fs"; import path from "path"; import { fileURLToPath, pathToFileURL } from "url";
 import { createPublicClient, createWalletClient, http as vhttp, fallback, parseAbi, formatEther, getAddress, defineChain, encodeAbiParameters, encodeFunctionData, keccak256, toHex, recoverTypedDataAddress, isAddress } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
@@ -61,6 +62,7 @@ const transport = RPCS.length > 1 ? fallback(RPCS.map(u => vhttp(u, { timeout: 3
 export const pub = createPublicClient({ chain, transport }); const wal = createWalletClient({ account, chain, transport });
 const log = (...a) => { const s = new Date().toISOString() + " " + a.join(" "); console.log(s); try { fs.appendFileSync(LOG, s + "\n"); } catch {} };
 const day = () => Math.floor(Date.now() / 86400000);
+export const screen = makeScreen(undefined, log);                    // OFAC SDN EVM addresses (sanctions/evm.json), reloaded on file change
 
 // ---- счётчики суток: gas = потрачено + зарезервировано под ещё не сверённые транзакции; пишутся в файл атомарно
 export let st = { day: day(), gas: 0n, perIp: {}, perFrom: {}, perPayer: {} };
@@ -140,6 +142,7 @@ async function sendAndTrack(call, gasLimit, reserve, from, tag, onRevert) {
 
 export async function relay(b, ip) {
   const from = getAddress(b.from), to = getAddress(b.to);
+  screen.check({ from, to, feeRecipient: account.address }, ip);      // before any RPC / counters / gas
   const main = parseAuth(b, ""); const value = main.value;
   if (value < MIN_VALUE) throw new Error("below the minimum of $0.10");
   let fee = null;
@@ -211,6 +214,7 @@ export async function relayPay(b, ip) {
   if (!EPH.test(b.eph || "") || !HEX1.test(b.viewTag || "")) throw new Error("bad ephemeral key or view tag");
   if (!HEX32.test(b.auth.r) || !HEX32.test(b.auth.s) || ![27, 28].includes(Number(b.auth.v))) throw new Error("bad signature fields");
   const token = getAddress(b.token), stealth = getAddress(b.stealth), feeTo = getAddress(b.feeRecipient), from = getAddress(b.auth.from);
+  screen.check({ payer: from, stealth, feeRecipient: feeTo }, ip);   // before any RPC / counters / gas
   if (token !== TOKEN) throw new Error("unsupported token");
   const amount = BigInt(b.amount), fee = BigInt(b.fee), eph = b.eph.toLowerCase(), tag = b.viewTag.toLowerCase();
   const auth = { from, validAfter: BigInt(b.auth.validAfter || 0), validBefore: BigInt(b.auth.validBefore), v: Number(b.auth.v), r: b.auth.r, s: b.auth.s };
@@ -269,6 +273,10 @@ function serve() {
   http.createServer((req, res) => {
     const send = (code, obj) => { const s = JSON.stringify(obj); res.writeHead(code, { "Content-Type": "application/json", "Cache-Control": "no-store", "Content-Length": Buffer.byteLength(s) }); res.end(s); };
     if (req.method === "GET" && req.url.endsWith("/relay/stats")) return send(200, stats());
+    if (req.method === "GET" && /\/relay\/screen(\?|$)/.test(req.url)) {                    // GET /stealth-api/relay/screen?addr=0x.. -> {addr,listed}
+      const a = new URL(req.url, "http://x").searchParams.get("addr") || ""; if (!isAddress(a)) return send(400, { error: "bad address" });
+      return send(200, { addr: a.toLowerCase(), listed: screen.isListed(a) });
+    }
     const isPay = req.url.endsWith("/relay/pay");
     if (req.method !== "POST" || !(isPay || req.url.endsWith("/relay"))) return send(404, { error: "not found" });
     let body = ""; req.on("data", c => { body += c; if (body.length > 8192) req.destroy(); });
