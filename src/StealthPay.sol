@@ -3,8 +3,9 @@ pragma solidity ^0.8.26;
 
 /// @title StealthPay
 /// @notice Pay an ERC-20 or ETH to a one-time (ERC-5564) stealth address and publish the announcement in the same
-///         transaction, so a payer's wallet needs one call instead of two and the receiver can always find the payment.
-///         No owner, no upgrade, no fee, no balance kept: tokens go straight from the payer to the stealth address
+///         transaction, so a payer's wallet needs one call instead of two (or, with payWithAuthorization, one
+///         signature and no gas) and the receiver can always find the payment.
+///         No owner, no upgrade, no protocol fee, no balance kept: tokens go straight from the payer to the stealth address
 ///         (transferFrom), ETH is forwarded in the same call. The announcement follows the ERC-5564 metadata layout:
 ///         view tag (1 byte) | function selector (4) | token (20) | amount (32); for ETH the token is 0xEeee...EEeE.
 ///
@@ -14,12 +15,18 @@ pragma solidity ^0.8.26;
 ///         payments made here; payments made elsewhere are the receiver's own concern. Residual: a watcher who sees a
 ///         pending payToken(stealth = X) could pay X one unit first and make the real payment revert with NotFresh; the
 ///         payer loses nothing but gas and retries with a new one-time address. Base has no public mempool, so this
-///         needs the sequencer's cooperation; accepted.
+///         needs the sequencer's cooperation; accepted. Same on Robinhood Chain (Arbitrum Orbit, private sequencer).
 interface IAnnouncer {
     function announce(uint256 schemeId, address stealthAddress, bytes memory ephemeralPubKey, bytes memory metadata) external;
 }
 interface IERC20 {
     function transferFrom(address from, address to, uint256 value) external returns (bool);
+    function transfer(address to, uint256 value) external returns (bool);
+    function balanceOf(address account) external view returns (uint256);
+}
+/// EIP-3009 (USDC, USDG): only `to` may submit a receive authorization, so nobody can take a signed one and send it elsewhere.
+interface IERC3009 {
+    function receiveWithAuthorization(address from, address to, uint256 value, uint256 validAfter, uint256 validBefore, bytes32 nonce, uint8 v, bytes32 r, bytes32 s) external;
 }
 
 contract StealthPay {
@@ -28,6 +35,9 @@ contract StealthPay {
     bytes4 private constant SEL_TRANSFER = 0xa9059cbb;
     bytes4 private constant SEL_ETH = 0xeeeeeeee;
     IAnnouncer public immutable ANNOUNCER;
+
+    /// The payer's EIP-3009 signature fields; grouped to keep the call within the stack limit without via-IR.
+    struct Authorization { address from; uint256 validAfter; uint256 validBefore; uint8 v; bytes32 r; bytes32 s; }
 
     mapping(address => bool) public used;
     uint256 private _lock;
@@ -41,6 +51,8 @@ contract StealthPay {
     error TransferFailed();
     error EthFailed();
     error NotAToken(address token);
+    error BadFee();
+    error AmountMismatch();
 
     constructor(address announcer) {
         if (announcer.code.length == 0) revert BadKey();
@@ -64,6 +76,34 @@ contract StealthPay {
         emit Paid(stealthAddress, token, amount);
     }
 
+    /// @notice Gasless payment with ONE payer signature: the payer signs an EIP-3009 ReceiveWithAuthorization to this
+    ///         contract and anyone (our relayer) submits it. The authorization nonce is not random: it is
+    ///         paymentNonce(...), a hash of the stealth address, ephemeral key, view tag, fee and fee recipient, so the
+    ///         signature commits to where the money goes and who earns the fee. A different destination, key, tag or
+    ///         fee gives a different nonce and the token rejects the signature. The money passes through this contract
+    ///         inside the one transaction (receive -> transfer), nothing stays here.
+    /// @param fee part of `amount` paid to `feeRecipient` for the gas (0 allowed); the stealth address gets amount - fee
+    function payWithAuthorization(
+        address token, uint256 amount, address stealthAddress, bytes calldata ephemeralPubKey, bytes1 viewTag,
+        uint256 fee, address feeRecipient, Authorization calldata auth
+    ) external lock {
+        if (amount == 0) revert ZeroAmount();
+        if (fee >= amount || (fee != 0 && (feeRecipient == address(0) || feeRecipient == address(this)))) revert BadFee();
+        if (token.code.length == 0) revert NotAToken(token);
+        _fresh(stealthAddress, ephemeralPubKey);
+        _receive(token, amount, paymentNonce(token, stealthAddress, ephemeralPubKey, viewTag, fee, feeRecipient), auth);
+        if (fee != 0) _send(token, feeRecipient, fee);
+        _deliver(token, stealthAddress, ephemeralPubKey, viewTag, amount - fee);
+    }
+
+    /// @notice The EIP-3009 nonce a payer signs for payWithAuthorization. Bound to this chain and this contract too, so a
+    ///         signature for one deployment or chain is useless on another.
+    function paymentNonce(address token, address stealthAddress, bytes calldata ephemeralPubKey, bytes1 viewTag, uint256 fee, address feeRecipient)
+        public view returns (bytes32)
+    {
+        return keccak256(abi.encode(keccak256("StealthPay.payWithAuthorization"), block.chainid, address(this), token, stealthAddress, keccak256(ephemeralPubKey), viewTag, fee, feeRecipient));
+    }
+
     /// @notice Pay the attached ETH to `stealthAddress` and announce it.
     function payETH(address stealthAddress, bytes calldata ephemeralPubKey, bytes1 viewTag) external payable lock {
         if (msg.value == 0) revert ZeroAmount();
@@ -72,6 +112,23 @@ contract StealthPay {
         if (!ok) revert EthFailed();
         ANNOUNCER.announce(SCHEME_ID, stealthAddress, ephemeralPubKey, abi.encodePacked(viewTag, SEL_ETH, ETH, msg.value));
         emit Paid(stealthAddress, ETH, msg.value);
+    }
+
+    function _receive(address token, uint256 amount, bytes32 nonce, Authorization calldata a) private {
+        uint256 before = IERC20(token).balanceOf(address(this));
+        IERC3009(token).receiveWithAuthorization(a.from, address(this), amount, a.validAfter, a.validBefore, nonce, a.v, a.r, a.s);
+        if (IERC20(token).balanceOf(address(this)) - before != amount) revert AmountMismatch();
+    }
+
+    function _deliver(address token, address stealthAddress, bytes calldata ephemeralPubKey, bytes1 viewTag, uint256 net) private {
+        _send(token, stealthAddress, net);
+        ANNOUNCER.announce(SCHEME_ID, stealthAddress, ephemeralPubKey, abi.encodePacked(viewTag, SEL_TRANSFER, token, net));
+        emit Paid(stealthAddress, token, net);
+    }
+
+    function _send(address token, address to, uint256 value) private {
+        (bool ok, bytes memory r) = token.call(abi.encodeWithSelector(IERC20.transfer.selector, to, value));
+        if (!ok || (r.length != 0 && !abi.decode(r, (bool)))) revert TransferFailed();
     }
 
     function _fresh(address stealthAddress, bytes calldata ephemeralPubKey) private {

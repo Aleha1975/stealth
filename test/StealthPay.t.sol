@@ -89,7 +89,7 @@ contract StealthPayTest is Test {
     }
     function testFuzz_token_amount_and_tag(uint96 amount, bytes1 tag, uint160 who) public {
         vm.assume(amount > 0 && who > 0xFFFF);
-        address s = address(who); vm.assume(s.code.length == 0 && !pay.used(s));
+        address s = address(who); vm.assume(s != payer && s.code.length == 0 && !pay.used(s));
         tok.mint(payer, amount);
         uint256 before = tok.balanceOf(payer);
         vm.prank(payer); pay.payToken(address(tok), amount, s, key, tag);
@@ -99,7 +99,7 @@ contract StealthPayTest is Test {
     }
     function testFuzz_eth_amount(uint96 wei_, uint160 who) public {
         vm.assume(wei_ > 0 && who > 0xFFFF);
-        address s = address(who); vm.assume(s.code.length == 0 && !pay.used(s));
+        address s = address(who); vm.assume(s.balance == 0 && s.code.length == 0 && !pay.used(s));
         vm.deal(payer, uint256(wei_));
         vm.prank(payer); pay.payETH{value: wei_}(s, key, 0x11);
         assertEq(s.balance, wei_); assertEq(address(pay).balance, 0);

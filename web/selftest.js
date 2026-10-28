@@ -1,4 +1,5 @@
-import { deriveForPayment, checkAnnouncement, metaAddress, keysFromSignature, signKeyRequestWith, addressFromPriv, unhex, hex, secpUtils, decodeMetadata } from "./stealth-crypto.js";
+import { deriveForPayment, checkAnnouncement, metaAddress, keysFromSignature, signKeyRequestWith, addressFromPriv, unhex, hex, secpUtils, decodeMetadata, KEY_DOMAIN, keyRequestTypedData } from "./stealth-crypto.js";
+import { CHAINS, pickChain, chainOfMeta } from "./chains.js";
 const out = document.getElementById("out"); const lines = [];
 const say = s => { lines.push(s); out.textContent = lines.join("\n"); };
 try {
@@ -34,5 +35,11 @@ try {
   threw = false; try { keysFromSignature(sig27 + "00".repeat(40), account); } catch { threw = true; } check("wrapped/long signature refused", threw);
   const other = unhex("0x" + "46".repeat(32)); const sigOther = signKeyRequestWith(other, account);
   threw = false; try { keysFromSignature(sigOther, account); } catch { threw = true; } check("signature by another key refused", threw);
+  // chain-independent key domain: no chainId anywhere, so every chain gives the same keys and wallets accept the request
+  const td = JSON.parse(keyRequestTypedData(account));
+  check("key domain has no chainId", !("chainId" in KEY_DOMAIN) && !("chainId" in td.domain) && !td.types.EIP712Domain.some(f => f.name === "chainId"));
+  check("chain configs", CHAINS.base.chainId === 8453 && CHAINS.base.chainHex === "0x2105" && CHAINS.rh.chainId === 4663 && CHAINS.rh.chainHex === "0x1237" && CHAINS.rh.token.symbol === "USDG" && CHAINS.rh.stealthPay === null);
+  check("chain select", pickChain("?chain=rh").key === "rh" && pickChain("").key === "base" && pickChain("?to=st:rh:0xab").key === "rh" && chainOfMeta("st:rh:0x1").key === "rh" && chainOfMeta("0x1") === null);
+  check("meta prefix per chain", metaAddress(k1, "rh").startsWith("st:rh:0x") && metaAddress(k1).startsWith("st:base:0x"));
   say((bad ? "RESULT FAIL " : "RESULT PASS ") + ok + " checks ok, " + bad + " failed, vectors " + vectors.length);
 } catch (e) { say("RESULT ERROR " + (e && e.stack || e)); }

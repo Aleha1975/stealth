@@ -5,7 +5,8 @@
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <meta name="referrer" content="no-referrer">
 <title>Stealth — get paid to a fresh address, every time</title>
-<meta name="description" content="Stealth: one link to receive on Base, a new address for every payment, found and spent only by you. ERC-5564 stealth addresses, keys never leave your device, no custody.">
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; object-src 'none'; base-uri 'none'; form-action 'none'">
+<meta name="description" content="Stealth: one link to receive stablecoins and ETH, a new address for every payment, found and spent only by you. ERC-5564 stealth addresses, keys never leave your device, no custody.">
 <link rel="icon" href="/favicon.svg">
 <style>
 :root{--bg:#0F1113;--raised:#15181C;--surface:#1A1E23;--line:rgba(236,233,226,.09);--line-strong:rgba(236,233,226,.18);--ink:#ECE9E2;--ink-soft:#A9A69E;--ink-faint:#6F6D67;--accent:#C9A96A;--accent-hi:#E3C78A;--pos:#5FD39B;--neg:#E5646E;--warn:#E0B458;--sans:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;--mono:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;--serif:Georgia,"Times New Roman",serif;color-scheme:dark}
@@ -58,7 +59,7 @@ footer{padding:26px 0 40px;font-size:13px;color:var(--ink-faint);display:flex;ju
 <body>
 <div class="wrap">
   <header class="top">
-    <a class="brand" href="/stealth/">Stealth<small>Base · ERC-5564</small></a>
+    <a class="brand" href="/stealth/">Stealth<small><span class="chain-name"></span> · ERC-5564</small></a>
     <button class="wallet" id="wbtn">Connect wallet</button>
   </header>
 
@@ -67,7 +68,7 @@ footer{padding:26px 0 40px;font-size:13px;color:var(--ink-faint);display:flex;ju
       <div class="eyebrow">private receive · base · your keys, your device</div>
       <h1>Get paid to a <em>fresh address</em>, every time.</h1>
       <p class="lead">One link to receive. Every payment lands on a new address that only you can find and spend. No single address that tells the world your income, your balance and who pays you.</p>
-      <p class="note">Built on the ERC-5564 stealth-address standard already live on Base. Keys are derived in your browser from one wallet signature and never leave it. We hold nothing: not your keys, not your funds. Open source, verified contracts.</p>
+      <p class="note">Built on the ERC-5564 stealth-address standard already live on EVM chains. Keys are derived in your browser from one wallet signature and never leave it. We hold nothing: not your keys, not your funds. Open source, verified contracts.</p>
     </div>
 
     <div class="card" id="app">
@@ -97,11 +98,11 @@ footer{padding:26px 0 40px;font-size:13px;color:var(--ink-faint);display:flex;ju
         <div id="pay-list"></div>
         <div id="withdraw" hidden>
           <div class="box">
-            <div class="lbl">withdraw USDC from <span id="wd-from" class="mono"></span></div>
+            <div class="lbl">withdraw <span class="tok-sym"></span> from <span id="wd-from" class="mono"></span></div>
             <label>to address</label><input id="wd-to" placeholder="0x… (not your public wallet)" autocomplete="off" spellcheck="false">
-            <label>amount, USDC (empty = all)</label><input id="wd-amt" placeholder="all" inputmode="decimal">
+            <label>amount, <span class="tok-sym"></span> (empty = all)</label><input id="wd-amt" placeholder="all" inputmode="decimal">
             <div class="row"><button class="btn" id="btn-wd">Send without gas</button><button class="btn ghost" id="btn-wd-cancel">Cancel</button></div>
-            <p class="note">A relayer pays the gas and submits your signed USDC authorization; the stealth address never needs ETH, so nothing links it to your main wallet. The relayer cannot change the amount or the destination.</p>
+            <p class="note">A relayer pays the gas and submits your signed <span class="tok-sym"></span> authorization; the stealth address never needs ETH, so nothing links it to your main wallet. The relayer cannot change the amount or the destination.</p>
           </div>
         </div>
         <div class="hint" id="pay-hint"></div>
@@ -109,10 +110,10 @@ footer{padding:26px 0 40px;font-size:13px;color:var(--ink-faint);display:flex;ju
 
       <div class="pane" id="pane-pay" hidden>
         <h3>Pay to a stealth link</h3>
-        <label>recipient meta-address or link</label><input id="to-meta" placeholder="st:base:0x… or https://app.deepyield.ai/stealth/?to=…" autocomplete="off" spellcheck="false">
+        <label>recipient meta-address or link</label><input id="to-meta" placeholder="st:…:0x… or https://app.deepyield.ai/stealth/?to=…" autocomplete="off" spellcheck="false">
         <div class="row" style="gap:16px">
           <div style="flex:1"><label>amount</label><input id="amount" placeholder="25" inputmode="decimal"></div>
-          <div style="width:120px"><label>token</label><select id="token"><option value="USDC">USDC</option><option value="ETH">ETH</option></select></div>
+          <div style="width:120px"><label>token</label><select id="token"><option value="TOKEN"></option><option value="NATIVE"></option></select></div>
         </div>
         <button class="btn" id="btn-pay">Pay</button>
         <div class="hint" id="send-hint"></div>
@@ -126,18 +127,18 @@ footer{padding:26px 0 40px;font-size:13px;color:var(--ink-faint);display:flex;ju
     <p class="sub">The receiver publishes one static key pair. Every payer derives a new address from it; the receiver finds those addresses with a viewing key and spends with a spending key. Nothing on chain ties the addresses to each other or to the receiver.</p>
     <div class="grid3">
       <div class="step"><div class="n">1</div><b>One signature</b><span>Your wallet signs a labelled request; from it your browser derives a spending key and a viewing key. Same wallet, same keys, any device.</span></div>
-      <div class="step"><div class="n">2</div><b>One link</b><span>Share your meta-address. A payer's wallet turns it into a fresh address for that payment and announces an encrypted hint on Base.</span></div>
-      <div class="step"><div class="n">3</div><b>Only you</b><span>Your viewing key reads the hints and finds your payments; your spending key moves them. Withdraw USDC without gas through a relayer so nothing links back to you.</span></div>
+      <div class="step"><div class="n">2</div><b>One link</b><span>Share your meta-address. A payer's wallet turns it into a fresh address for that payment and announces an encrypted hint on <span class="chain-name"></span>.</span></div>
+      <div class="step"><div class="n">3</div><b>Only you</b><span>Your viewing key reads the hints and finds your payments; your spending key moves them. Withdraw <span class="tok-sym"></span> without gas through a relayer so nothing links back to you.</span></div>
     </div>
   </section>
 
   <section>
     <h2>What it does not do</h2>
     <p class="sub">It hides the receiver, not the payer: the paying wallet is public as in any transaction. And privacy ends where you end it: send everything from your stealth addresses to your known wallet and the chain links them. The app refuses the obvious mistakes and warns about the rest.</p>
-    <p class="note">Contracts: ERC-5564 Announcer <span class="mono">0x55649E01B5Df198D18D95b5cc5051630cfD45564</span> (shared standard) · StealthPay <span class="mono" id="sp-addr"></span> (ours, Sourcify exact match, pays and announces in one call, holds nothing). Relayer: USDC only, EIP-3009 authorizations, daily gas budget, one withdrawal per address per day.</p>
+    <p class="note">Contracts: ERC-5564 Announcer <span class="mono">0x55649E01B5Df198D18D95b5cc5051630cfD45564</span> (shared standard) · StealthPay <span class="mono" id="sp-addr"></span> (ours, Sourcify exact match, pays and announces in one call, holds nothing). Relayer: <span class="tok-sym"></span> only, EIP-3009 authorizations, daily gas budget, one withdrawal per address per day.</p>
   </section>
 
-  <footer><div>Stealth · a DeepYield product · Base</div><div><a href="/hedge/">Hedge</a> · <a href="https://deepyield.ai">DeepYield</a></div></footer>
+  <footer><div>Stealth · a DeepYield product · <span class="chain-name"></span></div><div><a href="/hedge/">Hedge</a> · <a href="https://deepyield.ai">DeepYield</a></div></footer>
 </div>
 
 <script type="module" src="./app.js"></script>

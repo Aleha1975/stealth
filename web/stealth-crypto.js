@@ -3,13 +3,7 @@
    P_stealth = P_spend + s_h·G; address = keccak256(uncompressed P_stealth without 0x04)[12:].
    Receiver: S' = p_view · P_eph; same hash; p_stealth = (p_spend + s_h) mod n. Verified against a Python
    reference (coincurve) with fixed vectors in selftest.html. */
-import * as secp from "https://esm.sh/@noble/secp256k1@2.2.3";
-import { keccak_256 } from "https://esm.sh/@noble/hashes@1.7.1/sha3";
-import { hmac } from "https://esm.sh/@noble/hashes@1.7.1/hmac";
-import { sha256 } from "https://esm.sh/@noble/hashes@1.7.1/sha256";
-
-// noble v2 needs these hooks for signing / randomness in some builds
-secp.etc.hmacSha256Sync = (k, ...m) => hmac(sha256, k, secp.etc.concatBytes(...m));
+import { secp256k1 as secp, keccak_256, concatBytes } from "./vendor/noble.js";   // vendored @noble/curves 1.8.1 + @noble/hashes 1.7.1, see vendor/SHA256SUMS
 
 const N = secp.CURVE.n;
 export const hex = b => "0x" + Array.from(b, x => x.toString(16).padStart(2, "0")).join("");
@@ -36,19 +30,19 @@ function hashedShared(privBytes, pubCompressed) {
 }
 
 // ---- key derivation from ONE wallet signature over EIP-712 typed data (domain-labelled in the wallet UI)
-export const KEY_DOMAIN = { name: "DeepYield Stealth", version: "1", chainId: 8453 };
+export const KEY_DOMAIN = { name: "DeepYield Stealth", version: "1" };   // no chainId: wallets refuse typed data whose chainId differs from the active chain, and the same wallet must get the same keys on every chain;
 export const KEY_TYPES = { StealthKeys: [{ name: "purpose", type: "string" }, { name: "account", type: "address" }] };
 export const KEY_PURPOSE = "Derive my private stealth receiving keys. Never sign this on another site.";
 const utf8 = s => new TextEncoder().encode(s);
 const encType = "StealthKeys(string purpose,address account)";
 /** EIP-712 digest of the key-derivation request for `account` (what the wallet signs with eth_signTypedData_v4). */
 export function keyRequestDigest(account) {
-  const domainType = "EIP712Domain(string name,string version,uint256 chainId)";
-  const ds = keccak_256(unhex(hex(keccak_256(utf8(domainType))) + hex(keccak_256(utf8(KEY_DOMAIN.name))).slice(2) + hex(keccak_256(utf8(KEY_DOMAIN.version))).slice(2) + BigInt(KEY_DOMAIN.chainId).toString(16).padStart(64, "0")));
+  const domainType = "EIP712Domain(string name,string version)";
+  const ds = keccak_256(unhex(hex(keccak_256(utf8(domainType))) + hex(keccak_256(utf8(KEY_DOMAIN.name))).slice(2) + hex(keccak_256(utf8(KEY_DOMAIN.version))).slice(2)));
   const sh = keccak_256(unhex(hex(keccak_256(utf8(encType))) + hex(keccak_256(utf8(KEY_PURPOSE))).slice(2) + account.toLowerCase().replace(/^0x/, "").padStart(64, "0")));
   return keccak_256(unhex("0x1901" + hex(ds).slice(2) + hex(sh).slice(2)));
 }
-export const keyRequestTypedData = account => JSON.stringify({ types: { EIP712Domain: [{ name: "name", type: "string" }, { name: "version", type: "string" }, { name: "chainId", type: "uint256" }], ...KEY_TYPES },
+export const keyRequestTypedData = account => JSON.stringify({ types: { EIP712Domain: [{ name: "name", type: "string" }, { name: "version", type: "string" }], ...KEY_TYPES },
   primaryType: "StealthKeys", domain: KEY_DOMAIN, message: { purpose: KEY_PURPOSE, account } });
 /** Receiver keys from the wallet's signature. Refuses anything that is not a plain 65-byte ECDSA signature by `account`
  *  (smart wallets, passkeys, ERC-1271/6492 wrappers give randomised or wrapped signatures: keys could not be re-derived
@@ -60,7 +54,7 @@ export function keysFromSignature(sigHex, account) {
   if (v !== 0 && v !== 1) throw new Error("unexpected signature format");
   const recovered = secp.Signature.fromCompact(rs).addRecoveryBit(v).recoverPublicKey(keyRequestDigest(account));
   if (addressOf(recovered.toRawBytes(true)).toLowerCase() !== account.toLowerCase()) throw new Error("the signature does not come from the connected account");
-  const d = (t) => toBytes32(mod(toBig(keccak_256(secp.etc.concatBytes(rs, utf8(t)))), N) || 1n);
+  const d = (t) => toBytes32(mod(toBig(keccak_256(concatBytes(rs, utf8(t)))), N) || 1n);
   const spendPriv = d("deepyield-stealth/spend/v1"), viewPriv = d("deepyield-stealth/view/v1");
   return { spendPriv, viewPriv, spendPub: secp.getPublicKey(spendPriv, true), viewPub: secp.getPublicKey(viewPriv, true) };
 }
@@ -70,8 +64,8 @@ export function signKeyRequestWith(privBytes, account) {
   return hex(sig.toCompactRawBytes()) + (27 + sig.recovery).toString(16).padStart(2, "0");
 }
 export const addressFromPriv = priv => addressOf(secp.getPublicKey(priv, true));
-/** Meta-address: st:base:0x<P_spend><P_view> (66 bytes). */
-export const metaAddress = (keys, chain = "base") => "st:" + chain + ":" + hex(secp.etc.concatBytes(keys.spendPub, keys.viewPub));
+/** Meta-address: st:<chain>:0x<P_spend><P_view> (66 bytes). */
+export const metaAddress = (keys, chain = "base") => "st:" + chain + ":" + hex(concatBytes(keys.spendPub, keys.viewPub));
 export function parseMeta(s) {
   const m = String(s).trim().match(/^(?:st:[a-z0-9]+:)?(0x[0-9a-fA-F]{132})$/);
   if (!m) throw new Error("not a stealth meta-address");

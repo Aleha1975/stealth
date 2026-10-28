@@ -1,32 +1,50 @@
 #!/usr/bin/env python3
-"""Stealth: индексатор объявлений ERC-5564 на Base и маленький API для клиента (без ключей, без денег).
+"""Stealth: индексатор объявлений ERC-5564 (Base или Robinhood Chain, STEALTH_CHAIN=base|rh) и маленький API для клиента (без ключей, без денег).
 
 Читает события Announcement общего Announcer (0x5564…5564) с блока START в sqlite и отдаёт клиенту пачками; клиент
 проверяет каждую запись своим ключом просмотра у себя. Фильтры против спама: только схема 1, эфемерный ключ ровно
-33 байта, metadata обрезается до 128 байт. Голова берётся по тегу "safe" (реорги Base не заденут).
+33 байта, metadata обрезается до 128 байт. Голова: base -- тег "safe"; rh -- latest минус STEALTH_CONFIRMATIONS блоков
+(быстро видно), а раз в RECONCILE_EVERY секунд окно (safe..голова] перечитывается и строки, изменённые реорганизацией,
+удаляются/вставляются заново. Одна служба = одна цепь (порт/БД/цепь задаются окружением); конфиг цепей -- chains.json.
 API (127.0.0.1:3873, за nginx как /stealth-api/):
   GET /head                                  -> {head, chain_head, lag, count, ts, start}
   GET /announcements?since=<id>&limit=<n>     -> {rows:[{id,block,tx,scheme,stealth,caller,eph,meta,payer}], next}
-  GET /known?addr=0x..                        -> {known: bool}   (объявлено ЧЕРЕЗ наш StealthPay, USDC >= MIN_KNOWN_USDC)
-  GET /balances?addrs=0x..,0x..               -> {addr: {usdc, eth}} (до 50 адресов; чтобы телефон не ходил в публичный узел сам)
+  GET /known?addr=0x..                        -> {known: bool}   (объявлено ЧЕРЕЗ наш StealthPay -- payToken или payWithAuthorization, токен цепи >= MIN_KNOWN_USDC)
+  GET /balances?addrs=0x..,0x..               -> {addr: {usdc, eth}} (до 100 адресов, Multicall3 + кэш 15 с; usdc = токен цепи)
   GET /receipt?tx=0x..                        -> {status: 1|0|null}
-  GET /usdc-domain                            -> {domain_separator}
+  GET /usdc-domain                            -> {domain_separator, chain, token}
 """
 import json, os, sqlite3, threading, time, urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
+CHAIN = os.environ.get("STEALTH_CHAIN", "base").strip().lower()
+_CH = json.load(open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "chains.json")))
+if CHAIN not in _CH:
+    raise SystemExit("unknown STEALTH_CHAIN %r (have %s)" % (CHAIN, ",".join(_CH)))
+CC = _CH[CHAIN]
 ANNOUNCER = "0x55649E01B5Df198D18D95b5cc5051630cfD45564".lower()
 STEALTHPAY = os.environ.get("STEALTHPAY", "").lower()
-USDC = "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913"
-START = int(os.environ.get("STEALTH_START_BLOCK", "31700000"))
+USDC = CC["token"].lower()                                      # токен цепи (USDC на Base, USDG на RH); имя оставлено для совместимости
+MULTICALL3 = CC["multicall3"].lower()
+_sb = os.environ.get("STEALTH_START_BLOCK") or CC.get("start_block")
+START = int(_sb) if _sb else None                              # None (rh без env) -> при первом запуске head - BACKFILL
+BACKFILL = int(os.environ.get("STEALTH_BACKFILL", "200000"))
+MODE = os.environ.get("STEALTH_HEAD_MODE", CC["mode"])         # safe | latest
+CONF = int(os.environ.get("STEALTH_CONFIRMATIONS", CC["confirmations"]))
+RECONCILE_EVERY = int(os.environ.get("STEALTH_RECONCILE_EVERY", "60"))
 DB = os.environ.get("STEALTH_DB", "/opt/stealth/announcements.db")
 PORT = int(os.environ.get("STEALTH_PORT", "3873"))
 MIN_KNOWN_USDC = int(os.environ.get("MIN_KNOWN_USDC", "100000"))     # $0.10: мельче через релеер не выводим
 MAX_META = 128
-CHUNK0 = 50_000
-POLL = 20
-RPCS = [u for u in [os.environ.get("BASE_LOGS_RPC"), os.environ.get("BASE_RPC"), "https://base-rpc.publicnode.com"] if u]
+CHUNK0 = int(os.environ.get("STEALTH_CHUNK", "50000"))
+POLL = int(os.environ.get("STEALTH_POLL", "20" if MODE == "safe" else "2"))
+CACHE_TTL = float(os.environ.get("STEALTH_BAL_TTL", "15"))
+MAX_ADDRS = 100
+MAX_THREADS = int(os.environ.get("STEALTH_MAX_THREADS", "64"))
+SOCK_TIMEOUT = float(os.environ.get("STEALTH_SOCK_TIMEOUT", "10"))
+_env_rpc = [u.strip() for u in os.environ.get("STEALTH_RPC", "").split(",") if u.strip()]
+RPCS = _env_rpc or [u for u in [os.environ.get(k) for k in CC["rpc_env"]] + CC["rpcs"] if u]
 UA = {"Content-Type": "application/json", "User-Agent": "deepyield-stealth/1.0"}
 _lock = threading.Lock()
 
@@ -86,18 +104,96 @@ def decode(log):
 
 
 def safe_head():
-    b = rpc("eth_getBlockByNumber", ["safe", False])
+    b = rpc("eth_getBlockByNumber", ["safe", False], 20)
     return int(b["number"], 16)
 
 
+def latest_head():
+    return int(rpc("eth_blockNumber", [], 20), 16)
+
+
+def target_head():
+    """(голова для индексации, safe или None). rh: latest - CONF; base: safe."""
+    if MODE == "safe":
+        h = safe_head(); return h, h
+    lat = latest_head()
+    try: sf = safe_head()
+    except Exception: sf = None
+    return max(0, lat - CONF), sf
+
+
+def put_row(c, r, payers):
+    if r["tx"] not in payers:
+        try:
+            txo = rpc("eth_getTransactionByHash", [r["tx"]], 15); payers[r["tx"]] = ((txo or {}).get("from") or "").lower() or None
+        except Exception:
+            payers[r["tx"]] = None
+    with _lock:
+        c.execute("INSERT OR IGNORE INTO ann(block,tx,log_index,scheme,stealth,caller,eph,meta,view_tag,payer) VALUES(?,?,?,?,?,?,?,?,?,?)",
+                  (r["block"], r["tx"], r["log_index"], r["scheme"], r["stealth"], r["caller"], r["eph"], r["meta"], r["view_tag"], payers[r["tx"]]))
+
+
+def fetch_range(a, b):
+    """Все декодированные записи Announcer в [a,b]; getLogs режем пополам, если узел отказывает по размеру."""
+    try:
+        logs = rpc("eth_getLogs", [{"address": ANNOUNCER, "fromBlock": hex(a), "toBlock": hex(b)}])
+    except Exception:
+        if b - a < 1000: raise
+        m = (a + b) // 2
+        return fetch_range(a, m) + fetch_range(m + 1, b)
+    out = []
+    for lg in logs:
+        try:
+            r = decode(lg)
+        except Exception as e:
+            print("decode skip", lg.get("transactionHash"), str(e)[:80], flush=True); continue
+        if r: out.append(r)
+    return out
+
+
+def reconcile(c, sf, head_done):
+    """Реорг-страж (rh): перечитать (safe-100 .. head_done], убрать строки, которых в цепи больше нет (или они в другом блоке), добавить новые."""
+    a = max(START, (sf or head_done - 10000) - 100)
+    if a > head_done: return
+    fresh = fetch_range(a, head_done)
+    want = {(r["tx"], r["log_index"], r["block"]): r for r in fresh}
+    with _lock:
+        have = {(t, li, bl): i for i, t, li, bl in c.execute("SELECT id,tx,log_index,block FROM ann WHERE block>=?", (a,))}
+    gone = [i for k, i in have.items() if k not in want]
+    if gone:
+        with _lock:
+            c.executemany("DELETE FROM ann WHERE id=?", [(i,) for i in gone]); c.commit()
+        print("reconcile: removed", len(gone), "rows changed by reorg", flush=True)
+    new = [r for k, r in want.items() if k not in have]
+    payers = {}
+    for r in new: put_row(c, r, payers)
+    if new:
+        with _lock: c.commit()
+        print("reconcile: added", len(new), "rows", flush=True)
+
+
 def index_loop():
+    global START
     c = db()
     row = c.execute("SELECT v FROM meta WHERE k='head'").fetchone()
+    if START is None:                                       # rh без STEALTH_START_BLOCK: старт = голова - BACKFILL (запомним в БД)
+        r0 = c.execute("SELECT v FROM meta WHERE k='start'").fetchone()
+        while r0 is None:
+            try:
+                st0 = max(0, target_head()[0] - BACKFILL)
+                c.execute("INSERT OR REPLACE INTO meta(k,v) VALUES('start',?)", (str(st0),)); c.commit(); r0 = (str(st0),)
+            except Exception as e:
+                print("start block lookup failed:", str(e)[:100], flush=True); time.sleep(5)
+        START = int(r0[0])
     head_done = int(row[0]) if row else START - 1
     chunk = CHUNK0
+    last_rec = 0
     while True:
         try:
-            head = safe_head()
+            head, sf = target_head()
+            if head < head_done:                            # цепь откатилась глубже нашей головы: перечитаем с новой
+                print("chain head went back", head_done, "->", head, flush=True); head_done = head; last_rec = 0
+                with _lock: c.execute("INSERT OR REPLACE INTO meta(k,v) VALUES('head',?)", (str(head),)); c.commit()
             while head_done < head:
                 a = head_done + 1; b = min(a + chunk - 1, head)
                 try:
@@ -113,16 +209,7 @@ def index_loop():
                         r = decode(lg)
                     except Exception as e:
                         print("decode skip", lg.get("transactionHash"), str(e)[:80], flush=True)
-                    if not r:
-                        continue
-                    if r["tx"] not in payers:
-                        try:
-                            txo = rpc("eth_getTransactionByHash", [r["tx"]]); payers[r["tx"]] = ((txo or {}).get("from") or "").lower() or None
-                        except Exception:
-                            payers[r["tx"]] = None
-                    with _lock:
-                        c.execute("INSERT OR IGNORE INTO ann(block,tx,log_index,scheme,stealth,caller,eph,meta,view_tag,payer) VALUES(?,?,?,?,?,?,?,?,?,?)",
-                                  (r["block"], r["tx"], r["log_index"], r["scheme"], r["stealth"], r["caller"], r["eph"], r["meta"], r["view_tag"], payers[r["tx"]]))
+                    if r: put_row(c, r, payers)
                 with _lock:
                     c.execute("INSERT OR REPLACE INTO meta(k,v) VALUES('head',?)", (str(b),))
                     c.execute("INSERT OR REPLACE INTO meta(k,v) VALUES('ts',?)", (str(int(time.time())),))
@@ -133,21 +220,120 @@ def index_loop():
                     chunk = min(CHUNK0, chunk * 2)
                 if logs:
                     print("indexed", len(logs), "announcements up to block", b, flush=True)
+            with _lock:                                     # метка свежести и когда догнали (иначе lag/ts стоят, пока нет новых блоков)
+                c.execute("INSERT OR REPLACE INTO meta(k,v) VALUES('ts',?)", (str(int(time.time())),))
+                c.execute("INSERT OR REPLACE INTO meta(k,v) VALUES('chain_head',?)", (str(head),)); c.commit()
+            if MODE != "safe" and time.time() - last_rec >= RECONCILE_EVERY:
+                reconcile(c, sf, head_done); last_rec = time.time()
         except Exception as e:
             print("index error:", str(e)[:200], flush=True)
         time.sleep(POLL)
 
 
-def balances(addrs):
+_bal_cache = {}                 # addr -> (ts, {"usdc","eth"})
+_bal_lock = threading.Lock()
+_mc = {"ok": None, "ts": 0}     # есть ли код Multicall3 на этой цепи (eth_getCode), перепроверка раз в 10 мин или после сбоя
+
+
+def _word(x): return x.to_bytes(32, "big")
+
+
+def mc_encode(addrs):
+    """aggregate3([(target,allowFailure,callData)...]): на каждый адрес balanceOf(токен) и Multicall3.getEthBalance."""
+    calls = []
+    for a in addrs:
+        pad = bytes.fromhex(a[2:]).rjust(32, b"\0")
+        calls.append((bytes.fromhex(USDC[2:]), bytes.fromhex("70a08231") + pad))
+        calls.append((bytes.fromhex(MULTICALL3[2:]), bytes.fromhex("4d2301cc") + pad))
+    heads, tails = [], []
+    off = 32 * len(calls)
+    for tgt, cd in calls:
+        pcd = cd + b"\0" * (-len(cd) % 32)
+        t = tgt.rjust(32, b"\0") + _word(1) + _word(96) + _word(len(cd)) + pcd
+        heads.append(_word(off)); tails.append(t); off += len(t)
+    arr = _word(len(calls)) + b"".join(heads) + b"".join(tails)
+    return "0x82ad56cb" + (_word(32) + arr).hex()
+
+
+def mc_decode(hexs, n):
+    d = bytes.fromhex(hexs[2:])
+    base = int.from_bytes(d[0:32], "big"); cnt = int.from_bytes(d[base:base + 32], "big")
+    if cnt != n: raise ValueError("multicall length")
+    arr = base + 32; out = []
+    for i in range(cnt):
+        o = arr + int.from_bytes(d[arr + 32 * i:arr + 32 * i + 32], "big")
+        ok = int.from_bytes(d[o:o + 32], "big"); bo = o + int.from_bytes(d[o + 32:o + 64], "big")
+        ln = int.from_bytes(d[bo:bo + 32], "big"); out.append((bool(ok), d[bo + 32:bo + 32 + ln]))
+    return out
+
+
+def mc_available():
+    if _mc["ok"] is not None and time.time() - _mc["ts"] < 600: return _mc["ok"]
+    try:
+        _mc["ok"] = len(rpc("eth_getCode", [MULTICALL3, "latest"], 15)) > 4
+    except Exception:
+        _mc["ok"] = False
+    _mc["ts"] = time.time(); return _mc["ok"]
+
+
+def _fetch_multicall(addrs):
+    res = mc_decode(rpc("eth_call", [{"to": MULTICALL3, "data": mc_encode(addrs)}, "latest"], 20), 2 * len(addrs))
+    out = {}
+    for i, a in enumerate(addrs):
+        (ok1, r1), (ok2, r2) = res[2 * i], res[2 * i + 1]
+        out[a] = {"usdc": str(int.from_bytes(r1, "big")) if ok1 and r1 else "0", "eth": str(int.from_bytes(r2, "big")) if ok2 and r2 else "0"}
+    return out
+
+
+def _fetch_single(addrs):
     out = {}
     for a in addrs:
-        usdc = rpc("eth_call", [{"to": USDC, "data": "0x70a08231" + a[2:].rjust(64, "0")}, "latest"])
-        eth = rpc("eth_getBalance", [a, "latest"])
+        usdc = rpc("eth_call", [{"to": USDC, "data": "0x70a08231" + a[2:].rjust(64, "0")}, "latest"], 15)
+        eth = rpc("eth_getBalance", [a, "latest"], 15)
         out[a] = {"usdc": str(int(usdc, 16)) if usdc and usdc != "0x" else "0", "eth": str(int(eth, 16))}
     return out
 
 
+def balances(addrs):
+    now = time.time(); out = {}; miss = []
+    with _bal_lock:
+        for a in addrs:
+            e = _bal_cache.get(a)
+            if e and now - e[0] < CACHE_TTL: out[a] = e[1]
+            elif a not in miss: miss.append(a)
+    if miss:
+        fresh = None
+        if mc_available():
+            try: fresh = _fetch_multicall(miss)
+            except Exception as e:
+                print("multicall failed, fallback per-call:", str(e)[:100], flush=True); _mc["ok"] = None
+        if fresh is None: fresh = _fetch_single(miss)
+        with _bal_lock:
+            if len(_bal_cache) > 20000: _bal_cache.clear()
+            for a, v in fresh.items(): _bal_cache[a] = (now, v)
+        out.update(fresh)
+    return {a: out[a] for a in addrs}
+
+
+class BoundedServer(ThreadingHTTPServer):
+    """ThreadingHTTPServer с потолком одновременных потоков: сверх MAX_THREADS сразу 503, а не рост потоков до исчерпания памяти."""
+    daemon_threads = True
+    request_queue_size = 128
+    _sem = threading.BoundedSemaphore(MAX_THREADS)
+    def process_request(self, request, client_address):
+        if not self._sem.acquire(blocking=False):
+            try:
+                request.settimeout(2); request.sendall(b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nRetry-After: 2\r\nConnection: close\r\n\r\n")
+            except Exception: pass
+            self.shutdown_request(request); return
+        super().process_request(request, client_address)
+    def process_request_thread(self, request, client_address):
+        try: super().process_request_thread(request, client_address)
+        finally: self._sem.release()
+
+
 class H(BaseHTTPRequestHandler):
+    timeout = SOCK_TIMEOUT          # сокет-таймаут: медленный клиент не держит поток вечно
     def log_message(self, *a): pass
     def _json(self, code, obj):
         body = json.dumps(obj, separators=(",", ":")).encode()
@@ -161,7 +347,7 @@ class H(BaseHTTPRequestHandler):
                 h, ts, ch = g("head"), g("ts"), g("chain_head")
                 n = c.execute("SELECT COUNT(*) FROM ann").fetchone()[0]
                 head = int(h[0]) if h else None; chain = int(ch[0]) if ch else None
-                return self._json(200, {"head": head, "chain_head": chain, "lag": (chain - head) if (head and chain) else None, "count": n, "ts": int(ts[0]) if ts else None, "start": START})
+                return self._json(200, {"head": head, "chain_head": chain, "lag": (chain - head) if (head and chain) else None, "count": n, "ts": int(ts[0]) if ts else None, "start": START, "chain": CHAIN, "chain_id": CC["id"], "mode": MODE, "confirmations": CONF if MODE != "safe" else None})
             if u.path.endswith("/announcements"):
                 since = int(q.get("since", ["0"])[0]); limit = max(1, min(2000, int(q.get("limit", ["1000"])[0])))
                 rows = c.execute("SELECT id,block,tx,scheme,stealth,caller,eph,meta,payer FROM ann WHERE id>? ORDER BY id LIMIT ?", (since, limit)).fetchall()
@@ -176,22 +362,22 @@ class H(BaseHTTPRequestHandler):
                     if STEALTHPAY and caller != STEALTHPAY: continue
                     try:
                         m = bytes.fromhex(meta[2:]); amt = int.from_bytes(m[25:57], "big") if len(m) >= 57 else 0
-                        tok = "0x" + m[5:25].hex() if len(m) >= 57 else ""
+                        tok = "0x" + m[5:25].hex() if len(m) >= 57 and m[1:5] == bytes.fromhex("a9059cbb") else ""   # viewTag|transfer-селектор|токен|сумма (payToken и payWithAuthorization)
                     except Exception:
                         amt, tok = 0, ""
                     if tok == USDC and amt >= MIN_KNOWN_USDC: ok = True; break
                 return self._json(200, {"known": ok})
             if u.path.endswith("/balances"):
                 addrs = [a.lower() for a in (q.get("addrs", [""])[0] or "").split(",") if a]
-                if not addrs or len(addrs) > 50 or any(not (a.startswith("0x") and len(a) == 42) for a in addrs): return self._json(400, {"error": "addrs"})
+                if not addrs or len(addrs) > MAX_ADDRS or any(not (a.startswith("0x") and len(a) == 42) for a in addrs): return self._json(400, {"error": "addrs"})
                 return self._json(200, balances(addrs))
             if u.path.endswith("/receipt"):
                 tx = (q.get("tx", [""])[0] or "").lower()
                 if not (tx.startswith("0x") and len(tx) == 66): return self._json(400, {"error": "tx"})
-                rc = rpc("eth_getTransactionReceipt", [tx])
+                rc = rpc("eth_getTransactionReceipt", [tx], 15)
                 return self._json(200, {"status": (int(rc["status"], 16) if rc and rc.get("status") else None), "block": int(rc["blockNumber"], 16) if rc else None})
             if u.path.endswith("/usdc-domain"):
-                return self._json(200, {"domain_separator": rpc("eth_call", [{"to": USDC, "data": "0x3644e515"}, "latest"])})
+                return self._json(200, {"domain_separator": rpc("eth_call", [{"to": USDC, "data": "0x3644e515"}, "latest"], 15), "chain": CHAIN, "token": CC["token"]})
             return self._json(404, {"error": "not found"})
         except ValueError:
             return self._json(400, {"error": "bad parameter"})
@@ -203,8 +389,8 @@ class H(BaseHTTPRequestHandler):
 
 
 if __name__ == "__main__":
-    os.makedirs(os.path.dirname(DB), exist_ok=True)
+    os.makedirs(os.path.dirname(os.path.abspath(DB)), exist_ok=True)
     init_db()
     threading.Thread(target=index_loop, daemon=True).start()
-    print("stealth indexer on", PORT, "db", DB, "from block", START, "stealthpay", STEALTHPAY or "(any caller)", flush=True)
-    ThreadingHTTPServer(("127.0.0.1", PORT), H).serve_forever()
+    print("stealth indexer", CHAIN, "mode", MODE, "conf", CONF, "on", PORT, "db", DB, "from block", START if START is not None else "(head-%d)" % BACKFILL, "stealthpay", STEALTHPAY or "(any caller)", flush=True)
+    BoundedServer(("127.0.0.1", PORT), H).serve_forever()

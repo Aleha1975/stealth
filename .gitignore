@@ -2,3 +2,4 @@ cache/
 out/
 broadcast/
 test/fixtures/base_kyber.json
+node_modules/

@@ -2,6 +2,7 @@
 pragma solidity ^0.8.26;
 import "forge-std/Test.sol";
 import {StealthPay} from "../src/StealthPay.sol";
+interface IUSDG { function DOMAIN_SEPARATOR() external view returns (bytes32); }
 interface IERC20Like { function balanceOf(address) external view returns (uint256); function approve(address, uint256) external returns (bool); }
 
 /// Real chains: the shared ERC-5564 Announcer. Run: BASE_RPC=<url> forge test --match-contract Fork
@@ -41,5 +42,53 @@ contract ForkTest is Test {
         vm.stopPrank();
         assertEq(IERC20Like(USDG).balanceOf(stealth), 42e6);
         assertEq(IERC20Like(USDG).balanceOf(address(pay)), 0);
+    }
+
+    // ---- payWithAuthorization on real USDG (Robinhood Chain) ----
+    bytes32 constant RECEIVE_TYPEHASH = 0xd099cc98ef71107a616c4f0f941f04c322d8e254fe26b3c6668db87aae413de8;
+    uint256 constant PAYER_PK = 0xBADA55;
+    address constant RELAYER = address(0x7E1A);
+    address constant SUBMITTER = address(0x5B17);
+    bytes constant RH_KEY = hex"03" hex"2222222222222222222222222222222222222222222222222222222222222222";
+
+    function _rhSign(StealthPay pay, address stealth, uint256 amount, uint256 fee)
+        internal view returns (StealthPay.Authorization memory a)
+    {
+        bytes32 nonce = pay.paymentNonce(USDG, stealth, RH_KEY, 0x2a, fee, RELAYER);
+        a.from = vm.addr(PAYER_PK); a.validAfter = 0; a.validBefore = block.timestamp + 1 hours;
+        bytes32 inner = keccak256(abi.encode(RECEIVE_TYPEHASH, a.from, address(pay), amount, a.validAfter, a.validBefore, nonce));
+        (a.v, a.r, a.s) = vm.sign(PAYER_PK, keccak256(abi.encodePacked("\x19\x01", IUSDG(USDG).DOMAIN_SEPARATOR(), inner)));
+    }
+
+    function test_pay_with_authorization_on_robinhood_usdg() public {
+        vm.createSelectFork(vm.envString("RH_RPC"));
+        assertEq(block.chainid, 4663);
+        bytes32 computed = keccak256(abi.encode(keccak256("EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)"), keccak256("Global Dollar"), keccak256("1"), uint256(4663), USDG));
+        assertEq(IUSDG(USDG).DOMAIN_SEPARATOR(), computed, "domain matches Global Dollar / 1 / 4663");
+
+        StealthPay pay = new StealthPay(ANNOUNCER);
+        address payer = vm.addr(PAYER_PK);
+        address stealth = address(uint160(uint256(keccak256("fresh stealth rh auth"))));
+        deal(USDG, payer, 100e6);
+        uint256 fee = 0.05e6;
+        StealthPay.Authorization memory a = _rhSign(pay, stealth, 10e6, fee);
+
+        // negative: the same signature aimed at another stealth address is rejected by the token (nonce binds it)
+        address other = address(uint160(uint256(keccak256("other stealth rh auth"))));
+        vm.prank(SUBMITTER);
+        vm.expectRevert();
+        pay.payWithAuthorization(USDG, 10e6, other, RH_KEY, 0x2a, fee, RELAYER, a);
+        assertEq(IERC20Like(USDG).balanceOf(payer), 100e6, "nothing moved");
+
+        vm.expectEmit(true, true, true, true, ANNOUNCER);
+        emit Announcement(1, stealth, address(pay), RH_KEY, abi.encodePacked(bytes1(0x2a), bytes4(0xa9059cbb), USDG, uint256(10e6 - fee)));
+        vm.prank(SUBMITTER);
+        pay.payWithAuthorization(USDG, 10e6, stealth, RH_KEY, 0x2a, fee, RELAYER, a);
+
+        assertEq(IERC20Like(USDG).balanceOf(stealth), 10e6 - fee, "stealth gets net");
+        assertEq(IERC20Like(USDG).balanceOf(RELAYER), fee, "relayer gets fee");
+        assertEq(IERC20Like(USDG).balanceOf(address(pay)), 0, "contract keeps nothing");
+        assertEq(IERC20Like(USDG).balanceOf(payer), 90e6, "payer debited amount");
+        assertEq(IERC20Like(USDG).balanceOf(SUBMITTER), 0);
     }
 }
