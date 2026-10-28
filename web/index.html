@@ -5,7 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <meta name="referrer" content="no-referrer">
 <title>Stealth — get paid to a fresh address, every time</title>
-<meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; object-src 'none'; base-uri 'none'; form-action 'none'">
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self' https://1click.chaindefuser.com; object-src 'none'; base-uri 'none'; form-action 'none'">
 <meta name="description" content="Stealth: one link to receive stablecoins and ETH, a new address for every payment, found and spent only by you. ERC-5564 stealth addresses, keys never leave your device, no custody.">
 <link rel="icon" href="/favicon.svg">
 <style>
@@ -101,6 +101,16 @@ footer{padding:26px 0 40px;font-size:13px;color:var(--ink-faint);display:flex;ju
             <div class="lbl">withdraw <span class="tok-sym"></span> from <span id="wd-from" class="mono"></span></div>
             <label>to address</label><input id="wd-to" placeholder="0x… (not your public wallet)" autocomplete="off" spellcheck="false">
             <label>amount, <span class="tok-sym"></span> (empty = all)</label><input id="wd-amt" placeholder="all" inputmode="decimal">
+            <div id="wd-priv-wrap" hidden>
+              <label><input type="checkbox" id="wd-private" style="width:auto;margin:0 8px 0 0"> Private (via NEAR, ~1 min)</label>
+              <div id="wd-priv-opts" hidden>
+                <label>pay out on</label><select id="wd-dest"></select>
+                <label><input type="checkbox" id="wd-delay-on" style="width:auto;margin:0 8px 0 0"> add a random delay of up to <input id="wd-delay" value="5" inputmode="decimal" style="width:70px;display:inline-block;margin:0 6px"> min (the page waits; keep this tab open)</label>
+                <label>split into <select id="wd-parts" style="width:auto;display:inline-block;margin:6px 6px"><option value="1">1 part</option><option value="2">2 random parts</option><option value="3">3 random parts</option></select> (sent one after another)</label>
+                <div class="box" id="wd-quote" hidden></div>
+                <p class="note">Honest note: the deposit to NEAR Intents and the payout are both public on-chain. Matching amounts and timing can link them; splitting and a random delay help, they do not make it anonymous. Your main wallet is never used: a failed swap is refunded to this stealth address.</p>
+              </div>
+            </div>
             <div class="row"><button class="btn" id="btn-wd">Send without gas</button><button class="btn ghost" id="btn-wd-cancel">Cancel</button></div>
             <p class="note">A relayer pays the gas and submits your signed <span class="tok-sym"></span> authorization; the stealth address never needs ETH, so nothing links it to your main wallet. The relayer cannot change the amount or the destination.</p>
           </div>

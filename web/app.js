@@ -1,6 +1,7 @@
 import { keysFromSignature, keyRequestTypedData, metaAddress, parseMeta, deriveForPayment, checkAnnouncement, decodeMetadata, hex, unhex, keccak, signDigest, randomBytes32 } from "./stealth-crypto.js";
 import { paymentNonce, receiveTypedData, splitSig } from "./pay-auth.js";
-import { pickChain, chainOfMeta, addChainParams } from "./chains.js";
+import { CHAINS, pickChain, chainOfMeta, addChainParams } from "./chains.js";
+import * as PW from "./private-withdraw.js";
 
 const C = pickChain(), TOK = C.token, SYM = TOK.symbol, NAT = C.native.symbol;
 const USDC = TOK.address, STEALTHPAY = C.stealthPay, CHAIN_HEX = C.chainHex, API = C.api || "/stealth-api";
@@ -166,7 +167,58 @@ $("btn-scan").addEventListener("click", () => scan().catch(e => say("pay-hint", 
 
 // ---- withdraw the stablecoin gaslessly: EIP-3009 authorization signed by the stealth key, submitted by the relayer
 let wd = null;
-function openWithdraw(i) { wd = found[i]; $("wd-from").textContent = wd.stealth; $("wd-to").value = ""; $("wd-amt").value = ""; $("withdraw").hidden = false; }
+function openWithdraw(i) {
+  wd = found[i]; $("wd-from").textContent = wd.stealth; $("wd-to").value = ""; $("wd-amt").value = ""; $("withdraw").hidden = false;
+  // private withdraw (NEAR Intents 1Click) is offered only on chains that have it enabled in chains.js
+  $("wd-priv-wrap").hidden = !(C.privateWithdraw && C.oneClick); $("wd-private").checked = false; $("wd-priv-opts").hidden = true; pvReset();
+  const dest = $("wd-dest"); dest.textContent = "";
+  for (const k of ["base", C.key]) { const c = CHAINS[k]; if (c && c.oneClick && !Array.from(dest.options).some(o => o.value === c.key)) { const o = el("option", null, c.name + " (" + c.token.symbol + ")" + (c.key === C.key ? " · same chain" : "")); o.value = c.key; dest.appendChild(o); } }
+}
+// ---- private withdraw: preview (dry quote) first, then a second click sends. Any input change drops the preview.
+let pv = null;
+function pvReset() { pv = null; $("wd-quote").hidden = true; $("btn-wd").textContent = $("wd-private").checked ? "Preview private send" : "Send without gas"; }
+$("wd-private").addEventListener("change", () => { $("wd-priv-opts").hidden = !$("wd-private").checked; pvReset(); });
+["wd-to", "wd-amt", "wd-dest", "wd-delay", "wd-delay-on", "wd-parts"].forEach(id => { $(id).addEventListener("input", pvReset); $(id).addEventListener("change", pvReset); });
+async function privateWithdraw(to, value, hit) {
+  const dest = CHAINS[$("wd-dest").value]; if (!dest || !dest.oneClick) throw new Error("pick a destination chain");
+  const parts = Number($("wd-parts").value) || 1, delayMax = $("wd-delay-on").checked ? Math.max(0, Math.min(120, Number($("wd-delay").value) || 0)) : 0;
+  const key = [to.toLowerCase(), value, dest.key, parts, delayMax].join("|");
+  if (!pv || pv.key !== key) {                                    // step 1: show what it will cost, send nothing
+    say("pay-hint", "Asking NEAR Intents for a quote…");
+    const j = await PW.requestQuote({ base: PW.ONECLICK, req: PW.buildQuoteRequest({ from: C, to: dest, amount: value, recipient: to, refundTo: wd.stealth, dry: true }) });
+    const sm = PW.summarizeQuote(j, TOK.decimals, dest.token.decimals);
+    const box = $("wd-quote"); box.textContent = "";
+    box.appendChild(el("div", null, "You send " + sm.inText + " " + SYM + " from the stealth address; the destination receives about " + sm.outText + " " + dest.token.symbol + " on " + dest.name + "."));
+    box.appendChild(el("div", "note", "Fees: " + sm.feeText + " (" + sm.feePct + "%). Estimated " + sm.etaSec + " s after the deposit confirms. No gas for you: our relayer pays it."));
+    box.appendChild(el("div", "note", "Privacy level: " + (PW.SESSION_SIGNIN ? "confidential (basic)" : "public swap") + ". " + (PW.SESSION_SIGNIN ? "" : "Deposit and payout can be matched by amount and time. ") + (parts > 1 ? "The amount is cut into " + parts + " random parts, each quoted separately (fees may differ a little). " : "") + (delayMax ? "Each part waits a random time up to " + delayMax + " min first. " : "")));
+    box.hidden = false; pv = { key, ratio: Number(sm.amountOut) / Number(sm.amountIn) };
+    $("btn-wd").textContent = "Confirm: send privately";
+    say("pay-hint", "Check the quote above, then press Confirm.", "warn"); return;
+  }
+  const token = PW.SESSION_SIGNIN ? await PW.sessionSignIn({ priv: hit.stealthPriv, address: wd.stealth }) : null;   // signed in-page by the stealth key, no wallet prompt
+  const split = PW.randomSplit(value, parts); let sent = 0n;
+  const ctx = { from: C, to: dest, priv: hit.stealthPriv, stealth: wd.stealth, recipient: to, api: API, token, base: PW.ONECLICK, waitReceipt, randomNonce: randomBytes32,
+    minRatio: pv.ratio - 0.02, pollMs: 2500 };
+  $("btn-wd").disabled = true;
+  try {
+    for (let i = 0; i < split.length; i++) {
+      const tag = split.length > 1 ? "Part " + (i + 1) + "/" + split.length + ": " : "";
+      ctx.onProgress = m => say("pay-hint", tag + m);
+      let res;
+      try { res = await PW.runPart(ctx, split[i], PW.randomDelayMs(delayMax)); }
+      catch (e) { throw new Error((sent ? fmtTok(sent) + " " + SYM + " was sent already. " : "") + tag + (e.message || String(e)) + (sent || split.length > 1 ? " The rest stays on your stealth address." : "")); }
+      if (res.status !== "SUCCESS") {
+        spent.set(wd.stealth.toLowerCase(), { left: wd.usdc - sent - (res.status === "REFUNDED" ? 0n : split[i]), until: Date.now() + 120_000 });
+        throw new Error(tag + "the swap ended as " + res.status + (res.status === "REFUNDED" ? ": NEAR Intents sent the money back to your stealth address (minus its refund fee)." : ". Deposit address " + res.depositAddress + "."));
+      }
+      sent += split[i]; spent.set(wd.stealth.toLowerCase(), { left: wd.usdc - sent, until: Date.now() + 120_000 });
+    }
+  } finally { $("btn-wd").disabled = false; }
+  $("withdraw").hidden = true; pvReset();
+  const doneMsg = "Done privately: " + fmtTok(sent) + " " + SYM + " sent through NEAR Intents to " + to.slice(0, 8) + "… on " + dest.name + ".";
+  say("pay-hint", doneMsg, "ok"); await scan();
+  $("pay-hint").textContent = doneMsg + "\n" + $("pay-hint").textContent;
+}
 $("btn-wd-cancel").addEventListener("click", () => { $("withdraw").hidden = true; wd = null; });
 const TYPEHASH = keccak(new TextEncoder().encode("TransferWithAuthorization(address from,address to,uint256 value,uint256 validAfter,uint256 validBefore,bytes32 nonce)"));
 const DOMAIN_TYPEHASH = keccak(new TextEncoder().encode("EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)"));
@@ -186,6 +238,7 @@ $("btn-wd").addEventListener("click", async () => {
     if (!hit || hit.stealth.toLowerCase() !== wd.stealth.toLowerCase()) throw new Error("could not re-derive the key for this address");
     const info = await api("/usdc-domain");                       // the token's own domain separator, read server-side
     if (String(info.domain_separator).toLowerCase() !== hex(domainSeparator()).toLowerCase()) throw new Error(SYM + " domain mismatch; refusing to sign");
+    if ($("wd-private").checked && !$("wd-priv-wrap").hidden) return await privateWithdraw(to, value, hit);
     const now = Math.floor(Date.now() / 1000); const validBefore = BigInt(now + 3600); const nonce = randomBytes32();
     const struct = hex(TYPEHASH) + padAddr(wd.stealth) + padAddr(to) + pad(value) + pad(0n) + pad(validBefore) + nonce.slice(2);
     const digest = keccak(unhex("0x1901" + hex(domainSeparator()).slice(2) + hex(keccak(unhex(struct))).slice(2)));

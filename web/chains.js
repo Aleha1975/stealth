@@ -11,6 +11,8 @@ export const CHAINS = {
     stealthPay: "0xc1b372731c1ee68ee89f212a05cb8ac9a7929f76",
     rpc: "https://mainnet.base.org",
     api: "/stealth-api",
+    privateWithdraw: true,                               // withdraw through NEAR Intents 1Click (web/private-withdraw.js)
+    oneClick: { assetId: "nep141:base-0x833589fcd6edb6e08f4c7c32d4f71b54bda02913.omft.near" },
   },
   rh: {
     key: "rh", name: "Robinhood Chain", chainId: 4663, chainHex: "0x1237",
@@ -20,6 +22,8 @@ export const CHAINS = {
     stealthPay: null,                                   // not deployed yet
     rpc: "https://rpc.mainnet.chain.robinhood.com",
     api: "/stealth-api/rh",                              // nginx: /stealth-api/rh/ -> RH indexer :3883 / relayer :3884
+    privateWithdraw: true,
+    oneClick: { assetId: "nep141:hood-0x5fc5360d0400a0fd4f2af552add042d716f1d168.omft.near" },
   },
 };
 /** Chain a meta-address was made for (st:<key>:0x...), or null if it has no prefix / unknown prefix. */
