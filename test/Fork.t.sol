@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-pragma solidity ^0.8.26;
+pragma solidity 0.8.26;
 import "forge-std/Test.sol";
 import {StealthPay} from "../src/StealthPay.sol";
 interface IUSDG { function DOMAIN_SEPARATOR() external view returns (bytes32); }
@@ -12,7 +12,7 @@ contract ForkTest is Test {
     event Announcement(uint256 indexed schemeId, address indexed stealthAddress, address indexed caller, bytes ephemeralPubKey, bytes metadata);
     function test_real_announcer_on_base() public {
         vm.createSelectFork(vm.envString("BASE_RPC"));
-        StealthPay pay = new StealthPay(ANNOUNCER);
+        StealthPay pay = new StealthPay(ANNOUNCER, USDC);
         address payer = address(0xA11CE); address stealth = address(uint160(uint256(keccak256("fresh stealth"))));
         deal(USDC, payer, 100e6);
         bytes memory key = hex"02" hex"1111111111111111111111111111111111111111111111111111111111111111";
@@ -30,7 +30,7 @@ contract ForkTest is Test {
     function test_real_announcer_on_robinhood() public {
         vm.createSelectFork(vm.envString("RH_RPC"));
         assertEq(block.chainid, 4663);
-        StealthPay pay = new StealthPay(ANNOUNCER);
+        StealthPay pay = new StealthPay(ANNOUNCER, USDG);
         address payer = address(0xA11CE); address stealth = address(uint160(uint256(keccak256("fresh stealth rh"))));
         deal(USDG, payer, 100e6);
         bytes memory key = hex"03" hex"2222222222222222222222222222222222222222222222222222222222222222";
@@ -66,7 +66,7 @@ contract ForkTest is Test {
         bytes32 computed = keccak256(abi.encode(keccak256("EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)"), keccak256("Global Dollar"), keccak256("1"), uint256(4663), USDG));
         assertEq(IUSDG(USDG).DOMAIN_SEPARATOR(), computed, "domain matches Global Dollar / 1 / 4663");
 
-        StealthPay pay = new StealthPay(ANNOUNCER);
+        StealthPay pay = new StealthPay(ANNOUNCER, USDG);
         address payer = vm.addr(PAYER_PK);
         address stealth = address(uint160(uint256(keccak256("fresh stealth rh auth"))));
         deal(USDG, payer, 100e6);

@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-pragma solidity ^0.8.26;
+pragma solidity 0.8.26;
 import "forge-std/Test.sol";
 import {StealthPay} from "../src/StealthPay.sol";
 import {MockAnnouncer} from "./StealthPay.t.sol";
@@ -37,7 +37,7 @@ contract PayWithAuthorizationTest is Test {
 
     function setUp() public {
         vm.warp(1_800_000_000);
-        ann = new MockAnnouncer(); pay = new StealthPay(address(ann)); tok = new Tok3009();
+        ann = new MockAnnouncer(); tok = new Tok3009(); pay = new StealthPay(address(ann), address(tok));
         payer = vm.addr(pk); tok.mint(payer, 1_000e6);
     }
 
@@ -54,7 +54,7 @@ contract PayWithAuthorizationTest is Test {
     }
 
     function test_one_signature_pays_stealth_and_relayer_and_announces_net() public {
-        address s = address(0xBEEF);
+        address s = address(0xBEEF00);
         StealthPay.Authorization memory a = _sign(pk, 100e6, s, key, 0x2a, 0.05e6, relayer);
         vm.prank(relayer); pay.payWithAuthorization(address(tok), 100e6, s, key, 0x2a, 0.05e6, relayer, a);
         assertEq(tok.balanceOf(s), 99.95e6); assertEq(tok.balanceOf(relayer), 0.05e6); assertEq(tok.balanceOf(address(pay)), 0);
@@ -64,7 +64,7 @@ contract PayWithAuthorizationTest is Test {
     }
 
     function test_anyone_may_submit_and_the_outcome_is_identical() public {
-        address s = address(0xBEEF);
+        address s = address(0xBEEF00);
         StealthPay.Authorization memory a = _sign(pk, 10e6, s, key, 0x01, 0.01e6, relayer);
         vm.prank(address(0xBAD)); pay.payWithAuthorization(address(tok), 10e6, s, key, 0x01, 0.01e6, relayer, a);
         assertEq(tok.balanceOf(relayer), 0.01e6, "fee goes to the signed recipient, not the submitter");
@@ -72,7 +72,7 @@ contract PayWithAuthorizationTest is Test {
     }
 
     function test_signature_cannot_be_redirected() public {
-        address s = address(0xBEEF);
+        address s = address(0xBEEF00);
         StealthPay.Authorization memory a = _sign(pk, 10e6, s, key, 0x01, 0, address(0));
         vm.expectRevert(bytes("bad signature")); pay.payWithAuthorization(address(tok), 10e6, address(0xC0FFEE), key, 0x01, 0, address(0), a);
         bytes memory otherKey = hex"02" hex"3333333333333333333333333333333333333333333333333333333333333333";
@@ -86,21 +86,21 @@ contract PayWithAuthorizationTest is Test {
     }
 
     function test_signature_for_another_deployment_is_useless() public {
-        StealthPay other = new StealthPay(address(ann));
-        address s = address(0xBEEF);
+        StealthPay other = new StealthPay(address(ann), address(tok));
+        address s = address(0xBEEF00);
         StealthPay.Authorization memory a = _sign(pk, 10e6, s, key, 0x01, 0, address(0));
         vm.expectRevert(bytes("bad signature")); other.payWithAuthorization(address(tok), 10e6, s, key, 0x01, 0, address(0), a);
     }
 
     function test_replay_and_double_pay_refused() public {
-        address s = address(0xBEEF);
+        address s = address(0xBEEF00);
         StealthPay.Authorization memory a = _sign(pk, 10e6, s, key, 0x01, 0, address(0));
         pay.payWithAuthorization(address(tok), 10e6, s, key, 0x01, 0, address(0), a);
         vm.expectRevert(abi.encodeWithSelector(StealthPay.NotFresh.selector, s)); pay.payWithAuthorization(address(tok), 10e6, s, key, 0x01, 0, address(0), a);
     }
 
     function test_fee_rules() public {
-        address s = address(0xBEEF);
+        address s = address(0xBEEF00);
         StealthPay.Authorization memory a = _sign(pk, 10e6, s, key, 0x01, 10e6, relayer);
         vm.expectRevert(StealthPay.BadFee.selector); pay.payWithAuthorization(address(tok), 10e6, s, key, 0x01, 10e6, relayer, a);
         vm.expectRevert(StealthPay.BadFee.selector); pay.payWithAuthorization(address(tok), 10e6, s, key, 0x01, 1, address(0), a);
@@ -110,7 +110,7 @@ contract PayWithAuthorizationTest is Test {
 
     function test_fee_on_transfer_token_refused() public {
         tok.setSkim(1);
-        address s = address(0xBEEF);
+        address s = address(0xBEEF00);
         StealthPay.Authorization memory a = _sign(pk, 10e6, s, key, 0x01, 0, address(0));
         vm.expectRevert(StealthPay.AmountMismatch.selector); pay.payWithAuthorization(address(tok), 10e6, s, key, 0x01, 0, address(0), a);
     }
@@ -118,8 +118,8 @@ contract PayWithAuthorizationTest is Test {
     function test_freshness_and_key_rules_apply() public {
         StealthPay.Authorization memory a = _sign(pk, 10e6, address(tok), key, 0x01, 0, address(0));
         vm.expectRevert(abi.encodeWithSelector(StealthPay.NotFresh.selector, address(tok))); pay.payWithAuthorization(address(tok), 10e6, address(tok), key, 0x01, 0, address(0), a);
-        vm.expectRevert(StealthPay.BadKey.selector); pay.payWithAuthorization(address(tok), 10e6, address(0xBEEF), hex"04", 0x01, 0, address(0), a);
-        vm.expectRevert(abi.encodeWithSelector(StealthPay.NotAToken.selector, address(0x1234))); pay.payWithAuthorization(address(0x1234), 10e6, address(0xBEEF), key, 0x01, 0, address(0), a);
+        vm.expectRevert(StealthPay.BadKey.selector); pay.payWithAuthorization(address(tok), 10e6, address(0xBEEF00), hex"04", 0x01, 0, address(0), a);
+        vm.expectRevert(abi.encodeWithSelector(StealthPay.UnsupportedToken.selector, address(0x1234))); pay.payWithAuthorization(address(0x1234), 10e6, address(0xBEEF00), key, 0x01, 0, address(0), a);
     }
 
     function testFuzz_amount_fee_tag(uint64 amount, uint64 fee, bytes1 tag, uint160 sraw) public {
@@ -136,7 +136,7 @@ contract PayWithAuthorizationTest is Test {
     function _hookCall(bytes memory data, bool onTransfer) internal { tok.setHook(address(pay), data, onTransfer); }
 
     function test_reentry_during_receive_is_refused() public {
-        address s = address(0xBEEF); address s2 = address(0xBEE2);
+        address s = address(0xBEEF00); address s2 = address(0xBEE2);
         StealthPay.Authorization memory a = _sign(pk, 10e6, s, key, 0x01, 0, address(0));
         _hookCall(abi.encodeCall(StealthPay.payToken, (address(tok), 1, s2, key, bytes1(0x01))), false);
         pay.payWithAuthorization(address(tok), 10e6, s, key, 0x01, 0, address(0), a);
@@ -145,7 +145,7 @@ contract PayWithAuthorizationTest is Test {
     }
 
     function test_reentry_during_payout_is_refused() public {
-        address s = address(0xBEEF); address s2 = address(0xBEE2);
+        address s = address(0xBEEF00); address s2 = address(0xBEE2);
         StealthPay.Authorization memory a = _sign(pk, 10e6, s, key, 0x01, 1e6, relayer);
         StealthPay.Authorization memory a2 = _sign(pk, 5e6, s2, key, 0x01, 0, address(0));
         _hookCall(abi.encodeCall(StealthPay.payWithAuthorization, (address(tok), 5e6, s2, key, bytes1(0x01), 0, address(0), a2)), true);
@@ -154,7 +154,7 @@ contract PayWithAuthorizationTest is Test {
     }
 
     function test_blocklisted_fee_recipient_or_stealth_reverts_atomically() public {
-        address s = address(0xBEEF);
+        address s = address(0xBEEF00);
         StealthPay.Authorization memory a = _sign(pk, 10e6, s, key, 0x01, 1e6, relayer);
         tok.setBlocked(relayer, true);
         vm.expectRevert(StealthPay.TransferFailed.selector); pay.payWithAuthorization(address(tok), 10e6, s, key, 0x01, 1e6, relayer, a);
@@ -168,7 +168,7 @@ contract PayWithAuthorizationTest is Test {
 
     function test_stray_tokens_do_not_break_or_leak() public {
         tok.mint(address(pay), 777);
-        address s = address(0xBEEF);
+        address s = address(0xBEEF00);
         StealthPay.Authorization memory a = _sign(pk, 10e6, s, key, 0x01, 1e6, relayer);
         pay.payWithAuthorization(address(tok), 10e6, s, key, 0x01, 1e6, relayer, a);
         assertEq(tok.balanceOf(address(pay)), 777, "stray untouched, nothing extra paid out");
@@ -176,7 +176,7 @@ contract PayWithAuthorizationTest is Test {
     }
 
     function test_payToken_and_authorization_paths_share_freshness() public {
-        address s = address(0xBEEF);
+        address s = address(0xBEEF00);
         StealthPay.Authorization memory a = _sign(pk, 10e6, s, key, 0x01, 0, address(0));
         pay.payWithAuthorization(address(tok), 10e6, s, key, 0x01, 0, address(0), a);
         vm.expectRevert(abi.encodeWithSelector(StealthPay.NotFresh.selector, s));
@@ -184,10 +184,23 @@ contract PayWithAuthorizationTest is Test {
     }
 
     function test_expired_or_early_authorization_reverts() public {
-        address s = address(0xBEEF);
+        address s = address(0xBEEF00);
         StealthPay.Authorization memory a = _sign(pk, 10e6, s, key, 0x01, 0, address(0));
         vm.warp(2_000_000_001);
         vm.expectRevert(bytes("time")); pay.payWithAuthorization(address(tok), 10e6, s, key, 0x01, 0, address(0), a);
         assertFalse(pay.used(s));
     }
+
+    function test_fake_token_is_refused_by_payWithAuthorization() public {
+        FakeAuthTok fake = new FakeAuthTok(); address s = address(0xBEEF00);
+        StealthPay.Authorization memory a = _sign(pk, 10e6, s, key, 0x01, 0, address(0));
+        vm.expectRevert(abi.encodeWithSelector(StealthPay.UnsupportedToken.selector, address(fake)));
+        pay.payWithAuthorization(address(fake), 10e6, s, key, 0x01, 0, address(0), a);
+        assertEq(ann.n(), 0);
+    }
+}
+contract FakeAuthTok {
+    function receiveWithAuthorization(address, address, uint256, uint256, uint256, bytes32, uint8, bytes32, bytes32) external {}
+    function balanceOf(address) external pure returns (uint256) { return 0; }
+    function transfer(address, uint256) external pure returns (bool) { return true; }
 }

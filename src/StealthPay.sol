@@ -1,7 +1,17 @@
 // SPDX-License-Identifier: MIT
-pragma solidity ^0.8.26;
+pragma solidity 0.8.26;
 
 /// @title StealthPay
+/// @dev ONE TOKEN PER DEPLOYMENT: the ERC-20 this contract serves (e.g. USDC on Base, USDG on Robinhood Chain) is the
+///      immutable TOKEN set in the constructor, plus the native coin through payETH. payToken and payWithAuthorization
+///      keep the `token` argument (stable ABI for the web app and the relayer) but revert unless token == TOKEN, so a
+///      fake token cannot make phantom announcements. payToken also checks that the stealth address's balance grew by
+///      exactly `amount`, so the announced amount is what arrived (fee-on-transfer and lying tokens are refused);
+///      payWithAuthorization checks the same on the contract's own balance. Allowed paths: payToken(TOKEN),
+///      payWithAuthorization(TOKEN), payETH. Stealth addresses below 0x10000 (precompiles / system range) are refused.
+///      Residuals that remain: (1) the griefing front-run described below; (2) a rebasing or blocklisting TOKEN can
+///      still revert a payment (nothing is lost); (3) TOKEN is trusted to behave as the chosen real token (USDC/USDG)
+///      -- the deployer must pass the right address, it cannot be changed afterwards.
 /// @notice Pay an ERC-20 or ETH to a one-time (ERC-5564) stealth address and publish the announcement in the same
 ///         transaction, so a payer's wallet needs one call instead of two (or, with payWithAuthorization, one
 ///         signature and no gas) and the receiver can always find the payment.
@@ -35,6 +45,7 @@ contract StealthPay {
     bytes4 private constant SEL_TRANSFER = 0xa9059cbb;
     bytes4 private constant SEL_ETH = 0xeeeeeeee;
     IAnnouncer public immutable ANNOUNCER;
+    address public immutable TOKEN;                              // the one ERC-20 served by this deployment
 
     /// The payer's EIP-3009 signature fields; grouped to keep the call within the stack limit without via-IR.
     struct Authorization { address from; uint256 validAfter; uint256 validBefore; uint8 v; bytes32 r; bytes32 s; }
@@ -51,12 +62,16 @@ contract StealthPay {
     error TransferFailed();
     error EthFailed();
     error NotAToken(address token);
+    error UnsupportedToken(address token);
+    error NoAnnouncer();
     error BadFee();
     error AmountMismatch();
 
-    constructor(address announcer) {
-        if (announcer.code.length == 0) revert BadKey();
+    constructor(address announcer, address token) {
+        if (announcer.code.length == 0) revert NoAnnouncer();
+        if (token.code.length == 0) revert NotAToken(token);
         ANNOUNCER = IAnnouncer(announcer);
+        TOKEN = token;
     }
 
     modifier lock() { if (_lock != 0) revert Reentrancy(); _lock = 1; _; _lock = 0; }
@@ -66,12 +81,11 @@ contract StealthPay {
     /// @param viewTag the first byte of the hashed shared secret: lets the receiver skip 255 of 256 announcements
     function payToken(address token, uint256 amount, address stealthAddress, bytes calldata ephemeralPubKey, bytes1 viewTag) external lock {
         if (amount == 0) revert ZeroAmount();
-        // A call to an address without code "succeeds" with empty return data: without this check anyone could publish
+        // Only the deployment's own token: any other contract could "succeed" without moving funds and so publish
         // announcements of payments that never happened (phantom amounts in the receiver's list) for the price of gas.
-        if (token.code.length == 0) revert NotAToken(token);
+        if (token != TOKEN) revert UnsupportedToken(token);
         _fresh(stealthAddress, ephemeralPubKey);
-        (bool ok, bytes memory r) = token.call(abi.encodeWithSelector(IERC20.transferFrom.selector, msg.sender, stealthAddress, amount));
-        if (!ok || (r.length != 0 && !abi.decode(r, (bool)))) revert TransferFailed();
+        _pull(token, stealthAddress, amount);
         ANNOUNCER.announce(SCHEME_ID, stealthAddress, ephemeralPubKey, abi.encodePacked(viewTag, SEL_TRANSFER, token, amount));
         emit Paid(stealthAddress, token, amount);
     }
@@ -89,7 +103,7 @@ contract StealthPay {
     ) external lock {
         if (amount == 0) revert ZeroAmount();
         if (fee >= amount || (fee != 0 && (feeRecipient == address(0) || feeRecipient == address(this)))) revert BadFee();
-        if (token.code.length == 0) revert NotAToken(token);
+        if (token != TOKEN) revert UnsupportedToken(token);
         _fresh(stealthAddress, ephemeralPubKey);
         _receive(token, amount, paymentNonce(token, stealthAddress, ephemeralPubKey, viewTag, fee, feeRecipient), auth);
         if (fee != 0) _send(token, feeRecipient, fee);
@@ -126,13 +140,21 @@ contract StealthPay {
         emit Paid(stealthAddress, token, net);
     }
 
+    function _pull(address token, address stealthAddress, uint256 amount) private {
+        uint256 before = IERC20(token).balanceOf(stealthAddress);
+        (bool ok, bytes memory r) = token.call(abi.encodeWithSelector(IERC20.transferFrom.selector, msg.sender, stealthAddress, amount));
+        if (!ok || (r.length != 0 && !abi.decode(r, (bool)))) revert TransferFailed();
+        // The announced amount must be what arrived (replaces the fee-on-transfer residual).
+        if (IERC20(token).balanceOf(stealthAddress) - before != amount) revert AmountMismatch();
+    }
+
     function _send(address token, address to, uint256 value) private {
         (bool ok, bytes memory r) = token.call(abi.encodeWithSelector(IERC20.transfer.selector, to, value));
         if (!ok || (r.length != 0 && !abi.decode(r, (bool)))) revert TransferFailed();
     }
 
     function _fresh(address stealthAddress, bytes calldata ephemeralPubKey) private {
-        if (stealthAddress == address(0) || stealthAddress == address(this) || stealthAddress.code.length != 0 || used[stealthAddress]) revert NotFresh(stealthAddress);
+        if (uint160(stealthAddress) < 0x10000 || stealthAddress == address(this) || stealthAddress.code.length != 0 || used[stealthAddress]) revert NotFresh(stealthAddress);
         if (ephemeralPubKey.length != 33 || (ephemeralPubKey[0] != 0x02 && ephemeralPubKey[0] != 0x03)) revert BadKey();
         used[stealthAddress] = true;
     }
