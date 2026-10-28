@@ -105,6 +105,8 @@ async function getPages(man) {
   return k => pages[k];
 }
 // ---- payments: scan announcements (indexed by us), check each with the viewing key, balances via our API
+// After a withdraw the indexer's balance cache (~15 s) can still show the old amount: cap it by what we know is left.
+const spent = new Map();   // stealth -> { left, until }
 async function scan() {
   if (!keys) { say("pay-hint", "Derive your keys first (Receive tab).", "bad"); return; }
   const head = await api("/head");
@@ -139,7 +141,8 @@ async function scan() {
   }
   if (found.length) {
     const b = await api("/balances?addrs=" + found.map(f => f.stealth).join(","));
-    for (const f of found) { const x = b[f.stealth.toLowerCase()] || {}; f.usdc = BigInt(x.usdc || "0"); f.eth = BigInt(x.eth || "0"); }
+    for (const f of found) { const x = b[f.stealth.toLowerCase()] || {}; f.usdc = BigInt(x.usdc || "0"); f.eth = BigInt(x.eth || "0");
+      const sp = spent.get(f.stealth.toLowerCase()); if (sp && Date.now() < sp.until && f.usdc > sp.left) f.usdc = sp.left; }
   }
   render();
   const msg = n + " announcements scanned, " + found.length + " are yours.";
@@ -195,7 +198,10 @@ $("btn-wd").addEventListener("click", async () => {
     say("pay-hint", "Submitted: " + fmtTok(value) + " " + SYM + " → " + to.slice(0, 8) + "… waiting for the block…");
     const rc = await waitReceipt(d.hash);
     if (!rc.ok) throw new Error("the transfer reverted on chain (tx " + d.hash.slice(0, 12) + "…). Nothing moved.");
-    say("pay-hint", "Done: " + fmtTok(value) + " " + SYM + " sent, tx " + d.hash.slice(0, 12) + "…", "ok"); await scan();
+    spent.set(wd.stealth.toLowerCase(), { left: wd.usdc - value, until: Date.now() + 120_000 });
+    const doneMsg = "Done: " + fmtTok(value) + " " + SYM + " sent, tx " + d.hash.slice(0, 12) + "…";
+    say("pay-hint", doneMsg, "ok"); await scan();
+    $("pay-hint").textContent = doneMsg + "\n" + $("pay-hint").textContent;                // the rescan's status must not erase the confirmation
   } catch (e) { say("pay-hint", e.message || String(e), "bad"); }
 });
 async function waitReceipt(h) {
