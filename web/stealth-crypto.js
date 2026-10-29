@@ -52,19 +52,27 @@ export const keyRequestTypedData = account => JSON.stringify({ types: { EIP712Do
  *  (smart wallets, passkeys, ERC-1271/6492 wrappers give randomised or wrapped signatures: keys could not be re-derived
  *  later and incoming money would be lost). Derives from r||s only, so v = 0/1 vs 27/28 cannot change the keys. */
 export function keysFromSignature(sigHex, account) {
+  if (!/^(0x)?([0-9a-fA-F]{2})+$/.test(String(sigHex))) throw new Error("This wallet did not return a plain signature (not hex).");   // audit 1098 I: odd length / junk is refused here, not padded
   const sig = unhex(sigHex);
   if (sig.length !== 65) throw new Error("This wallet did not return a plain signature (smart wallet or passkey?). Stealth needs an ordinary key-based wallet such as MetaMask.");
-  let rs = sig.slice(0, 64); let v = sig[64]; if (v >= 27) v -= 27;
+  const raw = sig.slice(0, 64); let rs = raw; let v = sig[64]; if (v >= 27) v -= 27;
   if (v !== 0 && v !== 1) throw new Error("unexpected signature format");
+  const fromRs = (b) => {
+    const d = (t) => toBytes32(mod(toBig(keccak_256(concatBytes(b, utf8(t)))), N) || 1n);
+    const spendPriv = d("deepyield-stealth/spend/v1"), viewPriv = d("deepyield-stealth/view/v1");
+    return { spendPriv, viewPriv, spendPub: secp.getPublicKey(spendPriv, true), viewPub: secp.getPublicKey(viewPriv, true) };
+  };
+  const owns = (b, bit) => addressOf(secp.Signature.fromCompact(b).addRecoveryBit(bit).recoverPublicKey(keyRequestDigest(account)).toRawBytes(true)).toLowerCase() === account.toLowerCase();
   // ECDSA is malleable: (r, s, v) and (r, n-s, v^1) both verify for the same account but would give a different key set. Normalise to the
   // canonical low-s form first, so the keys depend only on the account and the message (a high-s signature must not yield other keys).
-  const sig0 = secp.Signature.fromCompact(rs);
-  if (sig0.hasHighS()) { rs = sig0.normalizeS().toCompactRawBytes(); v ^= 1; }
-  const recovered = secp.Signature.fromCompact(rs).addRecoveryBit(v).recoverPublicKey(keyRequestDigest(account));
-  if (addressOf(recovered.toRawBytes(true)).toLowerCase() !== account.toLowerCase()) throw new Error("the signature does not come from the connected account");
-  const d = (t) => toBytes32(mod(toBig(keccak_256(concatBytes(rs, utf8(t)))), N) || 1n);
-  const spendPriv = d("deepyield-stealth/spend/v1"), viewPriv = d("deepyield-stealth/view/v1");
-  return { spendPriv, viewPriv, spendPub: secp.getPublicKey(spendPriv, true), viewPub: secp.getPublicKey(viewPriv, true) };
+  const sig0 = secp.Signature.fromCompact(raw), high = sig0.hasHighS(), v0 = v;
+  if (high) { rs = sig0.normalizeS().toCompactRawBytes(); v ^= 1; }
+  if (!owns(rs, v)) throw new Error("the signature does not come from the connected account");
+  const keys = fromRs(rs);
+  // audit 1098 L-1: a wallet that emitted HIGH-s signatures used to get keys derived from the raw bytes. Those keys are still derived (verified to belong to the account) and
+  // returned as keys.legacy so the scan and the withdraw still find the old payments. They are never put in a meta-address; scan and withdraw only.
+  if (high && owns(raw, v0)) keys.legacy = fromRs(raw);
+  return keys;
 }
 /** Test helper: sign the key request with a raw private key the way an EOA wallet would (65-byte r||s||v). */
 export function signKeyRequestWith(privBytes, account) {
@@ -77,8 +85,9 @@ export const metaAddress = (keys, chain = "base") => "st:" + chain + ":" + hex(c
 export function parseMeta(s) {
   const m = String(s).trim().match(/^(?:st:[a-z0-9]+:)?(0x[0-9a-fA-F]{132})$/);
   if (!m) throw new Error("not a stealth meta-address");
-  const b = unhex(m[1]);
-  return { spendPub: b.slice(0, 33), viewPub: b.slice(33, 66) };
+  const b = unhex(m[1]), spendPub = b.slice(0, 33), viewPub = b.slice(33, 66);
+  try { secp.ProjectivePoint.fromHex(spendPub); secp.ProjectivePoint.fromHex(viewPub); } catch { throw new Error("not a valid stealth meta-address (a key is not a point on the curve)"); }   // audit 1098 I-4
+  return { spendPub, viewPub };
 }
 
 /** Sender: one-time address for this payment. Returns {stealth, ephPub (33 bytes hex), viewTag (0x..)}. */

@@ -241,9 +241,15 @@ export async function startHop(ctx) {
   await ctx.store.put(ctx.stealth.toLowerCase() + "#" + n, { st, db: null });
   return runHop(ctx);
 }
+const WEBZJS_SHA256 = { "webzjs_wallet.js": "PLACEHOLDER_JS", "webzjs_wallet_bg.wasm": "PLACEHOLDER_WASM" };   // keep in step with web/vendor/webzjs/SHA256SUMS
 export async function loadZjs(base = new URL("./vendor/webzjs/", import.meta.url)) {
   if (!self.crossOriginIsolated) throw new Error("this page is not cross-origin isolated (COOP/COEP), so the Zcash wallet cannot run here");
-  const m = await import(new URL("webzjs_wallet.js", base)); await m.default(); await m.initThreadPool(Math.min(4, navigator.hardwareConcurrency || 2)); return m;
+  // The wasm below receives the seed phrase: refuse to run any bytes other than the audited build (hashes = web/vendor/webzjs/SHA256SUMS; ops/build_webzjs.sh refreshes them).
+  const hex = async b => [...new Uint8Array(await crypto.subtle.digest("SHA-256", b))].map(x => x.toString(16).padStart(2, "0")).join("");
+  const get = async f => { const r = await fetch(new URL(f, base), { cache: "no-store", credentials: "omit" }); if (!r.ok) throw new Error("cannot load " + f); return r.arrayBuffer(); };
+  const [glue, wasm] = await Promise.all([get("webzjs_wallet.js"), get("webzjs_wallet_bg.wasm")]);
+  if (await hex(glue) !== WEBZJS_SHA256["webzjs_wallet.js"] || await hex(wasm) !== WEBZJS_SHA256["webzjs_wallet_bg.wasm"]) throw new Error("the Zcash wallet files do not match the audited build; refusing to load them");
+  const m = await import(new URL("webzjs_wallet.js", base)); await m.default({ module_or_path: wasm }); await m.initThreadPool(Math.min(4, navigator.hardwareConcurrency || 2)); return m;
 }
 let zjsP; export const sharedZjs = () => zjsP ||= loadZjs().catch(e => { zjsP = null; throw e; });
 
@@ -304,7 +310,8 @@ export async function runHop(ctx) {
   const known = async raw => { try { return ctx.txKnown ? await ctx.txKnown(txidOf(raw)) : undefined; } catch { return undefined; } };      // true / false / undefined = cannot tell
   const relay = async () => {
     if (st.dry) throw new Error("dry run never calls the relayer");
-    const { r, d } = await postRelay(fetchFn, ctx.api + "/relay", st.auth, { sleep: ctx.sleep, onBusy: m => ctx.onProgress && ctx.onProgress(m) });
+    const { r, d } = await postRelay(fetchFn, ctx.api + "/relay", st.auth, { sleep: ctx.sleep, onBusy: m => ctx.onProgress && ctx.onProgress(m), check: ctx.authUsed ? () => ctx.authUsed(st.auth.from, st.auth.nonce) : null });   // 1098 L-3: a 502/504 is settled on chain before any retry
+    if (d.used) return null;                                     // the relayer did get it: the authorization is used on chain
     if (r.ok && d.hash) return d.hash;
     if (/already used/.test(d.error || "")) return null;         // this very authorization was sent before: the transfer exists
     throw new Error(d.error || "relayer error");

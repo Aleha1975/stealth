@@ -186,7 +186,8 @@ export async function runPart(ctx, amount, delayMs) {
   const validBefore = Math.floor(Date.now() / 1000) + 3600;
   const auth = signTransferAuth({ chain: ctx.from, priv: ctx.priv, from: ctx.stealth, to: q.depositAddress, value: amount, validBefore, nonce: ctx.randomNonce() });
   say("Sending through the relayer (no gas for you)…");
-  const { r, d } = await postRelay(fetchFn, ctx.api + "/relay", auth, { onBusy: m => say(m) });
+  const { r, d } = await postRelay(fetchFn, ctx.api + "/relay", auth, { onBusy: m => say(m), check: ctx.authUsed ? () => ctx.authUsed(ctx.stealth, auth.nonce) : null });
+  if (d.used) throw new Error("The relayer received the deposit transfer (its authorization is used on chain) but its transaction hash was lost. Check the explorer; deposit address " + q.depositAddress + ".");
   if (!r.ok || d.error) throw new Error(d.error || "relayer error");
   say("Deposit sent (tx " + d.hash.slice(0, 12) + "…), waiting for the block…");
   const rc = await ctx.waitReceipt(d.hash); if (!rc.ok) throw new Error("the deposit transfer reverted (tx " + d.hash.slice(0, 12) + "…)");

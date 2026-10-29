@@ -5,7 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <meta name="referrer" content="no-referrer">
 <title>Loophole — app</title>
-<meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; worker-src 'self' blob:; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self' https://1click.chaindefuser.com https://zcash-mainnet.chainsafe.dev https://rpc.mainnet.chain.robinhood.com; object-src 'none'; base-uri 'none'; form-action 'none'">
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; worker-src 'self' blob:; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self' https://1click.chaindefuser.com https://zcash-mainnet.chainsafe.dev https://rpc.mainnet.chain.robinhood.com https://mainnet.base.org; object-src 'none'; base-uri 'none'; form-action 'none'">
 <link rel="icon" href="/favicon.svg">
 <link rel="stylesheet" href="./loophole.css">
 </head>
@@ -30,6 +30,7 @@
       <div class="pane" id="pane-receive">
         <h3>Your receiving link</h3>
         <p class="note">One signature. Same keys on any device.</p>
+        <p class="note"><b>Warning:</b> the signature you give here is the master key to every stealth payment you receive, on every chain. Anyone who gets the same signature can take the money and see your payments. Sign it only on this site (check the address bar), and never for any other site or message.</p>
         <button class="btn" id="btn-keys">Derive my keys</button>
         <div id="recv-out" hidden>
           <div class="box"><div class="lbl">meta-address</div><div class="mono" id="meta"></div></div>

@@ -18,9 +18,9 @@ for (const [name, hdr] of [["0xfffffffb", [0, 255, 255, 255, 251]], ["0x80000000
   ok("M-1 frame length " + name + " fails closed, no hang", r !== "HANG" && r !== "ok" && /frame/.test(r), r); }
 ok("M-1 truncated frame (length > bytes) throws", await rejects(R.getUtxos("https://lw", key.addr, mk(Uint8Array.from([0, 0, 0, 0, 9, 1, 2]))), /truncated/));
 ok("M-1 trailing garbage after the last frame throws", await rejects(R.getUtxos("https://lw", key.addr, mk(cat(fr(0, []), OKT, [1, 2, 3]))), /truncated/));
-ok("M-1 total body > 2 MiB refused (content-length and streamed)", await rejects(R.getUtxos("https://lw", key.addr, mk(fr(0, []), { h: { "content-length": String(3 << 20) } }), /too large/)) &&
-  await rejects(R.getUtxos("https://lw", key.addr, async () => ({ ok: true, status: 200, headers: { get: () => null }, body: { getReader: () => { let n = 0; return { read: async () => n++ < 5 ? { done: false, value: new Uint8Array(1 << 20) } : { done: true }, cancel: async () => {} }; } } })), /too large/));
-ok("M-1 frame over 1 MiB refused", await rejects(R.getUtxos("https://lw", key.addr, mk(cat([0, 0, 0x20, 0, 0], new Uint8Array(0x200000)))), /frame too large|too large/));
+ok("M-1 total body > 2 MiB refused (content-length and streamed)", await rejects(R.getTip("https://lw", mk(fr(0, []), { h: { "content-length": String(3 << 20) } }), /too large/)) &&
+  await rejects(R.getTip("https://lw", async () => ({ ok: true, status: 200, headers: { get: () => null }, body: { getReader: () => { let n = 0; return { read: async () => n++ < 5 ? { done: false, value: new Uint8Array(1 << 20) } : { done: true }, cancel: async () => {} }; } } })), /too large/));
+ok("M-1 frame over 1 MiB refused", await rejects(R.getTip("https://lw", mk(cat([0, 0, 0x20, 0, 0], new Uint8Array(0x200000)))), /frame too large|too large/));
 ok("M-1 unknown flag bits / two data frames / data after trailer refused", await rejects(R.getUtxos("https://lw", key.addr, mk(fr(0x02, []))), /flags/) && await rejects(R.getUtxos("https://lw", key.addr, mk(cat(fr(0, []), fr(0, []), OKT))), /unexpected/) && await rejects(R.getUtxos("https://lw", key.addr, mk(cat(OKT, fr(0, [])))), /unexpected/));
 ok("L-5 request has a timeout signal; a stalled server is aborted", await (async () => { let sig; await R.getUtxos("https://lw", key.addr, async (u, i) => { sig = i.signal; return resp(cat(fr(0, []), OKT)); }); return sig && typeof sig.aborted === "boolean"; })());
 
@@ -48,8 +48,9 @@ ok("L-1 no tip and no explicit expiry: refused (never 'never expires')", (() => 
 ok("L-6 tip below NU6.3 activation (3,428,143) refused; at activation accepted", (() => { try { R.buildSweep({ utxos: utx, key, to: TO, tip: 3_428_142 }); return false; } catch (e) { return /activation/.test(e.message); } })() && R.buildSweep({ utxos: [{ ...utx[0], height: 3_428_000 }], key, to: TO, tip: 3_428_143 }).branch === R.NU6_3_BRANCH);
 ok("L-6 tip 0/NaN/float refused", [0, NaN, 3_600_000.5, -1].every(t => { try { R.branchForHeight(t); return false; } catch { return true; } }));
 ok("L-1 a UTXO above the reported tip (lying tip) refused", (() => { try { R.buildSweep({ utxos: [{ ...utx[0], height: 3_700_000 }], key, to: TO, tip: 3_600_000 }); return false; } catch (e) { return /above the reported tip/.test(e.message); } })());
+const clockFor = h => (R.TIP_ANCHOR.time + (h - R.TIP_ANCHOR.height) * 75) * 1000;
 const tipRes = h => mk(cat(fr(0, cat(vf(1, h), ld(2, new Uint8Array(32)))), OKT));
-ok("L-1 getTip: parses GetLatestBlock height; request is an empty message", await (async () => { let body, url; const t = await R.getTip("https://lw", async (u, i) => { body = i.body; url = u; return resp(cat(fr(0, vf(1, 3_600_000)), OKT)); }); return t === 3_600_000 && body.length === 5 && /GetLatestBlock$/.test(url); })());
+ok("L-1 getTip: parses GetLatestBlock height; request is an empty message", await (async () => { let body, url; const t = await R.getTip("https://lw", async (u, i) => { body = i.body; url = u; return resp(cat(fr(0, vf(1, 3_600_000)), OKT)); }, { now: clockFor(3_600_000) }); return t === 3_600_000 && body.length === 5 && /GetLatestBlock$/.test(url); })());
 ok("L-1 getTip: absent / below activation / absurd / non-varint height refused", await rejects(R.getTip("https://lw", mk(cat(fr(0, []), OKT)))) && await rejects(R.getTip("https://lw", tipRes(5)), /implausible/) && await rejects(R.getTip("https://lw", tipRes(2n ** 40n)), /implausible/) && await rejects(R.getTip("https://lw", mk(cat(fr(0, ld(1, [1])), OKT))), /bad tip/));
 
 // L-3/L-4 dust and input cap
@@ -87,4 +88,48 @@ ok("txKnown: status 5 = false; zcashd -5 text under status 2 = false; gateway 'n
     const sig = R.signAll(t2, key), hs = [0, 1, 2].map(i => R.hex(R.sighash(t2, i)));
     const okSig = sig.vin.every((x, i) => { const sl = x.sig[0], der = x.sig.slice(1, sl); return secp256k1.verify(secp256k1.Signature.fromDER(der).normalizeS(), R.sighash(t2, i), key.pub, { lowS: false }); });
     return s.amount === set.reduce((a, x) => a + x.value, 0n) - 15_000n && new Set(hs).size === 3 && okSig && R.txid(sig) === R.txid(t2) && R.txid(t2) === s.txid; })()); }
+
+// ---- round 2 (job 1100)
+// L-1 the tip is bounded by the wall clock
+ok("r2 L-1 tip within the clock window accepted; a lying tip (far future / far past / expiry-never) refused", await (async () => {
+  const now = clockFor(3_700_000), at = h => R.getTip("https://lw", tipRes(h), { now });
+  return (await at(3_700_000)) === 3_700_000 && (await at(3_700_150)) === 3_700_150 && await rejects(at(3_700_000 + 5000), /clock/) && await rejects(at(3_700_000 - 5000), /clock/) && await rejects(at(499_999_000), /clock/); })());
+ok("r2 L-1 tipWithinClock: anchor block, +1 day, and a tip 1 day ahead of the clock", R.tipWithinClock(R.TIP_ANCHOR.height, R.TIP_ANCHOR.time * 1000) && R.tipWithinClock(R.TIP_ANCHOR.height + 1152, (R.TIP_ANCHOR.time + 86400) * 1000) && !R.tipWithinClock(R.TIP_ANCHOR.height + 1152 * 2, (R.TIP_ANCHOR.time + 86400) * 1000));
+
+// L-2 sendAndConfirm: accepted only if the node returns OUR bytes
+{ const RAW = Uint8Array.of(5, 0, 0, 128, 1, 2, 3), noSleep = { sleep: async () => {}, tries: 3 };
+  const node = ({ send = okMsg(TX), get = null, sendThrows = false } = {}) => async (u, i) => {
+    if (/SendTransaction$/.test(u)) { if (sendThrows) throw Object.assign(new Error("aborted"), { name: "AbortError" }); return resp(send); }
+    if (/GetTransaction$/.test(u)) return get ? resp(get) : resp(trailer("grpc-status: 5\r\ngrpc-message: not found\r\n"));
+    throw new Error("unexpected " + u); };
+  const got = bytes => cat(fr(0, ld(1, bytes)), OKT);
+  ok("r2 L-2 forged 'sent' reply with a node that does not know the tx is NOT sent", await rejects(R.sendAndConfirm("https://lw", RAW, node(), TX, noSleep), /NOT confirmed/));
+  ok("r2 L-2 node returning different bytes for our txid is NOT sent", await rejects(R.sendAndConfirm("https://lw", RAW, node({ get: got(Uint8Array.of(9, 9)) }), TX, noSleep), /NOT confirmed/));
+  ok("r2 L-2 node returning our exact bytes = sent", (await R.sendAndConfirm("https://lw", RAW, node({ get: got(RAW) }), TX, noSleep)) === TX);
+  ok("r2 L-2 abort of SendTransaction is resolved by the lookup (known -> sent; unknown -> error that names the abort)", (await R.sendAndConfirm("https://lw", RAW, node({ sendThrows: true, get: got(RAW) }), TX, noSleep)) === TX && await rejects(R.sendAndConfirm("https://lw", RAW, node({ sendThrows: true }), TX, noSleep), /aborted/));
+  ok("r2 L-2 network rejection is final and never looked up", await rejects(R.sendAndConfirm("https://lw", RAW, node({ send: cat(fr(0, cat(vf(1, 18), ld(2, enc("bad-txns")))), OKT), get: got(RAW) }), TX, noSleep), /Rejected by network/)); }
+
+// L-3 dust flood: reads stop after the first 500 valid entries instead of failing
+{ const ent = i => ld(1, U({ txid: ld(1, Uint8Array.from({ length: 32 }, (_, k) => k === 0 ? i & 255 : k === 1 ? i >> 8 : 7)), value: vf(4, 1000 + i) }));
+  const big = n => cat(...Array.from({ length: n }, (_, i) => ent(i)));
+  const flood = await R.getUtxos("https://lw", key.addr, mk(cat(fr(0, big(9000)), OKT)));
+  ok("r2 L-3 9000 entries (frame > 1 MiB): first 500 returned, truncated flagged, no failure", flood.length === 500 && flood.truncated === true && flood[0].value === 1000n, flood.length);
+  const huge = cat([0, 0, 0x40, 0, 0], big(30000));    // 3+ MiB body, never completed: the read stops at the cap and still yields 500
+  ok("r2 L-3 body over the 2 MiB cap (streamed, incomplete) still yields the first 500", (await R.getUtxos("https://lw", key.addr, async () => ({ ok: true, status: 200, headers: { get: () => null }, body: { getReader: () => { let n = 0; return { read: async () => n < huge.length ? { done: false, value: huge.slice(n, n += 1 << 18) } : { done: true }, cancel: async () => {} }; } } }))).length === 500);
+  ok("r2 L-3 a malformed entry AFTER the first 500 is ignored; before it, still refused", (await R.getUtxos("https://lw", key.addr, mk(cat(fr(0, cat(big(500), ld(1, [1, 2]))), OKT)))).length === 500 && await rejects(R.getUtxos("https://lw", key.addr, mk(cat(fr(0, cat(big(3), ld(1, [1, 2]))), OKT)))));
+  ok("r2 L-3 under the cap nothing is flagged", (await R.getUtxos("https://lw", key.addr, mk(cat(fr(0, big(10)), OKT)))).truncated === false); }
+
+// M-1 "empty" never hides by itself
+{ const T0 = 1_000_000_000_000, min = 60_000; let o = R.noteEmpty(null, true, T0);
+  ok("r2 M-1 one empty answer: not hidden, an observation is recorded", o.hide === false && o.obs.count === 1);
+  o = R.noteEmpty(o.obs, true, T0 + 1000); ok("r2 M-1 a second answer seconds later does not count", o.hide === false && o.obs.count === 1);
+  o = R.noteEmpty(o.obs, true, T0 + 10 * min); o = R.noteEmpty(o.obs, true, T0 + 20 * min);
+  ok("r2 M-1 3 answers over 20 min: still not hidden (needs 30 min)", o.hide === false && o.obs.count === 3);
+  const h = R.noteEmpty(o.obs, true, T0 + 31 * min); ok("r2 M-1 consistent answers spread over 30+ min: hide", h.hide === true);
+  ok("r2 M-1 one non-empty answer resets everything", R.noteEmpty(o.obs, false, T0 + 40 * min).obs === null && R.noteEmpty(o.obs, false, T0).hide === false);
+  ok("r2 M-1 garbage / future observation is restarted, not trusted", R.noteEmpty({ first: T0 + 9e9, last: T0, count: 99 }, true, T0).hide === false && R.noteEmpty({ count: 99 }, true, T0).hide === false); }
+
+// I-1 compressed flag, I-2 output floor
+ok("r2 I-1 compressed-flag frame (0x01) refused", await rejects(R.getUtxos("https://lw", key.addr, mk(fr(0x01, []))), /flags/));
+ok("r2 I-2 a sweep paying under the output floor is refused", (() => { try { R.buildSweep({ utxos: [{ ...utx[0], value: 5_001n }, { ...utx[0], txid: "dd".repeat(32), value: 5_001n }], key, to: TO, tip: 3_600_010 }); return false; } catch (e) { return /nothing/.test(e.message); } })());
 console.log(bad ? bad + " failed" : "all passed"); process.exit(bad ? 1 : 0);
