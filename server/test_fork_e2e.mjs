@@ -157,7 +157,7 @@ try {
   eq("A2 payer debited exactly 5.000000", usd(a1 - await bal(A.address)), "5.000000");
   eq("A2 stealth got the full 5.000000 (fee 0)", usd(await bal(d2.stealth)), "5.000000");
   // extra stealth payments (own gas, cheap) that the negative tests will withdraw from
-  const W = {}; for (const k of ["rep", "dom", "dom2", "exp", "amt", "feelow", "nofee", "sanc", "par", "stuck", "drop", "nonce", "after"]) { W[k] = newDest(); await payOwnGas(A, W[k], 3n * U); }
+  const W = {}; for (const k of ["rep", "dom", "dom2", "exp", "amt", "feelow", "nofee", "sanc", "par", "stuck", "drop", "nonce", "after", "dup", "dup2"]) { W[k] = newDest(); await payOwnGas(A, W[k], 3n * U); }
   await mine(3);
   // B scans announcements through the indexer
   let annRows = []; for (let i = 0; i < 90; i++) { try { annRows = (await (await fetch(IDX + "/announcements?since=0&limit=2000")).json()).rows; } catch {} if (annRows.length >= 2 + Object.keys(W).length) break; await sleep(500); }
@@ -296,6 +296,9 @@ try {
     await rpc("evm_setAutomine", [true]); await mine(2);
     await sleep(1500);
     eq("B8b after mining, money moved exactly once: C +2.00", usd((await bal(C)) - cc0), "2.000000");
+    { const sj = await fetch(RELAY + "/relay/status?hash=" + ws.hash).then(r => r.json());     // the client polled the ORIGINAL hash: the relayer says where it went
+      ok("B8b GET /relay/status follows the replacement: new hash, status success", sj.status === "success" && /^0x[0-9a-f]{64}$/.test(sj.hash) && sj.hash !== ws.hash.toLowerCase(), JSON.stringify(sj));
+      ok("B8b /relay/status rejects a bad hash", (await fetch(RELAY + "/relay/status?hash=0x12")).status === 400); }
     // (c) dropped tx: the node forgets it -> nonce gap must be closed and the next withdrawal must work
     const nD = await nonceOf(R1.addr);
     await rpc("evm_setAutomine", [false]);
@@ -340,6 +343,41 @@ try {
     const big = await fetch(RELAY2 + "/relay/pay", { method: "POST", body: "x".repeat(20000) }).then(r => "http " + r.status, e => "closed");
     ok("B10 oversize body (20 KB) is cut off", /closed|http 4/.test(big) && !!(await fetch(RELAY2 + "/relay/stats").then(r => r.json())).relayer, big);
     ok("B10 relayer fee recipient must be the relayer (cannot redirect fees)", (await post(RELAY2, "/relay/pay", payBody(payers[1], stealthFor(), 2n * U, FEE, payers[1].address, await payAuth(payers[1], stealthFor(), 2n * U, FEE, payers[1].address)), "5.5.5.5")).error === "fee recipient must be the relayer"); }
+
+  // B11 audit 1087: duplicate in-flight authorization, no refund on revert, IPv6 /64, log injection, routing by pathname
+  { await rpc("evm_setAutomine", [true]); await mine(1);
+    const c0 = await bal(C), body = await wbody(W.dup.stealth, C, 2n * U, FEE);
+    await rpc("evm_setAutomine", [false]);
+    const d1 = await post(RELAY, "/relay", body, nip()), d2 = await post(RELAY, "/relay", body, nip());
+    ok("B11a the same authorization sent twice while unmined returns the SAME hashes (no second transaction)", d1.status === 200 && d2.status === 200 && d1.hash === d2.hash && d1.feeHash === d2.feeHash, JSON.stringify([d1, d2]).slice(0, 200));
+    const stp = JSON.parse(fs.readFileSync(R1.state, "utf8"));
+    ok("B11a ...and the duplicate used no extra allowance", stp.perFrom[W.dup.stealth] === 1, JSON.stringify(stp.perFrom[W.dup.stealth]));
+    await rpc("evm_setAutomine", [true]); await mine(2);
+    for (const h of [d1.feeHash, d1.hash]) await pub.waitForTransactionReceipt({ hash: h, timeout: 15000 }).catch(() => {});
+    await sleep(800);
+    eq("B11a money moved exactly once: C +2.00", usd((await bal(C)) - c0), "2.000000");
+    const d3 = await post(RELAY, "/relay", body, nip()); ok("B11a after mining a repeat is a normal refusal (no longer answered from the in-flight table), nothing moves", d3.status === 400 && /already used|holds less/.test(d3.error) && (await bal(C)) - c0 === 2n * U, JSON.stringify(d3));
+    // revert must not give the allowance back: the payer empties the wallet after the relayer accepted the payment, so it reverts on chain
+    const P = await newPayer(2n * U), dA = newDest(), aA = await payAuth(P, dA, 2n * U, FEE, R1.addr);
+    await rpc("evm_setAutomine", [false]);
+    const pa = await post(RELAY, "/relay/pay", payBody(P, dA, 2n * U, FEE, R1.addr, aA), nip());
+    ok("B11b the payment passes the simulation (unmined)", pa.status === 200, JSON.stringify(pa).slice(0, 200));
+    await fundTok(P.address, 0n); await rpc("evm_setAutomine", [true]); await mine(2);
+    let rv = false; for (let i = 0; i < 40 && !rv; i++) { rv = /reverted pay/.test(R1.log()); if (!rv) await sleep(500); }
+    ok("B11b the payment reverted on chain", rv);
+    await sleep(500); const st3 = JSON.parse(fs.readFileSync(R1.state, "utf8"));
+    ok("B11b the revert did NOT refund the payer's daily allowance (still 1)", st3.perPayer[P.address] === 1, JSON.stringify(st3.perPayer[P.address]));
+    // IPv6: addresses of one /64 count as one network (R2 allows 3 per network)
+    const v6 = async i => { const payer = await newPayer(), dd = newDest(), au = await payAuth(payer, dd, 2n * U, FEE, R2.addr); return post(RELAY2, "/relay/pay", payBody(payer, dd, 2n * U, FEE, R2.addr, au), "2001:db8:aaaa:bbbb:" + (i + 1) + "::" + (i + 7)); };
+    const v6r = []; for (let i = 0; i < 4; i++) v6r.push(await v6(i));
+    ok("B11c IPv6: 4 addresses in one /64 share the per-network cap (3 ok, 4th refused)", v6r.slice(0, 3).every(r => r.status === 200) && v6r[3].status === 400 && /too many requests/.test(v6r[3].error), JSON.stringify(v6r.map(r => r.status)));
+    // log injection: a forged ALERT line must not become a line of its own
+    await post(RELAY, "/relay", { from: "0xdead\n2099-01-01T00:00:00.000Z ALERT forged line", to: C }, nip());
+    const lg = R1.log().split("\n");
+    ok("B11d log injection: no log line starts with the forged timestamp, the attempt is on one line", !lg.some(l => l.startsWith("2099-")) && lg.some(l => / refused .*forged line/.test(l)));
+    // routing by the parsed pathname, not by the end of the raw URL
+    const r1 = await fetch(RELAY + "/relay?x=/relay/pay", { method: "POST", body: "{}" }), r2 = await fetch(RELAY + "/relay/pay?x=/relay", { method: "POST", body: "{}" }), r3 = await fetch(RELAY + "/relay/stats?x=1");
+    ok("B11e POST with a query string is not routed (404); GET /relay/stats with a query still works", r1.status === 404 && r2.status === 404 && r3.status === 200, [r1.status, r2.status, r3.status].join()); }
 
   // ===================================================================================== C) UI pay amount
   sect("C) UI pay amount: 'you pay 10' = 10 leaves the wallet");
