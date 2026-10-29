@@ -5,184 +5,97 @@
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <meta name="referrer" content="no-referrer">
 <title>Loophole — get paid, leave no trail</title>
-<meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; worker-src 'self' blob:; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self' https://1click.chaindefuser.com https://zcash-mainnet.chainsafe.dev; object-src 'none'; base-uri 'none'; form-action 'none'">
-<meta name="description" content="Loophole: one link to receive stablecoins, a new address for every payment, found and spent only by you. Keys never leave your device, no custody.">
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; object-src 'none'; base-uri 'none'; form-action 'none'">
+<meta name="description" content="Loophole: one link to receive stablecoins. Every payment lands on a fresh address only you can find. No gas, no custody.">
 <link rel="icon" href="/favicon.svg">
-<style>
-:root{--bg:#000;--line:rgba(255,255,255,.12);--line-strong:rgba(255,255,255,.22);--ink:#fff;--ink-soft:rgba(255,255,255,.62);--ink-faint:rgba(255,255,255,.4);--glass:rgba(255,255,255,.04);--pos:#6fe0a8;--neg:#ff7a85;--warn:#e8c070;--sans:Inter,-apple-system,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;--mono:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;color-scheme:dark}
-*{box-sizing:border-box}html{scroll-behavior:smooth;scroll-padding-top:72px}html,body{margin:0;background:#000;color:var(--ink);font-family:var(--sans);font-size:16px;line-height:1.55;-webkit-font-smoothing:antialiased}
-body{overflow-x:hidden}
-a{color:#fff;text-decoration:none}
-.wrap{max-width:1080px;margin:0 auto;padding-left:max(16px,env(safe-area-inset-left,0px));padding-right:max(16px,env(safe-area-inset-right,0px))}
-nav.top{position:absolute;top:0;left:0;right:0;z-index:5}
-nav.top .wrap{display:flex;align-items:center;justify-content:space-between;gap:16px;height:72px}
-.brand{display:flex;align-items:center;gap:10px;font-weight:500;font-size:19px;letter-spacing:-.02em;color:#fff}
-.brand svg{width:22px;height:22px}
-.links{display:flex;gap:34px;font-size:14px}
-.links a{color:var(--ink-soft);transition:color .2s}.links a:hover{color:#fff}
-.wallet{font:inherit;font-size:13px;color:#fff;background:rgba(0,0,0,.4);border:1px solid var(--line-strong);border-radius:999px;padding:8px 16px;cursor:pointer;transition:background .2s}
-.wallet:hover{background:rgba(255,255,255,.1)}.wallet.on{color:var(--pos);border-color:rgba(111,224,168,.4)}
-.hero{position:relative;min-height:100vh;min-height:100svh;display:flex;align-items:center;justify-content:center;text-align:center;overflow:hidden;padding:96px 0 72px}
-#funnel{position:absolute;inset:0;width:100%;height:100%;pointer-events:none;z-index:0}
-.hero .in{position:relative;z-index:2}
-h1{font-weight:300;font-size:clamp(40px,8vw,104px);line-height:1;letter-spacing:-.05em;margin:0 0 24px}
-h1 span{display:block;background:linear-gradient(180deg,#fff 10%,rgba(255,255,255,.28) 100%);-webkit-background-clip:text;background-clip:text;color:transparent;-webkit-text-fill-color:transparent}
-.lead{font-size:clamp(15px,1.7vw,19px);color:var(--ink-soft);margin:0 auto 34px;max-width:520px}
-.cta{display:flex;gap:12px;justify-content:center;flex-wrap:wrap}
-.pill{display:inline-block;font:inherit;font-size:15px;font-weight:500;padding:13px 28px;border-radius:999px;cursor:pointer;border:1px solid transparent;transition:transform .15s,background .2s}
-.pill:hover{transform:translateY(-1px)}
-.pill.solid{background:#fff;color:#000}
-.pill.line{color:#fff;background:linear-gradient(#000,#000) padding-box,linear-gradient(135deg,rgba(255,255,255,.7),rgba(255,255,255,.08) 55%,rgba(255,255,255,.5)) border-box}
-main.app{position:relative;z-index:1;background:#000}
-.card{background:var(--glass);border:1px solid var(--line);border-radius:20px;padding:22px;backdrop-filter:blur(14px);-webkit-backdrop-filter:blur(14px);max-width:620px;margin:0 auto}
-.lbl{font-size:11px;letter-spacing:.14em;text-transform:uppercase;color:var(--ink-faint)}
-.card h3{font-weight:400;font-size:22px;letter-spacing:-.02em;margin:6px 0 12px}
-.tabs{display:flex;gap:4px;margin:12px 0 20px;background:rgba(255,255,255,.05);border-radius:999px;padding:4px}
-.tabs button{flex:1;background:none;border:0;border-radius:999px;color:var(--ink-soft);font:inherit;font-size:14px;padding:9px 8px;cursor:pointer;transition:background .2s,color .2s}
-.tabs button[aria-selected=true]{color:#000;background:#fff}
-.pane[hidden]{display:none}
-.btn{display:inline-block;background:#fff;color:#000;padding:11px 22px;border-radius:999px;border:1px solid #fff;font:inherit;font-size:14px;font-weight:500;cursor:pointer;transition:opacity .2s}
-.btn:hover{opacity:.88}.btn:disabled{opacity:.4;cursor:default}
-.btn.ghost{background:none;color:#fff;border:1px solid var(--line-strong)}.btn.ghost:hover{background:rgba(255,255,255,.08);opacity:1}
-input,select{width:100%;background:rgba(255,255,255,.05);border:1px solid var(--line);border-radius:12px;color:#fff;font:inherit;font-family:var(--mono);font-size:16px;padding:11px 14px;margin:6px 0 12px;outline:none;transition:border-color .2s}
-input:focus,select:focus{border-color:rgba(255,255,255,.45)}
-select option{background:#111;color:#fff}
-input[type=checkbox]{accent-color:#fff}
-label{font-size:13px;color:var(--ink-soft)}
-.mono{font-family:var(--mono);font-size:12.5px;word-break:break-all}
-.box{background:rgba(255,255,255,.04);border:1px solid var(--line);border-radius:14px;padding:12px 14px;margin:10px 0}
-.row{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
-.hint{font-size:13px;color:var(--ink-soft);min-height:20px;margin-top:10px;white-space:pre-line}
-.hint.bad{color:var(--neg)}.hint.ok{color:var(--pos)}.hint.warn{color:var(--warn)}
-.note{font-size:13px;color:var(--ink-faint)}
-.pay{border-top:1px solid var(--line);padding:12px 0}
-.pay .amt{font-size:22px;font-weight:300}
-.pay small{font-family:var(--mono);font-size:11px;color:var(--ink-faint)}
-.hop{border:1px solid var(--line-strong);background:var(--glass);border-radius:16px;padding:16px;margin:12px 0}
-.hop-t{font-size:18px;font-weight:400;letter-spacing:-.01em}.hop-amt{font-family:var(--mono);font-size:14px;color:var(--ink-soft);margin:4px 0 12px}
-.hop-bar{display:flex;gap:4px;margin:10px 0 8px}.hop-bar i{flex:1;height:6px;border-radius:3px;background:rgba(255,255,255,.14)}
-.hop-bar i.d{background:var(--pos)}.hop-bar i.c{background:#fff;animation:hp 1.4s ease-in-out infinite}
-@keyframes hp{50%{opacity:.35}}@media (prefers-reduced-motion:reduce){.hop-bar i.c{animation:none}}
-.hop-fill{height:8px;border-radius:4px;background:rgba(255,255,255,.12);overflow:hidden;margin:10px 0 6px}.hop-fill i{display:block;height:100%;border-radius:4px;background:linear-gradient(90deg,#4fc98d,var(--pos));transition:width 1s linear}.hop-pct{font-size:15px;color:var(--pos);font-variant-numeric:tabular-nums;margin:2px 0 6px}
-.hop-bar{margin-top:6px}.hop-bar i{height:4px!important}
-.hop-step{font-size:12px;letter-spacing:.08em;text-transform:uppercase;color:var(--ink-faint)}
-.hop-line{font-size:14px;color:var(--ink);margin-top:8px}.hop-foot{margin-top:8px}
-.hop.done{border-color:rgba(111,224,168,.45);background:rgba(111,224,168,.07)}.hop.done .hop-t{color:var(--pos)}
-.hop.warn{border-color:rgba(232,192,112,.45);background:rgba(232,192,112,.06)}.hop.warn .hop-t{color:var(--warn)}
-.hop.bad{border-color:rgba(255,122,133,.4);background:rgba(255,122,133,.06)}.hop.bad .hop-t{color:var(--neg)}
-.hop-link{display:inline-block;margin-top:8px;font-family:var(--mono);font-size:12.5px;text-decoration:underline;text-underline-offset:3px}
-.hop-det{margin-top:10px;font-size:12.5px;color:var(--ink-faint)}.hop-det summary{cursor:pointer}.hop-det .note{margin-top:6px;word-break:break-word;white-space:pre-line}
-.hop-phrase{margin-top:12px}.hop-phrase code{display:block;margin-top:6px;padding:10px;border-radius:8px;background:rgba(255,255,255,.06);font-size:13px;line-height:1.6;word-break:break-word}
-.hop-act{margin-top:12px}
-.qt{display:flex;gap:10px;flex-wrap:wrap}.qt>div{flex:1;min-width:130px}.qt .big{font-size:20px;font-weight:300;display:block;margin-top:2px}
-section{padding:72px 0}
-section#app-sec{padding-top:40px}
-h2{font-weight:300;font-size:clamp(30px,4vw,44px);letter-spacing:-.04em;margin:0 0 28px;text-align:center}
-.grid3{display:grid;grid-template-columns:repeat(3,1fr);gap:14px}
-.step{border:1px solid var(--line);border-radius:20px;padding:22px 20px;background:var(--glass)}
-.step .n{font-size:30px;font-weight:300;color:var(--ink-faint);line-height:1;margin-bottom:14px}
-.step b{display:block;font-weight:500;margin-bottom:4px}.step span{font-size:14px;color:var(--ink-soft)}
-.fine{text-align:center;margin-top:26px;font-size:12.5px;color:var(--ink-faint)}
-footer{padding:26px 0 40px;font-size:13px;color:var(--ink-faint);display:flex;justify-content:space-between;gap:12px;flex-wrap:wrap;border-top:1px solid var(--line)}
-footer a{color:var(--ink-soft)}
-@media (max-width:760px){.links{display:none}.grid3{grid-template-columns:1fr}.card{padding:18px 16px}.hero{padding-top:88px}}
-</style>
+<link rel="stylesheet" href="./loophole.css">
+<script type="module" src="./landing.js"></script>
 </head>
 <body>
 <nav class="top"><div class="wrap">
-  <a class="brand" href="/stealth/"><svg viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="1.4" aria-hidden="true"><ellipse cx="12" cy="5" rx="9" ry="2.6"/><path d="M3 5c3 5 6 7 9 14 3-7 6-9 9-14"/></svg>Loophole</a>
-  <div class="links"><a href="#app-sec" data-go="receive">Receive</a><a href="#app-sec" data-go="pay">Pay</a><a href="#app-sec" data-go="payments">Payments</a><a href="#how">How it works</a></div>
-  <button class="wallet" id="wbtn" title="Click to connect, or to switch to another wallet account">Connect wallet</button>
+  <a class="brand" href="./"><svg viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="1.4" aria-hidden="true"><ellipse cx="12" cy="5" rx="9" ry="2.6"/><path d="M3 5c3 5 6 7 9 14 3-7 6-9 9-14"/></svg>Loophole</a>
+  <div class="links"><a href="#why">Why</a><a href="#how">How it works</a><a href="#trust">Security</a></div>
+  <a class="pill solid sm" href="./app.html">Launch app</a>
 </div></nav>
 
 <header class="hero">
   <canvas id="funnel" aria-hidden="true"></canvas>
   <div class="in wrap">
     <h1>Get paid.<span>Leave no trail.</span></h1>
-    <p class="lead">One link. One signature.<br>Money passes through a shielded pool and arrives clean.</p>
-    <div class="cta"><a class="pill line" href="#app-sec" data-go="receive">Receive</a><a class="pill solid" href="#app-sec" data-go="pay">Pay a link</a></div>
+    <p class="lead">One link to receive stablecoins. Every payment lands on a fresh address that only you can find.</p>
+    <div class="cta"><a class="pill solid" href="./app.html">Launch app</a><a class="pill line" href="#how">How it works</a></div>
   </div>
+  <a class="scroll" href="#why" aria-label="Scroll down"><i></i></a>
 </header>
 
-<main class="app">
+<main class="land">
 <div class="wrap">
-  <section id="app-sec">
-    <div class="card" id="app">
-      <div class="lbl">Loophole · <span class="chain-name">Robinhood Chain</span></div>
-      <div class="tabs" role="tablist">
-        <button role="tab" aria-selected="true" data-pane="receive">Receive</button>
-        <button role="tab" aria-selected="false" data-pane="payments">My payments</button>
-        <button role="tab" aria-selected="false" data-pane="pay">Pay someone</button>
-      </div>
+  <div class="stats">
+    <div><b>1</b><span>signature to start</span></div>
+    <div><b>0</b><span>gas to pay or withdraw</span></div>
+    <div><b>0</b><span>custody. Keys stay on your device</span></div>
+    <div><b>✓</b><span>independently audited contract</span></div>
+  </div>
 
-      <div class="pane" id="pane-receive">
-        <h3>Your receiving link</h3>
-        <p class="note">One signature. Same keys on any device.</p>
-        <button class="btn" id="btn-keys">Derive my keys</button>
-        <div id="recv-out" hidden>
-          <div class="box"><div class="lbl">meta-address</div><div class="mono" id="meta"></div></div>
-          <div class="box"><div class="lbl">pay link</div><div class="mono" id="paylink"></div></div>
-          <div class="row"><button class="btn ghost" id="copy-link">Copy link</button><button class="btn ghost" id="copy-meta">Copy meta-address</button></div>
-        </div>
-        <div class="hint" id="recv-hint"></div>
-      </div>
-
-      <div class="pane" id="pane-payments" hidden>
-        <h3>Payments found for your keys</h3>
-        <div id="hop-resume" hidden></div>
-        <div class="row"><button class="btn" id="btn-scan">Scan</button><span class="note" id="scan-note">Derive your keys first.</span></div>
-        <div id="pay-list"></div>
-        <div id="withdraw" hidden>
-          <div class="box">
-            <div class="lbl">withdraw <span class="tok-sym"></span> from <span id="wd-from" class="mono"></span></div>
-            <label>to address</label><input id="wd-to" placeholder="0x… (not your public wallet)" autocomplete="off" spellcheck="false">
-            <label>amount, <span class="tok-sym"></span> (empty = all)</label><input id="wd-amt" placeholder="all" inputmode="decimal">
-            <div id="wd-priv-wrap" hidden>
-              <label><input type="checkbox" id="wd-private" style="width:auto;margin:0 8px 0 0"> Private</label>
-              <div id="wd-priv-opts" hidden>
-                <label hidden>pay out on</label><select id="wd-dest" hidden></select>
-                <div class="box" id="wd-quote" hidden></div>
-              </div>
-            </div>
-            <div class="row"><button class="btn" id="btn-wd">Send without gas</button><button class="btn ghost" id="btn-wd-cancel">Cancel</button></div>
-            <p class="note">No gas needed.</p>
-          </div>
-        </div>
-        <div class="hint" id="pay-hint"></div>
-      </div>
-
-      <div class="pane" id="pane-pay" hidden>
-        <h3>Pay a link</h3>
-        <label>recipient meta-address or link</label><input id="to-meta" placeholder="st:…:0x… or https://app.deepyield.ai/stealth/?to=…" autocomplete="off" spellcheck="false">
-        <div class="row" style="gap:16px">
-          <div style="flex:1;min-width:110px"><label>you pay</label><input id="amount" placeholder="5" inputmode="decimal"></div>
-          <div style="flex:1;min-width:110px"><label>receiver gets</label><input id="amount-get" placeholder="4.95" inputmode="decimal"></div>
-          <div style="width:120px"><label>token</label><select id="token"><option value="TOKEN"></option><option value="NATIVE"></option></select></div>
-        </div>
-        <div class="note" id="pay-calc"></div>
-        <div class="row"><button class="btn" id="btn-pay">Pay</button></div>
-        <div class="hint" id="send-hint"></div>
-        <p class="note">One signature, no gas.</p>
-      </div>
+  <section id="why" class="split">
+    <div>
+      <div class="eyebrow">The problem</div>
+      <h2 class="left">Your wallet is a public diary.</h2>
+    </div>
+    <div class="prose">
+      <p>Share one address and anyone can see every payment you get, your balance and who pays you. Forever.</p>
+      <p><b>Loophole gives every payer a new address for you.</b> On-chain they look like strangers. Only your keys tie them together.</p>
     </div>
   </section>
 
   <section id="how">
-    <h2>How it works</h2>
+    <div class="eyebrow c">How it works</div>
+    <h2>Three steps. No setup.</h2>
     <div class="grid3">
-      <div class="step"><div class="n">1</div><b>One signature</b><span>Your wallet signs once; your browser derives the keys.</span></div>
-      <div class="step"><div class="n">2</div><b>One link</b><span>Share it. Each payer gets a fresh address for you.</span></div>
-      <div class="step"><div class="n">3</div><b>Only you</b><span>You find and move the funds. Nothing links back.</span></div>
+      <div class="step"><div class="n">01</div><b>Sign once</b><span>Your wallet signs one message. Your browser derives private keys from it.</span></div>
+      <div class="step"><div class="n">02</div><b>Share one link</b><span>Payers open it and pay with one signature. No gas, no account.</span></div>
+      <div class="step"><div class="n">03</div><b>Collect privately</b><span>Scan, find your payments, move them anywhere. Still no gas.</span></div>
     </div>
-    <p class="fine">Hides the receiver, not the payer. Contracts: Announcer <span class="mono">0x55649E01B5Df198D18D95b5cc5051630cfD45564</span> · Pay contract <span class="mono" id="sp-addr"></span></p>
   </section>
 
-  <footer><div>Loophole · a DeepYield product · <span class="chain-name"></span></div><div><a href="/hedge/">Hedge</a> · <a href="https://deepyield.ai">DeepYield</a></div></footer>
+  <section id="feat">
+    <div class="grid2">
+      <div class="feat"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3l7 3v6c0 4.5-3 7.7-7 9-4-1.3-7-4.5-7-9V6z"/></svg><b>No custody</b><span>We never hold your money or your keys. Funds go straight to addresses only you control.</span></div>
+      <div class="feat"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M13 2L4 14h7l-1 8 9-12h-7z"/></svg><b>No gas, ever</b><span>Paying and withdrawing need no ETH. A small fixed fee covers the network.</span></div>
+      <div class="feat"><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="6" width="18" height="13" rx="3"/><path d="M3 10h18M16 15h2"/></svg><b>Any wallet</b><span>Works with the wallet you already have. Nothing to install, nothing to sign up for.</span></div>
+      <div class="feat"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 12a8 8 0 1016 0 8 8 0 10-16 0M12 4v16M4 12h16"/></svg><b>Built on a standard</b><span>ERC-5564 stealth addresses. Open source, verifiable on-chain.</span></div>
+    </div>
+  </section>
+
+  <section id="trust" class="split">
+    <div>
+      <div class="eyebrow">Security</div>
+      <h2 class="left">Audited. Open. Yours.</h2>
+    </div>
+    <div class="prose">
+      <ul class="checks">
+        <li>Pay contract audited: no critical, high or medium findings</li>
+        <li>Keys are derived and used only in your browser</li>
+        <li>Code is open source and verified on-chain</li>
+      </ul>
+    </div>
+  </section>
+
+  <section id="next" class="soon">
+    <div class="eyebrow c">Coming next</div>
+    <h2>Full privacy, end to end.</h2>
+    <p class="lead c">Withdrawals through Zcash's shielded pool, where millions of ZEC hide every transfer. One click, the mechanics stay hidden.</p>
+  </section>
+
+  <section class="final">
+    <h2>Your next payment<br>can be private.</h2>
+    <a class="pill solid" href="./app.html">Launch app</a>
+  </section>
+
+  <footer><div>Loophole · a DeepYield product</div><div><a href="./app.html">App</a> · <a href="https://github.com/Aleha1975/stealth">GitHub</a> · <a href="https://deepyield.ai">DeepYield</a></div></footer>
 </div>
 </main>
 
-<script type="module" src="./app.js"></script>
 <script type="module" src="./funnel.js"></script>
-<script type="module" src="./nav.js"></script>
 </body>
 </html>

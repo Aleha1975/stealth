@@ -30,6 +30,7 @@ document.querySelectorAll(".tabs button").forEach(b => b.addEventListener("click
 }));
 const q = new URLSearchParams(location.search);
 if (q.get("to")) { $("to-meta").value = q.get("to"); document.querySelector('[data-pane="pay"]').click(); }
+else if (["receive", "payments", "pay"].includes(q.get("tab"))) document.querySelector('[data-pane="' + q.get("tab") + '"]').click();
 
 // ---- wallet (payer path only talks to the wallet's own provider; reads go through our API)
 async function api(path) { const r = await fetch(API + path, { cache: "no-store" }); const d = await r.json(); if (!r.ok || d.error) throw new Error(d.error || ("api " + r.status)); return d; }
@@ -86,7 +87,7 @@ $("btn-keys").addEventListener("click", async () => {
     const meta = metaAddress(keys, C.key);
     // remember the public meta-address per account: if a later derivation differs, say so before a link is shared
     let prev = null; try { prev = localStorage.getItem("stealth.meta." + acct); localStorage.setItem("stealth.meta." + acct, meta); } catch {}
-    $("meta").textContent = meta; $("paylink").textContent = location.origin + "/stealth/?" + (C.key === pickChain("").key ? "" : "chain=" + C.key + "&") + "to=" + meta;
+    $("meta").textContent = meta; $("paylink").textContent = location.origin + location.pathname.replace(/[^/]*$/, "") + "app.html?" + (C.key === pickChain("").key ? "" : "chain=" + C.key + "&") + "to=" + meta;
     $("recv-out").hidden = false;
     if (prev && prev !== meta) say("recv-hint", "Warning: these keys differ from the ones this account derived before on this device. Payments sent to the old link are reachable only with the old keys. Check your wallet account.", "warn");
     else say("recv-hint", "Keys derived in this browser. They are not stored anywhere.", "ok");
