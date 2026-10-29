@@ -30,11 +30,11 @@ try {
     else if (m.method === "Runtime.consoleAPICalled" && m.params.type === "error") errors.push("console: " + m.params.args.map(a => a.value ?? a.description).join(" ").slice(0, 600));
     else if (m.method === "Network.requestWillBeSent") reqs.push(m.params.request.method + " " + m.params.request.url); };
   for (const d of ["Runtime", "Page", "Log", "Network"]) await send(d + ".enable");
-  await send("Page.navigate", { url: SITE });
+  await send("Page.navigate", { url: SITE + "app.html" });
   const ev = async expr => { const r = await send("Runtime.evaluate", { expression: expr, awaitPromise: true, returnByValue: true }); if (r.exceptionDetails) throw new Error(r.exceptionDetails.exception?.description || r.exceptionDetails.text); return r.result.value; };
   for (let i = 0; i < 40; i++) { if (await ev("document.readyState === 'complete' && !!document.getElementById('btn-keys')").catch(() => false)) break; await sleep(250); }
   ok("app loaded under COOP/COEP, cross-origin isolated", await ev("crossOriginIsolated === true && typeof SharedArrayBuffer === 'function'"));
-  ok("UI: Private checkbox present, old split/delay options gone", await ev("!!document.getElementById('wd-private') && !document.getElementById('wd-parts') && !document.getElementById('wd-delay') && /^\\s*Private\\s*$/.test(document.getElementById('wd-private').parentElement.textContent)"));
+  ok("UI: Private checkbox present, speed selector, old split/delay options gone", await ev("!!document.getElementById('wd-private') && !document.getElementById('wd-parts') && !document.getElementById('wd-delay') && !!document.getElementById('wd-mode') && /^\\s*Private\\s*$/.test(document.getElementById('wd-private').parentElement.textContent)"));
   const t0 = Date.now();
   const tmo = setTimeout(() => { console.log('TIMEOUT errors:', errors, 'last reqs:', reqs.slice(-12)); done(3); }, 120000);
   const out = JSON.parse(await ev(`(async () => {
@@ -45,14 +45,14 @@ try {
       dry: true, stopAt: "WAIT_T", api: "http://127.0.0.1:1", words, loadZjs: HM.sharedZjs, fetchFn, waitReceipt: () => bad("receipt"), onProgress: () => {} };
     const st = await HM.startHop(ctx), { rec } = await HM.findHop(ctx.store, ctx.stealth);
     const summary = await HM.hopSummary(ctx, rec);                      // restore from the saved bytes + real sync through the proxy
-    return JSON.stringify({ step: st.step, err: st.err, tIn: st.tIn, birthday: st.birthday, accts: st.accts, inQuote: st.inQuote, dbBytes: rec.db && rec.db.length, mn: await HM.mnemonicFor(ctx.priv, words),
+    return JSON.stringify({ step: st.step, err: st.err, tIn: st.tIn, birthday: st.birthday, accts: st.accts, nAccts: st.nAccts, inQuote: st.inQuote, dbBytes: rec.db && rec.db.length, mn: await HM.mnemonicFor(ctx.priv, words),
       summary: summary.map(s => ({ account: s.account, t: s.t, transparent: String(s.transparent), orchard: String(s.orchard) })) });
   })()`)); clearTimeout(tmo);
   ok("dry hop stops at WAIT_T without error", out.step === "WAIT_T" && !out.err, out.step + " " + (out.err || "") + " " + (Date.now() - t0) + " ms");
   ok("valid t-address, dry quote recorded (no deposit address)", /^t1[1-9A-HJ-NP-Za-km-z]{33}$/.test(out.tIn) && out.inQuote && out.inQuote.depositAddress === null && BigInt(out.inQuote.amountOut) > 132000n, out.tIn + " zats " + out.inQuote?.amountOut);
-  ok("4 accounts, birthday near the Zcash tip, wallet bytes saved", out.accts.length === 4 && out.birthday > 3_000_000 && out.dbBytes > 1000, "birthday " + out.birthday + " db " + out.dbBytes);
+  ok("accounts for the mode (" + out.nAccts + "), birthday near the Zcash tip, wallet bytes saved", out.accts.length === out.nAccts && out.nAccts >= 3 && out.birthday > 3_000_000 && out.dbBytes > 1000, "birthday " + out.birthday + " db " + out.dbBytes);
   ok("page mnemonic = node golden", out.mn === "youth alone tissue bomb stock old thank speed tissue night ugly exchange lumber salute switch glance peanut among average exhibit parrot stove tool derive");
-  ok("restored wallet: same t-address on account 0, 4 distinct addresses, empty", out.summary[0].t === out.tIn && new Set(out.summary.map(s => s.t)).size === 4 && out.summary.every(s => s.transparent === "0" && s.orchard === "0"));
+  ok("restored wallet: same t-address on account 0, all addresses distinct, empty", out.summary[0].t === out.tIn && new Set(out.summary.map(s => s.t)).size === out.summary.length && out.summary.length === out.nAccts && out.summary.every(s => s.transparent === "0" && s.orchard === "0"));
   // the page itself reads GET /relay/stats on load (fee display); only a POST to the relayer would submit anything
   const isSubmit = r => /^POST .*\/relay(\/pay)?$/.test(r);
   ok("no relayer call, no non-dry quote", !reqs.some(isSubmit) && !seen.some(isSubmit));
