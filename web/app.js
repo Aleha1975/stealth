@@ -175,15 +175,29 @@ function renderHops() {
   const box = $("hop-resume"); box.textContent = "";
   for (const [k, h] of hops) box.appendChild(hopCard(h, { onContinue: b => { b.disabled = true; runHop(h.f, h.hit, null).catch(e => say("pay-hint", e.message || String(e), "bad")); },
     onFunds: b => { b.disabled = true; runHop(h.f, h.hit, null).catch(e => say("pay-hint", e.message || String(e), "bad")); }, onDismiss: () => { hops.delete(k); renderHops(); },
-    onRecovery: (b, card) => { b.disabled = true; showPhrase(h, card).catch(e => { b.disabled = false; say("pay-hint", e.message || String(e), "bad"); }); } }));
+    onReturn: (b, card) => { b.disabled = true; returnZec(h, card).catch(e => { b.disabled = false; say("pay-hint", e.message || String(e), "bad"); }); } }));
   box.hidden = !hops.size;
 }
-// the hop wallet's phrase: import it into Zashi (account 0, from the birthday height) to reach any ZEC left in it
-async function showPhrase(h, card) {
-  const HM = await hopMod(), mn = await HM.mnemonicFor(h.hit.stealthPriv, await HM.loadWords(), h.st.n || 0), box = el("div", "hop-phrase");
-  box.appendChild(el("div", "note", "Import into Zashi · birthday " + (h.st.birthday ?? "—") + ". Anyone with these words can take the ZEC."));
-  const w = el("code", null, mn); w.style.userSelect = "all"; box.appendChild(w);
-  card.appendChild(box);
+// ZEC stuck on the hop t-address (shielding is refused since NU6.3): sign a plain transparent tx here and swap it back to the connected wallet
+async function returnZec(h, card) {
+  const [HM, ZR] = await Promise.all([hopMod(), import("./zec-return.js")]), { zcash: ZC } = await import("./chains.js");
+  if (!acct) throw new Error("Connect your wallet first.");
+  const line = el("div", "hop-line", "Looking for the ZEC…"); card.appendChild(line); const step = t => { line.textContent = t; };
+  const seed = await HM.mnemonicSeed(await HM.mnemonicFor(h.hit.stealthPriv, await HM.loadWords(), h.st.n || 0));
+  let key = null, utxos = [];
+  for (let a = 0; a < 4 && !utxos.length; a++) for (let i = 0; i < 3 && !utxos.length; i++) { key = ZR.deriveT(seed, ZR.tPath(a, i)); utxos = await ZR.getUtxos(ZC.lightwalletd, key.addr); }
+  if (!utxos.length) throw new Error("No ZEC found on the hop addresses.");
+  const total = utxos.reduce((s, u) => s + u.value, 0n), amount = total - ZR.FEE;
+  step("Getting a quote…");
+  const j = await PW.requestQuote({ req: HM.reqOut({ dest: C, amount, recipient: acct, refundT: key.addr }), okDeposit: a => /^t1[1-9A-HJ-NP-Za-km-z]{33}$/.test(a || "") });
+  step("Sending " + (Number(amount) / 1e8) + " ZEC…");
+  const sw = ZR.buildSweep({ utxos, key, to: j.quote.depositAddress });
+  if (sw.amount !== BigInt(j.quote.amountIn)) throw new Error("amount mismatch; refusing");
+  await ZR.broadcast(ZC.lightwalletd, sw.raw);
+  await PW.submitDeposit({ txHash: sw.txid, depositAddress: j.quote.depositAddress }).catch(() => {});
+  const fin = await PW.pollStatus({ depositAddress: j.quote.depositAddress, timeoutMs: 60 * 60_000, intervalMs: 10_000, onUpdate: s => step("Returning · " + s.status.toLowerCase().replace(/_/g, " ") + " · usually 10–20 min") });
+  step(fin.status === "SUCCESS" ? "Done: ≈ " + (Number(j.quote.amountOut) / 1e6).toFixed(2) + " " + SYM + " sent to your wallet." : "Swap ended as " + fin.status + ". The ZEC is back on the hop address; press Return money again.");
+  if (fin.status === "SUCCESS") { h.st.step = "FAILED"; h.st.result = "RETURNED"; }
 }
 setInterval(() => { const r = [...hops.values()].filter(h => h.running); if (r.length) { renderHops(); const v = hopView(r[0]); if (v.kind === "run" && v.what && $("pay-hint").textContent.startsWith("●")) say("pay-hint", statusLine(v), "ok"); } }, 1000);
 function render() {
