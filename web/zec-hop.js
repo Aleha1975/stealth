@@ -166,7 +166,7 @@ export function quoteInfoOf(j, req, { now = Date.now(), minLeft = QUOTE_MIN_LEFT
   if (aIn !== BigInt(req.amount)) throw new Halt("the quote changed the amount; refusing");
   if (aOut <= 0n || mOut <= 0n || mOut > aOut) throw new Halt("the quote's amounts are inconsistent (out " + aOut + ", min " + mOut + ")");
   if (mOut * 10000n < aOut * BigInt(10000 - slipBps)) throw new Halt("the quote allows more than " + slipBps / 100 + "% slippage; refusing");
-  const dl = Date.parse(q.deadline || (j.quoteRequest || {}).deadline), left = dl - now;
+  const dl = Math.min(...[(j.quoteRequest || {}).deadline, q.deadline].map(Date.parse).filter(Number.isFinite)), left = dl - now;   // the earlier of our request deadline and 1Click's (which can be days away)
   if (!Number.isFinite(dl)) throw new Halt("the quote has no deadline");
   if (left < minLeft) throw new Halt("the quote expires too soon (" + Math.round(left / 1000) + " s)"); if (left > maxLeft) throw new Halt("the quote's deadline is unreasonably far away");
   const dep = q.depositAddress || null;

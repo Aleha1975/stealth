@@ -338,6 +338,8 @@ for (const [name, tk] of [["no txKnown available", undefined], ["txKnown cannot 
   const good = (o = {}, qo = {}) => ({ quote: { amountIn: "5000000", amountOut: "10000000", minAmountOut: "9900000", depositAddress: dep, deadline: new Date(now + 3600_000).toISOString(), ...o }, quoteRequest: {}, ...qo });
   const bad = (j, rq = req, re) => { try { H.quoteInfoOf(j, rq, { now }); return false; } catch (e) { return e instanceof H.Halt && (!re || re.test(e.message)); } };
   const info = H.quoteInfoOf(good(), req, { now });
+  { const real = H.quoteInfoOf(good({ deadline: new Date(now + 3 * 86400_000).toISOString() }, { quoteRequest: { deadline: new Date(now + 3600_000).toISOString() } }), req, { now });
+    ok("M6 real 1Click shape: quote.deadline days away (inactivity time), request deadline 1 h -> accepted, binding deadline = request", real.deadlineMs === now + 3600_000); }
   ok("M6 a sane quote passes and keeps deposit, amounts, minOut and deadline", info.depositAddress === dep && info.amountOut === "10000000" && info.minOut === "9900000" && info.deadlineMs === now + 3600_000);
   ok("M6 refused: amountIn changed", bad(good({ amountIn: "5000001" }), req, /amount/));
   ok("M6 refused: amountOut 0 / not a number / minAmountOut > amountOut", bad(good({ amountOut: "0" })) && bad(good({ amountOut: "1e7" }), req, /number/) && bad(good({ minAmountOut: "10000001" }), req, /inconsistent/));
