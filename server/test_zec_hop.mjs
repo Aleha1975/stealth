@@ -55,10 +55,10 @@ function makeWorld(o = {}) {
   w.fetch = async (url, init = {}) => {
     const u = String(url), body = init.body ? JSON.parse(init.body) : null, J = (code, j) => ({ ok: code < 400, status: code, json: async () => j });
     if (u.endsWith("/v0/quote")) {
-      w.quotes.push(body); const isIn = body.originAsset !== ZC.assetId, amt = BigInt(body.amount), out = isIn ? amt * 100n : amt * 10n;
+      w.quotes.push(body); const isIn = body.originAsset !== ZC.assetId, amt = BigInt(body.amount), out = isIn ? amt * 2n : amt * BigInt(w.outPermille ?? 495) / 1000n;
       const q = { amountIn: body.amount, amountOut: out.toString(), minAmountOut: (out * 99n / 100n).toString(), timeEstimate: 60, deadline: body.deadline };
       if (!body.dry) { q.depositAddress = isIn ? "0x" + (w.quotes.length.toString(16).padStart(40, "0")) : tOf("dep" + w.quotes.length); w.swaps[q.depositAddress] = { isIn, paid: false, body, amt, out, shown: false }; }
-      return J(200, { quote: q, quoteRequest: body });
+      if (w.mutQuote) w.mutQuote(q, isIn, body); return J(200, { quote: q, quoteRequest: body });
     }
     if (u.includes("/v0/status")) {
       const a = decodeURIComponent(u.split("depositAddress=")[1]), s = w.swaps[a]; if (!s) return J(404, { message: "not found" });
@@ -97,7 +97,7 @@ function makeWorld(o = {}) {
   const sum = w.Zjs.WebWallet.prototype.get_wallet_summary; w.Zjs.WebWallet.prototype.get_wallet_summary = async function () { for (const [a, v] of w.pendLater || []) { w.oBal[a] = (w.oBal[a] || 0n) + v; w.pend[a] = 0n; } w.pendLater = []; return sum.call(this); };
   return w;
 }
-const mkCtx = (w, store, o = {}) => ({ store, stealth: STEALTH, priv: PRIV, chain: rh, dest: base, recipient: A, amount: 5_000_000n, api: "http://relay", words, Zjs: w.Zjs, fetchFn: w.fetch, sleep: vsleep, rand: () => 0.5,
+const mkCtx = (w, store, o = {}) => ({ store, stealth: STEALTH, priv: PRIV, chain: rh, dest: base, recipient: A, amount: 5_000_000n, api: "http://relay", words, Zjs: w.Zjs, fetchFn: w.fetch, sleep: vsleep, rand: () => 0, mode: "fast",
   waitReceipt: async () => ({ ok: true }), balance: async () => w.stealthBal, randomNonce: () => "0x" + (w.nonceN = (w.nonceN || 0) + 1).toString(16).padStart(64, "0"), ...o });
 const latest = async s => (await H.findHop(s, STEALTH)).rec;
 
@@ -105,18 +105,18 @@ const latest = async s => (await H.findHop(s, STEALTH)).rec;
   ok("happy path: DONE", st.step === "DONE" && !st.err, st.step + " " + st.err);
   ok("one relay of exactly the quoted amount, signed by the stealth key to the deposit address", w.relays === 1 && w.relayBodies[0].value === "5000000" && w.relayBodies[0].from === STEALTH && Object.keys(w.swaps).includes(w.relayBodies[0].to));
   ok("two real quotes: USDG->ZEC to the t-address, ZEC->USDG to the recipient", w.quotes.filter(q => !q.dry).length === 2 && w.quotes[0].recipient === rec.st.tIn && w.quotes[0].refundTo === STEALTH && w.quotes[1].recipient === A && w.quotes[1].refundTo !== rec.st.tIn && /^t1/.test(w.quotes[1].refundTo));
-  ok("out amount = shielded - fee reserve, delivered", w.delivered > 0n && BigInt(w.quotes[1].amount) === 500000000n - 15000n - 20000n, w.quotes[1].amount);
-  ok("random delay 2..10 min elapsed", off >= 120000 && off < 20 * 60_000 + 600000, off + " ms virtual");
-  ok("hop wallet saved, accounts 0.." + H.MAX_OUT + " with distinct t-addresses", w.created === 4 && rec.db && new Set(rec.st.accts.map(id => JSON.parse(Buffer.from(rec.db).toString()).addr[id])).size === 4 && rec.st.birthday === 3_499_990);
+  ok("out amount = shielded - fee reserve, delivered", w.delivered > 0n && BigInt(w.quotes[1].amount) === 10_000_000n - 15000n - 20000n, w.quotes[1].amount);
+  ok("fast mode: 5..20 min delay elapsed", off >= 300000 && off < 20 * 60_000 + 20 * 60_000, off + " ms virtual");
+  ok("hop wallet saved, " + H.accountsFor("fast") + " accounts with distinct t-addresses", w.created === H.accountsFor("fast") && rec.db && new Set(rec.st.accts.map(id => JSON.parse(Buffer.from(rec.db).toString()).addr[id])).size === H.accountsFor("fast") && rec.st.birthday === 3_499_990);
   ok("no mnemonic/private key in the saved state", !JSON.stringify(rec.st).includes(mn) && !JSON.stringify(rec.st).includes(PRIV.slice(2)));
-  ok("tx hash of the ZEC send recorded and submitted (reversed txid)", rec.st.outTx === Array.from({ length: 32 }, (_, k) => (32 - k).toString(16).padStart(2, "0")).join("") && w.swaps[rec.st.outQuote.depositAddress].submitted === rec.st.outTx);
+  ok("tx hash of the ZEC send recorded and submitted (reversed txid)", rec.st.parts[0].tx === Array.from({ length: 32 }, (_, k) => (32 - k).toString(16).padStart(2, "0")).join("") && w.swaps[rec.st.parts[0].quote.depositAddress].submitted === rec.st.parts[0].tx);
   ok("a finished hop does not block the next: new counter, new mnemonic", (await H.startHop(mkCtx(makeWorld(), s, { stopAt: "WAIT_T", dry: true }))).n === 1); }
 
 for (const step of H.STEPS.slice(1)) {          // stop cleanly before every step, then resume with a brand-new wallet object and ctx
   const w = makeWorld(), s = H.memStore(); off = 0;
   const a = await H.startHop(mkCtx(w, s, { stopAt: step })); const relaysBefore = w.relays;
   const b = await H.runHop(mkCtx(w, s));
-  ok("resume from " + step, a.step === step && b.step === "DONE" && w.relays === 1 && w.broadcasts === 1 && w.sig === 1 && w.created === 4 && w.quotes.filter(q => !q.dry).length === 2, `stopped ${a.step} relays-before ${relaysBefore} -> ${b.step} ${b.err || ""}`);
+  ok("resume from " + step, a.step === step && b.step === "DONE" && w.relays === 1 && w.broadcasts === 1 && w.sig === 1 && w.created === H.accountsFor("fast") && w.quotes.filter(q => !q.dry).length === 2, `stopped ${a.step} relays-before ${relaysBefore} -> ${b.step} ${b.err || ""}`);
 }
 { const w = makeWorld({ loseFirstRelay: true }), s = H.memStore(); const st = await H.startHop(mkCtx(w, s));       // relayer executed it but the answer was lost: the retry must not pay twice
   ok("lost relayer answer: paid once", st.step === "DONE" && w.relays === 1 && w.relayBodies.length === 1, st.err || ""); }
@@ -129,7 +129,7 @@ for (const step of H.STEPS.slice(1)) {          // stop cleanly before every ste
   const refunds = w.quotes.filter(q => q.originAsset === ZC.assetId).map(q => q.refundTo), txs = new Set(Object.keys(w.swaps).filter(a => !w.swaps[a].isIn).map(a => w.swaps[a].body.refundTo));
   ok("refund addresses are all different and differ from the in t-address", new Set([...refunds, rec.st.tIn]).size === 3 && txs.size === 2); }
 { const w = makeWorld({ outOutcomes: ["REFUNDED"] }), s = H.memStore(); const st = await H.startHop(mkCtx(w, s));
-  ok("refunded every time: FAILED after " + H.MAX_OUT + " attempts, state kept", st.step === "FAILED" && st.result === "REFUNDED" && st.attempt === H.MAX_OUT - 1 && /hop wallet/.test(H.recoveryText(st))); }
+  ok("refunded every time: FAILED after " + H.PART_TRIES + " tries of the part, state kept", st.step === "FAILED" && st.result === "REFUNDED" && st.attempt === H.PART_TRIES - 1 && /hop wallet/.test(H.recoveryText(st))); }
 { const w = makeWorld({ inOutcome: "REFUNDED" }), s = H.memStore(); const st = await H.startHop(mkCtx(w, s));
   ok("in-leg refund: FAILED_IN, stealth got its money back, no ZEC steps", st.step === "FAILED_IN" && w.stealthBal === 100_000_000n && w.sig === 0 && w.broadcasts === 0); }
 { const w = makeWorld(), s = H.memStore(); const st = await H.startHop(mkCtx(w, s, { dry: true, stopAt: "WAIT_T" })); const rec = await latest(s);
@@ -181,5 +181,179 @@ for (const step of H.STEPS.slice(1)) {          // stop cleanly before every ste
   C.resetLeft(); ok("status line", C.statusLine({ pct: 42, left: "≈ 18 min left", what: "Moving the ZEC into the shielded pool" }) === "● 42% · ≈ 18 min left · Moving the ZEC into the shielded pool"
     && C.hopView({ st: { ...mk("DEPOSIT_IN", 1, 1).st, step: "DONE", doneAt: now }, running: false }, now).pct === 100 && C.hopView(mk("SHIELD", 5, 1), now).what.length > 0);
   C.resetLeft(); }
+
+// ================= v2: fixes for the external audit (ODA job 1088). Test names start with the finding id. =================
+const R = await import("../web/zec-return.js");
+const mulberry = a => () => { a |= 0; a = a + 0x6D2B79F5 | 0; let t = Math.imul(a ^ a >>> 15, 1 | a); t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t; return ((t ^ t >>> 14) >>> 0) / 4294967296; };
+const outQuotes = w => w.quotes.filter(q => !q.dry && q.originAsset === ZC.assetId), inQuotes = w => w.quotes.filter(q => !q.dry && q.originAsset !== ZC.assetId);
+const rawHex = Array.from({ length: 32 }, (_, k) => (k + 1).toString(16).padStart(2, "0")).join(""), txidHex = Array.from({ length: 32 }, (_, k) => (32 - k).toString(16).padStart(2, "0")).join("");
+const patchSend = (w, fn) => { const orig = w.Zjs.WebWallet.prototype.send_authorized_transactions; w.Zjs.WebWallet.prototype.send_authorized_transactions = async function (raw) { return fn((r = raw) => orig.call(this, r), raw); }; };
+
+// ---------- H-1 split payout ----------
+{ let good = true, why = "";
+  for (let sd = 1; sd <= 400; sd++) { const r = mulberry(sd), k = 2 + sd % 3, total = BigInt(k * 150000 + 50000 + Math.floor(r() * 1e8)), a = H.splitAmounts(total, k, H.PART_FLOOR, r);
+    if (a.length !== k || a.reduce((x, y) => x + y, 0n) !== total || a.some(x => x < H.PART_FLOOR || x % H.ROUND === 0n) || new Set(a.map(String)).size !== k) { good = false; why = sd + " " + a; break; } }
+  ok("H1 split: k parts, sum exact, each >= floor, all different, none round (400 seeds)", good, why);
+  ok("H1 split: equal weights (rand const) still gives different, irregular amounts", (a => new Set(a.map(String)).size === 3 && a.every(x => x % H.ROUND !== 0n))(H.splitAmounts(9_000_000n, 3, H.PART_FLOOR, () => 0.5)));
+  let tight = true; for (let sd = 1; sd <= 200; sd++) { const r = mulberry(sd), orch = BigInt(150000 + Math.floor(r() * 1_500_000)); try { const p = H.planParts({ orchard: orch, mode: "private", rand: r, now: 0 }), sum = p.reduce((x, y) => x + BigInt(y.amount), 0n);
+    if (sum + 20000n * BigInt(p.length) !== orch || p.some(x => BigInt(x.amount) < ZC.minIn || BigInt(x.amount) < H.PART_FLOOR)) tight = false; } catch (e) { if (!(e instanceof H.Halt) || orch - 20000n >= H.PART_FLOOR) tight = false; } }
+  ok("H1 plan: a small balance shrinks k (never below the floor); only a too-small balance halts", tight);
+  let fastOk = true, privOk = true;
+  for (let sd = 1; sd <= 300; sd++) { const r = mulberry(sd), f = H.planParts({ orchard: 50_000_000n, mode: "fast", rand: r, now: 0 }), q = H.planParts({ orchard: 50_000_000n, mode: "private", rand: mulberry(sd + 1000), now: 0 });
+    const asc = p => p.every((x, i) => i === 0 || x.at > p[i - 1].at);
+    if (f.length < 1 || f.length > 2 || f[f.length - 1].at < 5 * 60_000 || f[f.length - 1].at > 20 * 60_000 || !asc(f)) fastOk = false;
+    if (q.length < 2 || q.length > 4 || q[q.length - 1].at < 3600_000 || q[q.length - 1].at > 6 * 3600_000 || !asc(q) || q[0].at < 5 * 60_000) privOk = false; }
+  ok("H1 modes: fast = 1..2 parts, last send 5..20 min; private = 2..4 parts, last send 1..6 h, ascending own times", fastOk && privOk);
+  ok("H1 plan: parts get distinct fields (own delay, no quote yet)", (p => new Set(p.map(x => x.at)).size === p.length && p.every(x => x.quote === null && x.refundAcct === null))(H.planParts({ orchard: 50_000_000n, mode: "private", rand: mulberry(7), now: 0 }))); }
+{ const w = makeWorld(), s = H.memStore(); off = 0; const msgs = [], t0 = Date.now(); const st = await H.startHop(mkCtx(w, s, { mode: "private", rand: mulberry(42), onProgress: (x, m) => msgs.push(m) })); const rec = await latest(s), P = rec.st.parts, o = outQuotes(w);
+  ok("H1 private end-to-end: DONE, k parts, one quote+deposit+send per part", st.step === "DONE" && !st.err && P.length >= 2 && P.length <= 4 && o.length === P.length && w.broadcasts === P.length && P.every(p => p.status === "SUCCESS"), st.err || P.length);
+  ok("H1 parts: amounts different, irregular, >= floor, sum = shielded - k fee reserves; each quote is for its part", new Set(P.map(p => p.amount)).size === P.length && P.every((p, i) => BigInt(p.amount) % H.ROUND !== 0n && BigInt(p.amount) >= H.PART_FLOOR && BigInt(o[i].amount) === BigInt(p.amount))
+    && P.reduce((x, p) => x + BigInt(p.amount), 0n) === 10_000_000n - 15000n - 20000n * BigInt(P.length));
+  ok("H1 refund address of every part = a different fresh hop t-address (never the in-leg or another part's)", new Set([...o.map(q => q.refundTo), rec.st.tIn]).size === P.length + 1 && o.every(q => /^t1/.test(q.refundTo)) && new Set(P.map(p => p.refundAcct)).size === P.length && P.every(p => p.refundAcct >= 1));
+  ok("H1 parts have their own deposit addresses and all pay the recipient", new Set(P.map(p => p.quote.depositAddress)).size === P.length && o.every(q => q.recipient === A) && w.delivered > 0n);
+  ok("H1 private mode spreads the payouts over 1..6 h of (virtual) time", off >= 3600_000 && off < 6 * 3600_000 + 2 * 3600_000, Math.round(off / 60000) + " min");
+  ok("H1 sends happen in order at/after each part's own time", P.every((p, i) => i === 0 || p.at > P[i - 1].at));
+  ok("H1 progress says 'payout i of k'", msgs.some(m => new RegExp("payout 2 of " + P.length).test(m)) && /payout 1 of/.test(msgs.join("|")));
+  ok("H1 done: total delivered text sums all parts", rec.st.outTotal === P.reduce((x, p) => x + BigInt(p.quote.amountOut), 0n).toString() && rec.st.payoutTxs !== undefined); }
+{ const w = makeWorld({ outOutcomes: ["REFUNDED", "SUCCESS", "SUCCESS", "SUCCESS", "SUCCESS", "SUCCESS"] }), s = H.memStore(); off = 0; const st = await H.startHop(mkCtx(w, s, { mode: "private", rand: mulberry(5) })); const rec = await latest(s), P = rec.st.parts, o = outQuotes(w);
+  ok("H1 a refunded part is shielded again and retried from a fresh account; every refund address stays unique", st.step === "DONE" && P[0].tries === 1 && o.length === P.length + 1 && w.sig === 2 && new Set([...o.map(q => q.refundTo), rec.st.tIn]).size === o.length + 1, st.err || "");
+  const w2 = makeWorld({ outOutcomes: ["REFUNDED"] }), s2 = H.memStore(); off = 0; const f = await H.startHop(mkCtx(w2, s2, { mode: "private", rand: mulberry(5) }));
+  ok("H1 a part that is refunded every time ends FAILED, state kept, text names the parts paid", f.step === "FAILED" && f.result === "REFUNDED" && /hop wallet/.test(H.recoveryText(f))); }
+{ const w = makeWorld(), s = H.memStore(); off = 0; await H.startHop(mkCtx(w, s, { stopAt: "DELAY" })); const rec = await latest(s);   // old-shape (v1) state: no mode / parts, one out-leg
+  for (const k of ["parts", "partIdx", "mode", "nAccts", "nextAcct"]) delete rec.st[k]; rec.st.v = 1; rec.st.delayUntil = Date.now(); await s.put(STEALTH + "#0", rec);
+  const st = await H.runHop(mkCtx(w, s)); const after = await latest(s);
+  ok("H1 resume of an old single-out-leg state works: one payout, old fields used, no parts", st.step === "DONE" && !st.err && outQuotes(w).length === 1 && BigInt(outQuotes(w)[0].amount) === 10_000_000n - 15000n - 20000n && after.st.outTx === txidHex && !after.st.parts, st.err || "");
+  const w2 = makeWorld({ outOutcomes: ["REFUNDED", "SUCCESS"] }), s2 = H.memStore(); off = 0; await H.startHop(mkCtx(w2, s2, { stopAt: "DELAY" })); const r2 = await latest(s2);
+  for (const k of ["parts", "partIdx", "mode", "nAccts", "nextAcct"]) delete r2.st[k]; r2.st.v = 1; r2.st.delayUntil = Date.now(); await s2.put(STEALTH + "#0", r2);
+  const st2 = await H.runHop(mkCtx(w2, s2)); const a2 = await latest(s2);
+  ok("H1 old state: out-leg refund still uses attempt+1 (legacy path)", st2.step === "DONE" && a2.st.attempt === 1 && w2.sig === 2 && outQuotes(w2).length === 2); }
+{ const M = 60_000, now = 10_000_000, S = H.STEP_MIN, send = (S.QUOTE_OUT + S.SEND_OUT) * M, parts = [{ at: now - 1 }, { at: now + 3600_000 }, { at: now + 7200_000 }];
+  ok("H1 ETA: part states are simulated one after the other (waits overlap the sends)", H.remainingMs({ step: "DELAY", mode: "private", partIdx: 1, parts, delayUntil: now + 3600_000, stepAt: now }, now) === 7200_000 + send
+    && H.remainingMs({ step: "DELAY", mode: "private", partIdx: 0, parts, delayUntil: now - 1, stepAt: now }, now) === 7200_000 + send);
+  ok("H1 ETA: private plan not made yet is far longer than fast; legacy state unchanged", H.remainingMs({ step: "QUOTE_IN", mode: "private", stepAt: now }, now) > 2.5 * 3600_000 && H.remainingMs({ step: "QUOTE_IN", mode: "fast", stepAt: now }, now) < 50 * M
+    && H.remainingMs({ step: "QUOTE_IN", stepAt: now }, now) === (M + (Object.values(S).reduce((a, b) => a + b, 0) - S.QUOTE_IN * 1) * M));
+  ok("H1 labels: ETA text per mode, progress text with 'payout 2 of 3'", H.etaLabel("fast") === "33–57 min" && /h$/.test(H.etaLabel("private")) && /^88 min–/.test(H.etaLabel("private"))
+    && /\(payout 2 of 3\)/.test(H.progressText({ step: "DELAY", mode: "private", partIdx: 1, parts: [{}, {}, {}] })) && H.progressText({ step: "WAIT_T" }) === "Private transfer: step 3/7 · keep this tab open · ~35 min");
+  const C = await import("../web/hop-card.js"); C.resetLeft();
+  const v = C.hopView({ running: true, msg: "", st: { step: "SEND_OUT", chain: "rh", dest: "base", amount: "5000000", recipient: A, stealth: STEALTH, startedAt: now - 3600_000, stepAt: now, mode: "private", partIdx: 1, parts: [{}, { at: now }, { at: now + 1 }] } }, now);
+  C.resetLeft(); const v0 = C.hopView({ running: true, msg: "", st: { step: "SEND_OUT", chain: "rh", dest: "base", amount: "5000000", recipient: A, stealth: STEALTH, startedAt: now - 3600_000, stepAt: now } }, now);
+  ok("H1 card: 'Payout 2 of 3' on the payout steps, none on a single-part state, longer ETA shown for parts", /payout 2 of 3/.test(v.stepName) && /payout 2 of 3/.test(v.what) && !/payout/.test(v0.stepName) && v.left.length > 0);
+  C.resetLeft(); }
+
+// ---------- M-1 double in-leg ----------
+async function haltedAtDeposit(extra = {}) { const w = makeWorld(), s = H.memStore(); off = 0; w.failRelay = 99; const a = await H.startHop(mkCtx(w, s, extra)); const rec = await latest(s); w.failRelay = 0; return { w, s, a, rec, nonce: rec.st.auth.nonce }; }
+{ let seen = null; const w = makeWorld(), s = H.memStore(); off = 0;
+  const fetchFn = async (u, i) => { if (String(u).endsWith("/relay")) seen = (await latest(s)).st.auth; return w.fetch(u, i); };
+  await H.startHop(mkCtx(w, s, { fetchFn }));
+  ok("M1 the authorization is saved in the store BEFORE it is sent to the relayer", seen && w.relayBodies.length === 1 && seen.nonce === w.relayBodies[0].nonce); }
+{ const { w, s, nonce } = await haltedAtDeposit(); off += 2 * 3600_000; const calls = []; const b = await H.runHop(mkCtx(w, s, { authUsed: async (a, n) => { calls.push([a, n]); return true; } })); const rec = await latest(s);
+  ok("M1 expired authorization that IS used on chain: no new nonce, no second relay, state keeps the old auth", w.nonceN === 1 && w.relays === 0 && rec.st.auth.nonce === nonce && rec.st.relayed === true && calls.length === 1 && calls[0][0] === STEALTH && calls[0][1] === nonce, b.err || b.step); }
+{ const { w, s, nonce } = await haltedAtDeposit(); off += 2 * 3600_000; const b = await H.runHop(mkCtx(w, s, { authUsed: async () => false })); const rec = await latest(s);
+  ok("M1 expired + unused on chain: fresh quote, ONE new authorization (new nonce), paid once", b.step === "DONE" && w.nonceN === 2 && rec.st.auth.nonce !== nonce && w.relays === 1 && inQuotes(w).length === 2, b.err || b.step); }
+{ const { w, s } = await haltedAtDeposit(); off += 2 * 3600_000; const b = await H.runHop(mkCtx(w, s, { authUsed: async () => { throw new Error("rpc down"); } }));
+  ok("M1 expired but the chain check fails: Halt, nothing new signed", b.step === "DEPOSIT_IN" && /could not check/.test(b.err) && w.nonceN === 1 && w.relays === 0, b.err);
+  const c = await H.runHop(mkCtx(w, s));
+  ok("M1 expired and no chain check available: Halt, nothing new signed", c.step === "DEPOSIT_IN" && /cannot tell/.test(c.err) && w.nonceN === 1 && w.relays === 0, c.err); }
+{ const { w, s, nonce } = await haltedAtDeposit(); let used = 0; const b = await H.runHop(mkCtx(w, s, { authUsed: async () => { used++; return false; } })); const rec = await latest(s);   // not expired: the same auth is re-sent, the chain is not even asked
+  ok("M1 not expired: the SAME authorization is re-sent, no chain call, no new nonce", b.step === "DONE" && w.nonceN === 1 && w.relayBodies[0].nonce === nonce && used === 0 && rec.st.auth.nonce === nonce); }
+{ const w = makeWorld(), s = H.memStore(); off = 0; let first = true; const a = await H.startHop(mkCtx(w, s, { waitReceipt: async () => first ? (first = false, { ok: false }) : { ok: true } })); const rec = await latest(s), nonce = rec.st.auth.nonce;
+  const b = await H.runHop(mkCtx(w, s));
+  ok("M1 a reverted deposit keeps the (now public) authorization; resume re-sends it instead of signing another", a.step === "DEPOSIT_IN" && /reverted/.test(a.err) && nonce && b.step === "DONE" && w.nonceN === 1 && w.relays === 1); }
+{ const calls = [], f = async (u, i) => { calls.push(JSON.parse(i.body)); return { ok: true, json: async () => ({ result: "0x" + "0".repeat(63) + "1" }) }; }, au = H.makeAuthUsed(rh, f), nonce = "0x" + "ab".repeat(32);
+  const used = await au(STEALTH, nonce), unused = await H.makeAuthUsed(rh, async () => ({ ok: true, json: async () => ({ result: "0x" + "0".repeat(64) }) }))(STEALTH, nonce), c = calls[0];
+  const sel = (await import("viem")).toFunctionSelector("authorizationState(address,bytes32)");
+  ok("M1 authUsed = USDG authorizationState(authorizer, nonce) eth_call on the chain rpc", used === true && unused === false && c.method === "eth_call" && c.params[0].to === rh.token.address && H.AUTH_STATE_SELECTOR === sel
+    && c.params[0].data === sel + "0".repeat(24) + STEALTH.slice(2) + nonce.slice(2));
+  ok("M1 authUsed rejects an unusable answer", await H.makeAuthUsed(rh, async () => ({ ok: true, json: async () => ({ error: { message: "x" } }) }))(STEALTH, nonce).then(() => false, () => true)); }
+
+// ---------- M-2 broadcast errors ----------
+{ const w = makeWorld(), s = H.memStore(); off = 0; let calls = 0, asked = []; patchSend(w, async (orig) => { if (++calls === 1) throw new Error("rpc error: unknown transaction / mempool conflict"); return orig(); });
+  const st = await H.startHop(mkCtx(w, s, { txKnown: async id => (asked.push(id), false) }));
+  ok("M2 an error mentioning 'unknown'/'mempool' is NOT success: txid unknown -> rebroadcast, then done", st.step === "DONE" && calls === 2 && w.broadcasts === 1 && asked[0] === txidHex, st.err || ""); }
+{ const w = makeWorld(), s = H.memStore(); off = 0; let calls = 0; patchSend(w, async (orig) => { calls++; await orig(); throw new Error("tx already in mempool"); });
+  const st = await H.startHop(mkCtx(w, s, { txKnown: async () => true }));
+  ok("M2 error but the txid IS known to the network: counted as sent, not rebroadcast", st.step === "DONE" && calls === 1 && w.broadcasts === 1, st.err || ""); }
+for (const [name, tk] of [["no txKnown available", undefined], ["txKnown cannot answer", async () => { throw new Error("proxy down"); }]]) {
+  const w = makeWorld(), s = H.memStore(); off = 0; patchSend(w, async () => { throw new Error("mempool: unknown"); }); const st = await H.startHop(mkCtx(w, s, { txKnown: tk })); const p = (await latest(s)).st.parts[0];
+  ok("M2 ambiguous error + " + name + ": Halt at SEND_OUT, tx NOT recorded, raw kept for a safe retry", st.step === "SEND_OUT" && /could not say/.test(st.err) && p.tx === null && !!p.raw && w.broadcasts === 0, st.err); }
+{ const w = makeWorld(), s = H.memStore(); off = 0; let calls = 0; patchSend(w, async () => { calls++; throw new Error("bad-txns-inputs-spent"); }); const st = await H.startHop(mkCtx(w, s, { txKnown: async () => false })); const p = (await latest(s)).st.parts[0];
+  ok("M2 a real rejection is retried then reported (4 tries), never recorded as sent", st.step === "SEND_OUT" && /bad-txns/.test(st.err) && calls === 4 && p.tx === null); }
+{ const body = new Uint8Array([1, 2, 3]), fr = (flag, b) => Uint8Array.from([flag, b.length >>> 24 & 255, b.length >>> 16 & 255, b.length >>> 8 & 255, b.length & 255, ...b]), cat = (...a) => Uint8Array.from(a.flatMap(x => [...x]));
+  const resp = (bytes, ok = true, status = 200) => ({ ok, status, headers: { get: () => null }, arrayBuffer: async () => bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.length) });
+  let req; const mk = bytes => async (u, i) => { req = { u, body: i.body }; return resp(bytes); }, trailer = t => fr(0x80, new TextEncoder().encode(t));
+  const tx = "0".repeat(62) + "ab";
+  const yes = await R.txKnown("https://lw", tx, mk(cat(fr(0, cat([0x0a, body.length], body)), trailer("grpc-status: 0\r\n")))), no = await R.txKnown("https://lw", tx, mk(trailer("grpc-status: 5\r\ngrpc-message: No such mempool or blockchain transaction\r\n")));
+  const boom = await R.txKnown("https://lw", tx, async () => resp(new Uint8Array(0), false, 503)).then(() => "no error", e => e.message);
+  ok("M2 zec-return.txKnown: GetTransaction with the little-endian txid; data = known, NotFound = unknown, other failures throw", yes === true && no === false && /503/.test(boom) && /GetTransaction$/.test(req.u) && Buffer.from(req.body.slice(5)).toString("hex") === "1a20" + "ab" + "0".repeat(62)
+    && await R.txKnown("https://lw", "zz", mk(new Uint8Array(0))).then(() => false, () => true)); }
+
+// ---------- M-3 expiry ----------
+{ const w = makeWorld(), s = H.memStore(); off = 0; await H.startHop(mkCtx(w, s, { stopAt: "SEND_OUT" })); const rec = await latest(s), p = rec.st.parts[0];
+  ok("M3 every stored artefact has a deadline: in-quote, out-quote, auth validBefore (and Zcash tx expiry once built)", rec.st.inQuote.deadlineMs > 0 && p.quote.deadlineMs > 0 && rec.st.auth.validBefore > 0);
+  off += 3 * 3600_000; const st = await H.runHop(mkCtx(w, s)); const fin = await latest(s);
+  ok("M3 expired out-quote, nothing sent: re-quoted, paid once, new Zcash expiry height recorded", st.step === "DONE" && outQuotes(w).length === 2 && w.broadcasts === 1 && fin.st.parts[0].expiry > 3_500_000, st.err || ""); }
+{ const w = makeWorld(), s = H.memStore(); off = 0; await H.startHop(mkCtx(w, s, { stopAt: "SEND_OUT" })); const rec = await latest(s); rec.st.parts[0].raw = rawHex; rec.st.parts[0].expiry = 5; await s.put(STEALTH + "#0", rec);
+  const asked = []; const st = await H.runHop(mkCtx(w, s, { txKnown: async id => (asked.push(id), false) })); const fin = await latest(s);
+  ok("M3 transaction past its expiry height and not on the network: discarded, quote and tx rebuilt, nothing paid twice", st.step === "DONE" && asked[0] === txidHex && outQuotes(w).length === 2 && w.broadcasts === 1 && fin.st.waitExpiry == null, st.err || ""); }
+{ const w = makeWorld(), s = H.memStore(); off = 0; await H.startHop(mkCtx(w, s, { stopAt: "SEND_OUT" })); const rec = await latest(s), dep = rec.st.parts[0].quote.depositAddress; rec.st.parts[0].raw = rawHex; rec.st.parts[0].expiry = 5; await s.put(STEALTH + "#0", rec);
+  const st = await H.runHop(mkCtx(w, s, { txKnown: async () => { w.swaps[dep].paid = true; return true; } })); const fin = await latest(s);
+  ok("M3 expired but the network already has the transaction: it is NOT redone, we follow it", st.step === "DONE" && outQuotes(w).length === 1 && w.broadcasts === 0 && fin.st.parts[0].tx === txidHex, st.err || ""); }
+{ const w = makeWorld(), s = H.memStore(); off = 0; await H.startHop(mkCtx(w, s, { stopAt: "SEND_OUT" })); const rec = await latest(s); rec.st.parts[0].raw = rawHex; rec.st.parts[0].expiry = 5; await s.put(STEALTH + "#0", rec);
+  const st = await H.runHop(mkCtx(w, s));
+  ok("M3 expired and the network cannot say: Halt, nothing new built", st.step === "SEND_OUT" && /cannot tell/.test(st.err) && outQuotes(w).length === 1 && w.broadcasts === 0, st.err); }
+{ const w = makeWorld(), s = H.memStore(); off = 0; await H.startHop(mkCtx(w, s, { stopAt: "DEPOSIT_IN" })); off += 3 * 3600_000; const st = await H.runHop(mkCtx(w, s));
+  ok("M3 in-quote expired before anything was signed: new quote, one payment", st.step === "DONE" && inQuotes(w).length === 2 && w.relays === 1, st.err || ""); }
+
+// ---------- M-4 hop counter from the chain ----------
+{ const w = makeWorld(), s = H.memStore(), w2 = makeWorld(), s2 = H.memStore(), w0 = makeWorld(), s0 = H.memStore();
+  const a = await H.startHop(mkCtx(w, s, { stopAt: "QUOTE_IN", countPriorHops: async () => 3 })), b = await H.startHop(mkCtx(w2, s2, { stopAt: "QUOTE_IN", countPriorHops: async () => 3 })), z = await H.startHop(mkCtx(w0, s0, { stopAt: "QUOTE_IN" }));
+  ok("M4 counter = chain count: a device with empty storage picks the same n and the same hop wallet as another device", a.n === 3 && b.n === 3 && z.n === 0 && (await latest(s)).st.n === 3);
+  const sa = H.memStore(); await H.startHop(mkCtx(makeWorld(), sa)); const c1 = await H.startHop(mkCtx(makeWorld(), sa, { stopAt: "QUOTE_IN", countPriorHops: async () => 0 })), sb = H.memStore(); await H.startHop(mkCtx(makeWorld(), sb)); const c2 = await H.startHop(mkCtx(makeWorld(), sb, { stopAt: "QUOTE_IN", countPriorHops: async () => 7 }));
+  ok("M4 IndexedDB is only a cache: n = max(local+1, chain count), never lower than either", c1.n === 1 && c2.n === 7);
+  const sc = H.memStore(); const err = await H.startHop(mkCtx(makeWorld(), sc, { countPriorHops: async () => { throw new Error("rpc down"); } })).then(() => null, e => e.message);
+  ok("M4 chain unreadable: refuses to start (fail closed), nothing stored", /could not read/.test(err) && (await sc.keys()).length === 0);
+  ok("M4 a bogus count is refused", await H.startHop(mkCtx(makeWorld(), H.memStore(), { countPriorHops: async () => -1 })).then(() => false, () => true));
+  const calls = [], f = async (u, i) => { calls.push(JSON.parse(i.body)); return { ok: true, json: async () => ({ result: [{}, {}, {}, {}] }) }; }, n = await H.makeCountPriorHops(rh, f)(STEALTH), c = calls[0], sig = keccak256(stringToBytes("AuthorizationUsed(address,bytes32)"));
+  ok("M4 makeCountPriorHops = number of AuthorizationUsed logs of the stealth address on the token", n === 4 && c.method === "eth_getLogs" && c.params[0].address === rh.token.address && c.params[0].topics[0] === sig && H.AUTH_USED_TOPIC === sig && c.params[0].topics[1] === "0x" + "0".repeat(24) + STEALTH.slice(2)); }
+
+// ---------- M-5 nothing shared between the legs ----------
+{ const r1 = H.reqIn({ chain: rh, amount: 5_000_000n, tAddr: T, stealth: STEALTH, dry: true, now: 0, rand: () => 0.1 }), r2 = H.reqOut({ dest: base, amount: 400000n, recipient: A, refundT: "t1" + "2".repeat(33), dry: true, now: 0, rand: () => 0.9 });
+  const sh = H.sharedFields(r1, r2).map(x => x.split("=")[0]), forbidden = /referral|appFee|userId|session|token|affiliate|clientId|memo|correlation/i;
+  ok("M5 the two requests share only protocol constants; no referral/appFees/user/session field exists", sh.every(k => H.CONSTANT_FIELDS.has(k)) && ![...Object.keys(r1), ...Object.keys(r2)].some(k => forbidden.test(k)) && r1.refundTo !== r2.refundTo && r1.recipient !== r2.recipient && r1.deadline !== r2.deadline, sh.join());
+  const w = makeWorld(), s = H.memStore(); off = 0; const logIn = [], logOut = [];
+  const mk = log => async (u, i) => { log.push([String(u), i]); return w.fetch(u, i); };
+  const st = await H.startHop(mkCtx(w, s, { mode: "private", rand: mulberry(9), fetchFn: mk(logIn), fetchFnOut: mk(logOut) })); const rec = await latest(s), outDeps = new Set(rec.st.parts.map(p => p.quote.depositAddress)), inDep = rec.st.inQuote.depositAddress;
+  const one = [...logIn, ...logOut].filter(([u]) => u.includes("1click") || u.includes("chaindefuser"));
+  ok("M5 out-leg calls go through the separate out-leg fetch (own network path), in-leg calls never touch out deposit addresses and vice versa", st.step === "DONE" && logOut.length > 0 && logOut.every(([u, i]) => /\/v0\/quote$/.test(u) ? JSON.parse(i.body).originAsset === ZC.assetId : [...outDeps].some(d => decodeURIComponent(u + (i && i.body || "")).includes(d)))
+    && logIn.filter(([u]) => !u.endsWith("/relay")).every(([u, i]) => !/\/v0\/quote$/.test(u) ? decodeURIComponent(u + (i && i.body || "")).includes(inDep) : JSON.parse(i.body).originAsset !== ZC.assetId) && ![...outDeps].some(d => logIn.some(([u, i]) => decodeURIComponent(u + (i && i.body || "")).includes(d))));
+  ok("M5 every 1Click call is sent without cookies/credentials and without referrer", one.length > 0 && one.every(([, i]) => i && i.credentials === "omit" && i.referrerPolicy === "no-referrer"));
+  ok("M5 all quote requests of one withdrawal: refundTo unique, deadlines not identical", (qs => new Set(qs.map(q => q.refundTo)).size === qs.length && new Set(qs.map(q => q.deadline)).size === qs.length)(w.quotes.filter(q => !q.dry))); }
+
+// ---------- M-6 quote validation ----------
+{ const now = 1_000_000_000, req = { amount: "5000000", originAsset: rh.oneClick.assetId, destinationAsset: ZC.assetId, refundTo: STEALTH, recipient: T, dry: false }, dep = "0x" + "77".repeat(20);
+  const good = (o = {}, qo = {}) => ({ quote: { amountIn: "5000000", amountOut: "10000000", minAmountOut: "9900000", depositAddress: dep, deadline: new Date(now + 3600_000).toISOString(), ...o }, quoteRequest: {}, ...qo });
+  const bad = (j, rq = req, re) => { try { H.quoteInfoOf(j, rq, { now }); return false; } catch (e) { return e instanceof H.Halt && (!re || re.test(e.message)); } };
+  const info = H.quoteInfoOf(good(), req, { now });
+  ok("M6 a sane quote passes and keeps deposit, amounts, minOut and deadline", info.depositAddress === dep && info.amountOut === "10000000" && info.minOut === "9900000" && info.deadlineMs === now + 3600_000);
+  ok("M6 refused: amountIn changed", bad(good({ amountIn: "5000001" }), req, /amount/));
+  ok("M6 refused: amountOut 0 / not a number / minAmountOut > amountOut", bad(good({ amountOut: "0" })) && bad(good({ amountOut: "1e7" }), req, /number/) && bad(good({ minAmountOut: "10000001" }), req, /inconsistent/));
+  ok("M6 refused: slippage floor more than 3% under the quote", bad(good({ minAmountOut: "9600000" }), req, /slippage/) && !bad(good({ minAmountOut: "9710000" })));
+  ok("M6 refused: deadline too short (< 5 min) / too far (> 2 h) / missing / unparsable", bad(good({ deadline: new Date(now + 60_000).toISOString() }), req, /too soon/) && bad(good({ deadline: new Date(now + 5 * 3600_000).toISOString() }), req, /far/) && bad(good({ deadline: undefined }), req, /no deadline/) && bad(good({ deadline: "soon" }), req, /no deadline/));
+  ok("M6 refused: bad deposit address format (in-leg needs 0x..40 hex, out-leg a t1 address), or one of our own", bad(good({ depositAddress: "0x12" }), req, /deposit/) && bad(good({ depositAddress: T }), req, /deposit/) && bad(good({ depositAddress: undefined }), req, /deposit/)
+    && bad(good({ depositAddress: STEALTH }), req, /own address/) && bad(good({ depositAddress: dep }), { ...req, originAsset: ZC.assetId }, /deposit/) && !bad(good({ depositAddress: T }), { ...req, originAsset: ZC.assetId, recipient: A, refundTo: "t1" + "3".repeat(33) }));
+  ok("M6 dry (preview) quotes need no deposit address", !bad(good({ depositAddress: undefined }), { ...req, dry: true }));
+  const l = H.projectedLoss({ amountIn: 5_000_000n, inDec: 6, outDec: 6, paidOut: 0, rate: 0.495, zatsLeft: 9_965_000n });
+  ok("M6 projected loss math (round trip incl. ZEC fees)", l > 0.01 && l < 0.03 && H.projectedLoss({ amountIn: 5_000_000n, inDec: 6, outDec: 6, paidOut: 2_000_000, rate: 0.5, zatsLeft: 6_000_000n }) === 0); }
+{ const w = makeWorld({}), s = H.memStore(); off = 0; w.outPermille = 450; const st = await H.startHop(mkCtx(w, s));   // ~11% round-trip loss
+  ok("M6 round-trip loss above the cap: Halt BEFORE any ZEC is sent, ZEC stays shielded", st.step === "QUOTE_OUT" && /would lose/.test(st.err) && w.broadcasts === 0 && (await latest(s)).st.parts[0].quote === null, st.err);
+  w.outPermille = 495; const ok2 = await H.runHop(mkCtx(w, s));
+  ok("M6 ... and resumes fine once the rate is acceptable again", ok2.step === "DONE" && w.broadcasts === 1);
+  const w2 = makeWorld(), s2 = H.memStore(); off = 0; w2.outPermille = 450; const hi = await H.startHop(mkCtx(w2, s2, { maxLoss: 0.2 }));
+  ok("M6 the cap is configurable (ctx.maxLoss)", hi.step === "DONE"); }
+{ const w = makeWorld(), s = H.memStore(); off = 0; w.mutQuote = (q, isIn) => { if (isIn) q.minAmountOut = String(BigInt(q.amountOut) / 2n); }; const st = await H.startHop(mkCtx(w, s));
+  ok("M6 in-leg quote with a 50% slippage floor is refused before anything is signed", st.step === "QUOTE_IN" && /slippage/.test(st.err) && w.relays === 0); }
+{ const w = makeWorld(), s = H.memStore(); off = 0; w.mutQuote = (q, isIn) => { if (!isIn) q.deadline = new Date(Date.now() + 30_000).toISOString(); }; const st = await H.startHop(mkCtx(w, s));
+  ok("M6 out-leg quote expiring in 30 s is refused, nothing sent", st.step === "QUOTE_OUT" && /too soon/.test(st.err) && w.broadcasts === 0); }
+
 Date.now = realNow;
 console.log(fails ? fails + " FAILED" : "all passed"); process.exit(fails ? 1 : 0);

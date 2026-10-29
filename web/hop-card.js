@@ -1,14 +1,14 @@
 /* Progress card of the private transfer (DOM only via createElement/textContent). Pure view of a hop record: no network, no keys.
    h = { st (hop state, see zec-hop.js), msg (last progress text), running (this tab is driving it) } */
 import { CHAINS } from "./chains.js";
-import { remainingMs, STEPS, STEP_MIN } from "./zec-hop.js";
+import { remainingMs, STEPS, STEP_MIN, partsLabel, modeOf } from "./zec-hop.js";
 
 export const STEP_UI = [   // one entry per zec-hop.js STEPS item, in order
   { name: "Preparing", line: "Preparing the swap", wait: "a few seconds" },
   { name: "Converting to ZEC", line: "Converting to ZEC", wait: "~3–5 min" },
   { name: "Receiving ZEC", line: "Waiting for Zcash confirmations", wait: "~12 min" },
   { name: "Entering the shielded pool", line: "Moving the ZEC into the shielded pool", wait: "usually 2–5 min" },
-  { name: "Mixing delay", line: "Mixing delay", wait: "2–10 min, random" },
+  { name: "Mixing delay", line: "Mixing delay", wait: "random" },
   { name: "Converting back", line: "Preparing the swap back", wait: "a few seconds" },
   { name: "Sending to recipient", line: "Sending to the recipient", wait: "usually 3–10 min" },
 ];
@@ -41,11 +41,13 @@ const el = (tag, cls, text) => { const e = document.createElement(tag); if (cls)
 /** Everything the card says, as plain data (testable). */
 export function hopView(h, now = Date.now()) {
   const st = h.st, src = CHAINS[st.chain] || {}, dst = CHAINS[st.dest] || src, tok = (src.token || { symbol: "", decimals: 6 }), dtok = dst.token || tok;
-  const idx = Math.max(0, STEP_ORDER.indexOf(st.step)), ui = STEP_UI[idx];
+  const idx = Math.max(0, STEP_ORDER.indexOf(st.step)), ui0 = STEP_UI[idx], pl = partsLabel(st), inParts = pl && idx >= STEP_ORDER.indexOf("DELAY");    // "payout 2 of 3" on the three payout steps
+  const m = st.mode ? modeOf(st.mode) : null, delayWait = m ? (m.totalMax >= 60 ? "random, spread over " + m.totalMin / 60 + "–" + m.totalMax / 60 + " h" : m.totalMin + "–" + m.totalMax + " min, random") : "2–10 min, random";
+  const ui = { ...ui0, name: ui0.name + (inParts ? " · " + pl : ""), line: ui0.line + (inParts ? " (" + pl + ")" : ""), wait: st.step === "DELAY" ? delayWait : ui0.wait };
   const v = { idx, total: STEP_UI.length, stepName: ui.name, amountLine: amt(st.amount, tok.decimals) + " " + tok.symbol + " → " + short(st.recipient),
     left: "", pct: 0, what: "", elapsed: st.startedAt ? fmtElapsed((st.doneAt || now) - st.startedAt) : "", kind: "run", title: "Private transfer in progress", line: "", body: "", detail: "", action: null, link: null };
   if (st.step === "DONE") {
-    const got = st.outQuote ? amt(st.outQuote.amountOut, dtok.decimals) : amt(st.amount, tok.decimals), p = st.payoutTx;
+    const got = st.outTotal ? amt(st.outTotal, dtok.decimals) : st.outQuote ? amt(st.outQuote.amountOut, dtok.decimals) : amt(st.amount, tok.decimals), p = st.payoutTx;
     v.kind = "done"; v.pct = 100; v.title = "Sent privately: " + got + " " + dtok.symbol + " to " + short(st.recipient); v.amountLine = ""; v.idx = v.total;
     v.line = "Total time " + v.elapsed + " (min:sec).";
     if (p && p.hash) v.link = { text: "Payout tx " + p.hash.slice(0, 10) + "…", href: /^https:\/\//.test(p.url || "") ? p.url : (dst.explorer || "") + "/tx/" + p.hash };

@@ -147,3 +147,16 @@ export async function broadcast(base, raw, fetchFn) {
   if (code !== 0) throw new Error("Rejected by network: " + msg);
   return msg;
 }
+/** Is this transaction known to lightwalletd (mempool or chain)? txid = display hex. lightwalletd's TxFilter.hash is the little-endian (wire) txid.
+ *  true = known, false = clearly unknown (NotFound / "No such mempool or blockchain transaction"); any other failure throws, so a caller never mistakes "could not ask" for "not there". */
+export async function txKnown(base, txid, fetchFn) {
+  if (!/^[0-9a-fA-F]{64}$/.test(txid || "")) throw new Error("bad txid");
+  try {
+    const res = pbRead(await grpc(base, "GetTransaction", pbField(3, 2, unhex(txid).reverse()), fetchFn));
+    const data = res.find(([no]) => no === 1);
+    return !!(data && data[1].length > 0);
+  } catch (e) {
+    if (/not ?found|no such (mempool|blockchain)|-5\b|code = NotFound/i.test(String(e && e.message))) return false;
+    throw e;
+  }
+}

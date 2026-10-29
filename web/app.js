@@ -233,8 +233,10 @@ let pv = null, HOPM = null;
 const hopMod = () => HOPM || (HOPM = import("./zec-hop.js"));
 function pvReset() { pv = null; $("wd-quote").hidden = true; $("btn-wd").textContent = $("wd-private").checked ? "Preview" : "Send without gas"; }
 $("wd-private").addEventListener("change", () => { $("wd-priv-opts").hidden = !$("wd-private").checked; pvReset(); });
-["wd-to", "wd-amt", "wd-dest"].forEach(id => { $(id).addEventListener("input", pvReset); $(id).addEventListener("change", pvReset); });
-const hopCtx = async (HM, f, hit, o) => ({ store: HM.idbStore(), stealth: f.stealth, priv: hit.stealthPriv, chain: C, api: API, words: await HM.loadWords(), loadZjs: HM.sharedZjs, waitReceipt, randomNonce: randomBytes32,
+["wd-to", "wd-amt", "wd-dest", "wd-mode"].forEach(id => { $(id).addEventListener("input", pvReset); $(id).addEventListener("change", pvReset); });
+// chain reads for the hop go through the connected wallet's own RPC (the page CSP allows no direct RPC); same JSON-RPC shape as fetch, so zec-hop.js stays injectable
+const walletRpc = async (_u, init) => { const { method, params } = JSON.parse(init.body); try { const result = await wallet(method, params); return { ok: true, json: async () => ({ result }) }; } catch (e) { return { ok: true, json: async () => ({ error: { message: String((e && e.message) || e) } }) }; } };
+const hopCtx = async (HM, f, hit, o) => ({ authUsed: HM.makeAuthUsed(C, walletRpc), countPriorHops: HM.makeCountPriorHops(C, walletRpc), txKnown: HM.makeTxKnown(), store: HM.idbStore(), stealth: f.stealth, priv: hit.stealthPriv, chain: C, api: API, words: await HM.loadWords(), loadZjs: HM.sharedZjs, waitReceipt, randomNonce: randomBytes32,
   balance: async () => BigInt(((await api("/balances?addrs=" + f.stealth))[f.stealth.toLowerCase()] || {}).usdc || "0"), onProgress: (s, m) => hopProgress(f, s, m), ...o });
 function hopProgress(f, s, m) {
   const k = f.stealth.toLowerCase(), h = hops.get(k); if (!h) return;
@@ -266,7 +268,7 @@ async function runHop(f, hit, o) {
 }
 async function privateWithdraw(to, value, hit) {
   const dest = CHAINS[$("wd-dest").value]; if (!dest || !dest.oneClick) throw new Error("pick a destination chain");
-  const HM = await hopMod(), key = [to.toLowerCase(), value, dest.key].join("|");
+  const HM = await hopMod(), mode = $("wd-mode").value === "private" ? "private" : "fast", key = [to.toLowerCase(), value, dest.key, mode].join("|");
   if (!pv || pv.key !== key) {                                    // step 1: show what it will cost, send nothing
     say("pay-hint", "Asking NEAR Intents for a quote…");
     const q1 = await PW.requestQuote({ base: PW.ONECLICK, req: HM.reqIn({ chain: C, amount: value, tAddr: HM.DRY_T, stealth: wd.stealth, dry: true }) }), zec = BigInt(q1.quote.amountOut);
@@ -276,13 +278,13 @@ async function privateWithdraw(to, value, hit) {
     const pct = (Number(fee) / Number(value) * 100).toFixed(1), qt = el("div", "qt"), c1 = el("div"), c2 = el("div");
     c1.appendChild(el("span", "note", "Recipient gets")); c1.appendChild(el("span", "big", "≈ " + (Number(out) / 10 ** dest.token.decimals).toFixed(2) + " " + dest.token.symbol));
     c2.appendChild(el("span", "note", "Fee")); c2.appendChild(el("span", "big", "≈ " + (Number(fee) / TUNIT).toFixed(2) + " (" + pct + "%)"));
-    const c3 = el("div"); c3.appendChild(el("span", "note", "Takes about")); c3.appendChild(el("span", "big", "30–35 min"));
-    qt.appendChild(c1); qt.appendChild(c2); qt.appendChild(c3); box.appendChild(qt); box.appendChild(el("div", "note", "Takes about 30–35 min · keep this tab open"));
+    const c3 = el("div"); c3.appendChild(el("span", "note", "Takes about")); c3.appendChild(el("span", "big", HM.etaLabel(mode)));
+    qt.appendChild(c1); qt.appendChild(c2); qt.appendChild(c3); box.appendChild(qt); box.appendChild(el("div", "note", "Takes about " + HM.etaLabel(mode) + " · keep this tab open" + (mode === "private" ? " (it can be resumed if you close it)" : "")));
     box.hidden = false; pv = { key }; $("btn-wd").textContent = "Confirm private transfer";
     say("pay-hint", "Check the quote, then confirm.", "warn"); return;
   }
   $("btn-wd").disabled = true; $("withdraw").hidden = true;
-  try { await runHop(wd, hit, { recipient: to, amount: value, dest }); } finally { $("btn-wd").disabled = false; pvReset(); }
+  try { await runHop(wd, hit, { recipient: to, amount: value, dest, mode }); } finally { $("btn-wd").disabled = false; pvReset(); }
 }
 // ---- unfinished hops of the payments found: banner with Resume (needs the keys, so it appears after Scan)
 async function showResume() {
