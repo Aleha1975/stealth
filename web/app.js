@@ -174,8 +174,16 @@ const activeHop = f => { const h = hops.get(f.stealth.toLowerCase()); return h &
 function renderHops() {
   const box = $("hop-resume"); box.textContent = "";
   for (const [k, h] of hops) box.appendChild(hopCard(h, { onContinue: b => { b.disabled = true; runHop(h.f, h.hit, null).catch(e => say("pay-hint", e.message || String(e), "bad")); },
-    onFunds: b => { b.disabled = true; runHop(h.f, h.hit, null).catch(e => say("pay-hint", e.message || String(e), "bad")); }, onDismiss: () => { hops.delete(k); renderHops(); } }));
+    onFunds: b => { b.disabled = true; runHop(h.f, h.hit, null).catch(e => say("pay-hint", e.message || String(e), "bad")); }, onDismiss: () => { hops.delete(k); renderHops(); },
+    onRecovery: (b, card) => { b.disabled = true; showPhrase(h, card).catch(e => { b.disabled = false; say("pay-hint", e.message || String(e), "bad"); }); } }));
   box.hidden = !hops.size;
+}
+// the hop wallet's phrase: import it into Zashi (account 0, from the birthday height) to reach any ZEC left in it
+async function showPhrase(h, card) {
+  const HM = await hopMod(), mn = await HM.mnemonicFor(h.hit.stealthPriv, await HM.loadWords(), h.st.n || 0), box = el("div", "hop-phrase");
+  box.appendChild(el("div", "note", "Import into Zashi · birthday " + (h.st.birthday ?? "—") + ". Anyone with these words can take the ZEC."));
+  const w = el("code", null, mn); w.style.userSelect = "all"; box.appendChild(w);
+  card.appendChild(box);
 }
 setInterval(() => { const r = [...hops.values()].filter(h => h.running); if (r.length) { renderHops(); const v = hopView(r[0]); if (v.kind === "run" && v.what && $("pay-hint").textContent.startsWith("●")) say("pay-hint", statusLine(v), "ok"); } }, 1000);
 function render() {

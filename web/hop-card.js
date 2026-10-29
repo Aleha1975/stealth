@@ -68,7 +68,7 @@ export function hopView(h, now = Date.now()) {
   return v;
 }
 
-/** Build the card. cb = { onContinue, onFunds, onDismiss } */
+/** Build the card. cb = { onContinue, onFunds, onDismiss, onRecovery } */
 export function hopCard(h, cb = {}, now = Date.now()) {
   const v = hopView(h, now), card = el("div", "hop " + v.kind);
   card.appendChild(el("div", "hop-t", v.title));
@@ -90,6 +90,7 @@ export function hopCard(h, cb = {}, now = Date.now()) {
   const btn = (txt, cls, fn) => { const b = el("button", "btn " + cls, txt); b.type = "button"; b.addEventListener("click", () => fn(b)); acts.appendChild(b); };
   if (v.action === "continue") btn("Continue transfer", "", b => cb.onContinue && cb.onContinue(b));
   if (v.action === "funds") btn("Show funds", "", b => cb.onFunds && cb.onFunds(b));
+  if (!h.running && v.kind === "warn" && cb.onRecovery) btn("Recovery phrase", "ghost", b => cb.onRecovery(b, card));
   if (!h.running && (v.kind === "done" || v.kind === "warn" && !v.action)) btn("Dismiss", "ghost", () => cb.onDismiss && cb.onDismiss());
   if (acts.childNodes.length) card.appendChild(acts);
   return card;
