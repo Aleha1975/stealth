@@ -7,7 +7,8 @@ import { secp256k1 as secp, keccak_256, concatBytes } from "./vendor/noble.js"; 
 
 const N = secp.CURVE.n;
 export const hex = b => "0x" + Array.from(b, x => x.toString(16).padStart(2, "0")).join("");
-export const unhex = h => { h = h.startsWith("0x") ? h.slice(2) : h; if (h.length % 2) h = "0" + h; return Uint8Array.from(h.match(/../g) || [], x => parseInt(x, 16)); };
+// audit 1086 I-1: strict. Garbage from an untrusted indexer used to turn into zero bytes (a different, valid-looking value); now it throws, callers that scan wrap it.
+export const unhex = h => { h = String(h); h = h.startsWith("0x") ? h.slice(2) : h; if (!/^[0-9a-fA-F]*$/.test(h)) throw new Error("not hex"); if (h.length % 2) h = "0" + h; return Uint8Array.from(h.match(/../g) || [], x => parseInt(x, 16)); };
 const toBig = b => BigInt(hex(b));
 const toBytes32 = n => unhex(n.toString(16).padStart(64, "0"));
 const mod = (a, m) => ((a % m) + m) % m;
@@ -30,6 +31,9 @@ function hashedShared(privBytes, pubCompressed) {
 }
 
 // ---- key derivation from ONE wallet signature over EIP-712 typed data (domain-labelled in the wallet UI)
+// audit 1086 M-1 (key-request phishing), DECISION: not changed. The keys are a pure function of this exact typed data, so adding an origin / contract / salt to it would give every
+// existing user DIFFERENT keys and strand their money; an unbound request cannot be told apart from ours by the wallet. What we do instead: the page tells the user to sign only on its own
+// host (app.js), and the typed data names the rule in `purpose`. A future opt-in "v2" request (origin-bound, new meta-address) can be offered next to this one, never replace it.
 export const KEY_DOMAIN = { name: "DeepYield Stealth", version: "1" };   // no chainId: wallets refuse typed data whose chainId differs from the active chain, and the same wallet must get the same keys on every chain;
 export const KEY_TYPES = { StealthKeys: [{ name: "purpose", type: "string" }, { name: "account", type: "address" }] };
 export const KEY_PURPOSE = "Derive my private stealth receiving keys. Never sign this on another site.";
@@ -87,20 +91,22 @@ export function deriveForPayment(metaOrParsed, ephPriv = secp.utils.randomPrivat
 
 /** Receiver: does this announcement pay me? Returns {stealth, stealthPriv} or null. Cheap view-tag check first. */
 export function checkAnnouncement(keys, ephPubHex, viewTagHex) {
-  const ephPub = unhex(ephPubHex);
+  let ephPub; try { ephPub = unhex(ephPubHex); } catch { return null; }        // hostile indexer data: skip, never throw
   if (ephPub.length !== 33) return null;
   let sh;
   try { sh = hashedShared(keys.viewPriv, ephPub); } catch { return null; }
   if (viewTagHex && (sh[0] !== parseInt(viewTagHex, 16))) return null;
-  const P = secp.ProjectivePoint.fromHex(keys.spendPub).add(secp.ProjectivePoint.fromPrivateKey(sh));
-  const stealth = addressOf(P.toRawBytes(true));
-  const priv = toBytes32(mod(toBig(keys.spendPriv) + toBig(sh), N));
-  return { stealth, stealthPriv: hex(priv) };
+  try {                                                    // audit 1086 L-3: sh = 0 or >= n (2^-128) must not abort a scan loop
+    const P = secp.ProjectivePoint.fromHex(keys.spendPub).add(secp.ProjectivePoint.fromPrivateKey(sh));
+    const stealth = addressOf(P.toRawBytes(true));
+    const priv = toBytes32(mod(toBig(keys.spendPriv) + toBig(sh), N));
+    return { stealth, stealthPriv: hex(priv) };
+  } catch { return null; }
 }
 
 /** ERC-5564 metadata for a token payment: viewTag | 0xa9059cbb | token | amount (57 bytes). Decode helper. */
 export function decodeMetadata(metaHex) {
-  const b = unhex(metaHex);
+  let b; try { b = unhex(metaHex); } catch { return null; }
   if (b.length < 1) return null;
   const out = { viewTag: "0x" + b[0].toString(16).padStart(2, "0") };
   if (b.length >= 57) {

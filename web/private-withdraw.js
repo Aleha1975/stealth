@@ -110,6 +110,8 @@ export async function requestQuote({ base = ONECLICK, req, token, fetchFn = fetc
   if (String(e.recipient).toLowerCase() !== req.recipient.toLowerCase() || String(e.refundTo).toLowerCase() !== req.refundTo.toLowerCase()
     || e.originAsset !== req.originAsset || e.destinationAsset !== req.destinationAsset) throw new Error("the quote does not match the request; refusing");
   if (!req.dry && !okDeposit(q.depositAddress)) throw new Error("the quote has no usable deposit address");
+  // audit 1086 L-2: beyond the format, the deposit address must not be one of our own / the token or the zero address (a hijacked quote would point the signature at those)
+  if (!req.dry) { const d = String(q.depositAddress).toLowerCase(); if ([req.refundTo, req.recipient, "0x0000000000000000000000000000000000000000"].some(a => String(a || "").toLowerCase() === d)) throw new Error("the quote's deposit address is not acceptable; refusing"); }
   return j;
 }
 /** Human numbers from a quote. Both stablecoins here have 6 decimals (token.decimals of the destination chain is used for the output). */

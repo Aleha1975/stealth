@@ -3,12 +3,15 @@
    paymentNonce mirrors StealthPay.paymentNonce (abi.encode of 9 words; bytes1 is left-aligned). */
 import { keccak, hex, unhex } from "./stealth-crypto.js";
 const te = new TextEncoder();
-const w = v => (typeof v === "bigint" ? v : BigInt(v)).toString(16).padStart(64, "0");
-const a32 = a => a.toLowerCase().replace(/^0x/, "").padStart(64, "0");
+// audit 1086 I-3: validate instead of silently producing a wrong nonce (negative, non-integer, over-long or non-hex input throws)
+const w = v => { const b = typeof v === "bigint" ? v : BigInt(v); if (b < 0n || b >= 1n << 256n) throw new Error("number out of range"); return b.toString(16).padStart(64, "0"); };
+const a32 = a => { if (!/^0x[0-9a-fA-F]{40}$/.test(String(a))) throw new Error("bad address"); return a.toLowerCase().replace(/^0x/, "").padStart(64, "0"); };
 const k = b => hex(keccak(b)).slice(2);
 export const PAYMENT_NONCE_TAG = "StealthPay.payWithAuthorization";
 /** keccak256(abi.encode(keccak256(tag), chainid, stealthPay, token, stealth, keccak256(eph), viewTag, fee, feeRecipient)) -> 0x… */
 export function paymentNonce({ chainId, stealthPay, token, stealth, eph, viewTag, fee, feeRecipient }) {
+  if (!/^0x[0-9a-fA-F]{2}$/.test(String(viewTag))) throw new Error("bad view tag");
+  if (!/^0x[0-9a-fA-F]+$/.test(String(eph)) || eph.length % 2) throw new Error("bad ephemeral key");
   const enc = "0x" + k(te.encode(PAYMENT_NONCE_TAG)) + w(chainId) + a32(stealthPay) + a32(token) + a32(stealth) + k(unhex(eph)) +
     viewTag.replace(/^0x/, "").padEnd(64, "0") + w(fee) + a32(feeRecipient);
   return "0x" + k(unhex(enc));
@@ -47,3 +50,6 @@ export function payAmounts({ src, text, decimals, fee }) {
   if (raw <= 0n) return null;
   return src === "amount-get" ? { send: raw + fee, get: raw, fee } : { send: raw, get: raw - fee, fee };
 }
+/** Client-side cap on the relayer's fee (audit 1086 L-1): the fee and its recipient come from our relayer API, so a compromised API must not be able to take (almost) the whole
+ *  payment. Refused when the fee is above `maxAbs` token units (default 1.00 with 6 decimals) or above half of what leaves the wallet. */
+export const feeWithinCap = (fee, raw, maxAbs = 1_000_000n) => fee >= 0n && fee <= maxAbs && fee * 2n <= raw;
