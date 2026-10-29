@@ -187,7 +187,7 @@ function openWithdraw(i) {
   // Private = the hidden Zcash hop (web/zec-hop.js): offered only on a cross-origin isolated page, on chains with 1Click, and only if the module loads; then it is on by default
   const mine = wd; $("wd-priv-wrap").hidden = true; $("wd-private").checked = false; $("wd-priv-opts").hidden = true; pvReset();
   const dest = $("wd-dest"); dest.textContent = "";
-  for (const k of ["base", C.key]) { const c = CHAINS[k]; if (c && c.oneClick && !Array.from(dest.options).some(o => o.value === c.key)) { const o = el("option", null, c.name + " (" + c.token.symbol + ")" + (c.key === C.key ? " · same chain" : "")); o.value = c.key; dest.appendChild(o); } }
+  for (const k of [C.key])   // one payout chain for now: the same chain { const c = CHAINS[k]; if (c && c.oneClick && !Array.from(dest.options).some(o => o.value === c.key)) { const o = el("option", null, c.name + " (" + c.token.symbol + ")" + (c.key === C.key ? " · same chain" : "")); o.value = c.key; dest.appendChild(o); } }
   if (self.crossOriginIsolated && C.privateWithdraw && C.oneClick) hopMod().then(() => { if (wd !== mine) return; $("wd-priv-wrap").hidden = false; $("wd-private").checked = true; $("wd-priv-opts").hidden = false; pvReset(); }).catch(() => {});
 }
 // ---- private withdraw: preview (two dry quotes) first, then a second click starts the hop. Any input change drops the preview.
