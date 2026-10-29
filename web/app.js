@@ -187,7 +187,12 @@ async function returnZec(h, card) {
   const seed = await HM.mnemonicSeed(await HM.mnemonicFor(h.hit.stealthPriv, await HM.loadWords(), h.st.n || 0));
   let key = null, utxos = [];
   for (let a = 0; a < 4 && !utxos.length; a++) for (let i = 0; i < 3 && !utxos.length; i++) { key = ZR.deriveT(seed, ZR.tPath(a, i)); utxos = await ZR.getUtxos(ZC.lightwalletd, key.addr); }
-  if (!utxos.length) throw new Error("No ZEC found on the hop addresses.");
+  if (!utxos.length) {                                   // nothing transparent left: if the shielded side is empty too, this transfer is over (e.g. returned earlier)
+    step("Checking the shielded balance…");
+    const r = await HM.findHop(HM.idbStore(), h.f.stealth), left = await HM.hopSummary(await hopCtx(HM, h.f, h.hit, null), r && r.rec);
+    if (left.some(x => x.transparent + x.orchard > 0n)) throw new Error("ZEC is still in the shielded pool. Press Continue transfer.");
+    await hideHop(HM, h); step("Nothing left here. Removed."); return;
+  }
   const total = utxos.reduce((s, u) => s + u.value, 0n), amount = total - ZR.FEE;
   step("Getting a quote…");
   const j = await PW.requestQuote({ req: HM.reqOut({ dest: C, amount, recipient: acct, refundT: key.addr }), okDeposit: a => /^t1[1-9A-HJ-NP-Za-km-z]{33}$/.test(a || "") });
@@ -198,7 +203,13 @@ async function returnZec(h, card) {
   await PW.submitDeposit({ txHash: sw.txid, depositAddress: j.quote.depositAddress }).catch(() => {});
   const fin = await PW.pollStatus({ depositAddress: j.quote.depositAddress, timeoutMs: 60 * 60_000, intervalMs: 10_000, onUpdate: s => step("Returning · " + s.status.toLowerCase().replace(/_/g, " ") + " · usually 10–20 min") });
   step(fin.status === "SUCCESS" ? "Done: ≈ " + (Number(j.quote.amountOut) / 1e6).toFixed(2) + " " + SYM + " sent to your wallet." : "Swap ended as " + fin.status + ". The ZEC is back on the hop address; press Return money again.");
-  if (fin.status === "SUCCESS") { h.st.step = "FAILED"; h.st.result = "RETURNED"; }
+  if (fin.status === "SUCCESS") await hideHop(HM, h);
+}
+// a finished or returned transfer leaves no card behind (the record stays in IndexedDB, flagged)
+async function hideHop(HM, h) {
+  const store = HM.idbStore(), r = await HM.findHop(store, h.f.stealth);
+  if (r) { r.rec.st = { ...r.rec.st, step: "FAILED", result: "RETURNED", hidden: true }; await store.put(r.key, r.rec); }
+  hops.delete(h.f.stealth.toLowerCase()); renderHops(); render();
 }
 setInterval(() => { const r = [...hops.values()].filter(h => h.running); if (r.length) { renderHops(); const v = hopView(r[0]); if (v.kind === "run" && v.what && $("pay-hint").textContent.startsWith("●")) say("pay-hint", statusLine(v), "ok"); } }, 1000);
 function render() {
@@ -292,7 +303,7 @@ async function showResume() {
   const HM = await hopMod(), store = HM.idbStore();
   for (const f of found) {
     const k = f.stealth.toLowerCase(); if ((hops.get(k) || {}).running) continue;
-    const r = await HM.findHop(store, f.stealth); if (!r || ["DONE", "FAILED_IN"].includes(r.rec.st.step)) continue;
+    const r = await HM.findHop(store, f.stealth); if (!r || r.rec.st.hidden || ["DONE", "FAILED_IN"].includes(r.rec.st.step)) continue;
     const hit = checkAnnouncement(keys, f.eph, null); if (!hit || hit.stealth.toLowerCase() !== k) continue;
     hops.set(k, { f, hit, running: false, msg: "", st: r.rec.st });
   }
