@@ -9,7 +9,15 @@ import { zcash as ZC } from "./chains.js";
 
 export const STEPS = ["QUOTE_IN", "DEPOSIT_IN", "WAIT_T", "SHIELD", "DELAY", "QUOTE_OUT", "SEND_OUT"];
 export const DONE_STEPS = new Set(["DONE", "FAILED_IN", "FAILED"]);
-export const HOP_TAG = "stealth-zec-hop/v1", MAX_OUT = 3, PENDING = "PENDING_DEPOSIT", ETA_MIN = 20;
+export const HOP_TAG = "stealth-zec-hop/v1", MAX_OUT = 3, PENDING = "PENDING_DEPOSIT", ETA_MIN = 35, T_CONFS = 10;   // T_CONFS: WebZjs spends transparent coins received from others only after 10 confirmations (ZIP-315)
+export const STEP_MIN = { QUOTE_IN: 0.5, DEPOSIT_IN: 4, WAIT_T: 12, SHIELD: 3, DELAY: 6, QUOTE_OUT: 0.5, SEND_OUT: 8 };   // typical minutes per step (sum 34)
+/** Time left for an unfinished hop, in ms: rest of the current step (min 1 min) + typical time of the later steps. DELAY uses its exact end. Never below 1 min while unfinished, 0 once finished. */
+export function remainingMs(st, now = Date.now()) {
+  const i = STEPS.indexOf(st.step); if (i < 0) return 0;
+  const after = STEPS.slice(i + 1).reduce((a, k) => a + STEP_MIN[k] * 60_000, 0);
+  const cur = st.step === "DELAY" && st.delayUntil ? Math.max(0, st.delayUntil - now) : Math.max(60_000, STEP_MIN[st.step] * 60_000 - (now - (st.stepAt || now)));
+  return Math.max(60_000, cur + after);
+}
 export const WORDLIST_SHA256 = "2f5eed53a4727b4bf8880d8f3f199efc90e58503646d9ff8eff3a2ed3b24dbda";
 export const SHIELD_FEE = 15000n, DRY_T = "t1ZeyyQnfsDVuLZNDGxsNbwpcseoFVkz5sJ";   // DRY_T: any valid t-address, used only in dry (preview) quotes
 const RESERVE = 20000n, MIN_SHIELD = 20000n;       // zatoshi: kept back for the out fee (ZIP-317 ~15000) / dust threshold / shield fee
@@ -62,7 +70,7 @@ export const newState = ({ stealth, chain, dest, recipient, amount, dry, n = 0, 
   dry: !!dry, step: "QUOTE_IN", attempt: 0, reserve: RESERVE.toString(), startedAt: now, err: null });
 export const afterIn = status => (status === "SUCCESS" ? { step: "WAIT_T" } : { step: "FAILED_IN", result: status });
 export const afterOut = (st, status) => status === "SUCCESS" ? { step: "DONE" }
-  : status === "REFUNDED" && st.attempt + 1 < MAX_OUT ? { step: "WAIT_T", attempt: st.attempt + 1, outQuote: null, outRaw: null, outTx: null }   // ZEC came back to account attempt+1's t-address: shield and send again
+  : status === "REFUNDED" && st.attempt + 1 < MAX_OUT ? { step: "WAIT_T", attempt: st.attempt + 1, tSeenHeight: null, tSeenAt: null, outQuote: null, outRaw: null, outTx: null }   // ZEC came back to account attempt+1's t-address: shield and send again
   : { step: "FAILED", result: status };
 export const progressText = st => DONE_STEPS.has(st.step) ? (st.step === "DONE" ? "Private transfer done" : "Private transfer stopped") : "Private transfer: step " + (STEPS.indexOf(st.step) + 1) + "/" + STEPS.length + " · keep this tab open · ~" + ETA_MIN + " min";
 export function recoveryText(st) {
@@ -107,7 +115,8 @@ export async function runHop(ctx) {
   const { store, fetchFn = fetch, sleep = sleepMs, base = PW.ONECLICK } = ctx, found = await findHop(store, ctx.stealth);
   if (!found) throw new Error("no private transfer to resume"); const { key, rec } = found, st = rec.st;
   const mn = await mnemonicFor(ctx.priv, ctx.words, st.n || 0), say = m => ctx.onProgress && ctx.onProgress(st, m), save = () => store.put(key, rec);
-  const go = async (step, patch = {}) => { Object.assign(st, patch, { step }); await save(); };
+  const go = async (step, patch = {}) => { Object.assign(st, patch, { step }, st.step === step && st.stepAt ? {} : { stepAt: Date.now() }); await save(); };
+  if (!st.stepAt) st.stepAt = Date.now();                        // state saved by older code: count from now
   let W = null, Z = null;
   const wallet = async () => {                                   // restore from the saved bytes, or create accounts 0..MAX_OUT at the stored birthday (re-creating gives the same addresses)
     if (W) return W; Z = ctx.Zjs || (ctx.Zjs = await ctx.loadZjs());
@@ -172,16 +181,34 @@ export async function runHop(ctx) {
     },
     async WAIT_T() {
       const need = st.attempt ? MIN_SHIELD : BigInt(st.inQuote.minOut) * 9n / 10n;
-      await until("ZEC to arrive", 45 * 60_000, async () => { const b = await bal(st.attempt); return b.t >= need || b.o >= ZC.minIn; });
+      let last = null;
+      await until("ZEC to arrive", 45 * 60_000, async () => { last = await bal(st.attempt); return last.t >= need || last.o >= ZC.minIn; });
+      if (!(last.o >= ZC.minIn && last.t < MIN_SHIELD)) {        // coins on the t-address: they become spendable only after T_CONFS confirmations
+        const w = await wallet(), tip = async () => Number(await retry(() => w.get_latest_block()));
+        if (st.tSeenHeight == null) { st.tSeenHeight = await tip(); st.tSeenAt = Date.now(); await save(); }   // also fills in states saved before this fix
+        const t0 = Date.now();
+        for (;;) {
+          const n = Math.max(0, Math.min(T_CONFS, (await tip()) - st.tSeenHeight)); if (n >= T_CONFS) break;
+          if (Date.now() - t0 > 45 * 60_000) throw new Halt("Zcash confirmations are taking too long");
+          say("Waiting for Zcash confirmations (" + n + "/" + T_CONFS + ")"); await sleep(20000);
+        }
+      }
       await go("SHIELD");
     },
     async SHIELD() {
-      const i = st.attempt, b = await bal(i);
-      if (b.t >= MIN_SHIELD) {                                   // the transparent coins are still there: shield (once sent they are no longer spendable, so a resume skips this)
-        say("Shielding…"); const w = await wallet(), seed = await mnemonicSeed(mn);
-        let p = await w.pczt_shield(st.accts[i]);
-        p = await Z.pczt_sign(ZC.network, p, new Z.UnifiedSpendingKey(ZC.network, seed, i), new Z.SeedFingerprint(seed));
-        await w.pczt_send(await w.pczt_prove(p, null)); await saveWallet();
+      const i = st.attempt, t0 = Date.now();
+      for (;;) {
+        const b = await bal(i); if (b.t < MIN_SHIELD) break;     // nothing left to shield (already sent: a resume skips this)
+        try {
+          say("Shielding…"); const w = await wallet(), seed = await mnemonicSeed(mn);
+          let p = await w.pczt_shield(st.accts[i]);
+          p = await Z.pczt_sign(ZC.network, p, new Z.UnifiedSpendingKey(ZC.network, seed, i), new Z.SeedFingerprint(seed));
+          await w.pczt_send(await w.pczt_prove(p, null)); await saveWallet(); break;
+        } catch (e) {
+          if (!/InsufficientFunds/.test(String((e && e.message) || e))) throw e;          // coins not spendable yet (confirmations): wait and try again
+          if (Date.now() - t0 > 30 * 60_000) throw new Halt("The ZEC has arrived but is not spendable yet. Press Continue in a few minutes.");
+          say("Waiting for the ZEC to become spendable…"); await sleep(60_000);
+        }
       }
       await until("the shielded balance (1 confirmation)", 40 * 60_000, async () => { const x = await bal(i); await saveWallet(); return x.o >= ZC.minIn && x.p === 0n && x.t < MIN_SHIELD; }, 15000);
       await go("DELAY", { delayUntil: Date.now() + delayMs(ctx.rand) });

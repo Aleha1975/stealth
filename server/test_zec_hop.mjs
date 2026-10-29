@@ -41,7 +41,7 @@ ok("birthday is conservative", H.birthdayFromTime(1_000_000, 3_500_000, 1_000_00
 const st0 = H.newState({ stealth: STEALTH.toUpperCase().replace("0X", "0x"), chain: rh, dest: base, recipient: A, amount: 5n, now: 1 });
 ok("transitions", H.afterIn("SUCCESS").step === "WAIT_T" && H.afterIn("REFUNDED").step === "FAILED_IN" && H.afterIn("FAILED").step === "FAILED_IN" && H.afterOut(st0, "SUCCESS").step === "DONE"
   && H.afterOut(st0, "REFUNDED").step === "WAIT_T" && H.afterOut(st0, "REFUNDED").attempt === 1 && H.afterOut({ ...st0, attempt: H.MAX_OUT - 1 }, "REFUNDED").step === "FAILED" && H.afterOut(st0, "FAILED").step === "FAILED" && st0.step === "QUOTE_IN");
-ok("texts", H.progressText({ step: "WAIT_T" }) === "Private transfer: step 3/7 · keep this tab open · ~20 min" && /unfinished|Resume/.test(H.recoveryText({ step: "SHIELD", err: "x" })) && /back on the stealth/.test(H.recoveryText({ step: "FAILED_IN", result: "REFUNDED" })));
+ok("texts", H.progressText({ step: "WAIT_T" }) === "Private transfer: step 3/7 · keep this tab open · ~35 min" && /unfinished|Resume/.test(H.recoveryText({ step: "SHIELD", err: "x" })) && /back on the stealth/.test(H.recoveryText({ step: "FAILED_IN", result: "REFUNDED" })));
 { let n = 0, slept = []; const v = await H.retry(async () => { if (++n < 3) throw new Error("x"); return 7; }, { sleep: async ms => slept.push(ms) });
   let m = 0; await H.retry(async () => { m++; throw new H.Halt("h"); }, { sleep: async () => {} }).catch(() => {});
   let k = 0; await H.retry(async () => { k++; throw new Error("e"); }, { sleep: async () => {} }).catch(() => {});
@@ -51,7 +51,7 @@ ok("texts", H.progressText({ step: "WAIT_T" }) === "Private transfer: step 3/7 �
 let off = 0; const realNow = Date.now; Date.now = () => realNow() + off; const vsleep = async ms => { off += ms; };
 const b58 = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz", tOf = s => "t1" + Array.from({ length: 33 }, (_, i) => b58[(s.charCodeAt(i % s.length) * 7 + i * 13) % 58]).join("");
 function makeWorld(o = {}) {
-  const w = { stealthBal: 100_000_000n, tBal: {}, oBal: {}, pend: {}, swaps: {}, relays: 0, relayBodies: [], nonces: new Set(), quotes: [], broadcasts: 0, sig: 0, created: 0, loseFirstRelay: !!o.loseFirstRelay, failRelay: 0, inOutcome: o.inOutcome || "SUCCESS", outOutcomes: o.outOutcomes || ["SUCCESS"], ...o };
+  const w = { stealthBal: 100_000_000n, tBal: {}, oBal: {}, pend: {}, swaps: {}, relays: 0, relayBodies: [], nonces: new Set(), quotes: [], broadcasts: 0, sig: 0, created: 0, loseFirstRelay: !!o.loseFirstRelay, failRelay: 0, inOutcome: o.inOutcome || "SUCCESS",shieldFails: o.shieldFails || 0, off0: null, shieldCalls: 0, shieldHeights: [], outOutcomes: o.outOutcomes || ["SUCCESS"], ...o };
   w.fetch = async (url, init = {}) => {
     const u = String(url), body = init.body ? JSON.parse(init.body) : null, J = (code, j) => ({ ok: code < 400, status: code, json: async () => j });
     if (u.endsWith("/v0/quote")) {
@@ -80,12 +80,12 @@ function makeWorld(o = {}) {
   w.Zjs = {
     WebWallet: class {
       constructor(net, url, a, b, db) { this.url = url; this.d = db ? JSON.parse(Buffer.from(db).toString()) : { accts: [], addr: {} }; if (url !== ZC.lightwalletd) throw new Error("wrong lightwalletd " + url); }
-      async get_latest_block() { return 3_500_000n; } async sync() {} async db_to_bytes() { return new Uint8Array(Buffer.from(JSON.stringify(this.d))); }
+      async get_latest_block() { if (w.off0 == null) w.off0 = off; return BigInt(3_500_000 + Math.floor((off - w.off0) / 75000)); }   /* ~75 s per block, driven by the virtual clock */ async sync() {} async db_to_bytes() { return new Uint8Array(Buffer.from(JSON.stringify(this.d))); }
       async create_account(name, m, i, bd) { if (bd !== 3_499_990) throw new Error("birthday " + bd); w.created++; const id = this.d.accts.length + 1; this.d.accts.push(id); this.d.addr[id] = tOf(m.slice(0, 20) + i); return id; }
       async get_current_address_transparent(id) { return this.d.addr[id]; }
       async get_wallet_summary() { return { account_balances: this.d.accts.map(id => [id, { unshielded_balance: Number(w.tBal[this.d.addr[id]] || 0n), orchard_balance: Number(w.oBal[this.d.addr[id]] || 0n), pending_change: Number(w.pend[this.d.addr[id]] || 0n), pending_spendable: 0 }]) }; }
       async pczt_shield(id) { return { id, a: this.d.addr[id] }; } async pczt_prove(p) { return p; }
-      async pczt_send(p) { w.sig++; const v = w.tBal[p.a]; w.tBal[p.a] = 0n; w.pend[p.a] = v - 15000n; w.pendLater = (w.pendLater || []).concat([[p.a, v - 15000n]]); }
+      async pczt_send(p) { w.shieldCalls++; if (w.shieldCalls <= w.shieldFails) throw new Error("Error when shielding: Change(InsufficientFunds { available: Zatoshis(0), required: Zatoshis(10000) })"); w.shieldHeights.push(3_500_000 + Math.floor((off - (w.off0 ?? off)) / 75000)); w.sig++; const v = w.tBal[p.a]; w.tBal[p.a] = 0n; w.pend[p.a] = v - 15000n; w.pendLater = (w.pendLater || []).concat([[p.a, v - 15000n]]); }
       async propose_transfer(id, to, v) { const a = this.d.addr[id]; if ((w.oBal[a] || 0n) < v + 15000n) throw new Error("insufficient"); return { a, to, v }; }
       async create_proposed_transactions(p, m, i) { if (m.split(" ").length !== 24 || tOf(m.slice(0, 20) + i) !== p.a) throw new Error("wrong key"); w.pr = p; return Uint8Array.from({ length: 32 }, (_, k) => k + 1); }
       async send_authorized_transactions(raw) { w.broadcasts++; if (raw.length !== 32) throw new Error("bad txids"); w.oBal[w.pr.a] -= w.pr.v + 15000n; w.swaps[w.pr.to].paid = true; }
@@ -140,5 +140,46 @@ for (const step of H.STEPS.slice(1)) {          // stop cleanly before every ste
   ok("a second hop from the same address is refused while one is unfinished", await H.startHop(mkCtx(w, s)).then(() => false, e => /unfinished/.test(e.message))); }
 { const w = makeWorld(), s = H.memStore(); w.stealthBal = 0n; await H.startHop(mkCtx(w, s, { stopAt: "DEPOSIT_IN" })); const rec = await latest(s); rec.st.auth = { validBefore: 1, nonce: "0x01" }; await s.put(STEALTH + "#0", rec);
   const st = await H.runHop(mkCtx(w, s)); ok("expired auth + stealth already debited: no second signature/relay", w.relays === 0 && st.step === "DEPOSIT_IN", st.err || st.step); }
+// ---- ETA / countdown (remainingMs) ----
+{ const M = 60_000, now = 10_000_000, S = H.STEP_MIN, sum = Object.values(S).reduce((a, b) => a + b, 0);
+  ok("STEP_MIN covers every step, sums to 30-35 min, ETA_MIN 35", H.STEPS.every(k => S[k] > 0) && sum >= 30 && sum <= 35 && H.ETA_MIN === 35, String(sum));
+  let prev = Infinity, mono = true;
+  for (const k of H.STEPS) { const r = H.remainingMs({ step: k, stepAt: now }, now); if (k !== "DELAY" && r !== Math.max(M, S[k] * M) + H.STEPS.slice(H.STEPS.indexOf(k) + 1).reduce((a, x) => a + S[x] * M, 0)) mono = false; if (r >= prev) mono = false; prev = r; }
+  ok("remainingMs: fresh step = typical time of it and all later steps, falls step by step", mono);
+  ok("remainingMs: half way through WAIT_T", H.remainingMs({ step: "WAIT_T", stepAt: now - 6 * M }, now) === (6 + S.SHIELD + S.DELAY + S.QUOTE_OUT + S.SEND_OUT) * M);
+  ok("remainingMs: overrun clamps the current step to 1 min", H.remainingMs({ step: "WAIT_T", stepAt: now - 90 * M }, now) === (1 + S.SHIELD + S.DELAY + S.QUOTE_OUT + S.SEND_OUT) * M && H.remainingMs({ step: "SEND_OUT", stepAt: now - 90 * M }, now) === M);
+  ok("remainingMs: DELAY uses the exact end", H.remainingMs({ step: "DELAY", delayUntil: now + 3 * M, stepAt: now }, now) === (3 + S.QUOTE_OUT + S.SEND_OUT) * M && H.remainingMs({ step: "DELAY", delayUntil: now - 5, stepAt: now }, now) === (S.QUOTE_OUT + S.SEND_OUT) * M);
+  ok("remainingMs: missing stepAt (old state) counts from now; never < 1 min; 0 when finished", H.remainingMs({ step: "SHIELD" }, now) === (S.SHIELD + S.DELAY + S.QUOTE_OUT + S.SEND_OUT) * M && H.remainingMs({ step: "SEND_OUT", stepAt: now + 5 * M }, now) >= M && H.remainingMs({ step: "DONE" }, now) === 0 && H.remainingMs({ step: "FAILED" }, now) === 0); }
+
+// ---- WAIT_T confirmation gate and SHIELD InsufficientFunds retry ----
+{ const w = makeWorld(), s = H.memStore(); off = 0; const st = await H.startHop(mkCtx(w, s)); const rec = await latest(s);
+  ok("WAIT_T gate: t-balance first-seen height/time recorded, shield only >= 10 blocks later", st.step === "DONE" && Number.isInteger(rec.st.tSeenHeight) && rec.st.tSeenAt > 0 && w.shieldHeights.length === 1 && w.shieldHeights[0] >= rec.st.tSeenHeight + H.T_CONFS, JSON.stringify([rec.st.tSeenHeight, w.shieldHeights]));
+  ok("stepAt recorded and updated on step change", rec.st.stepAt > 0); }
+{ const w = makeWorld(), s = H.memStore(); off = 0; await H.startHop(mkCtx(w, s, { stopAt: "SHIELD" })); const rec = await latest(s);
+  const msgs = []; const c = mkCtx(w, s, { onProgress: (x, m) => msgs.push(m) }); delete rec.st.tSeenHeight; delete rec.st.stepAt; rec.st.step = "WAIT_T"; await s.put(STEALTH + "#0", rec);   // state from the OLD code, mid-flight
+  const t0 = off; const r = await H.runHop(c); const after = await latest(s);
+  ok("resume of an old state (no tSeenHeight/stepAt) works and still waits for confirmations", r.step === "DONE" && !r.err && after.st.tSeenHeight > 0 && w.shieldHeights[0] >= after.st.tSeenHeight + H.T_CONFS && off - t0 >= (H.T_CONFS - 1) * 75000 && after.st.stepAt > 0, r.err || "");
+  ok("progress says (n/10)", msgs.some(m => /Waiting for Zcash confirmations \(\d\/10\)/.test(m))); }
+{ const w = makeWorld({ shieldFails: 3 }), s = H.memStore(); off = 0; const t0 = off; const st = await H.startHop(mkCtx(w, s));
+  ok("SHIELD retries InsufficientFunds every 60 s without halting", st.step === "DONE" && !st.err && w.shieldCalls === 4 && w.sig === 1, st.err || ""); }
+{ const w = makeWorld({ shieldFails: 999 }), s = H.memStore(); off = 0; const st = await H.startHop(mkCtx(w, s)); const rec = await latest(s);
+  ok("SHIELD gives up after 30 min with a friendly Halt, state kept at SHIELD", st.step === "SHIELD" && /not spendable yet/.test(st.err) && !/InsufficientFunds/.test(st.err) && w.shieldCalls >= 30 && w.shieldCalls <= 33 && w.sig === 0, st.err + " calls " + w.shieldCalls);
+  w.shieldFails = 0; const r = await H.runHop(mkCtx(w, s)); ok("... and Continue finishes it", r.step === "DONE" && w.sig === 1); }
+{ const w = makeWorld({ shieldFails: 1 }), s = H.memStore(); off = 0; w.Zjs.WebWallet.prototype.pczt_send = async () => { throw new Error("some other failure"); };
+  const st = await H.startHop(mkCtx(w, s)); ok("SHIELD: other errors still halt at once", st.step === "SHIELD" && /other failure/.test(st.err)); }
+// ---- percent and status line (hop-card.js) ----
+{ const C = await import("../web/hop-card.js"), now = 5_000_000, M = 60_000; C.resetLeft();
+  const mk = (step, el, stepAgo, extra = {}) => ({ st: { step, chain: "rh", dest: "rh", amount: "1000000", recipient: A, stealth: STEALTH, startedAt: now - el * M, stepAt: now - stepAgo * M, ...extra }, running: true, msg: "" });
+  const v1 = C.hopView(mk("WAIT_T", 10, 4), now); C.resetLeft(); const v0 = C.hopView(mk("QUOTE_IN", 0, 0), now);
+  ok("pct: 1..99 while running, grows with time", v0.pct >= 1 && v1.pct > v0.pct && v1.pct < 99, v0.pct + " -> " + v1.pct);
+  C.resetLeft(); const a1 = C.hopView(mk("SEND_OUT", 33, 50), now), a2 = C.hopView(mk("SEND_OUT", 90, 99), now + 1000);
+  ok("pct: capped at 99, never decreases, left stays >= 1 min", a1.pct <= 99 && a2.pct >= a1.pct && a2.pct <= 99 && /left/.test(a2.left) && !/^0/.test(a2.left));
+  C.resetLeft(); const b1 = C.hopView(mk("WAIT_T", 12, 0), now), b2 = C.hopView(mk("WAIT_T", 70, 0), now + 1000);
+  ok("pct monotone when the estimate jumps up", b2.pct >= b1.pct);
+  C.resetLeft(); const l1 = C.hopView(mk("DELAY", 20, 0, { delayUntil: now + 5 * M }), now), l2 = C.hopView(mk("DELAY", 20, 0, { delayUntil: now + 9 * M }), now + 1000);
+  ok("countdown rises by at most 1 min within a step", l2.left !== undefined && /[0-9]/.test(l1.left));
+  C.resetLeft(); ok("status line", C.statusLine({ pct: 42, left: "≈ 18 min left", what: "Moving the ZEC into the shielded pool" }) === "● 42% · ≈ 18 min left · Moving the ZEC into the shielded pool"
+    && C.hopView({ st: { ...mk("DEPOSIT_IN", 1, 1).st, step: "DONE", doneAt: now }, running: false }, now).pct === 100 && C.hopView(mk("SHIELD", 5, 1), now).what.length > 0);
+  C.resetLeft(); }
 Date.now = realNow;
 console.log(fails ? fails + " FAILED" : "all passed"); process.exit(fails ? 1 : 0);

@@ -2,7 +2,7 @@ import { keysFromSignature, keyRequestTypedData, metaAddress, parseMeta, deriveF
 import { paymentNonce, receiveTypedData, splitSig } from "./pay-auth.js";
 import { CHAINS, pickChain, chainOfMeta, addChainParams } from "./chains.js";
 import * as PW from "./private-withdraw.js";
-import { hopCard } from "./hop-card.js";
+import { hopCard, hopView, statusLine } from "./hop-card.js";
 
 const C = pickChain(), TOK = C.token, SYM = TOK.symbol, NAT = C.native.symbol;
 const USDC = TOK.address, STEALTHPAY = C.stealthPay, CHAIN_HEX = C.chainHex, API = C.api || "/stealth-api";
@@ -177,7 +177,7 @@ function renderHops() {
     onFunds: b => { b.disabled = true; runHop(h.f, h.hit, null).catch(e => say("pay-hint", e.message || String(e), "bad")); }, onDismiss: () => { hops.delete(k); renderHops(); } }));
   box.hidden = !hops.size;
 }
-setInterval(() => { if ([...hops.values()].some(h => h.running)) renderHops(); }, 1000);
+setInterval(() => { const r = [...hops.values()].filter(h => h.running); if (r.length) { renderHops(); const v = hopView(r[0]); if (v.kind === "run" && v.what && $("pay-hint").textContent.startsWith("●")) say("pay-hint", statusLine(v), "ok"); } }, 1000);
 function render() {
   const list = $("pay-list"); list.textContent = "";
   if (!found.length) { list.appendChild(el("p", "note", "Nothing found yet. Payments appear a few seconds after they land.")); return; }
@@ -220,6 +220,7 @@ function hopProgress(f, s, m) {
     h.sp = true; const amtIn = BigInt(s.inQuote.amountIn);
     spent.set(k, { left: f.usdc > amtIn ? f.usdc - amtIn : 0n, until: Date.now() + 120_000 }); render(); setTimeout(() => refreshBalances().catch(() => {}), 3000);
   }
+  if (h.running) { const v = hopView(h); if (v.kind === "run" && v.what) say("pay-hint", statusLine(v), "ok"); }   // green while it runs normally
   renderHops();
 }
 /** start (o = { recipient, amount, dest }) or resume (o = null) the hop of one found payment; one tab at a time per address */
@@ -252,7 +253,8 @@ async function privateWithdraw(to, value, hit) {
     const pct = (Number(fee) / Number(value) * 100).toFixed(1), qt = el("div", "qt"), c1 = el("div"), c2 = el("div");
     c1.appendChild(el("span", "note", "Recipient gets")); c1.appendChild(el("span", "big", "≈ " + (Number(out) / 10 ** dest.token.decimals).toFixed(2) + " " + dest.token.symbol));
     c2.appendChild(el("span", "note", "Fee")); c2.appendChild(el("span", "big", "≈ " + (Number(fee) / TUNIT).toFixed(2) + " (" + pct + "%)"));
-    qt.appendChild(c1); qt.appendChild(c2); box.appendChild(qt); box.appendChild(el("div", "note", "~" + HM.ETA_MIN + " min · keep this tab open"));
+    const c3 = el("div"); c3.appendChild(el("span", "note", "Takes about")); c3.appendChild(el("span", "big", "30–35 min"));
+    qt.appendChild(c1); qt.appendChild(c2); qt.appendChild(c3); box.appendChild(qt); box.appendChild(el("div", "note", "Takes about 30–35 min · keep this tab open"));
     box.hidden = false; pv = { key }; $("btn-wd").textContent = "Confirm private transfer";
     say("pay-hint", "Check the quote, then confirm.", "warn"); return;
   }
