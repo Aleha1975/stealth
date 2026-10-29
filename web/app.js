@@ -46,10 +46,18 @@ async function connect() {
 // already connected: open the wallet's account picker so another account can be chosen
 async function switchAccount() {
   if (!window.ethereum) return connect();
-  try { await wallet("wallet_requestPermissions", [{ eth_accounts: {} }]); }
-  catch (e) { if (e && e.code === 4001) return acct; say("recv-hint", "Your wallet cannot open an account picker here: switch the account in the wallet itself, the page follows it.", "warn"); return acct; }
-  const a = await wallet("eth_accounts", []); setAcct(a && a[0]); return acct;
+  let perm;
+  try { perm = await wallet("wallet_requestPermissions", [{ eth_accounts: {} }]); }
+  catch (e) { if (e && e.code === 4001) return acct; say("recv-hint", "Switch the account in your wallet; the page follows it.", "warn"); return acct; }
+  // the picker's answer lists the chosen accounts; eth_accounts may still put the previous one first
+  const chosen = (perm || []).flatMap(p => (p.caveats || []).flatMap(c => Array.isArray(c.value) ? c.value : []));
+  const a = chosen.length ? chosen : await wallet("eth_accounts", []); setAcct(a && a[0]); return acct;
 }
+// wallets do not always emit accountsChanged (e.g. switching to an account not yet connected to this site): re-check on focus and every few seconds
+// follow only a change of the wallet's own first account, so a choice made in the picker is not undone
+let lastWalletAcct;
+function syncAcct() { if (window.ethereum && document.visibilityState === "visible") wallet("eth_accounts", []).then(a => { const x = a && a[0] ? a[0].toLowerCase() : null; if (lastWalletAcct !== undefined && x !== lastWalletAcct) setAcct(x); lastWalletAcct = x; }).catch(() => {}); }
+window.addEventListener("focus", syncAcct); document.addEventListener("visibilitychange", syncAcct); setInterval(syncAcct, 3000);
 async function ensureChain() {
   const cur = async () => String(await wallet("eth_chainId", [])).toLowerCase();
   if ((await cur()) !== CHAIN_HEX) {
