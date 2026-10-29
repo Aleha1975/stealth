@@ -12,7 +12,7 @@ $("sp-addr").textContent = STEALTHPAY || "not deployed on " + C.name + " yet";
 document.querySelectorAll(".chain-name").forEach(e => e.textContent = C.name);
 document.querySelectorAll(".tok-sym").forEach(e => e.textContent = SYM);
 { const o = document.querySelectorAll("#token option"); if (o[0]) { o[0].value = "TOKEN"; o[0].textContent = SYM; } if (o[1]) { o[1].value = "NATIVE"; o[1].textContent = NAT; } }
-document.title = "Stealth · " + C.name;
+document.title = "Loophole · " + C.name;
 $("to-meta").placeholder = "st:" + C.key + ":0x… or a pay link";
 const say = (id, msg, cls) => { const e = $(id); e.textContent = msg; e.className = "hint" + (cls ? " " + cls : ""); };
 const isAddr = a => /^0x[0-9a-fA-F]{40}$/.test(a || ""), isHash = h => /^0x[0-9a-fA-F]{64}$/.test(h || "");
@@ -287,14 +287,14 @@ async function waitReceipt(h) {
 //      so the flow can be swapped without touching the rest)
 /** Sends the payment + announcement from the payer's wallet. token: "TOKEN" (chain stablecoin) or "NATIVE". Returns the tx hash. */
 async function payStealth({ token, amount, d, own = false }) {
-  if (!STEALTHPAY) throw new Error("StealthPay is not deployed on " + C.name + " yet");
+  if (!STEALTHPAY) throw new Error("The pay contract is not deployed on " + C.name + " yet");
   const ephLen = pad(33n), ephData = d.ephPub.slice(2).padEnd(128, "0"), tagWord = d.viewTag.slice(2).padEnd(64, "0");
   if (token === "TOKEN" && !own) return payGasless({ amount, d, ephLen, ephData, tagWord });
   if (token === "TOKEN") {
     const raw = BigInt(Math.round(amount * TUNIT));
     const al = BigInt(await wallet("eth_call", [{ to: USDC, data: "0xdd62ed3e" + padAddr(acct) + padAddr(STEALTHPAY) }, "latest"]));
     if (al < raw) {
-      say("send-hint", "Approve " + amount + " " + SYM + " for StealthPay (1 of 2)…");
+      say("send-hint", "Approve " + amount + " " + SYM + " for the pay contract (1 of 2)…");
       const h = await wallet("eth_sendTransaction", [{ from: acct, to: USDC, data: "0x095ea7b3" + padAddr(STEALTHPAY) + pad(raw) }]);
       if (!(await waitReceipt(h)).ok) throw new Error("approve reverted");
     }
