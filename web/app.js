@@ -247,7 +247,9 @@ $("wd-private").addEventListener("change", () => { $("wd-priv-opts").hidden = !$
 ["wd-to", "wd-amt", "wd-dest", "wd-mode"].forEach(id => { $(id).addEventListener("input", pvReset); $(id).addEventListener("change", pvReset); });
 // chain reads for the hop go through the connected wallet's own RPC (the page CSP allows no direct RPC); same JSON-RPC shape as fetch, so zec-hop.js stays injectable
 const walletRpc = async (_u, init) => { const { method, params } = JSON.parse(init.body); try { const result = await wallet(method, params); return { ok: true, json: async () => ({ result }) }; } catch (e) { return { ok: true, json: async () => ({ error: { message: String((e && e.message) || e) } }) }; } };
-const hopCtx = async (HM, f, hit, o) => ({ authUsed: HM.makeAuthUsed(C, walletRpc), countPriorHops: HM.makeCountPriorHops(C, walletRpc), txKnown: HM.makeTxKnown(), store: HM.idbStore(), stealth: f.stealth, priv: hit.stealthPriv, chain: C, api: API, words: await HM.loadWords(), loadZjs: HM.sharedZjs, waitReceipt, randomNonce: randomBytes32,
+// chain reads for the hop: the chain's public RPC directly (CORS open, listed in the page CSP), the wallet's RPC as a fallback
+const chainRpc = async (u, init) => { try { const r = await fetch(u, init); if (r.ok) { const j = await r.clone().json().catch(() => null); if (j && j.result !== undefined) return r; } } catch {} return walletRpc(u, init); };
+const hopCtx = async (HM, f, hit, o) => ({ authUsed: HM.makeAuthUsed(C, chainRpc), countPriorHops: HM.makeCountPriorHops(C, chainRpc), txKnown: HM.makeTxKnown(), store: HM.idbStore(), stealth: f.stealth, priv: hit.stealthPriv, chain: C, api: API, words: await HM.loadWords(), loadZjs: HM.sharedZjs, waitReceipt, randomNonce: randomBytes32,
   balance: async () => BigInt(((await api("/balances?addrs=" + f.stealth))[f.stealth.toLowerCase()] || {}).usdc || "0"), onProgress: (s, m) => hopProgress(f, s, m), ...o });
 function hopProgress(f, s, m) {
   const k = f.stealth.toLowerCase(), h = hops.get(k); if (!h) return;
