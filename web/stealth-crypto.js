@@ -50,8 +50,12 @@ export const keyRequestTypedData = account => JSON.stringify({ types: { EIP712Do
 export function keysFromSignature(sigHex, account) {
   const sig = unhex(sigHex);
   if (sig.length !== 65) throw new Error("This wallet did not return a plain signature (smart wallet or passkey?). Stealth needs an ordinary key-based wallet such as MetaMask.");
-  const rs = sig.slice(0, 64); let v = sig[64]; if (v >= 27) v -= 27;
+  let rs = sig.slice(0, 64); let v = sig[64]; if (v >= 27) v -= 27;
   if (v !== 0 && v !== 1) throw new Error("unexpected signature format");
+  // ECDSA is malleable: (r, s, v) and (r, n-s, v^1) both verify for the same account but would give a different key set. Normalise to the
+  // canonical low-s form first, so the keys depend only on the account and the message (a high-s signature must not yield other keys).
+  const sig0 = secp.Signature.fromCompact(rs);
+  if (sig0.hasHighS()) { rs = sig0.normalizeS().toCompactRawBytes(); v ^= 1; }
   const recovered = secp.Signature.fromCompact(rs).addRecoveryBit(v).recoverPublicKey(keyRequestDigest(account));
   if (addressOf(recovered.toRawBytes(true)).toLowerCase() !== account.toLowerCase()) throw new Error("the signature does not come from the connected account");
   const d = (t) => toBytes32(mod(toBig(keccak_256(concatBytes(rs, utf8(t)))), N) || 1n);
