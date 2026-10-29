@@ -1,0 +1,105 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="referrer" content="no-referrer">
+<title>Loophole — get paid, leave no trail</title>
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; object-src 'none'; base-uri 'none'; form-action 'none'">
+<meta name="description" content="Loophole: one link to receive stablecoins. Every payment lands on a fresh address only you can find. No gas, no custody.">
+<link rel="icon" href="./favicon.svg">
+<link rel="stylesheet" href="./loophole.css">
+<script type="module" src="./landing.js"></script>
+</head>
+<body>
+<nav class="top"><div class="wrap">
+  <a class="brand" href="./"><svg viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="1.4" aria-hidden="true"><ellipse cx="12" cy="5" rx="9" ry="2.6"/><path d="M3 5c3 5 6 7 9 14 3-7 6-9 9-14"/></svg>Loophole</a>
+  <div class="links"><a href="#why">Why</a><a href="#how">How it works</a><a href="#trust">Security</a><a href="#roadmap">Roadmap</a></div>
+  <a class="pill solid sm" href="./app.html">Launch app</a>
+</div></nav>
+
+<header class="hero">
+  <canvas id="funnel" aria-hidden="true"></canvas>
+  <div class="in wrap">
+    <h1>Get paid.<span>Leave no trail.</span></h1>
+    <p class="lead">One link to receive stablecoins. Every payment lands on a fresh address that only you can find.</p>
+    <div class="cta"><a class="pill solid" href="./app.html">Launch app</a><a class="pill line" href="#how">How it works</a></div>
+  </div>
+  <a class="scroll" href="#why" aria-label="Scroll down"><i></i></a>
+</header>
+
+<main class="land">
+<div class="wrap">
+  <div class="stats">
+    <div><b>1</b><span>signature to start</span></div>
+    <div><b>0</b><span>gas to pay or withdraw</span></div>
+    <div><b>0</b><span>custody. Keys stay on your device</span></div>
+    <div><b>✓</b><span>independently audited contract</span></div>
+  </div>
+
+  <section id="why" class="split">
+    <div>
+      <div class="eyebrow">The problem</div>
+      <h2 class="left">Your wallet is a public diary.</h2>
+    </div>
+    <div class="prose">
+      <p>Share one address and anyone can see every payment you get, your balance and who pays you. Forever.</p>
+      <p><b>Loophole gives every payer a new address for you.</b> On-chain they look like strangers. Only your keys tie them together.</p>
+    </div>
+  </section>
+
+  <section id="how">
+    <div class="eyebrow c">How it works</div>
+    <h2>Three steps. No setup.</h2>
+    <div class="grid3">
+      <div class="step"><div class="n">01</div><b>Sign once</b><span>Your wallet signs one message. Your browser derives private keys from it.</span></div>
+      <div class="step"><div class="n">02</div><b>Share one link</b><span>Payers open it and pay with one signature. No gas, no account.</span></div>
+      <div class="step"><div class="n">03</div><b>Collect privately</b><span>Scan, find your payments, move them anywhere. Still no gas.</span></div>
+    </div>
+  </section>
+
+  <section id="feat">
+    <div class="grid2">
+      <div class="feat"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3l7 3v6c0 4.5-3 7.7-7 9-4-1.3-7-4.5-7-9V6z"/></svg><b>No custody</b><span>We never hold your money or your keys. Funds go straight to addresses only you control.</span></div>
+      <div class="feat"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M13 2L4 14h7l-1 8 9-12h-7z"/></svg><b>No gas, ever</b><span>Paying and withdrawing need no ETH. A small fixed fee covers the network.</span></div>
+      <div class="feat"><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="6" width="18" height="13" rx="3"/><path d="M3 10h18M16 15h2"/></svg><b>Any wallet</b><span>Works with the wallet you already have. Nothing to install, nothing to sign up for.</span></div>
+      <div class="feat"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 12a8 8 0 1016 0 8 8 0 10-16 0M12 4v16M4 12h16"/></svg><b>Built on a standard</b><span>ERC-5564 stealth addresses. Open source, verifiable on-chain.</span></div>
+    </div>
+  </section>
+
+  <section id="trust" class="split">
+    <div>
+      <div class="eyebrow">Security</div>
+      <h2 class="left">Audited. Open. Yours.</h2>
+    </div>
+    <div class="prose">
+      <ul class="checks">
+        <li>Pay contract audited: no critical, high or medium findings</li>
+        <li>Keys are derived and used only in your browser</li>
+        <li>Code is open source and verified on-chain</li>
+      </ul>
+    </div>
+  </section>
+
+  <section id="roadmap">
+    <div class="eyebrow c">Roadmap</div>
+    <h2>Full privacy, end to end.</h2>
+    <div class="road">
+      <div class="rm live"><div class="tag">Live</div><b>Private receiving</b><ul><li>One link, a fresh address per payment</li><li>Pay and withdraw with no gas</li><li>Cross-chain swaps via NEAR Intents</li><li>Audited pay contract</li></ul></div>
+      <div class="rm now"><div class="tag">In progress</div><b>Shielded withdrawals</b><ul><li>Withdrawals route through Zcash's shielded pool (Ironwood)</li><li>Millions of ZEC hide every transfer</li><li>One click, no Zcash wallet needed</li></ul></div>
+      <div class="rm"><div class="tag">Next</div><b>No patterns left</b><ul><li>Random split and timing, so amounts can't be matched</li><li>Independent audit of the shielded path</li><li>Verifiable build, hosted on IPFS</li></ul></div>
+    </div>
+  </section>
+
+  <section class="final">
+    <h2>Your next payment<br>can be private.</h2>
+    <a class="pill solid" href="./app.html">Launch app</a>
+  </section>
+
+  <footer><div>Loophole · a DeepYield product</div><div><a href="./app.html">App</a> · <a href="https://github.com/Aleha1975/stealth">GitHub</a> · <a href="https://deepyield.ai">DeepYield</a></div></footer>
+</div>
+</main>
+
+<script type="module" src="./funnel.js"></script>
+</body>
+</html>
