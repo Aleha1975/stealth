@@ -5,6 +5,7 @@ import fs from "fs"; import path from "path"; import { fileURLToPath } from "url
 import { entropyToMnemonic, mnemonicToSeed, validateMnemonic } from "@scure/bip39"; import { wordlist } from "@scure/bip39/wordlists/english";
 import { keccak256, toHex, toBytes, stringToBytes } from "viem";
 import * as H from "../web/zec-hop.js"; import { CHAINS, zcash as ZC } from "../web/chains.js"; import { buildQuoteRequest } from "../web/private-withdraw.js";
+H.setRpcRetry({ tries: 2, base: 1 });
 const WEB = path.join(path.dirname(fileURLToPath(import.meta.url)), "../web");
 let fails = 0; const ok = (name, pass, extra = "") => { console.log((pass ? "PASS " : "FAIL ") + name + (extra ? "  " + extra : "")); if (!pass) fails++; };
 const words = fs.readFileSync(path.join(WEB, "vendor/bip39-english.txt"), "utf8").trim().split("\n");
@@ -315,6 +316,8 @@ for (const [name, tk] of [["no txKnown available", undefined], ["txKnown cannot 
   ok("M4 a bogus count is refused", await H.startHop(mkCtx(makeWorld(), H.memStore(), { countPriorHops: async () => -1 })).then(() => false, () => true));
   const calls = [], TIP = H.PAY_FROM_BLOCK.rh + H.LOG_SPAN + 5, f = async (u, i) => { const b = JSON.parse(i.body); if (b.method === "eth_blockNumber") return { ok: true, json: async () => ({ result: "0x" + TIP.toString(16) }) }; calls.push(b); return { ok: true, json: async () => ({ result: calls.length === 1 ? [{}, {}, {}] : [{}] }) }; }, n = await H.makeCountPriorHops(rh, f)(STEALTH), c = calls[0], sig = keccak256(stringToBytes("AuthorizationUsed(address,bytes32)"));
   ok("M4 log scan starts at the pay contract and splits the range under the RPC cap", calls.length === 2 && parseInt(calls[0].params[0].fromBlock, 16) === H.PAY_FROM_BLOCK.rh && parseInt(calls[1].params[0].toBlock, 16) === TIP && calls.every(x => parseInt(x.params[0].toBlock, 16) - parseInt(x.params[0].fromBlock, 16) < 10_000_000));
+  { let k = 0; const flaky = async (u, i) => { const b = JSON.parse(i.body); if (b.method === "eth_blockNumber") return { ok: true, json: async () => ({ result: "0x" + (H.PAY_FROM_BLOCK.rh + 10).toString(16) }) }; return ++k === 1 ? { ok: false, status: 429, json: async () => ({}) } : { ok: true, json: async () => ({ result: [{}] }) }; };
+    ok("M4 a rate-limited RPC answer is retried", await H.makeCountPriorHops(rh, flaky)(STEALTH) === 1 && k === 2); }
   ok("M4 makeCountPriorHops = number of AuthorizationUsed logs of the stealth address on the token", n === 4 && c.method === "eth_getLogs" && c.params[0].address === rh.token.address && c.params[0].topics[0] === sig && H.AUTH_USED_TOPIC === sig && c.params[0].topics[1] === "0x" + "0".repeat(24) + STEALTH.slice(2)); }
 
 // ---------- M-5 nothing shared between the legs ----------

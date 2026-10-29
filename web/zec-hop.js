@@ -183,10 +183,13 @@ export function projectedLoss({ amountIn, inDec, outDec, paidOut, rate, zatsLeft
 }
 
 // ---------------------------------------------------------------- chain reads (M-1, M-4) and lightwalletd (M-2); all injectable in ctx
-const rpcCall = async (fetchFn, url, method, params) => {
+// Public RPCs (and wallets in front of them) answer 429 / "client error" under load: retry with backoff before giving up.
+export let RPC_RETRY = { tries: 4, base: 1500 };
+const rpcCall = (fetchFn, url, method, params) => retry(async () => {
   const r = await fetchFn(url, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ jsonrpc: "2.0", id: 1, method, params }) });
   const j = await r.json().catch(() => ({})); if (!r.ok || j.error || j.result === undefined) throw new Error("rpc " + method + " failed: " + ((j.error && j.error.message) || r.status)); return j.result;
-};
+}, RPC_RETRY);
+export const setRpcRetry = o => { RPC_RETRY = o; };
 const pad32 = h => String(h).replace(/^0x/, "").toLowerCase().padStart(64, "0");
 export const AUTH_STATE_SELECTOR = "0xe94a0102";                      // authorizationState(address,bytes32) of EIP-3009
 export const AUTH_USED_TOPIC = hex(keccak(enc("AuthorizationUsed(address,bytes32)")));
@@ -198,7 +201,7 @@ export const makeAuthUsed = (chain, fetchFn = fetch) => async (authorizer, nonce
 /** ctx.countPriorHops(stealth) -> number of AuthorizationUsed events of this stealth address on the token (every private withdraw spends exactly one). Counts every EIP-3009 use of the address, so it
  *  can only over-count (e.g. after a public withdraw), which skips a counter value but never reuses one. Same answer on every device. */
 // RPCs cap eth_getLogs at 10M blocks per call; a stealth address cannot authorize anything before the pay contract existed, so scan from there in windows.
-export const LOG_SPAN = 9_000_000, PAY_FROM_BLOCK = { rh: 100_761_230 };
+export const LOG_SPAN = 2_000_000, PAY_FROM_BLOCK = { rh: 100_761_230 };
 export const makeCountPriorHops = (chain, fetchFn = fetch) => async stealth => {
   const tip = Number(await rpcCall(fetchFn, chain.rpc, "eth_blockNumber", [])); if (!Number.isFinite(tip)) throw new Error("unexpected block number");
   let n = 0;
