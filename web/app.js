@@ -295,9 +295,9 @@ async function payStealth({ token, amount, d, own = false }) {
 /** Token payment with ONE signature and no gas for the payer: EIP-3009 ReceiveWithAuthorization bound (via the nonce) to this exact
  *  stealth address, key, tag, fee and fee recipient; our relayer submits StealthPay.payWithAuthorization and takes `fee` from the amount. */
 async function payGasless({ amount, d, ephLen, ephData, tagWord }) {
-  const stats = await api("/relay/stats").catch(() => { throw new Error("The relayer is not reachable. You can pay with your own gas instead."); });
-  if (!stats.pay_enabled || !isAddr(stats.relayer) || stats.pay_fee == null) throw new Error("Gasless payments are not available on " + C.name + " right now. You can pay with your own gas instead.");
-  if (String(stats.stealthpay || "").toLowerCase() !== STEALTHPAY.toLowerCase()) throw new Error("The relayer serves a different StealthPay contract; refusing. You can pay with your own gas instead.");
+  const stats = await api("/relay/stats").catch(() => { throw new Error("The relayer is not reachable."); });
+  if (!stats.pay_enabled || !isAddr(stats.relayer) || stats.pay_fee == null) throw new Error("Gasless payments are not available on " + C.name + " right now.");
+  if (String(stats.stealthpay || "").toLowerCase() !== STEALTHPAY.toLowerCase()) throw new Error("The relayer serves a different StealthPay contract; refusing.");
   const raw = BigInt(Math.round(amount * TUNIT)), fee = BigInt(stats.pay_fee), feeTo = stats.relayer;
   if (fee < 0n || fee >= raw) throw new Error("The amount is below the relayer fee (" + fmtTok(fee) + " " + SYM + ").");
   const bal = BigInt(await wallet("eth_call", [{ to: USDC, data: "0x70a08231" + padAddr(acct) }, "latest"]));
@@ -316,10 +316,27 @@ async function payGasless({ amount, d, ephLen, ephData, tagWord }) {
   const r = await fetch(API + "/relay/pay", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({
     token: USDC, amount: raw.toString(), stealth: d.stealth, eph: d.ephPub, viewTag: d.viewTag, fee: fee.toString(), feeRecipient: feeTo,
     auth: { from: acct, validAfter: "0", validBefore: String(validBefore), v: sig.v, r: sig.r, s: sig.s } }) });
-  const j = await r.json(); if (!r.ok || j.error) throw new Error((j.error || "relayer error") + ". You can pay with your own gas instead.");
+  const j = await r.json(); if (!r.ok || j.error) throw new Error((j.error || "relayer error") + ".");
   say("send-hint", "Submitted, tx " + j.hash.slice(0, 12) + "… waiting for the block…");
   return j.hash;
 }
+// ---- amount: "I send" or "receiver gets"; the gasless fee (from the relayer) is shown live and added or taken accordingly
+let payFee = null;
+api("/relay/stats").then(s => { if (s.pay_enabled && s.pay_fee != null) payFee = BigInt(s.pay_fee); calc(); }).catch(() => {});
+/** Returns { send, get, fee } in token units for the current inputs, or null. */
+function payAmounts() {
+  const v = Number($("amount").value); if (!(v > 0)) return null;
+  const raw = BigInt(Math.round(v * TUNIT)), fee = payFee ?? 0n;
+  return $("amt-mode").value === "get" ? { send: raw + fee, get: raw, fee } : { send: raw, get: raw - fee, fee };
+}
+function calc() {
+  const out = $("pay-calc"), a = payAmounts();
+  if ($("token").value !== "TOKEN") { out.textContent = a ? "Gas is paid from your wallet." : ""; return; }
+  if (!a) { out.textContent = payFee != null ? "Network fee " + fmtTok(payFee) + " " + SYM : ""; return; }
+  if (a.get <= 0n) { out.textContent = "Minimum is above the " + fmtTok(a.fee) + " " + SYM + " network fee."; return; }
+  out.textContent = "Receiver gets " + fmtTok(a.get) + " " + SYM + " (" + fmtTok(a.fee) + " network fee) · you send " + fmtTok(a.send);
+}
+["amount", "amt-mode", "token"].forEach(id => { $(id).addEventListener("input", calc); $(id).addEventListener("change", calc); });
 async function doPay(own) {
   try {
     if (!acct && !(await connect())) return;
@@ -329,8 +346,9 @@ async function doPay(own) {
     if (mc && mc.key !== C.key) throw new Error("This meta-address is for " + mc.name + ". Open this page with ?chain=" + mc.key + " to pay it.");
     const m = parseMeta(metaIn);
     await ensureChain();
-    const amount = Number($("amount").value); if (!(amount > 0)) throw new Error("enter an amount");
-    const token = $("token").value;
+    const token = $("token").value, a = payAmounts(); if (!a) throw new Error("enter an amount");
+    // "receiver gets" adds the fee on top for the gasless stablecoin path; the native coin has no fee in the amount
+    const amount = token === "TOKEN" ? Number(a.send) / TUNIT : Number($("amount").value);
     const d = deriveForPayment(m);
     say("send-hint", "Paying " + amount + " " + (token === "TOKEN" ? SYM : NAT) + " to a fresh address " + d.stealth.slice(0, 10) + "…");
     const tx = await payStealth({ token, amount, d, own });
@@ -339,4 +357,3 @@ async function doPay(own) {
   } catch (e) { say("send-hint", e.message || String(e), "bad"); }
 }
 $("btn-pay").addEventListener("click", () => doPay(false));
-$("btn-pay-own").addEventListener("click", () => doPay(true));

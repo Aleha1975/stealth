@@ -68,7 +68,7 @@ footer{padding:26px 0 40px;font-size:13px;color:var(--ink-faint);display:flex;ju
       <div class="eyebrow">private receive · <span class="chain-name">Robinhood Chain</span> · your keys, your device</div>
       <h1>Get paid to a <em>fresh address</em>, every time.</h1>
       <p class="lead">One link to receive. Every payment lands on a new address that only you can find and spend. No single address that tells the world your income, your balance and who pays you.</p>
-      <p class="note">Built on the ERC-5564 stealth-address standard already live on EVM chains. Keys are derived in your browser from one wallet signature and never leave it. We hold nothing: not your keys, not your funds. Open source, verified contracts.</p>
+      <p class="note">Your keys stay in your browser. We never hold your keys or funds.</p>
     </div>
 
     <div class="card" id="app">
@@ -81,13 +81,13 @@ footer{padding:26px 0 40px;font-size:13px;color:var(--ink-faint);display:flex;ju
 
       <div class="pane" id="pane-receive">
         <h3>Your receiving link</h3>
-        <p class="note">Sign one request to derive your keys. The same wallet always gives the same keys, so you can come back from any device. Key-based wallets only (MetaMask and the like); smart wallets and passkeys are refused because their signatures change.</p>
+        <p class="note">One signature gives your keys. Same wallet, same keys on any device.</p>
         <button class="btn" id="btn-keys">Derive my keys</button>
         <div id="recv-out" hidden>
           <div class="box"><div class="lbl">meta-address</div><div class="mono" id="meta"></div></div>
           <div class="box"><div class="lbl">pay link</div><div class="mono" id="paylink"></div></div>
           <div class="row"><button class="btn ghost" id="copy-link">Copy link</button><button class="btn ghost" id="copy-meta">Copy meta-address</button></div>
-          <p class="note" style="margin-top:12px">Give the link to whoever pays you. Each payment is announced on chain in a way only your keys can read.</p>
+          <p class="note" style="margin-top:12px">Share this link with whoever pays you.</p>
         </div>
         <div class="hint" id="recv-hint"></div>
       </div>
@@ -108,11 +108,11 @@ footer{padding:26px 0 40px;font-size:13px;color:var(--ink-faint);display:flex;ju
                 <label><input type="checkbox" id="wd-delay-on" style="width:auto;margin:0 8px 0 0"> add a random delay of up to <input id="wd-delay" value="5" inputmode="decimal" style="width:70px;display:inline-block;margin:0 6px"> min (the page waits; keep this tab open)</label>
                 <label>split into <select id="wd-parts" style="width:auto;display:inline-block;margin:6px 6px"><option value="1">1 part</option><option value="2">2 random parts</option><option value="3">3 random parts</option></select> (sent one after another)</label>
                 <div class="box" id="wd-quote" hidden></div>
-                <p class="note">Honest note: the deposit to NEAR Intents and the payout are both public on-chain. Matching amounts and timing can link them; splitting and a random delay help, they do not make it anonymous. Your main wallet is never used: a failed swap is refunded to this stealth address.</p>
+                <p class="note">Splitting and a random delay make the payout harder to link.</p>
               </div>
             </div>
             <div class="row"><button class="btn" id="btn-wd">Send without gas</button><button class="btn ghost" id="btn-wd-cancel">Cancel</button></div>
-            <p class="note">A relayer pays the gas and submits your signed <span class="tok-sym"></span> authorization; the stealth address never needs ETH, so nothing links it to your main wallet. The relayer cannot change the amount or the destination.</p>
+            <p class="note">No gas needed. The amount and address can’t be changed by anyone.</p>
           </div>
         </div>
         <div class="hint" id="pay-hint"></div>
@@ -122,12 +122,13 @@ footer{padding:26px 0 40px;font-size:13px;color:var(--ink-faint);display:flex;ju
         <h3>Pay to a stealth link</h3>
         <label>recipient meta-address or link</label><input id="to-meta" placeholder="st:…:0x… or https://app.deepyield.ai/stealth/?to=…" autocomplete="off" spellcheck="false">
         <div class="row" style="gap:16px">
-          <div style="flex:1"><label>amount</label><input id="amount" placeholder="25" inputmode="decimal"></div>
+          <div style="flex:1"><label>amount <select id="amt-mode" style="width:auto;display:inline-block;margin:0 0 0 6px;padding:2px 6px"><option value="send">I send</option><option value="get">receiver gets</option></select></label><input id="amount" placeholder="25" inputmode="decimal"></div>
           <div style="width:120px"><label>token</label><select id="token"><option value="TOKEN"></option><option value="NATIVE"></option></select></div>
         </div>
-        <div class="row"><button class="btn" id="btn-pay">Pay</button><button class="btn ghost" id="btn-pay-own" title="Two transactions (approve, then pay), you pay the gas">Pay with my own gas</button></div>
+        <div class="note" id="pay-calc"></div>
+        <div class="row"><button class="btn" id="btn-pay">Pay</button></div>
         <div class="hint" id="send-hint"></div>
-        <p class="note">For the stablecoin you sign once and pay no gas: a relayer submits your signed authorization and keeps a small fee out of the amount (shown before you sign). The money goes to a one-time address derived for this payment and the announcement is published in the same transaction. "Pay with my own gas" and the native coin are sent from your wallet instead. Your own address stays visible as the sender, as in any on-chain payment.</p>
+        <p class="note">One signature, no gas. Your address is visible as the sender.</p>
       </div>
     </div>
   </section>
