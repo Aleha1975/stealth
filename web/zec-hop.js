@@ -210,7 +210,9 @@ export async function runHop(ctx) {
         st.outTx = hex(unhex(st.outRaw).slice(0, 32).reverse()).slice(2); await save();
         await PW.submitDeposit({ base, txHash: st.outTx, depositAddress: oq.depositAddress, fetchFn }).catch(() => {});
       }
-      const fin = await poll(oq.depositAddress, "Swap from ZEC", 90 * 60_000), a = afterOut(st, fin.status); await go(a.step, a);
+      const fin = await poll(oq.depositAddress, "Swap from ZEC", 90 * 60_000), a = afterOut(st, fin.status);
+      if (a.step === "DONE") { const t = (((fin.swapDetails || {}).destinationChainTxHashes) || [])[0]; if (t && t.hash) a.payoutTx = { hash: String(t.hash), url: String(t.explorerUrl || "") }; a.doneAt = Date.now(); }
+      await go(a.step, a);
     },
   };
   for (st.err = null; !DONE_STEPS.has(st.step) && st.step !== ctx.stopAt;) {

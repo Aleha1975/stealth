@@ -2,6 +2,7 @@ import { keysFromSignature, keyRequestTypedData, metaAddress, parseMeta, deriveF
 import { paymentNonce, receiveTypedData, splitSig } from "./pay-auth.js";
 import { CHAINS, pickChain, chainOfMeta, addChainParams } from "./chains.js";
 import * as PW from "./private-withdraw.js";
+import { hopCard } from "./hop-card.js";
 
 const C = pickChain(), TOK = C.token, SYM = TOK.symbol, NAT = C.native.symbol;
 const USDC = TOK.address, STEALTHPAY = C.stealthPay, CHAIN_HEX = C.chainHex, API = C.api || "/stealth-api";
@@ -155,15 +156,28 @@ async function scan() {
     if (n % 2000 === 0 && n) say("pay-hint", n + " announcements checked…");
     if (!d.rows.length || d.next === since) break; since = d.next;
   }
-  if (found.length) {
-    const b = await api("/balances?addrs=" + found.map(f => f.stealth).join(","));
-    for (const f of found) { const x = b[f.stealth.toLowerCase()] || {}; f.usdc = BigInt(x.usdc || "0"); f.eth = BigInt(x.eth || "0");
-      const sp = spent.get(f.stealth.toLowerCase()); if (sp && Date.now() < sp.until && f.usdc > sp.left) f.usdc = sp.left; }
-  }
+  await refreshBalances(false);
   render(); showResume().catch(() => {});
   const msg = n + " announcements scanned, " + found.length + " are yours.";
   if (head.lag != null && head.lag > 50) say("pay-hint", msg + " Index is " + head.lag + " blocks behind.", "warn"); else say("pay-hint", msg, "ok");
 }
+async function refreshBalances(redraw = true) {
+  if (!found.length) return;
+  const list = found, b = await api("/balances?addrs=" + list.map(f => f.stealth).join(","));
+  for (const f of list) { const x = b[f.stealth.toLowerCase()] || {}; f.usdc = BigInt(x.usdc || "0"); f.eth = BigInt(x.eth || "0");
+    const sp = spent.get(f.stealth.toLowerCase()); if (sp && Date.now() < sp.until && f.usdc > sp.left) f.usdc = sp.left; }
+  if (redraw && list === found) render();
+}
+// ---- private transfers in flight or unfinished: stealth -> { f, hit, st, msg, running, extra }; drawn as cards at the top of My payments
+const hops = new Map(), TERMINAL = ["DONE", "FAILED_IN", "FAILED"];
+const activeHop = f => { const h = hops.get(f.stealth.toLowerCase()); return h && !TERMINAL.includes(h.st.step) ? h : null; };
+function renderHops() {
+  const box = $("hop-resume"); box.textContent = "";
+  for (const [k, h] of hops) box.appendChild(hopCard(h, { onContinue: b => { b.disabled = true; runHop(h.f, h.hit, null).catch(e => say("pay-hint", e.message || String(e), "bad")); },
+    onFunds: b => { b.disabled = true; runHop(h.f, h.hit, null).catch(e => say("pay-hint", e.message || String(e), "bad")); }, onDismiss: () => { hops.delete(k); renderHops(); } }));
+  box.hidden = !hops.size;
+}
+setInterval(() => { if ([...hops.values()].some(h => h.running)) renderHops(); }, 1000);
 function render() {
   const list = $("pay-list"); list.textContent = "";
   if (!found.length) { list.appendChild(el("p", "note", "Nothing found yet. Payments appear a few seconds after they land.")); return; }
@@ -172,9 +186,10 @@ function render() {
     const label = f.token === "ETH" ? (Number(f.amount) / NUNIT).toFixed(5) + " " + NAT : f.token && f.token.toLowerCase() === USDC.toLowerCase() ? fmtTok(f.amount) + " " + SYM : "payment";
     top.appendChild(el("span", "amt", label)); top.appendChild(el("span", "mono", f.stealth.slice(0, 8) + "…" + f.stealth.slice(-4)));
     row.appendChild(top);
-    const small = el("small", null, "block " + f.block + " · now holds " + fmtTok(f.usdc) + " " + SYM + (f.eth ? " + " + (Number(f.eth) / NUNIT).toFixed(5) + " " + NAT : "") + " · ");
+    const hp = activeHop(f);
+    const small = el("small", null, "block " + f.block + " · " + (hp ? fmtTok(BigInt(hp.st.amount)) + " " + SYM + " · in private transfer" : "now holds " + fmtTok(f.usdc) + " " + SYM + (f.eth ? " + " + (Number(f.eth) / NUNIT).toFixed(5) + " " + NAT : "")) + " · ");
     const a = el("a", null, "tx"); a.href = C.explorer + "/tx/" + f.tx; a.target = "_blank"; a.rel = "noopener noreferrer"; small.appendChild(a); row.appendChild(small);
-    if (f.usdc > 0n) { const d = el("div"); d.style.marginTop = "8px"; const b = el("button", "btn ghost", "Withdraw " + SYM); b.type = "button"; b.addEventListener("click", () => openWithdraw(i)); d.appendChild(b); row.appendChild(d); }
+    if (!hp && f.usdc > 0n) { const d = el("div"); d.style.marginTop = "8px"; const b = el("button", "btn ghost", "Withdraw " + SYM); b.type = "button"; b.addEventListener("click", () => openWithdraw(i)); d.appendChild(b); row.appendChild(d); }
     list.appendChild(row);
   });
 }
@@ -193,22 +208,37 @@ function openWithdraw(i) {
 // ---- private withdraw: preview (two dry quotes) first, then a second click starts the hop. Any input change drops the preview.
 let pv = null, HOPM = null;
 const hopMod = () => HOPM || (HOPM = import("./zec-hop.js"));
-function pvReset() { pv = null; $("wd-quote").hidden = true; $("btn-wd").textContent = $("wd-private").checked ? "Preview private send" : "Send without gas"; }
+function pvReset() { pv = null; $("wd-quote").hidden = true; $("btn-wd").textContent = $("wd-private").checked ? "Preview" : "Send without gas"; }
 $("wd-private").addEventListener("change", () => { $("wd-priv-opts").hidden = !$("wd-private").checked; pvReset(); });
 ["wd-to", "wd-amt", "wd-dest"].forEach(id => { $(id).addEventListener("input", pvReset); $(id).addEventListener("change", pvReset); });
 const hopCtx = async (HM, f, hit, o) => ({ store: HM.idbStore(), stealth: f.stealth, priv: hit.stealthPriv, chain: C, api: API, words: await HM.loadWords(), loadZjs: HM.sharedZjs, waitReceipt, randomNonce: randomBytes32,
-  balance: async () => BigInt(((await api("/balances?addrs=" + f.stealth))[f.stealth.toLowerCase()] || {}).usdc || "0"), onProgress: (s, m) => say("pay-hint", HM.progressText(s) + (m ? "\n" + m : "")), ...o });
+  balance: async () => BigInt(((await api("/balances?addrs=" + f.stealth))[f.stealth.toLowerCase()] || {}).usdc || "0"), onProgress: (s, m) => hopProgress(f, s, m), ...o });
+function hopProgress(f, s, m) {
+  const k = f.stealth.toLowerCase(), h = hops.get(k); if (!h) return;
+  h.st = s; h.msg = m || "";
+  if (s.relayed && s.inQuote && !h.sp) {                          // the deposit leg has left the stealth address: stop showing its old balance
+    h.sp = true; const amtIn = BigInt(s.inQuote.amountIn);
+    spent.set(k, { left: f.usdc > amtIn ? f.usdc - amtIn : 0n, until: Date.now() + 120_000 }); render(); setTimeout(() => refreshBalances().catch(() => {}), 3000);
+  }
+  renderHops();
+}
 /** start (o = { recipient, amount, dest }) or resume (o = null) the hop of one found payment; one tab at a time per address */
 async function runHop(f, hit, o) {
-  const HM = await hopMod(), ctx = await hopCtx(HM, f, hit, o || {});
-  if (!o) { const r = await HM.findHop(ctx.store, f.stealth); if (!r) throw new Error("nothing to resume"); ctx.chain = CHAINS[r.rec.st.chain]; ctx.dest = CHAINS[r.rec.st.dest]; }
-  const run = () => (o ? HM.startHop(ctx) : HM.runHop(ctx)), key = "zec-hop:" + f.stealth.toLowerCase();
-  const st = await (navigator.locks ? navigator.locks.request(key, { ifAvailable: true }, l => l ? run() : Promise.reject(new Error("This transfer is already running in another tab."))) : run());
-  if (st.relayed) spent.set(f.stealth.toLowerCase(), { left: f.usdc > BigInt(st.inQuote.amountIn) ? f.usdc - BigInt(st.inQuote.amountIn) : 0n, until: Date.now() + 120_000 });
-  if (st.step === "DONE") { const m = "Done privately: " + fmtTok(BigInt(st.amount)) + " " + SYM + " sent to " + st.recipient.slice(0, 8) + "… on " + CHAINS[st.dest].name + "."; say("pay-hint", m, "ok"); await scan(); $("pay-hint").textContent = m + "\n" + $("pay-hint").textContent; return; }
-  let msg = HM.recoveryText(st);
-  if (st.step === "FAILED") try { const rec = (await HM.findHop(ctx.store, f.stealth)).rec; msg += "\n" + (await HM.hopSummary(ctx, rec)).filter(x => x.transparent + x.orchard > 0n).map(x => "Hop wallet account " + x.account + ": " + x.t + " " + (Number(x.transparent) / 1e8) + " ZEC transparent, " + (Number(x.orchard) / 1e8) + " ZEC shielded").join("\n"); } catch (e) { msg += " (could not read the hop wallet: " + e.message + ")"; }
-  say("pay-hint", msg, st.step === "FAILED_IN" ? "warn" : "bad"); await showResume();
+  const k = f.stealth.toLowerCase(); if ((hops.get(k) || {}).running) return;
+  const HM = await hopMod(), ctx = await hopCtx(HM, f, hit, o || {}), key = "zec-hop:" + k;
+  let h;
+  if (o) h = { f, hit, running: true, msg: "", st: { step: "QUOTE_IN", chain: C.key, dest: o.dest.key, amount: o.amount.toString(), recipient: o.recipient, startedAt: Date.now() } };
+  else { const r = await HM.findHop(ctx.store, f.stealth); if (!r) throw new Error("nothing to resume"); ctx.chain = CHAINS[r.rec.st.chain]; ctx.dest = CHAINS[r.rec.st.dest]; h = { f, hit, running: true, msg: "", st: r.rec.st }; }
+  hops.set(k, h); say("pay-hint", ""); renderHops(); render();
+  const run = () => (o ? HM.startHop(ctx) : HM.runHop(ctx));
+  let st;
+  try { st = await (navigator.locks ? navigator.locks.request(key, { ifAvailable: true }, l => l ? run() : Promise.reject(new Error("This transfer is already running in another tab."))) : run()); }
+  catch (e) { if (o) hops.delete(k); else h.running = false; renderHops(); render(); throw e; }
+  h.st = st; h.running = false;
+  if (st.relayed && st.inQuote && !h.sp) { const amtIn = BigInt(st.inQuote.amountIn); spent.set(k, { left: f.usdc > amtIn ? f.usdc - amtIn : 0n, until: Date.now() + 120_000 }); }
+  if (st.step === "FAILED_IN") spent.delete(k);
+  if (st.step === "FAILED") try { const rec = (await HM.findHop(ctx.store, f.stealth)).rec; h.extra = (await HM.hopSummary(ctx, rec)).filter(x => x.transparent + x.orchard > 0n).map(x => "Hop wallet account " + x.account + ": " + (Number(x.transparent) / 1e8) + " ZEC transparent, " + (Number(x.orchard) / 1e8) + " ZEC shielded").join("\n"); } catch (e) { h.extra = "Could not read the hop wallet: " + e.message; }
+  renderHops(); render(); await refreshBalances().catch(() => {});
 }
 async function privateWithdraw(to, value, hit) {
   const dest = CHAINS[$("wd-dest").value]; if (!dest || !dest.oneClick) throw new Error("pick a destination chain");
@@ -219,26 +249,27 @@ async function privateWithdraw(to, value, hit) {
     if (!HM.okSize(zec)) throw new Error("Too small for the private route. Try a larger amount.");
     const q2 = await PW.requestQuote({ base: PW.ONECLICK, req: HM.reqOut({ dest, amount: HM.outAmount(zec - HM.SHIELD_FEE), recipient: to, refundT: HM.DRY_T, dry: true }) });
     const out = BigInt(q2.quote.amountOut), fee = value - out, box = $("wd-quote"); box.textContent = "";
-    box.appendChild(el("div", null, "You send " + fmtTok(value) + " " + SYM + "; the recipient gets about " + (Number(out) / 10 ** dest.token.decimals).toFixed(2) + " " + dest.token.symbol + " on " + dest.name + "."));
-    box.appendChild(el("div", "note", "Fees about " + (Number(fee) / TUNIT).toFixed(2) + " (" + (Number(fee) / Number(value) * 100).toFixed(1) + "%) · ~" + HM.ETA_MIN + " min · keep this tab open."));
-    box.hidden = false; pv = { key }; $("btn-wd").textContent = "Confirm: send privately";
-    say("pay-hint", "Check the quote above, then press Confirm.", "warn"); return;
+    const pct = (Number(fee) / Number(value) * 100).toFixed(1), qt = el("div", "qt"), c1 = el("div"), c2 = el("div");
+    c1.appendChild(el("span", "note", "Recipient gets")); c1.appendChild(el("span", "big", "≈ " + (Number(out) / 10 ** dest.token.decimals).toFixed(2) + " " + dest.token.symbol));
+    c2.appendChild(el("span", "note", "Fee")); c2.appendChild(el("span", "big", "≈ " + (Number(fee) / TUNIT).toFixed(2) + " (" + pct + "%)"));
+    qt.appendChild(c1); qt.appendChild(c2); box.appendChild(qt); box.appendChild(el("div", "note", "~" + HM.ETA_MIN + " min · keep this tab open"));
+    box.hidden = false; pv = { key }; $("btn-wd").textContent = "Confirm private transfer";
+    say("pay-hint", "Check the quote, then confirm.", "warn"); return;
   }
   $("btn-wd").disabled = true; $("withdraw").hidden = true;
   try { await runHop(wd, hit, { recipient: to, amount: value, dest }); } finally { $("btn-wd").disabled = false; pvReset(); }
 }
 // ---- unfinished hops of the payments found: banner with Resume (needs the keys, so it appears after Scan)
 async function showResume() {
-  const box = $("hop-resume"); box.hidden = true; box.textContent = "";
   if (!self.crossOriginIsolated || !keys || !((await (indexedDB.databases ? indexedDB.databases() : [])) || []).some(d => d.name === "stealth-zec-hop")) return;
   const HM = await hopMod(), store = HM.idbStore();
   for (const f of found) {
+    const k = f.stealth.toLowerCase(); if ((hops.get(k) || {}).running) continue;
     const r = await HM.findHop(store, f.stealth); if (!r || ["DONE", "FAILED_IN"].includes(r.rec.st.step)) continue;
-    const hit = checkAnnouncement(keys, f.eph, null); if (!hit || hit.stealth.toLowerCase() !== f.stealth.toLowerCase()) continue;
-    const row = el("div", "row"), b = el("button", "btn", r.rec.st.step === "FAILED" ? "Show funds" : "Resume"); b.type = "button";
-    b.addEventListener("click", () => { b.disabled = true; runHop(f, hit, null).catch(e => say("pay-hint", e.message || String(e), "bad")).finally(() => { b.disabled = false; }); });
-    row.appendChild(el("span", "note", f.stealth.slice(0, 8) + "… · " + HM.progressText(r.rec.st))); row.appendChild(b); box.appendChild(row); box.hidden = false;
+    const hit = checkAnnouncement(keys, f.eph, null); if (!hit || hit.stealth.toLowerCase() !== k) continue;
+    hops.set(k, { f, hit, running: false, msg: "", st: r.rec.st });
   }
+  renderHops(); render();
 }
 $("btn-wd-cancel").addEventListener("click", () => { $("withdraw").hidden = true; wd = null; });
 const TYPEHASH = keccak(new TextEncoder().encode("TransferWithAuthorization(address from,address to,uint256 value,uint256 validAfter,uint256 validBefore,bytes32 nonce)"));
