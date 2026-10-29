@@ -34,7 +34,7 @@ if (q.get("to")) { $("to-meta").value = q.get("to"); document.querySelector('[da
 async function api(path) { const r = await fetch(API + path, { cache: "no-store" }); const d = await r.json(); if (!r.ok || d.error) throw new Error(d.error || ("api " + r.status)); return d; }
 async function wallet(method, params) { return window.ethereum.request({ method, params }); }
 function setAcct(a) {
-  const changed = acct && a && a !== acct;
+  const changed = acct && (a || "").toLowerCase() !== acct;
   acct = a ? a.toLowerCase() : null;
   $("wbtn").textContent = acct ? acct.slice(0, 6) + "…" + acct.slice(-4) : "Connect wallet"; $("wbtn").classList.toggle("on", !!acct);
   if (changed) { keys = null; found = []; $("recv-out").hidden = true; $("pay-list").textContent = ""; $("withdraw").hidden = true; say("recv-hint", "Account changed: derive the keys again for this account.", "warn"); }
@@ -42,6 +42,13 @@ function setAcct(a) {
 async function connect() {
   if (!window.ethereum) { say("recv-hint", "No wallet found. Open this page inside MetaMask.", "bad"); return null; }
   const a = await wallet("eth_requestAccounts", []); setAcct(a[0]); return acct;
+}
+// already connected: open the wallet's account picker so another account can be chosen
+async function switchAccount() {
+  if (!window.ethereum) return connect();
+  try { await wallet("wallet_requestPermissions", [{ eth_accounts: {} }]); }
+  catch (e) { if (e && e.code === 4001) return acct; say("recv-hint", "Your wallet cannot open an account picker here: switch the account in the wallet itself, the page follows it.", "warn"); return acct; }
+  const a = await wallet("eth_accounts", []); setAcct(a && a[0]); return acct;
 }
 async function ensureChain() {
   const cur = async () => String(await wallet("eth_chainId", [])).toLowerCase();
@@ -54,7 +61,7 @@ async function ensureChain() {
   }
   if ((await cur()) !== CHAIN_HEX) throw new Error("switch your wallet to " + C.name);
 }
-$("wbtn").addEventListener("click", () => connect().catch(e => say("recv-hint", e.message || String(e), "bad")));
+$("wbtn").addEventListener("click", () => (acct ? switchAccount() : connect()).catch(e => say("recv-hint", e.message || String(e), "bad")));
 if (window.ethereum) {
   wallet("eth_accounts", []).then(a => { if (a && a.length) setAcct(a[0]); }).catch(() => {});
   window.ethereum.on && window.ethereum.on("accountsChanged", a => setAcct(a && a[0]));
