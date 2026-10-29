@@ -170,7 +170,7 @@ async function refreshBalances(redraw = true) {
   if (redraw && list === found) render();
 }
 // ---- private transfers in flight or unfinished: stealth -> { f, hit, st, msg, running, extra }; drawn as cards at the top of My payments
-const hops = new Map(), TERMINAL = ["DONE", "FAILED_IN", "FAILED"];
+const autoTries = new Map(), hops = new Map(), TERMINAL = ["DONE", "FAILED_IN", "FAILED"];
 const activeHop = f => { const h = hops.get(f.stealth.toLowerCase()); return h && !TERMINAL.includes(h.st.step) ? h : null; };
 function renderHops() {
   const box = $("hop-resume"); box.textContent = "";
@@ -243,6 +243,7 @@ $("btn-scan").addEventListener("click", () => scan().catch(e => say("pay-hint", 
 // ---- withdraw the stablecoin gaslessly: EIP-3009 authorization signed by the stealth key, submitted by the relayer
 let wd = null;
 function openWithdraw(i) {
+  if (activeHop(found[i])) { $("withdraw").hidden = true; say("pay-hint", "This payment has a transfer in progress: use the card above.", "warn"); return; }
   wd = found[i]; $("wd-from").textContent = wd.stealth; $("wd-to").value = ""; $("wd-amt").value = ""; $("withdraw").hidden = false;
   // Private = the hidden Zcash hop (web/zec-hop.js): offered only on a cross-origin isolated page, on chains with 1Click, and only if the module loads; then it is on by default
   const mine = wd; $("wd-priv-wrap").hidden = true; $("wd-private").checked = false; $("wd-priv-opts").hidden = true; pvReset();
@@ -285,6 +286,11 @@ async function runHop(f, hit, o) {
   try { st = await (navigator.locks ? navigator.locks.request(key, { ifAvailable: true }, l => l ? run() : Promise.reject(new Error("This transfer is already running in another tab."))) : run()); }
   catch (e) { if (o) hops.delete(k); else h.running = false; renderHops(); render(); throw e; }
   h.st = st; h.running = false;
+  // transient failures (network, RPC, quote service) resume on their own: 1, 2, 4, 8, 16 min; a deliberate stop (a failed check) waits for the user
+  if (!TERMINAL.includes(st.step) && st.err && !st.halted && (autoTries.get(k) || 0) < 5) {
+    const n = (autoTries.get(k) || 0) + 1; autoTries.set(k, n); h.retryAt = Date.now() + 60_000 * 2 ** (n - 1);
+    setTimeout(() => runHop(f, hit, null).catch(e => say("pay-hint", e.message || String(e), "bad")), h.retryAt - Date.now());
+  } else if (TERMINAL.includes(st.step)) autoTries.delete(k);
   if (st.relayed && st.inQuote && !h.sp) { const amtIn = BigInt(st.inQuote.amountIn); spent.set(k, { left: f.usdc > amtIn ? f.usdc - amtIn : 0n, until: Date.now() + 120_000 }); }
   if (st.step === "FAILED_IN") spent.delete(k);
   if (st.step === "FAILED") try { const rec = (await HM.findHop(ctx.store, f.stealth)).rec; h.extra = (await HM.hopSummary(ctx, rec)).filter(x => x.transparent + x.orchard > 0n).map(x => "Hop wallet account " + x.account + ": " + (Number(x.transparent) / 1e8) + " ZEC transparent, " + (Number(x.orchard) / 1e8) + " ZEC shielded").join("\n"); } catch (e) { h.extra = "Could not read the hop wallet: " + e.message; }

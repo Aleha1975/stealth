@@ -65,7 +65,7 @@ export function hopView(h, now = Date.now()) {
     v.line = v.what + " · " + (left != null ? fmtElapsed(left * 1000) + " left" : ui.wait);
   } else {
     const early = idx < STEPS.indexOf("WAIT_T");               // nothing has left the stealth address yet / no ZEC exists yet
-    v.kind = "warn"; v.title = "Transfer paused"; v.body = (st.err ? "Stopped: " + st.err + ". " : "") + (early ? "Your money has not moved." : "Your funds are safe.") + " Press Continue transfer to try again.";
+    v.kind = "warn"; v.title = "Transfer paused"; v.body = (h.retryAt && h.retryAt > now ? "Network hiccup, retrying by itself in " + Math.max(1, Math.ceil((h.retryAt - now) / 60_000)) + " min. " : st.err ? "Stopped: " + st.err + ". " : "") + (early ? "Your money has not moved." : "Your funds are safe.") + " Press Continue transfer to try again.";
     v.action = "continue"; v.detail = ""; v.zec = !early; v.pct = shownPct((st.stealth || "") + "#" + (st.n || 0), st, remainingMs(st, now), now);
   }
   return v;

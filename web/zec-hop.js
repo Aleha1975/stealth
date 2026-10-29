@@ -437,9 +437,9 @@ export async function runHop(ctx) {
       await go(a.step, a);
     },
   };
-  for (st.err = null; !DONE_STEPS.has(st.step) && st.step !== ctx.stopAt;) {
+  for (st.err = null, st.halted = false; !DONE_STEPS.has(st.step) && st.step !== ctx.stopAt;) {
     if (st.dry && !["QUOTE_IN", "DEPOSIT_IN"].includes(st.step)) { st.err = "dry run stops here"; break; }
-    try { await retry(() => H[st.step](), { sleep }); } catch (e) { st.err = e.message || String(e); break; }
+    try { await retry(() => H[st.step](), { sleep }); } catch (e) { st.err = e.message || String(e); st.halted = e instanceof Halt; break; }   // halted = a deliberate stop (checks); otherwise a transient failure the app may retry
   }
   await save(); say(st.err || progressText(st)); return st;
 }
