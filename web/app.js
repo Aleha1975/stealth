@@ -194,7 +194,7 @@ async function returnZec(h, card) {
   const line = el("div", "hop-line", "Looking for the ZEC…"); card.appendChild(line); const step = t => { line.textContent = t; };
   const seed = await HM.mnemonicSeed(await HM.mnemonicFor(h.hit.stealthPriv, await HM.loadWords(), h.st.n || 0));
   let key = null, utxos = [];
-  for (let a = 0; a < 4 && !utxos.length; a++) for (let i = 0; i < 3 && !utxos.length; i++) { key = ZR.deriveT(seed, ZR.tPath(a, i)); utxos = await ZR.getUtxos(ZC.lightwalletd, key.addr); }
+  for (let a = 0; a < 4 && !utxos.length; a++) for (let i = 0; i < 3 && !utxos.length; i++) { key = ZR.deriveT(seed, ZR.tPath(a, i)); utxos = ZR.sweepSet(await ZR.getUtxos(ZC.lightwalletd, key.addr)); }
   if (!utxos.length) {                                   // nothing transparent left: if the shielded side is empty too, this transfer is over (e.g. returned earlier)
     step("Checking the shielded balance…");
     const r = await HM.findHop(HM.idbStore(), h.f.stealth), left = await HM.hopSummary(await hopCtx(HM, h.f, h.hit, null), r && r.rec);
@@ -205,9 +205,9 @@ async function returnZec(h, card) {
   step("Getting a quote…");
   const j = await PW.requestQuote({ req: HM.reqOut({ dest: C, amount, recipient: acct, refundT: key.addr }), okDeposit: a => /^t1[1-9A-HJ-NP-Za-km-z]{33}$/.test(a || "") });
   step("Sending " + (Number(amount) / 1e8) + " ZEC…");
-  const sw = ZR.buildSweep({ utxos, key, to: j.quote.depositAddress });
+  const sw = ZR.buildSweep({ utxos, key, to: j.quote.depositAddress, tip: await ZR.getTip(ZC.lightwalletd) });
   if (sw.amount !== BigInt(j.quote.amountIn)) throw new Error("amount mismatch; refusing");
-  await ZR.broadcast(ZC.lightwalletd, sw.raw);
+  await ZR.broadcast(ZC.lightwalletd, sw.raw, undefined, sw.txid);
   await PW.submitDeposit({ txHash: sw.txid, depositAddress: j.quote.depositAddress }).catch(() => {});
   const fin = await PW.pollStatus({ depositAddress: j.quote.depositAddress, timeoutMs: 60 * 60_000, intervalMs: 10_000, onUpdate: s => step("Returning · " + s.status.toLowerCase().replace(/_/g, " ") + " · usually 10–20 min") });
   step(fin.status === "SUCCESS" ? "Done: ≈ " + (Number(j.quote.amountOut) / 1e6).toFixed(2) + " " + SYM + " sent to your wallet." : "Swap ended as " + fin.status + ". The ZEC is back on the hop address; press Return money again.");

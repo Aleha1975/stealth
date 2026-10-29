@@ -8,7 +8,7 @@ import { blake2b, sha256, sha512, hmac, ripemd160 } from "./vendor/zec-hash.js";
 export const NU6_3_BRANCH = 0x37a5165b;        // librustzcash zcash_protocol BranchId::Nu6_3 (mainnet activation 3,428,143)
 export const V5_GROUP = 0x26a7270a, V5_HEADER = (5 | 0x80000000) >>> 0;
 export const FEE = 10_000n;                     // ZIP-317: max(2, logical actions) * 5000 for 1 in / 1 out
-export const sweepFee = nIn => 5_000n * BigInt(Math.max(2, nIn));   // n входов, 1 выход: logical actions = max(n, 1)
+export const sweepFee = nIn => 5_000n * BigInt(Math.max(2, nIn));   // n inputs, 1 output: at least the ZIP-317 conventional fee (overpays by one action per ~75 inputs, never underpays)
 const P2PKH = [0x1c, 0xb8], P2SH = [0x1c, 0xbd];
 const B58 = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
 const enc = s => new TextEncoder().encode(s);
@@ -47,6 +47,7 @@ const N = secp256k1.CURVE.n, H = 0x80000000;
 const toBig = b => BigInt("0x" + hex(b)), to32 = n => unhex(n.toString(16).padStart(64, "0"));
 export function deriveT(seed, path) {
   let I = hmac(sha512, enc("Bitcoin seed"), seed), k = toBig(I.slice(0, 32)), c = I.slice(32);
+  if (k === 0n || k >= N) throw new Error("bip32: invalid master key");
   for (const i of path) {
     const data = i >= H ? cat(Uint8Array.of(0), to32(k), u32be(i)) : cat(secp256k1.getPublicKey(to32(k), true), u32be(i));
     I = hmac(sha512, c, data); const t = toBig(I.slice(0, 32)); if (t >= N) throw new Error("bip32: invalid child");
@@ -100,53 +101,130 @@ export function signAll(tx, key) {
   });
   return { ...tx, vin };
 }
-/** Sweep all UTXOs of one key to `to` (amount = total - sweepFee(inputs), no change). */
-export function buildSweep({ utxos, key, to, branch = NU6_3_BRANCH, expiry = 0 }) {
+export const BRANCH_ACTIVATION = 3_428_143;      // NU6.3 mainnet activation height: below it 0x37a5165b is not valid, so we refuse (a newer upgrade needs a code update, fail closed)
+export const EXPIRY_DELTA = 40;                  // ZIP 203 default: the tx dies 40 blocks after the tip it was built on
+export const MIN_INPUT = 5_001n;                 // an input worth <= its own 5000 zat of fee is net negative: skipped
+export const MAX_INPUTS = 50;                    // per transaction (far below the 100 kB standardness limit); the rest is swept by the next press
+const MAX_TIP = 0x7fffffff, MAX_MONEY = 2_100_000_000_000_000n;
+/** Consensus branch id for the chain tip height. Refuses heights below the NU6.3 activation. */
+export function branchForHeight(h) {
+  if (!Number.isInteger(h) || h < BRANCH_ACTIVATION || h > MAX_TIP) throw new Error("chain tip " + h + " is below the NU6.3 activation (or invalid); refusing to build");
+  return NU6_3_BRANCH;
+}
+/** What a sweep will actually spend: skips dust, biggest first, at most MAX_INPUTS. buildSweep applies it too, so callers can size quotes with the same set. */
+export const sweepSet = utxos => utxos.filter(u => BigInt(u.value) >= MIN_INPUT).sort((a, b) => (BigInt(b.value) > BigInt(a.value) ? 1 : BigInt(b.value) < BigInt(a.value) ? -1 : 0)).slice(0, MAX_INPUTS);
+/** Sweep the UTXOs of one key to `to` (amount = total - sweepFee(inputs), no change). Pass `tip` (GetLatestBlock height): branch id comes from it and the tx expires at tip + 40.
+ *  Without `tip` an explicit `branch` AND `expiry` are required (tests / replays); nothing defaults to "never expires". */
+export function buildSweep({ utxos, key, to, tip, branch, expiry }) {
+  if (tip !== undefined) { branch = branchForHeight(tip); expiry = tip + EXPIRY_DELTA; for (const u of utxos) if (u.height > tip) throw new Error("UTXO is above the reported tip; refusing"); }
+  else if (!(branch >= 0) || !(expiry > 0)) throw new Error("tip (or explicit branch and expiry) required");
+  if (!(expiry > 0 && expiry < 500_000_000)) throw new Error("bad expiry height");
+  utxos = sweepSet(utxos); if (!utxos.length) throw new Error("nothing to send");
   const total = utxos.reduce((s, u) => s + BigInt(u.value), 0n), amount = total - sweepFee(utxos.length);
   if (amount <= 0n) throw new Error("nothing to send");
   const script = cat(Uint8Array.of(0x76, 0xa9, 0x14), ripemd160(sha256(key.pub)), Uint8Array.of(0x88, 0xac));
   const tx = { branch, lockTime: 0, expiry, vin: utxos.map(u => ({ txid: u.txid, n: u.n, seq: 0xffffffff, value: BigInt(u.value), script })), vout: [{ value: amount, script: tAddrScript(to) }] };
   for (const u of utxos) if (u.script && hex(u.script) !== hex(script)) throw new Error("UTXO is not this key's");
   const signed = signAll(tx, key);
-  return { raw: serialize(signed), txid: txid(signed), amount };
+  return { raw: serialize(signed), txid: txid(signed), amount, expiry, branch };
 }
 
-// ---- lightwalletd over gRPC-web (unary calls only)
+// ---- lightwalletd over gRPC-web (unary calls only). Everything from the server is untrusted: bounded, parsed strictly, fail closed.
+const MAX_FRAME = 1 << 20, MAX_BODY = 2 << 20, TIMEOUT_MS = 20_000;
 const pbVarint = n => { n = BigInt(n); const o = []; do { let b = Number(n & 127n); n >>= 7n; if (n) b |= 128; o.push(b); } while (n); return Uint8Array.from(o); };
 const pbField = (no, wire, body) => cat(pbVarint(no << 3 | wire), wire === 2 ? cat(pbVarint(body.length), body) : body);
 function pbRead(b) {
   const out = []; let i = 0;
-  const vi = () => { let n = 0n, s = 0n; for (;;) { const x = b[i++]; n |= BigInt(x & 127) << s; s += 7n; if (!(x & 128)) return n; } };
-  while (i < b.length) { const k = Number(vi()), no = k >> 3, w = k & 7;
-    if (w === 0) out.push([no, vi()]); else if (w === 2) { const l = Number(vi()); out.push([no, b.slice(i, i + l)]); i += l; }
-    else if (w === 1) { out.push([no, b.slice(i, i + 8)]); i += 8; } else if (w === 5) { out.push([no, b.slice(i, i + 4)]); i += 4; } else throw new Error("protobuf wire " + w); }
+  const vi = () => { let n = 0n, s = 0n; for (let k = 0; k < 10; k++) { if (i >= b.length) throw new Error("protobuf: truncated varint"); const x = b[i++]; n |= BigInt(x & 127) << s; s += 7n; if (!(x & 128)) return n; } throw new Error("protobuf: varint too long"); };
+  const take = l => { if (l < 0 || i + l > b.length) throw new Error("protobuf: truncated field"); const v = b.slice(i, i + l); i += l; return v; };
+  while (i < b.length) { const k = vi(), no = Number(k >> 3n), w = Number(k & 7n); if (no < 1 || no > 0x1fffffff) throw new Error("protobuf: bad field number");
+    if (w === 0) out.push([no, vi()]); else if (w === 2) { const l = vi(); if (l > BigInt(MAX_FRAME)) throw new Error("protobuf: field too long"); out.push([no, take(Number(l))]); }
+    else if (w === 1) out.push([no, take(8)]); else if (w === 5) out.push([no, take(4)]); else throw new Error("protobuf wire " + w); }
   return out;
+}
+async function readBody(r) {
+  const cl = r.headers && r.headers.get && r.headers.get("content-length"); if (cl && Number(cl) > MAX_BODY) throw new Error("lightwalletd: reply too large");
+  if (r.body && r.body.getReader) {
+    const rd = r.body.getReader(), parts = []; let n = 0;
+    for (;;) { const { done, value } = await rd.read(); if (done) break; n += value.length; if (n > MAX_BODY) { try { await rd.cancel(); } catch {} throw new Error("lightwalletd: reply too large"); } parts.push(value); }
+    return cat(...parts);
+  }
+  const b = new Uint8Array(await r.arrayBuffer()); if (b.length > MAX_BODY) throw new Error("lightwalletd: reply too large"); return b;
+}
+/** Split a gRPC-web body into { data, trailer }. Lengths are unsigned and bounded; anything truncated, trailing or duplicated throws. */
+export function grpcFrames(b) {
+  if (b.length > MAX_BODY) throw new Error("lightwalletd: reply too large");
+  let i = 0, data = null, trailer = null;
+  while (i < b.length) {
+    if (i + 5 > b.length) throw new Error("lightwalletd: truncated frame header");
+    const f = b[i], l = ((b[i + 1] << 24) | (b[i + 2] << 16) | (b[i + 3] << 8) | b[i + 4]) >>> 0;
+    if (l > MAX_FRAME) throw new Error("lightwalletd: frame too large");
+    if (i + 5 + l > b.length) throw new Error("lightwalletd: truncated frame");
+    if (f & 0x7e) throw new Error("lightwalletd: bad frame flags");
+    const p = b.slice(i + 5, i + 5 + l); i += 5 + l;
+    if (f & 0x80) { if (trailer !== null) throw new Error("lightwalletd: duplicate trailer"); trailer = new TextDecoder().decode(p); }
+    else { if (trailer !== null || data !== null) throw new Error("lightwalletd: unexpected data frame"); data = p; }
+  }
+  return { data, trailer };
 }
 async function grpc(base, method, msg, fetchFn = fetch) {
   const body = cat(Uint8Array.of(0), Uint8Array.of(msg.length >>> 24 & 255, msg.length >>> 16 & 255, msg.length >>> 8 & 255, msg.length & 255), msg);
-  const r = await fetchFn(base.replace(/\/$/, "") + "/cash.z.wallet.sdk.rpc.CompactTxStreamer/" + method, { method: "POST", headers: { "content-type": "application/grpc-web+proto", "x-grpc-web": "1" }, body });
-  const b = new Uint8Array(await r.arrayBuffer());
-  if (!r.ok) throw new Error("lightwalletd " + r.status);
-  let i = 0, data = null, trailer = "";
-  while (i + 5 <= b.length) { const f = b[i], l = b[i + 1] << 24 | b[i + 2] << 16 | b[i + 3] << 8 | b[i + 4], p = b.slice(i + 5, i + 5 + l); i += 5 + l; if (f & 0x80) trailer += new TextDecoder().decode(p); else data = p; }
-  const st = /grpc-status:\s*(\d+)/.exec(trailer) || [null, r.headers.get("grpc-status") || "0"];
-  if (st[1] !== "0") throw new Error("lightwalletd: " + decodeURIComponent((/grpc-message:\s*(.*)/.exec(trailer) || [])[1] || r.headers.get("grpc-message") || "error " + st[1]).trim());
-  return data || new Uint8Array(0);
+  const ac = typeof AbortController === "function" ? new AbortController() : null, timer = setTimeout(() => ac && ac.abort(), TIMEOUT_MS);
+  let r, b;
+  try {
+    r = await fetchFn(base.replace(/\/$/, "") + "/cash.z.wallet.sdk.rpc.CompactTxStreamer/" + method, { method: "POST", headers: { "content-type": "application/grpc-web+proto", "x-grpc-web": "1" }, body, signal: ac ? ac.signal : undefined });
+    if (!r.ok) throw new Error("lightwalletd " + r.status);
+    b = await readBody(r);
+  } finally { clearTimeout(timer); }
+  const { data, trailer } = grpcFrames(b);
+  const status = (/^grpc-status:[ \t]*(\d+)[ \t]*\r?$/m.exec(trailer || "") || [null, r.headers.get("grpc-status")])[1];
+  if (status == null || !/^\d+$/.test(status)) throw new Error("lightwalletd: no grpc-status in the reply");
+  if (status !== "0") {
+    let m; try { m = decodeURIComponent((/^grpc-message:[ \t]*(.*?)\r?$/m.exec(trailer || "") || [])[1] || r.headers.get("grpc-message") || "error " + status).trim(); } catch { m = "error " + status; }
+    const e = new Error("lightwalletd: " + m.slice(0, 300)); e.grpcStatus = Number(status); throw e;
+  }
+  if (data === null) throw new Error("lightwalletd: reply without a message");
+  return data;
 }
-/** UTXOs of one t-address: [{ txid (display hex), n, value, script, height }] */
+const bigOf = (v, what) => { if (typeof v !== "bigint") throw new Error("lightwalletd: bad " + what); return v; };
+/** Current chain tip height (GetLatestBlock). */
+export async function getTip(base, fetchFn) {
+  const h = bigOf((pbRead(await grpc(base, "GetLatestBlock", new Uint8Array(0), fetchFn)).find(([no]) => no === 1) || [])[1], "tip height");
+  if (h < BigInt(BRANCH_ACTIVATION) || h > BigInt(MAX_TIP)) throw new Error("lightwalletd: implausible chain tip " + h);
+  return Number(h);
+}
+/** UTXOs of one t-address: [{ txid (display hex), n, value, script, height }], each one validated; duplicates and foreign scripts are errors. */
 export async function getUtxos(base, addr, fetchFn) {
+  const mine = tAddrScript(addr);
   const res = await grpc(base, "GetAddressUtxos", cat(pbField(1, 2, enc(addr)), pbField(2, 0, pbVarint(0)), pbField(3, 0, pbVarint(0))), fetchFn);
+  const seen = new Set();
   return pbRead(res).filter(([no]) => no === 1).map(([, m]) => {
-    const u = { n: 0, value: 0n, height: 0 }; for (const [no, v] of pbRead(m)) {
-      if (no === 1) u.txid = hex(v.slice().reverse()); else if (no === 2) u.n = Number(v); else if (no === 3) u.script = v; else if (no === 4) u.value = v; else if (no === 5) u.height = Number(v); }
+    if (!(m instanceof Uint8Array)) throw new Error("lightwalletd: bad UTXO entry");
+    const u = { n: 0, value: 0n, height: 0 }; let has = 0;
+    for (const [no, v] of pbRead(m)) {
+      if (no === 1) { if (!(v instanceof Uint8Array) || v.length !== 32) throw new Error("lightwalletd: bad UTXO txid"); u.txid = hex(v.slice().reverse()); has |= 1; }
+      else if (no === 2) { if (bigOf(v, "UTXO index") >= 0x100000000n) throw new Error("lightwalletd: bad UTXO index"); u.n = Number(v); }
+      else if (no === 3) { if (!(v instanceof Uint8Array)) throw new Error("lightwalletd: bad UTXO script"); u.script = v; }
+      else if (no === 4) { if (bigOf(v, "UTXO value") <= 0n || v > MAX_MONEY) throw new Error("lightwalletd: bad UTXO value"); u.value = v; has |= 2; }
+      else if (no === 5) { if (bigOf(v, "UTXO height") > BigInt(MAX_TIP)) throw new Error("lightwalletd: bad UTXO height"); u.height = Number(v); }
+      else if (no === 6) { if (!(v instanceof Uint8Array) || new TextDecoder().decode(v) !== addr) throw new Error("lightwalletd: UTXO of another address"); } }
+    if (has !== 3) throw new Error("lightwalletd: incomplete UTXO");
+    if (u.script && hex(u.script) !== hex(mine)) throw new Error("lightwalletd: UTXO script is not this address's");
+    const id = u.txid + ":" + u.n; if (seen.has(id)) throw new Error("lightwalletd: duplicate UTXO"); seen.add(id);
     return u;
   });
 }
-export async function broadcast(base, raw, fetchFn) {
+/** Send a raw tx. Succeeds only on a well-formed reply with errorCode 0 whose returned txid equals `expectTxid` (display hex, the locally computed one). */
+export async function broadcast(base, raw, fetchFn, expectTxid) {
+  if (!/^[0-9a-f]{64}$/i.test(expectTxid || "")) throw new Error("broadcast needs the locally computed txid");
   const res = pbRead(await grpc(base, "SendTransaction", pbField(1, 2, raw), fetchFn));
-  const code = Number((res.find(([no]) => no === 1) || [0, 0n])[1]), msg = new TextDecoder().decode((res.find(([no]) => no === 2) || [0, new Uint8Array(0)])[1]);
-  if (code !== 0) throw new Error("Rejected by network: " + msg);
-  return msg;
+  const c = res.find(([no]) => no === 1), m = res.find(([no]) => no === 2);
+  if (c && typeof c[1] !== "bigint" || m && !(m[1] instanceof Uint8Array)) throw new Error("lightwalletd: malformed broadcast reply");
+  const code = c ? c[1] : 0n, msg = m ? new TextDecoder().decode(m[1]) : "";
+  if (code !== 0n) throw new Error("Rejected by network: " + msg.slice(0, 300));
+  const got = msg.trim().replace(/^"|"$/g, "").toLowerCase();
+  if (got !== expectTxid.toLowerCase()) throw new Error("lightwalletd confirmed a different txid than ours (" + got.slice(0, 80) + "); not treating it as sent");
+  return got;
 }
 /** Is this transaction known to lightwalletd (mempool or chain)? txid = display hex. lightwalletd's TxFilter.hash is the little-endian (wire) txid.
  *  true = known, false = clearly unknown (NotFound / "No such mempool or blockchain transaction"); any other failure throws, so a caller never mistakes "could not ask" for "not there". */
@@ -157,7 +235,8 @@ export async function txKnown(base, txid, fetchFn) {
     const data = res.find(([no]) => no === 1);
     return !!(data && data[1].length > 0);
   } catch (e) {
-    if (/not ?found|no such (mempool|blockchain)|-5\b|code = NotFound/i.test(String(e && e.message))) return false;
+    // only a structured NotFound (grpc-status 5) or zcashd's own -5 text carried by lightwalletd counts as "not there"; gateway text such as "host not found" must not
+    if (e && (e.grpcStatus === 5 || (e.grpcStatus === 2 && /^lightwalletd: (-5: )?No such mempool or blockchain transaction/i.test(String(e.message))))) return false;
     throw e;
   }
 }

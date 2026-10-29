@@ -10,7 +10,7 @@ const key = R.deriveT(new Uint8Array(64).fill(7), R.tPath(0, 0));
 const utxos = [{ txid: "a083616da180465d19aa92f019ec4b57e1bf145319ca8030b0856f973c379534", n: 0, value: 1434934n }];
 const tx = { branch: R.NU6_3_BRANCH, lockTime: 0, expiry: 0, vin: [{ txid: utxos[0].txid, n: 0, seq: 0xffffffff, value: 1434934n, script: R.unhex("76a914" + "11".repeat(20) + "88ac") }], vout: [{ value: 1424934n, script: R.tAddrScript("t1RmRrhYbbAka8JZ4APf27rnZ43cHy9NqLt") }] };
 console.log("FIXED " + JSON.stringify({ txid: R.txid(tx), sighash: R.hex(R.sighash(tx, 0)), raw: R.hex(R.serialize(tx)) }));
-const sw = R.buildSweep({ utxos, key, to: "t1RmRrhYbbAka8JZ4APf27rnZ43cHy9NqLt" });
+const sw = R.buildSweep({ utxos, key, to: "t1RmRrhYbbAka8JZ4APf27rnZ43cHy9NqLt", tip: 3_600_000 });
 ok(sw.amount === 1424934n, "sweep amount = total - fee");
 ok(R.sweepFee(1) === 10000n && R.sweepFee(2) === 10000n && R.sweepFee(3) === 15000n && R.sweepFee(5) === 25000n, "ZIP-317 sweep fee grows with inputs");
 console.log("SWEEP " + JSON.stringify({ raw: R.hex(sw.raw), txid: sw.txid, pub: R.hex(key.pub), addr: key.addr }));
