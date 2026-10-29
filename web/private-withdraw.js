@@ -100,7 +100,7 @@ async function call(fetchFn, url, init) {
   return j;
 }
 /** Requests a quote and refuses anything that differs from what we asked (amount, recipient, refund address, assets). */
-export async function requestQuote({ base = ONECLICK, req, token, fetchFn = fetch }) {
+export async function requestQuote({ base = ONECLICK, req, token, fetchFn = fetch, okDeposit = isAddr }) {
   const headers = { "content-type": "application/json" }; if (token) headers.authorization = "Bearer " + token;
   const j = await call(fetchFn, base + "/v0/quote", { method: "POST", headers, body: JSON.stringify(req) });
   const q = j.quote, e = j.quoteRequest || {};
@@ -108,7 +108,7 @@ export async function requestQuote({ base = ONECLICK, req, token, fetchFn = fetc
   if (q.amountIn !== req.amount) throw new Error("the quote changed the amount; refusing");
   if (String(e.recipient).toLowerCase() !== req.recipient.toLowerCase() || String(e.refundTo).toLowerCase() !== req.refundTo.toLowerCase()
     || e.originAsset !== req.originAsset || e.destinationAsset !== req.destinationAsset) throw new Error("the quote does not match the request; refusing");
-  if (!req.dry && !isAddr(q.depositAddress)) throw new Error("the quote has no usable deposit address");
+  if (!req.dry && !okDeposit(q.depositAddress)) throw new Error("the quote has no usable deposit address");
   return j;
 }
 /** Human numbers from a quote. Both stablecoins here have 6 decimals (token.decimals of the destination chain is used for the output). */

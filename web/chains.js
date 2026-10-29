@@ -26,6 +26,8 @@ export const CHAINS = {
     oneClick: { assetId: "nep141:hood-0x5fc5360d0400a0fd4f2af552add042d716f1d168.omft.near" },
   },
 };
+/** Zcash leg of the private withdraw (web/zec-hop.js). lightwalletd = gRPC-web proxy; change this ONE value to switch to our own proxy. */
+export const zcash = { lightwalletd: "https://zcash-mainnet.chainsafe.dev", network: "main", assetId: "nep141:zec.omft.near", decimals: 8, minIn: 132000n, orchardActivation: 1687104 };
 /** Chain a meta-address was made for (st:<key>:0x...), or null if it has no prefix / unknown prefix. */
 export function chainOfMeta(s) {
   const m = String(s).trim().match(/^st:([a-z0-9]+):/);

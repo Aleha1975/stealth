@@ -3,3 +3,6 @@ out/
 broadcast/
 test/fixtures/base_kyber.json
 node_modules/
+web/vendor/webzjs/*
+!web/vendor/webzjs/SHA256SUMS
+!web/vendor/webzjs/README.md
