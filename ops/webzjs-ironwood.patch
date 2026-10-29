@@ -2473,10 +2473,60 @@ index 8f62e2a..e8c97b7 100644
      }
  
 diff --git a/crates/webzjs-keys/src/pczt_sign.rs b/crates/webzjs-keys/src/pczt_sign.rs
-index c066079..fa7f4cc 100644
+index c066079..35d02bd 100644
 --- a/crates/webzjs-keys/src/pczt_sign.rs
 +++ b/crates/webzjs-keys/src/pczt_sign.rs
-@@ -134,6 +134,7 @@ pub async fn pczt_sign_inner(
+@@ -48,6 +48,9 @@ pub async fn pczt_sign_inner(
+         Orchard {
+             index: usize,
+         },
++        Ironwood {
++            index: usize,
++        },
+         Sapling {
+             index: usize,
+         },
+@@ -81,6 +84,28 @@ pub async fn pczt_sign_inner(
+             Ok(())
+         })
+         .map_err(|e| Error::PcztSign(format!("Invalid PCZT: {:?}", e)))?
++        .with_ironwood::<Infallible, _>(|bundle| {
++            for (index, action) in bundle.actions().iter().enumerate() {
++                if let Some(account_index) =
++                    action
++                        .spend()
++                        .zip32_derivation()
++                        .as_ref()
++                        .and_then(|derivation| {
++                            derivation.extract_account_index(
++                                &seed_fp,
++                                zip32::ChildIndex::hardened(network.network_type().coin_type()),
++                            )
++                        })
++                {
++                    keys.entry(account_index)
++                        .or_default()
++                        .push(KeyRef::Ironwood { index });
++                }
++            }
++            Ok(())
++        })
++        .map_err(|e| Error::PcztSign(format!("Invalid PCZT: {:?}", e)))?
+         .with_sapling::<Infallible, _>(|bundle| {
+             for (index, spend) in bundle.spends().iter().enumerate() {
+                 if let Some(account_index) =
+@@ -125,8 +150,8 @@ pub async fn pczt_sign_inner(
+         })
+         .map_err(|e| Error::PcztSign(format!("Invalid PCZT: {:?}", e)))?
+         .finish();
+-    let mut signer = Signer::new(pczt).unwrap();
+-    //.map_err(|e| anyhow!("Failed to initialize Signer: {:?}", e))?;
++    let mut signer = Signer::new(pczt)
++        .map_err(|e| Error::PcztSign(format!("Failed to initialize Signer: {:?}", e)))?;
+     for (_, spends) in keys {
+         // let usk = UnifiedSpendingKey::from_seed(&params, seed, account_index)?;
+         for keyref in spends {
+@@ -134,6 +159,7 @@ pub async fn pczt_sign_inner(
                  KeyRef::Orchard { index } => {
                      signer
                          .sign_orchard(
@@ -2484,8 +2534,25 @@ index c066079..fa7f4cc 100644
                              index,
                              &orchard::keys::SpendAuthorizingKey::from(usk.orchard()),
                          )
-@@ -146,7 +147,11 @@ pub async fn pczt_sign_inner(
+@@ -144,9 +170,28 @@ pub async fn pczt_sign_inner(
+                             ))
+                         })?;
                  }
++                KeyRef::Ironwood { index } => {
++                    // Ironwood spends use the account's Orchard spend authorizing key
++                    signer
++                        .sign_ironwood(
++                            rand_core::UnwrapErr(rand::rngs::SysRng),
++                            index,
++                            &orchard::keys::SpendAuthorizingKey::from(usk.orchard()),
++                        )
++                        .map_err(|e| {
++                            Error::PcztSign(format!(
++                                "Failed to sign Ironwood spend {index}: {:?}",
++                                e
++                            ))
++                        })?;
++                }
                  KeyRef::Sapling { index } => {
                      signer
 -                        .sign_sapling(index, &usk.sapling().expsk.ask)
@@ -2722,7 +2789,7 @@ index cacd624..d6ecc93 100644
  pub mod init;
  pub mod validation;
 diff --git a/crates/webzjs-wallet/src/wallet.rs b/crates/webzjs-wallet/src/wallet.rs
-index 025bc09..efe0410 100644
+index 025bc09..6527d79 100644
 --- a/crates/webzjs-wallet/src/wallet.rs
 +++ b/crates/webzjs-wallet/src/wallet.rs
 @@ -28,13 +28,14 @@ use tokio::sync::RwLock;
@@ -2777,7 +2844,7 @@ index 025bc09..efe0410 100644
              &change_strategy,
              request,
              self.min_confirmations,
-+            &SpendPolicy::default(),
++            &SpendPolicy::shielded_pools([ShieldedPool::Ironwood]),
 +            None,
 +            None,
          )
@@ -2843,7 +2910,7 @@ index 025bc09..efe0410 100644
              &change_strategy,
              request,
              self.min_confirmations,
-+            &SpendPolicy::default(),
++            &SpendPolicy::shielded_pools([ShieldedPool::Ironwood]),
 +            None,
 +            None,
          )
@@ -8145,10 +8212,10 @@ index 0000000..f220285
 +}
 diff --git a/vendor/zcash_client_memory/src/input_source.rs b/vendor/zcash_client_memory/src/input_source.rs
 new file mode 100644
-index 0000000..6f29722
+index 0000000..b313b03
 --- /dev/null
 +++ b/vendor/zcash_client_memory/src/input_source.rs
-@@ -0,0 +1,575 @@
+@@ -0,0 +1,579 @@
 +use std::num::NonZeroU32;
 +
 +use zcash_client_backend::{
@@ -8564,7 +8631,7 @@ index 0000000..6f29722
 +                    confirmations_policy,
 +                    exclude,
 +                )
-+                .unwrap()
++                .unwrap_or(false)
 +            })
 +            .collect::<Vec<_>>();
 +
@@ -8572,15 +8639,18 @@ index 0000000..6f29722
 +        eligible_notes.sort_by_key(|a| a.commitment_tree_position);
 +
 +        // now take notes until we have enough to cover the target value
++        let target = match target_value {
++            TargetValue::AtLeast(target) => target,
++            TargetValue::AllFunds(_) => {
++                return Err(Error::Other("send-max (AllFunds) selection is not supported".into()))
++            }
++        };
 +        let mut value_acc = Zatoshis::ZERO;
 +        let selection: Vec<_> = eligible_notes
 +            .into_iter()
 +            .take_while(|note| {
-+                let take = match target_value {
-+                    TargetValue::AtLeast(target) => value_acc <= target,
-+                    TargetValue::AllFunds(_) => unimplemented!(),
-+                };
-+                value_acc = (value_acc + note.note.value()).expect("value overflow");
++                let take = value_acc <= target;
++                value_acc = (value_acc + note.note.value()).unwrap_or(value_acc);
 +                take
 +            })
 +            .collect();
@@ -8678,15 +8748,16 @@ index 0000000..6f29722
 +                    confirmations_policy,
 +                    exclude,
 +                )
-+                .expect("note account & transaction are known to the wallet")
++                .unwrap_or(false)
 +            })
 +            .filter(|note| {
 +                self.matches_note_filter(note, filter)
-+                    .unwrap()
++                    .ok()
++                    .flatten()
 +                    .is_some_and(|b| b)
 +            })
 +            .fold((0, Zatoshis::ZERO), |(count, total), note| {
-+                (count + 1, (total + note.note.value()).unwrap())
++                (count + 1, (total + note.note.value()).unwrap_or(total))
 +            });
 +
 +        Ok(Some(PoolMeta::new(count, total)))
@@ -8700,8 +8771,8 @@ index 0000000..6f29722
 +    ) -> Result<Option<bool>, Error> {
 +        match filter {
 +            NoteFilter::ExceedsMinValue(min_value) => Ok(Some(note.note.value() > *min_value)),
-+            NoteFilter::ExceedsPriorSendPercentile(_n) => todo!(),
-+            NoteFilter::ExceedsBalancePercentage(_p) => todo!(),
++            NoteFilter::ExceedsPriorSendPercentile(_n) => Ok(None),
++            NoteFilter::ExceedsBalancePercentage(_p) => Ok(None),
 +            // evaluate both conditions.
 +            // If one cannot be evaluated (e.g. it returns None) it is ignored
 +            NoteFilter::Combine(a, b) => {
@@ -15382,7 +15453,7 @@ index 0000000..4a7e0dc
 +}
 diff --git a/vendor/zcash_client_memory/src/types/transaction.rs b/vendor/zcash_client_memory/src/types/transaction.rs
 new file mode 100644
-index 0000000..36d0747
+index 0000000..bd9f863
 --- /dev/null
 +++ b/vendor/zcash_client_memory/src/types/transaction.rs
 @@ -0,0 +1,322 @@
@@ -15566,7 +15637,7 @@ index 0000000..36d0747
 +        match self.0.entry(tx.txid()) {
 +            Entry::Occupied(mut entry) => {
 +                entry.get_mut().fee = fee;
-+                entry.get_mut().expiry_height = Some(tx.expiry_height());
++                entry.get_mut().expiry_height = Some(tx.expiry_height()).filter(|h| u32::from(*h) != 0); // 0 = never expires
 +
 +                let mut raw = Vec::new();
 +                tx.write(&mut raw).unwrap();
@@ -15579,7 +15650,7 @@ index 0000000..36d0747
 +                    tx_status: TransactionStatus::NotInMainChain,
 +                    tx_index: None,
 +                    block: None,
-+                    expiry_height: Some(tx.expiry_height()),
++                    expiry_height: Some(tx.expiry_height()).filter(|h| u32::from(*h) != 0), // 0 = never expires
 +                    raw: Some(raw),
 +                    fee,
 +                    _target_height: target_height,
@@ -15941,10 +16012,10 @@ index 0000000..6481301
 +}
 diff --git a/vendor/zcash_client_memory/src/wallet_commitment_trees.rs b/vendor/zcash_client_memory/src/wallet_commitment_trees.rs
 new file mode 100644
-index 0000000..93abf1b
+index 0000000..315fb6c
 --- /dev/null
 +++ b/vendor/zcash_client_memory/src/wallet_commitment_trees.rs
-@@ -0,0 +1,280 @@
+@@ -0,0 +1,294 @@
 +use std::convert::Infallible;
 +
 +use incrementalmerkletree::Address;
@@ -16003,6 +16074,12 @@ index 0000000..93abf1b
 +        self.with_sapling_tree_mut(|t| {
 +            for (root, i) in roots.iter().zip(0u64..) {
 +                let root_addr = Address::from_parts(SAPLING_SHARD_HEIGHT.into(), start_index + i);
++                // Re-inserting a root the tree already holds is a no-op that costs ~0.1 s per root
++                // (cap clone + re-hash); every sync() after the first re-sends all of them.
++                if t.store().get_shard(root_addr).map_err(ShardTreeError::Storage)?
++                    .and_then(|s| s.root().node_value().cloned()).as_ref() == Some(root.root_hash()) {
++                    continue;
++                }
 +                t.insert(root_addr, *root.root_hash())?;
 +            }
 +            Ok::<_, ShardTreeError<Self::Error>>(())
@@ -16048,6 +16125,10 @@ index 0000000..93abf1b
 +        self.with_orchard_tree_mut(|t| {
 +            for (root, i) in roots.iter().zip(0u64..) {
 +                let root_addr = Address::from_parts(ORCHARD_SHARD_HEIGHT.into(), start_index + i);
++                if t.store().get_shard(root_addr).map_err(ShardTreeError::Storage)?
++                    .and_then(|s| s.root().node_value().cloned()).as_ref() == Some(root.root_hash()) {
++                    continue;
++                }
 +                t.insert(root_addr, *root.root_hash())?;
 +            }
 +            Ok::<_, ShardTreeError<Self::Error>>(())
@@ -16102,7 +16183,11 @@ index 0000000..93abf1b
 +        tracing::debug!("put_ironwood_subtree_roots");
 +        for (root, i) in roots.iter().zip(0u64..) {
 +            let root_addr = Address::from_parts(ORCHARD_SHARD_HEIGHT.into(), start_index + i);
-+            self.ironwood_tree.insert(root_addr, *root.root_hash())?;
++            let known = self.ironwood_tree.store().get_shard(root_addr).map_err(ShardTreeError::Storage)?
++                .and_then(|s| s.root().node_value().cloned());
++            if known.as_ref() != Some(root.root_hash()) {
++                self.ironwood_tree.insert(root_addr, *root.root_hash())?;
++            }
 +            self.ironwood_tree_shard_end_heights
 +                .insert(root_addr, root.subtree_end_height());
 +        }
@@ -16227,10 +16312,10 @@ index 0000000..93abf1b
 +}
 diff --git a/vendor/zcash_client_memory/src/wallet_read.rs b/vendor/zcash_client_memory/src/wallet_read.rs
 new file mode 100644
-index 0000000..30e0552
+index 0000000..0bd04c1
 --- /dev/null
 +++ b/vendor/zcash_client_memory/src/wallet_read.rs
-@@ -0,0 +1,968 @@
+@@ -0,0 +1,973 @@
 +use std::{
 +    collections::{HashMap, hash_map::Entry},
 +    num::NonZeroU32,
@@ -16493,18 +16578,23 @@ index 0000000..30e0552
 +            if self.note_is_spent(note, target_height)? {
 +                continue;
 +            }
-+            // don't count notes in unscanned ranges
-+            let unscanned_ranges = self.unscanned_ranges();
-+            for (_, _, start_position, end_position_exclusive) in unscanned_ranges {
-+                if note.commitment_tree_position >= start_position
-+                    && note.commitment_tree_position < end_position_exclusive
-+                {
-+                    continue; // note is in an unscanned range. Skip it
-+                }
++            // don't count notes in unscanned ranges. The ranges are Sapling tree positions, so they
++            // only apply to Sapling notes (Orchard/Ironwood positions are separate number spaces).
++            if note.pool() == PoolType::SAPLING
++                && self.unscanned_ranges().into_iter().any(|(_, _, start, end)| {
++                    note.commitment_tree_position >= start && note.commitment_tree_position < end
++                })
++            {
++                continue;
 +            }
-+            // don't count notes in unmined transactions or that have expired
++            // don't count notes of unmined transactions that have expired (nExpiryHeight 0 = never)
 +            if let Ok(Some(note_tx)) = self.get_transaction(note.txid) {
-+                if note_tx.expiry_height() < BlockHeight::from(target_height) {
++                let mined = self
++                    .tx_table
++                    .get(&note.txid)
++                    .map_or(false, |t| t.mined_height().is_some());
++                let expiry = u32::from(note_tx.expiry_height());
++                if !mined && expiry != 0 && expiry < u32::from(BlockHeight::from(target_height)) {
 +                    continue;
 +                }
 +            }
@@ -16542,7 +16632,7 @@ index 0000000..30e0552
 +                PoolType::IRONWOOD => {
 +                    account_balance.with_ironwood_balance_mut(update_balance_with_note)?;
 +                }
-+                _ => unimplemented!("Unknown pool type"),
++                _ => return Err(Error::Other("unknown pool type".into())),
 +            }
 +        }
 +
@@ -17201,10 +17291,10 @@ index 0000000..30e0552
 +}
 diff --git a/vendor/zcash_client_memory/src/wallet_write.rs b/vendor/zcash_client_memory/src/wallet_write.rs
 new file mode 100644
-index 0000000..22c3aac
+index 0000000..eaf9b65
 --- /dev/null
 +++ b/vendor/zcash_client_memory/src/wallet_write.rs
-@@ -0,0 +1,1655 @@
+@@ -0,0 +1,1663 @@
 +use std::{
 +    collections::{BTreeSet, HashMap, HashSet},
 +    ops::Range,
@@ -17273,10 +17363,7 @@ index 0000000..22c3aac
 +        key_source: Option<&str>,
 +    ) -> Result<(<Self as WalletRead>::AccountId, UnifiedSpendingKey), <Self as WalletRead>::Error> {
 +        if cfg!(not(test)) {
-+            unimplemented!(
-+                "Memwallet does not support adding accounts from seed phrases. 
-+    Instead derive the ufvk in the calling code and import it using `import_account_ufvk`"
-+            )
++            return Err(Error::Other("Memwallet does not support adding accounts from seed phrases; import a UFVK".into()))
 +        } else {
 +            let seed_fingerprint = SeedFingerprint::from_seed(seed.expose_secret())
 +                .ok_or(<Self as WalletRead>::Error::InvalidSeedLength)?;
@@ -17310,8 +17397,8 @@ index 0000000..22c3aac
 +    }
 +
 +    fn delete_account(&mut self, account: <Self as WalletRead>::AccountId) -> Result<(), <Self as WalletRead>::Error> {
-+        self.accounts.accounts.remove(&account);
-+        todo!("remove all transactions associated with the account")
++        let _ = account;
++        Err(Error::Other("delete_account is not supported by the memory wallet".into()))
 +    }
 +
 +    fn get_next_available_address(
@@ -18574,13 +18661,14 @@ index 0000000..22c3aac
 +
 +            // Delete from the nullifier map any entries with a locator referencing a block
 +            // height greater than the truncation height.
-+            // Willem: We don't need to do this I think..
++            self.tx_locator.0.retain(|(h, _), _| *h <= truncation_height);
++            self.nullifiers.0.retain(|_, (h, _)| *h <= truncation_height);
 +        }
 +        Ok(truncation_height)
 +    }
 +
 +    fn truncate_to_chain_state(&mut self, _chain_state: ChainState) -> Result<(), <Self as WalletRead>::Error> {
-+        todo!()
++        Err(Error::Other("truncate_to_chain_state is not supported by the memory wallet".into()))
 +    }
 +
 +    fn rewind_to_chain_state(
@@ -18599,10 +18687,7 @@ index 0000000..22c3aac
 +        _birthday: &AccountBirthday,
 +        _key_source: Option<&str>,
 +    ) -> Result<(Self::Account, UnifiedSpendingKey), <Self as WalletRead>::Error> {
-+        unimplemented!(
-+            "Memwallet does not support adding accounts from seed phrases. 
-+Instead derive the ufvk in the calling code and import it using `import_account_ufvk`"
-+        )
++        Err(Error::Other("Memwallet does not support adding accounts from seed phrases; import a UFVK".into()))
 +    }
 +
 +    fn import_account_ufvk(
@@ -18665,6 +18750,19 @@ index 0000000..22c3aac
 +
 +                #[cfg(not(feature = "orchard"))]
 +                panic!("Sent a transaction with Orchard Actions without `orchard` enabled?");
++            }
++            // Mark ironwood notes as spent
++            #[cfg(feature = "orchard")]
++            if let Some(bundle) = sent_tx.tx().ironwood_bundle() {
++                detectable_via_scanning = true;
++                for action in bundle.actions() {
++                    match self.mark_ironwood_note_spent(*action.nullifier(), sent_tx.tx().txid()) {
++                        Ok(()) => {}
++                        // new outputs of this transaction have no note to mark
++                        Err(Error::NoteNotFound) => {}
++                        Err(e) => return Err(e),
++                    }
++                }
 +            }
 +            // Mark transparent UTXOs as spent
 +            #[cfg(feature = "transparent-inputs")]
@@ -18773,7 +18871,7 @@ index 0000000..22c3aac
 +        _diversifier_index: DiversifierIndex,
 +        _request: UnifiedAddressRequest,
 +    ) -> Result<Option<UnifiedAddress>, <Self as WalletRead>::Error> {
-+        todo!()
++        Err(Error::Other("get_address_for_index is not supported by the memory wallet".into()))
 +    }
 +
 +    #[cfg(feature = "transparent-inputs")]
@@ -18792,7 +18890,7 @@ index 0000000..22c3aac
 +        _account: <Self as WalletRead>::AccountId,
 +        _pubkey: secp256k1::PublicKey,
 +    ) -> Result<(), <Self as WalletRead>::Error> {
-+        todo!()
++        Err(Error::Other("standalone transparent import is not supported".into()))
 +    }
 +
 +    #[cfg(feature = "transparent-key-import")]
@@ -18801,7 +18899,7 @@ index 0000000..22c3aac
 +        _account: <Self as WalletRead>::AccountId,
 +        _script: zcash_script::script::Redeem,
 +    ) -> Result<(), <Self as WalletRead>::Error> {
-+        todo!()
++        Err(Error::Other("standalone transparent import is not supported".into()))
 +    }
 +}
 +

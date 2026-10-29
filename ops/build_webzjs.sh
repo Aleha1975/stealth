@@ -4,17 +4,21 @@
 # Pins: ChainSafe/WebZjs a50df944c32243cb8da9f86e7d52cb65ac926439 + webzjs-ironwood.patch (librustzcash 0.25, vendored zcash_client_memory ported to Ironwood)
 #       rust nightly-2025-06-20 = rustc 1.89.0-nightly (set by the patch in rust-toolchain.toml; librustzcash 0.25 MSRV is 1.89, nightly-2025-01-07 is too old; NEWER nightlies (tested 2026-10-28) make wasm-bindgen 0.2.100 skip its threads transform -> non-shared memory, DataCloneError)
 #       clang 18.1.8 · wasm-bindgen-cli 0.2.100 (= wasm-bindgen in Cargo.lock) · just/wasm-pack from stable.
-# Usage: ops/build_webzjs_ironwood.sh                 full build in $WORK (default ~/.cache/webzjs-build); no system changes
-#        PKG_DIR=<dir> ops/build_webzjs_ironwood.sh   skip the build, only patch + copy + hash an existing wasm-pack output (packages/webzjs-wallet)
+# Usage: ops/build_webzjs.sh                 full build in $WORK (default ~/.cache/webzjs-build); no system changes
+#        PKG_DIR=<dir> ops/build_webzjs.sh   skip the build, only patch + copy + hash an existing wasm-pack output (packages/webzjs-wallet)
 # PATCH (default: next to this script) = the diff a50df94..spike/ironwood; its sha256 is checked against PATCH_SHA256.
-# The ~60 MB wasm and generated JS are NOT committed; only SHA256SUMS and README.md are. The build is not bit-for-bit reproducible.
+# The ~60 MB wasm and generated JS are NOT committed; only SHA256SUMS and README.md are. The build is not bit-for-bit reproducible, so this script (re)writes SHA256SUMS and the two hashes
+# in web/zec-hop.js (WEBZJS_SHA256); ops/deploy_lab.sh refuses to ship files that do not match SHA256SUMS and loadZjs() refuses to run a wasm/glue that does not match WEBZJS_SHA256.
 set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"; OUT="$ROOT/web/vendor/webzjs"
-COMMIT=a50df944c32243cb8da9f86e7d52cb65ac926439; CLANG=18.1.8; WBG=0.2.100; NIGHTLY=nightly-2025-06-20
-PATCH="${PATCH:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/webzjs-ironwood.patch}"; PATCH_SHA256="${PATCH_SHA256:-cace4fc171f132b9e1f0b35936bf788e03f88b1b821bbb33ee34f7670f5d62f0}"
+COMMIT=a50df944c32243cb8da9f86e7d52cb65ac926439; CLANG=18.1.8; WBG=0.2.100; NIGHTLY=nightly-2025-06-20; JUST=1.59.0; WASMPACK=0.15.0
+# sha256 of the downloads; empty = not recorded yet: the script prints the hash it got and refuses until it is filled in (CLANG_SHA256_<platform>, RUSTUP_INIT_SHA256)
+CLANG_SHA256_Darwin_arm64="${CLANG_SHA256_Darwin_arm64:-4573b7f25f46d2a9c8882993f091c52f416c83271db6f5b213c93f0bd0346a10}"; CLANG_SHA256_Linux_x86_64="${CLANG_SHA256_Linux_x86_64:-}"; RUSTUP_INIT_SHA256="${RUSTUP_INIT_SHA256:-9502b514362a21096210d498f143b8cdacda365d3dfcf45e8f5541e089ccafc0}"
+PATCH="${PATCH:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/webzjs-ironwood.patch}"; PATCH_SHA256="${PATCH_SHA256:-f5bcc597e900498b2b32a3b0c3b27b106aee574db921853443742d19ea5c6906}"
 WORK="${WORK:-$HOME/.cache/webzjs-build}"
 sha() { if command -v sha256sum >/dev/null; then sha256sum "$@"; else shasum -a 256 "$@"; fi; }
 if [ -z "${PKG_DIR:-}" ]; then
+  unset RUSTFLAGS CARGO_ENCODED_RUSTFLAGS CARGO_BUILD_RUSTFLAGS   # a caller's RUSTFLAGS would REPLACE the patch's .cargo/config.toml flags (+atomics, getrandom backend)
   mkdir -p "$WORK"; export RUSTUP_HOME="$WORK/rustup" CARGO_HOME="$WORK/cargo"; export PATH="$WORK/llvm/bin:$CARGO_HOME/bin:$PATH"
   if [ -s "$PATCH" ]; then [ "$PATCH_SHA256" = "$(sha "$PATCH" | cut -d' ' -f1)" ] || { echo "patch hash mismatch (set PATCH_SHA256 after reviewing $PATCH)"; exit 1; }
   else echo "missing patch $PATCH"; exit 1; fi
@@ -22,20 +26,27 @@ if [ -z "${PKG_DIR:-}" ]; then
     case "$(uname -s)-$(uname -m)" in
       Darwin-arm64) T="clang+llvm-$CLANG-arm64-apple-macos11";; Linux-x86_64) T="clang+llvm-$CLANG-x86_64-linux-gnu-ubuntu-18.04";; *) echo "unsupported platform; put clang $CLANG in $WORK/llvm"; exit 1;;
     esac
-    curl -fL "https://github.com/llvm/llvm-project/releases/download/llvmorg-$CLANG/$T.tar.xz" | tar -xJ -C "$WORK" && mv "$WORK/$T" "$WORK/llvm"
+    curl -fL -o "$WORK/$T.tar.xz" "https://github.com/llvm/llvm-project/releases/download/llvmorg-$CLANG/$T.tar.xz"
+    want="$(eval echo "\${CLANG_SHA256_$(uname -s)_$(uname -m | tr - _):-}")"; got="$(sha "$WORK/$T.tar.xz" | cut -d' ' -f1)"
+    [ -n "$want" ] && [ "$want" = "$got" ] || { echo "clang tarball sha256 $got does not match the recorded one ('$want'); review it and set CLANG_SHA256_$(uname -s)_$(uname -m | tr - _)"; rm -f "$WORK/$T.tar.xz"; exit 1; }
+    tar -xJ -C "$WORK" -f "$WORK/$T.tar.xz" && mv "$WORK/$T" "$WORK/llvm" && rm -f "$WORK/$T.tar.xz"
   fi
-  [ -x "$CARGO_HOME/bin/rustup" ] || { curl -fsSL https://sh.rustup.rs | sh -s -- -y --no-modify-path --profile minimal; }
+  if [ ! -x "$CARGO_HOME/bin/rustup" ]; then
+    curl -fsSL -o "$WORK/rustup-init.sh" https://sh.rustup.rs; got="$(sha "$WORK/rustup-init.sh" | cut -d' ' -f1)"
+    [ -n "$RUSTUP_INIT_SHA256" ] && [ "$RUSTUP_INIT_SHA256" = "$got" ] || { echo "rustup installer sha256 $got does not match the recorded one ('$RUSTUP_INIT_SHA256'); review it and set RUSTUP_INIT_SHA256"; rm -f "$WORK/rustup-init.sh"; exit 1; }
+    sh "$WORK/rustup-init.sh" -y --no-modify-path --profile minimal; rm -f "$WORK/rustup-init.sh"
+  fi
   rustup toolchain list | grep -q '^stable' || rustup toolchain install stable --profile minimal
   rustup toolchain list | grep -q "^$NIGHTLY" || rustup toolchain install "$NIGHTLY" --profile minimal -c rust-src -t wasm32-unknown-unknown
   # build tools with STABLE (they need a newer rustc than any old nightly)
-  [ -x "$CARGO_HOME/bin/just" ] || cargo +stable install --locked just
-  [ -x "$CARGO_HOME/bin/wasm-pack" ] || cargo +stable install --locked wasm-pack
+  [ "$(just --version 2>/dev/null)" = "just $JUST" ] || cargo +stable install --locked just --version "$JUST" --force
+  [ "$(wasm-pack --version 2>/dev/null)" = "wasm-pack $WASMPACK" ] || cargo +stable install --locked wasm-pack --version "$WASMPACK" --force
   [ "$(wasm-bindgen --version 2>/dev/null)" = "wasm-bindgen $WBG" ] || cargo +stable install --locked wasm-bindgen-cli --version "$WBG" --force
   [ "$(clang --version | head -1 | grep -o '[0-9.]*' | head -1)" = "$CLANG" ] || { echo "clang $CLANG not first in PATH"; exit 1; }
   export CC_wasm32_unknown_unknown="$WORK/llvm/bin/clang" AR_wasm32_unknown_unknown="$WORK/llvm/bin/llvm-ar"
   SRC="$WORK/WebZjs"
   [ -d "$SRC/.git" ] || git clone https://github.com/ChainSafe/WebZjs "$SRC"
-  git -C "$SRC" fetch -q origin && git -C "$SRC" reset -q --hard && git -C "$SRC" clean -qfd && git -C "$SRC" checkout -q --detach "$COMMIT"
+  git -C "$SRC" fetch -q origin && git -C "$SRC" reset -q --hard && git -C "$SRC" clean -qfdx && git -C "$SRC" checkout -q --detach "$COMMIT"
   [ "$(git -C "$SRC" rev-parse HEAD)" = "$COMMIT" ] || { echo "wrong commit"; exit 1; }
   git -C "$SRC" apply --index "$PATCH"            # Cargo.lock is part of the patch: crates are resolved exactly as audited
   # one cargo at a time, 4 jobs max; rust-toolchain.toml (from the patch) selects $NIGHTLY
@@ -65,3 +76,10 @@ for f in README.md SHA256SUMS; do [ -f "$OUT/$f" ] && cp "$OUT/$f" "$OUT.new/$f"
 rm -rf "$OUT"; mv "$OUT.new" "$OUT"
 ( cd "$OUT" && find . -type f ! -name SHA256SUMS ! -name README.md | sed 's#^\./##' | LC_ALL=C sort | xargs -I{} bash -c "$(declare -f sha); sha '{}'" > SHA256SUMS )
 echo "web/vendor/webzjs ready: $(wc -l < "$OUT/SHA256SUMS") files, wasm $(du -h "$OUT/webzjs_wallet_bg.wasm" | cut -f1)"
+python3 - "$OUT" "$ROOT/web/zec-hop.js" <<'PY'
+import re, sys
+out, js = sys.argv[1], sys.argv[2]
+want = {f: v.strip() for v, f in ((l.split()[0], l.split()[1]) for l in open(out + "/SHA256SUMS").read().splitlines())}
+s = open(js).read(); s2 = re.sub(r'const WEBZJS_SHA256 = \{[^}]*\};', 'const WEBZJS_SHA256 = { "webzjs_wallet.js": "%s", "webzjs_wallet_bg.wasm": "%s" };' % (want["webzjs_wallet.js"], want["webzjs_wallet_bg.wasm"]), s, count=1)
+assert s2 != s or "%s" % want["webzjs_wallet.js"] in s, "WEBZJS_SHA256 not found in web/zec-hop.js"; open(js, "w").write(s2)
+PY
