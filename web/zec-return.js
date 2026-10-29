@@ -8,6 +8,7 @@ import { blake2b, sha256, sha512, hmac, ripemd160 } from "./vendor/zec-hash.js";
 export const NU6_3_BRANCH = 0x37a5165b;        // librustzcash zcash_protocol BranchId::Nu6_3 (mainnet activation 3,428,143)
 export const V5_GROUP = 0x26a7270a, V5_HEADER = (5 | 0x80000000) >>> 0;
 export const FEE = 10_000n;                     // ZIP-317: max(2, logical actions) * 5000 for 1 in / 1 out
+export const sweepFee = nIn => 5_000n * BigInt(Math.max(2, nIn));   // n входов, 1 выход: logical actions = max(n, 1)
 const P2PKH = [0x1c, 0xb8], P2SH = [0x1c, 0xbd];
 const B58 = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
 const enc = s => new TextEncoder().encode(s);
@@ -99,9 +100,9 @@ export function signAll(tx, key) {
   });
   return { ...tx, vin };
 }
-/** Sweep all UTXOs of one key to `to` (amount = total - FEE, no change). */
+/** Sweep all UTXOs of one key to `to` (amount = total - sweepFee(inputs), no change). */
 export function buildSweep({ utxos, key, to, branch = NU6_3_BRANCH, expiry = 0 }) {
-  const total = utxos.reduce((s, u) => s + BigInt(u.value), 0n), amount = total - FEE;
+  const total = utxos.reduce((s, u) => s + BigInt(u.value), 0n), amount = total - sweepFee(utxos.length);
   if (amount <= 0n) throw new Error("nothing to send");
   const script = cat(Uint8Array.of(0x76, 0xa9, 0x14), ripemd160(sha256(key.pub)), Uint8Array.of(0x88, 0xac));
   const tx = { branch, lockTime: 0, expiry, vin: utxos.map(u => ({ txid: u.txid, n: u.n, seq: 0xffffffff, value: BigInt(u.value), script })), vout: [{ value: amount, script: tAddrScript(to) }] };

@@ -12,6 +12,7 @@ const tx = { branch: R.NU6_3_BRANCH, lockTime: 0, expiry: 0, vin: [{ txid: utxos
 console.log("FIXED " + JSON.stringify({ txid: R.txid(tx), sighash: R.hex(R.sighash(tx, 0)), raw: R.hex(R.serialize(tx)) }));
 const sw = R.buildSweep({ utxos, key, to: "t1RmRrhYbbAka8JZ4APf27rnZ43cHy9NqLt" });
 ok(sw.amount === 1424934n, "sweep amount = total - fee");
+ok(R.sweepFee(1) === 10000n && R.sweepFee(2) === 10000n && R.sweepFee(3) === 15000n && R.sweepFee(5) === 25000n, "ZIP-317 sweep fee grows with inputs");
 console.log("SWEEP " + JSON.stringify({ raw: R.hex(sw.raw), txid: sw.txid, pub: R.hex(key.pub), addr: key.addr }));
 if (process.argv.includes("--live")) {
   const u = await R.getUtxos("https://zcash-mainnet.chainsafe.dev", "t1RmRrhYbbAka8JZ4APf27rnZ43cHy9NqLt");

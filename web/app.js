@@ -194,7 +194,7 @@ async function returnZec(h, card) {
     if (left.some(x => x.transparent + x.orchard > 0n)) throw new Error("ZEC is still in the shielded pool. Press Continue transfer.");
     await hideHop(HM, h); step("Nothing left here. Removed."); return;
   }
-  const total = utxos.reduce((s, u) => s + u.value, 0n), amount = total - ZR.FEE;
+  const total = utxos.reduce((s, u) => s + u.value, 0n), amount = total - ZR.sweepFee(utxos.length);
   step("Getting a quote…");
   const j = await PW.requestQuote({ req: HM.reqOut({ dest: C, amount, recipient: acct, refundT: key.addr }), okDeposit: a => /^t1[1-9A-HJ-NP-Za-km-z]{33}$/.test(a || "") });
   step("Sending " + (Number(amount) / 1e8) + " ZEC…");
