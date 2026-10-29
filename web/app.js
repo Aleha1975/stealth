@@ -222,7 +222,7 @@ async function hideHop(HM, h) {
   if (r) { r.rec.st = { ...r.rec.st, step: "FAILED", result: "RETURNED", hidden: true }; await store.put(r.key, r.rec); }
   hops.delete(h.f.stealth.toLowerCase()); renderHops(); render();
 }
-setInterval(() => { const r = [...hops.values()].filter(h => h.running); if (r.length) { renderHops(); const v = hopView(r[0]); if (v.kind === "run" && v.what && $("pay-hint").textContent.startsWith("●")) say("pay-hint", statusLine(v), "ok"); } }, 1000);
+setInterval(() => { const r = [...hops.values()].filter(h => h.running); if (!r.length && $("pay-hint").textContent.startsWith("●")) say("pay-hint", ""); if (r.length) { renderHops(); const v = hopView(r[0]); if (v.kind === "run" && v.what && $("pay-hint").textContent.startsWith("●")) say("pay-hint", statusLine(v), "ok"); } }, 1000);
 function render() {
   const list = $("pay-list"); list.textContent = "";
   if (!found.length) { list.appendChild(el("p", "note", "Nothing found yet. Payments appear a few seconds after they land.")); return; }

@@ -64,8 +64,9 @@ export function hopView(h, now = Date.now()) {
     v.what = ui.line + (state ? " · " + state : "");
     v.line = v.what + " · " + (left != null ? fmtElapsed(left * 1000) + " left" : ui.wait);
   } else {
-    v.kind = "warn"; v.title = "Transfer paused"; v.body = "Your funds are safe. Press Continue transfer to carry on from step " + (idx + 1) + " of " + v.total + ".";
-    v.action = "continue"; v.detail = st.err || ""; v.pct = shownPct((st.stealth || "") + "#" + (st.n || 0), st, remainingMs(st, now), now);
+    const early = idx < STEPS.indexOf("WAIT_T");               // nothing has left the stealth address yet / no ZEC exists yet
+    v.kind = "warn"; v.title = "Transfer paused"; v.body = (st.err ? "Stopped: " + st.err + ". " : "") + (early ? "Your money has not moved." : "Your funds are safe.") + " Press Continue transfer to try again.";
+    v.action = "continue"; v.detail = ""; v.zec = !early; v.pct = shownPct((st.stealth || "") + "#" + (st.n || 0), st, remainingMs(st, now), now);
   }
   return v;
 }
@@ -92,7 +93,7 @@ export function hopCard(h, cb = {}, now = Date.now()) {
   const btn = (txt, cls, fn) => { const b = el("button", "btn " + cls, txt); b.type = "button"; b.addEventListener("click", () => fn(b)); acts.appendChild(b); };
   if (v.action === "continue") btn("Continue transfer", "", b => cb.onContinue && cb.onContinue(b));
   if (v.action === "funds") btn("Show funds", "", b => cb.onFunds && cb.onFunds(b));
-  if (!h.running && v.kind === "warn" && cb.onReturn) btn("Return money", "", b => cb.onReturn(b, card));
+  if (!h.running && v.kind === "warn" && v.zec && cb.onReturn) btn("Return money", "", b => cb.onReturn(b, card));
   if (!h.running && (v.kind === "done" || v.kind === "warn" && !v.action)) btn("Dismiss", "ghost", () => cb.onDismiss && cb.onDismiss());
   if (acts.childNodes.length) card.appendChild(acts);
   return card;
