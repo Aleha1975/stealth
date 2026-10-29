@@ -2,7 +2,7 @@
    стелс-адреса, чтобы одноразовому адресу не нужен был ETH на газ. Подпись делает клиент у себя ключом стелс-адреса; релеер
    платит газ своим ОТДЕЛЬНЫМ ключом (RELAYER_KEY из /opt/stealth/relayer.env) и шлёт транзакцию. Цепь: STEALTH_CHAIN=base|rh
    (chains.json; одна служба = одна цепь, порт/состояние/лог через окружение). Ограничения против расхода нашего газа чужими:
-   адрес должен быть объявлен через наш StealthPay (индексатор /known), один вывод с адреса в сутки (с замком на время
+   адрес должен быть объявлен через наш StealthPay (индексатор /known), до STEALTH_RELAY_PER_FROM (3) выводов с адреса в сутки (с замком на время
    обработки -- два параллельных запроса с одного адреса не пройдут оба), бюджет газа в сутки (резервируется ДО отправки,
    сверяется по квитанции), лимит на IP; счётчики пишутся в файл (рестарт не обнуляет). Застрявшая транзакция заменяется
    один раз тем же nonce с повышенной комиссией. Баланс релеера ниже порога -> отказ и строка ALERT в логе.
@@ -13,14 +13,17 @@
    API 127.0.0.1:3874: POST /stealth-api/relay {from,to,value,validAfter,validBefore,nonce,v,r,s[,feeAuth:{value,validAfter,validBefore,nonce,v,r,s}]}
    -> {hash[,feeHash]}; GET /stealth-api/relay/stats */
 import { makeScreen } from "./sanctions/screen.mjs";
+import { cleanLog, ipKey, parseEnvLine } from "./relay-util.mjs";
 import http from "http"; import fs from "fs"; import path from "path"; import { fileURLToPath, pathToFileURL } from "url";
 import { createPublicClient, createWalletClient, http as vhttp, fallback, parseAbi, formatEther, getAddress, defineChain, encodeAbiParameters, encodeFunctionData, keccak256, toHex, recoverTypedDataAddress, isAddress } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
 const HERE = path.dirname(fileURLToPath(import.meta.url));
-for (const f of ["/opt/mprhedged/exec/.env", "/opt/stealth/relayer.env"]) {
+// audit 1087 L-2: the foreign project's file (/opt/mprhedged) may only lend RPC URLs, never the hot key or limits; our own file may set anything. Quoted values keep # and quotes.
+const FOREIGN_OK = /^(BASE_RPC2?|BASE_LOGS_RPC|RH_RPC2?|RH_LOGS_RPC)$/;
+for (const [f, own] of [["/opt/mprhedged/exec/.env", false], ["/opt/stealth/relayer.env", true]]) {
   if (process.env.STEALTH_ENV_ONLY === "1" || !fs.existsSync(f)) continue;   // ENV_ONLY=1 (rh.env): never fall back to the Base key file
   for (const line of fs.readFileSync(f, "utf8").split("\n")) {
-    const m = line.match(/^\s*(?:export\s+)?([A-Z0-9_]+)=["']?([^"'#\n]+)/); if (m && !process.env[m[1]]) process.env[m[1]] = m[2].trim();
+    const kv = parseEnvLine(line); if (kv && (own || FOREIGN_OK.test(kv[0])) && !process.env[kv[0]]) process.env[kv[0]] = kv[1];
   }
 }
 const E = process.env;
@@ -61,7 +64,8 @@ if (!/^0x[0-9a-fA-F]{64}$/.test(KEY)) { console.error("RELAYER_KEY missing: gene
 export const account = privateKeyToAccount(KEY);
 const transport = RPCS.length > 1 ? fallback(RPCS.map(u => vhttp(u, { timeout: 30000 }))) : vhttp(RPCS[0], { timeout: 30000 });
 export const pub = createPublicClient({ chain, transport }); const wal = createWalletClient({ account, chain, transport });
-const log = (...a) => { const s = new Date().toISOString() + " " + a.join(" "); console.log(s); try { fs.appendFileSync(LOG, s + "\n"); } catch {} };
+const log = (...a) => { const s = new Date().toISOString() + " " + cleanLog(a.join(" "));   // audit 1087 L-1: no line breaks from user-derived text
+   console.log(s); try { fs.appendFileSync(LOG, s + "\n"); } catch {} };
 const day = () => Math.floor(Date.now() / 86400000);
 export const screen = makeScreen(undefined, log);                    // OFAC SDN EVM addresses (sanctions/evm.json), reloaded on file change
 
@@ -78,6 +82,12 @@ export const load = () => {
 load();
 const roll = () => { if (st.day !== day()) { st = { day: day(), gas: 0n, perIp: {}, perFrom: {}, perPayer: {} }; save(); } };
 const inflight = new Set();                 // from-адреса, обрабатываемые прямо сейчас
+// audit 1087 L-4a: поправки к суточному счётчику применяются только к тому дню, в котором сделан резерв (после полуночи новый день не «прощает» чужие траты)
+const adj = (d0, delta) => { if (st.day === d0) { st.gas += delta; if (st.gas < 0n) st.gas = 0n; } };
+// audit 1087 M-1: подписи, отправленные, но ещё не смайненные: from:nonce -> ответ клиенту. Повтор той же подписи получает тот же хеш (не вторую транзакцию, которая откатится и сожжёт газ).
+const pendingAuth = new Map();
+// audit "stuck tx": исходный хеш -> хеш замены; клиент спрашивает GET /relay/status?hash= и идёт по цепочке
+const replacedBy = new Map(); const remember = (h, h2) => { if (replacedBy.size > 500) replacedBy.clear(); replacedBy.set(h.toLowerCase(), h2); };
 let nonceLock = Promise.resolve();
 let lastAlert = 0;
 const alertOnce = (...a) => { if (Date.now() - lastAlert > 60000) { lastAlert = Date.now(); log("ALERT", ...a); } };
@@ -119,7 +129,8 @@ async function submit(call, gasLimit, retried = false) {
 }
 // отправка со сверкой по квитанции; возвращает hash сразу. spent: резерв заменяется фактом по квитанции
 const TRANSFER_CALL = args => ({ address: TOKEN, abi, functionName: "transferWithAuthorization", args });
-async function sendAndTrack(call, gasLimit, reserve, from, tag, onRevert) {
+async function sendAndTrack(call, gasLimit, reserve, from, tag, onRevert, onDone = () => {}) {
+  const d0 = st.day;
   let hash;
   const tq = Date.now(); let tw = 0;
   await (nonceLock = nonceLock.then(async () => { tw = Date.now() - tq; hash = await submit(call, gasLimit); }, () => {}));
@@ -143,7 +154,7 @@ async function sendAndTrack(call, gasLimit, reserve, from, tag, onRevert) {
           }
         } catch (e) { log("ALERT nonce gap fill failed", n, String(e).slice(0, 80)); }
         if (onRevert) onRevert(); else if (tag === "main") { if ((st.perFrom[from] || 0) > 1) st.perFrom[from]--; else delete st.perFrom[from]; }   // клиент может повторить: подпись не использована
-        save(); return;
+        adj(d0, -reserve); save(); return;                     // audit 1087 L-4c: транзакции нет ни в пуле, ни в блоке -- газа не потрачено, резерв возвращается
       }
       try {                                                    // застряла: та же nonce, комиссия выше -- один раз
         const tx = await pub.getTransaction({ hash });
@@ -151,22 +162,27 @@ async function sendAndTrack(call, gasLimit, reserve, from, tag, onRevert) {
         const fees = tx.maxFeePerGas ? { maxFeePerGas: up(tx.maxFeePerGas), maxPriorityFeePerGas: up(tx.maxPriorityFeePerGas || 0n) } : { gasPrice: up(tx.gasPrice) };
         log("stuck", tag, hash, "nonce", tx.nonce, "-> replacing with +" + BUMP_PCT + "%");
         const h2 = await wal.writeContract({ ...call, nonce: tx.nonce, gas: tx.gas, ...fees });
-        log("replacement", tag, h2);
+        log("replacement", tag, h2); remember(hash, h2);
+        const extra = reserve * BUMP_PCT / 100n; adj(d0, extra); reserve += extra;   // audit 1087 L-4b: замена дороже на BUMP_PCT -- доплата в резерв, иначе бюджет занижен
       } catch (e) { log("replace failed", tag, hash, String(e).slice(0, 100)); }
-      try { rc = await pub.waitForTransactionReceipt({ hash, timeout: 180_000, onReplaced: r => log("replaced", hash, "->", r.transaction.hash, r.reason) }); }
+      try { rc = await pub.waitForTransactionReceipt({ hash, timeout: 180_000, onReplaced: r => { log("replaced", hash, "->", r.transaction.hash, r.reason); remember(hash, r.transaction.hash); } }); }
       catch (e) { log("ALERT receipt wait failed", tag, hash, String(e).slice(0, 80)); return; }   // резерв остаётся (консервативно)
     }
-    const spent = rc.gasUsed * (rc.effectiveGasPrice || 0n); st.gas += spent - reserve; if (st.gas < 0n) st.gas = 0n;
-    if (rc.status !== "success") { if (onRevert) onRevert(); else if (tag === "main") { if ((st.perFrom[from] || 0) > 1) st.perFrom[from]--; else delete st.perFrom[from]; } log("reverted", tag, hash); } else log("mined", tag, hash, "gas", formatEther(spent), "ETH");
+    const spent = rc.gasUsed * (rc.effectiveGasPrice || 0n); adj(d0, spent - reserve);
+    // audit 1087 M-1: откат НЕ возвращает лимит на адрес/плательщика (раньше возвращал -- можно было гонять откаты бесконечно за наш газ); возвращается только пропажа транзакции (выше)
+    if (rc.status !== "success") log("reverted", tag, hash); else log("mined", tag, hash, "gas", formatEther(spent), "ETH");
     save();
   };
-  watch().catch(e => log("watch error", String(e).slice(0, 80)));
+  watch().catch(e => log("watch error", String(e).slice(0, 80))).finally(onDone);
   return hash;
 }
 
 export async function relay(b, ip) {
+  ip = ipKey(ip);                                                      // audit 1087 M-1: IPv6 -> its /64
   const from = getAddress(b.from), to = getAddress(b.to);
-  screen.check({ from, to, feeRecipient: account.address }, ip);      // before any RPC / counters / gas
+  // audit 1087 M-3: `to` is a 1Click deposit address for a private withdraw. A client that names the real end recipient (endRecipient) gets it screened too;
+  // the web app screens it itself via /relay/screen before signing (sending it here would tell this server who receives the money).
+  screen.check({ from, to, feeRecipient: account.address, ...(b.endRecipient ? { endRecipient: getAddress(b.endRecipient) } : {}) }, ip);      // before any RPC / counters / gas
   const main = parseAuth(b, ""); const value = main.value;
   if (value < MIN_VALUE) throw new Error("below the minimum of $0.10");
   let fee = null;
@@ -176,6 +192,9 @@ export async function relay(b, ip) {
     if (fee.value < FEE_MIN) throw new Error("fee below the minimum");
   } else if (FEE_MIN > 0n) throw new Error("fee authorization required");
   roll();
+  const dupKey = (from + ":" + main.nonce).toLowerCase(), dup = pendingAuth.get(dupKey);
+  if (dup) { if (!(await pub.getTransactionReceipt({ hash: dup.hash }).catch(() => null))) return dup; pendingAuth.delete(dupKey); }   // уже смайнена -- дальше обычная проверка («already used»)                                                // audit 1087 M-1: та же подпись уже в пути -- тот же ответ, ничего нового не отправляется и не считается
+  const d0 = st.day;
   // ---- синхронный блок: проверки суток и замок адреса без await между проверкой и записью
   if ((st.perIp[ip] || 0) >= MAX_PER_IP_PER_DAY) throw new Error("too many requests from this network today");
   if ((st.perFrom[from] || 0) >= MAX_PER_FROM) throw new Error("this address reached its withdrawal limit today; try tomorrow");
@@ -211,15 +230,17 @@ export async function relay(b, ip) {
     const n = BigInt(calls.length); let left = reserve;
     for (let i = 0; i < calls.length; i++) {                 // комиссия первой; резерв делится поровну между транзакциями
       const [tag, args] = calls[i]; const part = i === calls.length - 1 ? left : reserve / n; left -= part;
-      try { hashes[tag] = await sendAndTrack(TRANSFER_CALL(args), lims[i], part, from, tag); }
+      const last = i === calls.length - 1;       // освободить запись о подписи, когда смайнена (или потеряна) последняя транзакция
+      try { hashes[tag] = await sendAndTrack(TRANSFER_CALL(args), lims[i], part, from, tag, undefined, last ? () => pendingAuth.delete(dupKey) : undefined); }
       catch (e) { if (sent) log("ALERT fee sent but main failed", from, String(e).slice(0, 80)); throw e; }
       sent = true; used += part;
       if (tag === "main") { st.perFrom[from] = (st.perFrom[from] || 0) + 1; save(); }
     }
     log("relay", from, "->", to, (Number(value) / 1e6).toFixed(6), CC.token_symbol, hashes.main, fee ? "fee " + (Number(fee.value) / 1e6).toFixed(6) + " " + hashes.fee : "", "ip", ip);
-    return fee ? { hash: hashes.main, feeHash: hashes.fee } : { hash: hashes.main };
+    const res = fee ? { hash: hashes.main, feeHash: hashes.fee } : { hash: hashes.main };
+    pendingAuth.set(dupKey, res); return res;
   } catch (e) {
-    st.gas -= reserve - used; if (st.gas < 0n) st.gas = 0n;     // неотправленная часть резерва возвращается
+    adj(d0, -(reserve - used));                                 // неотправленная часть резерва возвращается (в том же дне)
     if (!sent && st.perIp[ip] > 0) st.perIp[ip]--;              // до отправки ничего не потрачено: вернуть и счётчик IP
     save();
     throw e;
@@ -237,6 +258,7 @@ export async function relayPay(b, ip) {
   if (!b || !b.auth || !isAddress(b.token || "") || !isAddress(b.stealth || "") || !isAddress(b.auth.from || "") || !isAddress(b.feeRecipient || "")) throw new Error("bad request");
   if (!EPH.test(b.eph || "") || !HEX1.test(b.viewTag || "")) throw new Error("bad ephemeral key or view tag");
   if (!HEX32.test(b.auth.r) || !HEX32.test(b.auth.s) || ![27, 28].includes(Number(b.auth.v))) throw new Error("bad signature fields");
+  ip = ipKey(ip);                                                      // audit 1087 M-1: IPv6 -> its /64
   const token = getAddress(b.token), stealth = getAddress(b.stealth), feeTo = getAddress(b.feeRecipient), from = getAddress(b.auth.from);
   screen.check({ payer: from, stealth, feeRecipient: feeTo }, ip);   // before any RPC / counters / gas
   if (token !== TOKEN) throw new Error("unsupported token");
@@ -247,6 +269,9 @@ export async function relayPay(b, ip) {
   if (fee > 0n ? feeTo !== account.address : feeTo !== "0x0000000000000000000000000000000000000000") throw new Error("fee recipient must be the relayer");
   if (stealth === STEALTHPAY || stealth === TOKEN || stealth === account.address || stealth === from) throw new Error("bad destination");
   roll();
+  const nonce = localPaymentNonce(token, stealth, eph, tag, fee, feeTo), dupKey = ("pay:" + from + ":" + nonce).toLowerCase(), dup = pendingAuth.get(dupKey);
+  if (dup) { if (!(await pub.getTransactionReceipt({ hash: dup.hash }).catch(() => null))) return dup; pendingAuth.delete(dupKey); }                                                // audit 1087 M-1: тот же платёж уже в пути -- тот же хеш
+  const d0 = st.day;
   if ((st.perIp[ip] || 0) >= MAX_PER_IP_PER_DAY) throw new Error("too many requests from this network today");
   if ((st.perPayer[from] || 0) >= MAX_PER_PAYER_PER_DAY) throw new Error("too many payments from this wallet today");
   const lockKey = "pay:" + from;
@@ -255,7 +280,6 @@ export async function relayPay(b, ip) {
   inflight.add(lockKey); st.perIp[ip] = (st.perIp[ip] || 0) + 1; st.perPayer[from] = (st.perPayer[from] || 0) + 1;
   let reserve = 0n, sent = false;
   try {
-    const nonce = localPaymentNonce(token, stealth, eph, tag, fee, feeTo);
     // независимые чтения -- одним залпом (раньше ~6 последовательных RPC на заявку); проверки применяются в прежнем порядке
     const [onchain, code, bal, used, bw] = await Promise.all([
       pub.readContract({ address: STEALTHPAY, abi: payAbi, functionName: "paymentNonce", args: [token, stealth, eph, tag, fee, feeTo] }),
@@ -281,33 +305,44 @@ export async function relayPay(b, ip) {
     const est = g * GAS_PAD_PCT / 100n * (fees.maxFeePerGas || fees.gasPrice || 0n);
     if (st.gas + est > GAS_BUDGET_WEI_PER_DAY) throw new Error("relayer gas budget for today is spent");
     st.gas += est; reserve = est; save();
-    const hash = await sendAndTrack(call, g * GAS_PAD_PCT / 100n, reserve, from, "pay", () => { if (st.perPayer[from] > 0) st.perPayer[from]--; });
-    sent = true;
+    const hash = await sendAndTrack(call, g * GAS_PAD_PCT / 100n, reserve, from, "pay", () => { if (st.perPayer[from] > 0) st.perPayer[from]--; }, () => pendingAuth.delete(dupKey));   // onRevert = только пропавшая транзакция, не откат (audit 1087 M-1)
+    sent = true; pendingAuth.set(dupKey, { hash });
     log("relay-pay", from, "->", stealth, (Number(amount) / 1e6).toFixed(6), CC.token_symbol, "fee", (Number(fee) / 1e6).toFixed(6), hash, "ip", ip);
     return { hash };
   } catch (e) {
-    if (!sent) { st.gas -= reserve; if (st.gas < 0n) st.gas = 0n; if (st.perIp[ip] > 0) st.perIp[ip]--; if (st.perPayer[from] > 0) st.perPayer[from]--; save(); }
+    if (!sent) { adj(d0, -reserve); if (st.perIp[ip] > 0) st.perIp[ip]--; if (st.perPayer[from] > 0) st.perPayer[from]--; save(); }
     throw e;
   } finally { inflight.delete(lockKey); }
 }
 
+/** GET /relay/status?hash=0x.. -> {hash: latest hash (follows a replacement), status: "pending"|"success"|"reverted"} */
+export async function statusOf(h) {
+  if (!HEX32.test(h || "")) throw new Error("bad hash");
+  let cur = h.toLowerCase(); for (let i = 0; i < 5 && replacedBy.has(cur); i++) cur = replacedBy.get(cur).toLowerCase();
+  const rc = await pub.getTransactionReceipt({ hash: cur }).catch(() => null);
+  return { hash: cur, status: rc ? (rc.status === "success" ? "success" : "reverted") : "pending" };
+}
 export const stats = () => { roll(); return { chain: CHAIN, relayer: account.address, gas_spent_today_eth: formatEther(st.gas), gas_budget_eth: formatEther(GAS_BUDGET_WEI_PER_DAY), fee_min: FEE_MIN.toString(), pay_enabled: !!STEALTHPAY, stealthpay: STEALTHPAY, pay_fee: PAY_FEE.toString(), pay_fee_min: PAY_FEE_MIN.toString(), sends: tmStats.n, avg_lock_wait_ms: tmStats.n ? Math.round(tmStats.wait / tmStats.n) : 0, max_lock_wait_ms: tmStats.maxWait, avg_send_ms: tmStats.n ? Math.round(tmStats.send / tmStats.n) : 0 }; };
 
 function serve() {
   http.createServer((req, res) => {
     const send = (code, obj) => { const s = JSON.stringify(obj); res.writeHead(code, { "Content-Type": "application/json", "Cache-Control": "no-store", "Content-Length": Buffer.byteLength(s) }); res.end(s); };
-    if (req.method === "GET" && req.url.endsWith("/relay/stats")) return send(200, stats());
-    if (req.method === "GET" && /\/relay\/screen(\?|$)/.test(req.url)) {                    // GET /stealth-api/relay/screen?addr=0x.. -> {addr,listed}
-      const a = new URL(req.url, "http://x").searchParams.get("addr") || ""; if (!isAddress(a)) return send(400, { error: "bad address" });
+    // audit 1087 L-5: route by the parsed pathname (never by a substring of the raw URL with its query string); POSTs take no query at all
+    let u; try { u = new URL(req.url, "http://x"); } catch { return send(400, { error: "bad url" }); }
+    const route = u.pathname.replace(/\/+$/, "").match(/\/relay(\/(?:stats|screen|status|pay))?$/);
+    if (req.method === "GET" && route && route[1] === "/stats") return send(200, stats());
+    if (req.method === "GET" && route && route[1] === "/screen") {                           // GET /stealth-api/relay/screen?addr=0x.. -> {addr,listed}
+      const a = u.searchParams.get("addr") || ""; if (!isAddress(a)) return send(400, { error: "bad address" });
       return send(200, { addr: a.toLowerCase(), listed: screen.isListed(a) });
     }
-    const isPay = req.url.endsWith("/relay/pay");
-    if (req.method !== "POST" || !(isPay || req.url.endsWith("/relay"))) return send(404, { error: "not found" });
+    if (req.method === "GET" && route && route[1] === "/status") return statusOf(u.searchParams.get("hash")).then(r => send(200, r), e => send(400, { error: String(e.message).slice(0, 80) }));
+    const isPay = !!route && route[1] === "/pay";
+    if (req.method !== "POST" || !route || (route[1] && !isPay) || u.search) return send(404, { error: "not found" });
     let body = ""; req.on("data", c => { body += c; if (body.length > 8192) req.destroy(); });
     req.on("end", async () => {
       const ip = String(req.headers["x-forwarded-for"] || req.socket.remoteAddress || "").split(",")[0].trim();
       try { send(200, await (isPay ? relayPay : relay)(JSON.parse(body), ip)); }
-      catch (e) { const msg = String(e && (e.shortMessage || e.message) || e).slice(0, 160); log("refused", ip, msg); send(400, { error: msg }); }
+      catch (e) { const msg = String(e && (e.shortMessage || e.message) || e).slice(0, 160); log("refused", ip, JSON.stringify(msg)); send(400, { error: msg }); }   // JSON.stringify: audit 1087 L-1, one line per refusal
     });
   }).listen(Number(E.STEALTH_RELAY_PORT || 3874), "127.0.0.1", async () => {
     log("stealth relayer", CHAIN, "on", E.STEALTH_RELAY_PORT || 3874, "as", account.address, "balance", formatEther(await pub.getBalance({ address: account.address })), "ETH");

@@ -1,7 +1,7 @@
 Install notes (NOT done; files only)
   useradd --system --home /opt/stealth --shell /usr/sbin/nologin stealth   (if absent)
   install -d -o stealth -g stealth -m 750 /opt/stealth/data-rh /opt/stealth/data-watch
-  /opt/stealth/{stealth_indexer.py,relayer.mjs,chains.json,stealth_watch.py,node_modules->symlink,package.json} readable by user stealth
+  /opt/stealth/{stealth_indexer.py,relayer.mjs,relay-util.mjs,sanctions/,chains.json,stealth_watch.py,node_modules->symlink,package.json} readable by user stealth
   install -m 600 -o stealth -g stealth rh.env /opt/stealth/rh.env ; watch.env likewise
   cp stealth-*.service stealth-watch.timer /etc/systemd/system/ ; systemctl daemon-reload
   systemctl enable --now stealth-indexer-rh stealth-relayer-rh stealth-watch.timer
