@@ -205,6 +205,17 @@ async function returnZec(h, card) {
   step(fin.status === "SUCCESS" ? "Done: ≈ " + (Number(j.quote.amountOut) / 1e6).toFixed(2) + " " + SYM + " sent to your wallet." : "Swap ended as " + fin.status + ". The ZEC is back on the hop address; press Return money again.");
   if (fin.status === "SUCCESS") await hideHop(HM, h);
 }
+// A transfer from the first version (before Ironwood) could never shield, so its ZEC only ever sat on the hop t-addresses:
+// once those are empty (returned) the record is history and shows nothing. Later versions are never hidden this way.
+async function staleV1(HM, r, hit) {
+  if (r.rec.st.v === 2) return false;
+  try {
+    const ZR = await import("./zec-return.js"), { zcash: ZC } = await import("./chains.js");
+    const seed = await HM.mnemonicSeed(await HM.mnemonicFor(hit.stealthPriv, await HM.loadWords(), r.rec.st.n || 0));
+    for (let a = 0; a < 4; a++) for (let i = 0; i < 3; i++) if ((await ZR.getUtxos(ZC.lightwalletd, ZR.deriveT(seed, ZR.tPath(a, i)).addr)).length) return false;
+    return true;
+  } catch { return false; }
+}
 // a finished or returned transfer leaves no card behind (the record stays in IndexedDB, flagged)
 async function hideHop(HM, h) {
   const store = HM.idbStore(), r = await HM.findHop(store, h.f.stealth);
@@ -307,6 +318,7 @@ async function showResume() {
     const k = f.stealth.toLowerCase(); if ((hops.get(k) || {}).running) continue;
     const r = await HM.findHop(store, f.stealth); if (!r || r.rec.st.hidden || ["DONE", "FAILED_IN"].includes(r.rec.st.step)) continue;
     const hit = checkAnnouncement(keys, f.eph, null); if (!hit || hit.stealth.toLowerCase() !== k) continue;
+    if (await staleV1(HM, r, hit)) { r.rec.st = { ...r.rec.st, hidden: true }; await store.put(r.key, r.rec); continue; }
     hops.set(k, { f, hit, running: false, msg: "", st: r.rec.st });
   }
   renderHops(); render();
