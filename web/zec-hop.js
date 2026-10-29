@@ -217,8 +217,9 @@ export const makeTxKnown = (fetchFn = fetch, base = ZC.lightwalletd) => async tx
 
 // ---------------------------------------------------------------- storage: key = "<stealth>#<n>", value = { st, db } (db = wallet bytes)
 export function idbStore(name = "stealth-zec-hop") {
-  let dbp; const open = () => dbp ||= new Promise((res, rej) => { const r = indexedDB.open(name, 1); r.onupgradeneeded = () => r.result.createObjectStore("hops"); r.onsuccess = () => res(r.result); r.onerror = () => rej(r.error); });
-  const run = (mode, f) => open().then(db => new Promise((res, rej) => { const t = db.transaction("hops", mode), q = f(t.objectStore("hops")); t.oncomplete = () => res(q.result); t.onerror = () => rej(t.error); }));
+  // 1088 L-4: every way a request can end settles the promise (abort, blocked, version change); a failed open is not cached; storage is asked to be persistent (no silent eviction)
+  let dbp; const open = () => dbp ||= new Promise((res, rej) => { const r = indexedDB.open(name, 1); r.onupgradeneeded = () => r.result.createObjectStore("hops"); r.onsuccess = () => { r.result.onversionchange = () => { r.result.close(); dbp = null; }; res(r.result); }; r.onerror = () => rej(r.error); r.onblocked = () => rej(new Error("storage is blocked by another tab")); try { navigator.storage && navigator.storage.persist && navigator.storage.persist(); } catch {} }).catch(e => { dbp = null; throw e; });
+  const run = (mode, f) => open().then(db => new Promise((res, rej) => { const t = db.transaction("hops", mode), q = f(t.objectStore("hops")); t.oncomplete = () => res(q.result); t.onerror = () => rej(t.error); t.onabort = () => rej(t.error || new Error("storage write aborted")); }));
   return { get: k => run("readonly", s => s.get(k)), put: (k, v) => run("readwrite", s => s.put(v, k)), keys: () => run("readonly", s => s.getAllKeys()) };
 }
 export const memStore = () => { const m = new Map(); return { get: async k => m.get(k) && structuredClone(m.get(k)), put: async (k, v) => void m.set(k, structuredClone(v)), keys: async () => [...m.keys()] }; };
@@ -309,6 +310,7 @@ export async function runHop(ctx) {
           if (!st.auth && Date.now() > q.deadlineMs - 120_000) return go("QUOTE_IN", { inQuote: null });      // quote nearly expired and nothing signed: start over
           const spent = st.auth && !st.txIn && ctx.balance && (await ctx.balance()) < BigInt(q.amountIn);       // authorization used but the answer got lost
           let skip = !!spent;
+          if (skip && ctx.authUsed) { try { if ((await ctx.authUsed(st.stealth, st.auth.nonce)) === false) skip = false; } catch {} }   // 1088 L-3: a low or missing balance reading alone is no proof; the chain must say the nonce was used (else the SAME authorization is sent again, which is safe)
           if (!skip && st.auth && !st.txIn && st.auth.validBefore * 1000 <= Date.now()) {
             // M-1: the saved authorization has expired. It may still have been settled. A new one (new nonce) is allowed ONLY if the chain says this nonce was never used.
             let used; try { used = ctx.authUsed ? await ctx.authUsed(st.stealth, st.auth.nonce) : undefined; } catch (e) { throw new Halt("could not check the earlier authorization on chain (" + e.message + "); nothing new was signed"); }
@@ -318,7 +320,7 @@ export async function runHop(ctx) {
           }
           if (!skip) {
             if (!st.auth) {
-              st.auth = PW.signTransferAuth({ chain: ctx.chain, priv: ctx.priv, from: st.stealth, to: q.depositAddress, value: BigInt(q.amountIn), validBefore: Math.floor(Date.now() / 1000) + 3600, nonce: ctx.randomNonce() });
+              st.auth = PW.signTransferAuth({ chain: ctx.chain, priv: ctx.priv, from: st.stealth, to: q.depositAddress, value: BigInt(q.amountIn), validBefore: Math.min(Math.floor(Date.now() / 1000) + 3600, Math.floor(q.deadlineMs / 1000) - 30), nonce: ctx.randomNonce() });     // 1088 M-3: never valid past the quote
               await save();                                      // recorded BEFORE it can leave the device
             }
             if (!st.txIn) { say("Sending through the relayer…"); st.txIn = await relay(); await save(); }
@@ -407,7 +409,10 @@ export async function runHop(ctx) {
           if (!p.raw) {
             let proposal; try { proposal = await w.propose_transfer(st.accts[p.acct], oq.depositAddress, BigInt(oq.amountIn)); }
             catch (e) {
-              const r = BigInt(p.reserve || st.reserve); p.reserve = (r * 2n).toString(); p.quote = null;
+              const r = BigInt(p.reserve || st.reserve);
+              if (!/insufficient|fee|funds/i.test(String((e && e.message) || e))) throw e;                              // 1088 L-2: only a fee shortfall doubles the reserve; sync / network errors just retry
+              if (r >= RESERVE * 8n) throw new Halt("the Zcash fee does not fit even with a reserve of " + r + " zatoshi (" + e.message + ")");   // ... and never without bound
+              p.reserve = (r * 2n).toString(); p.quote = null;
               if (partsOn()) { p.amount = (BigInt(p.amount) - r).toString(); if (BigInt(p.amount) < ZC.minIn) throw new Halt("the Zcash fee does not fit into this payout part (" + e.message + ")"); }
               await go("QUOTE_OUT"); throw new Halt("the Zcash fee did not fit; resume to try with a bigger reserve (" + e.message + ")");
             }
@@ -442,7 +447,15 @@ export async function runHop(ctx) {
     if (st.dry && !["QUOTE_IN", "DEPOSIT_IN"].includes(st.step)) { st.err = "dry run stops here"; break; }
     try { await retry(() => H[st.step](), { sleep }); } catch (e) { st.err = e.message || String(e); st.halted = e instanceof Halt; break; }   // halted = a deliberate stop (checks); otherwise a transient failure the app may retry
   }
-  await save(); say(st.err || progressText(st)); return st;
+  await save(); say(st.err || progressText(st));
+  return st;
+}
+
+/** 1088 L-6: a finished transfer must not keep the stealth -> hop address -> recipient link (nor the wallet / viewing key) in plaintext. Leaves only what findHop / startHop need.
+ *  Called by the app once the result has been shown (not inside runHop: the caller and tests still read the full state). */
+export async function scrubFinished(store, stealth) {
+  const f = await findHop(store, stealth); if (!f || !["DONE", "FAILED_IN"].includes(f.rec.st.step)) return false;
+  const st = f.rec.st; await store.put(f.key, { st: { v: st.v, n: st.n, stealth: st.stealth, chain: st.chain, dest: st.dest, step: st.step, result: st.result, doneAt: st.doneAt, amount: st.amount, hidden: st.hidden, scrubbed: true }, db: null }); return true;
 }
 
 /** Funds left in the hop wallet: per account t-address and balances. Works from the saved wallet, or from the keys alone (fallback birthday from the payment's block time). */

@@ -1,6 +1,6 @@
 import { keysFromSignature, keyRequestTypedData, metaAddress, parseMeta, deriveForPayment, checkAnnouncement, decodeMetadata, hex, unhex, keccak, signDigest, randomBytes32 } from "./stealth-crypto.js";
 import { postRelay } from "./relay-post.js";
-import { paymentNonce, receiveTypedData, splitSig, payAmounts as calcAmounts } from "./pay-auth.js";
+import { paymentNonce, receiveTypedData, splitSig, payAmounts as calcAmounts, feeWithinCap } from "./pay-auth.js";
 import { CHAINS, pickChain, chainOfMeta, addChainParams } from "./chains.js";
 import * as PW from "./private-withdraw.js";
 import { hopCard, hopView, statusLine } from "./hop-card.js";
@@ -82,12 +82,19 @@ if (window.ethereum) {
 $("btn-keys").addEventListener("click", async () => {
   try {
     if (!acct && !(await connect())) return;
-    say("recv-hint", "Sign the request in your wallet…");
+    // audit 1086 M-1: this signature IS the master key; any site that gets the same signature gets the funds. Say so, and name the only host to sign on.
+    say("recv-hint", "Sign the request in your wallet… Only ever sign this on " + location.host + ", never on another site.");
     const sig = await wallet("eth_signTypedData_v4", [acct, keyRequestTypedData(acct)]);
     keys = keysFromSignature(sig, acct);
     const meta = metaAddress(keys, C.key);
     // remember the public meta-address per account: if a later derivation differs, say so before a link is shared
-    let prev = null; try { prev = localStorage.getItem("stealth.meta." + acct); localStorage.setItem("stealth.meta." + acct, meta); } catch {}
+    let prev = null; try { prev = localStorage.getItem("stealth.meta." + acct); } catch {}
+    if (!prev) {                                         // audit 1086 M-3: first derivation on this browser: ask once more; a wallet that signs with random nonces gives other keys each time, and its meta-address could never be re-derived
+      say("recv-hint", "First time on this browser: sign the same request once more to prove your wallet gives the same keys every time…");
+      const again = keysFromSignature(await wallet("eth_signTypedData_v4", [acct, keyRequestTypedData(acct)]), acct);
+      if (metaAddress(again, C.key) !== meta) { keys = null; throw new Error("Your wallet gave a different signature the second time (randomised signing). Keys derived from it could not be recovered later, so none were made. Use a standard key-based wallet such as MetaMask."); }
+    }
+    try { localStorage.setItem("stealth.meta." + acct, meta); } catch {}
     $("meta").textContent = meta; $("paylink").textContent = location.origin + location.pathname.replace(/[^/]*$/, "") + "app.html?" + (C.key === pickChain("").key ? "" : "chain=" + C.key + "&") + "to=" + meta;
     $("recv-out").hidden = false;
     if (prev && prev !== meta) say("recv-hint", "Warning: these keys differ from the ones this account derived before on this device. Payments sent to the old link are reachable only with the old keys. Check your wallet account.", "warn");
@@ -280,13 +287,14 @@ async function runHop(f, hit, o) {
   const HM = await hopMod(), ctx = await hopCtx(HM, f, hit, o || {}), key = "zec-hop:" + k;
   let h;
   if (o) h = { f, hit, running: true, msg: "", st: { step: "QUOTE_IN", chain: C.key, dest: o.dest.key, amount: o.amount.toString(), recipient: o.recipient, startedAt: Date.now() } };
-  else { const r = await HM.findHop(ctx.store, f.stealth); if (!r) throw new Error("nothing to resume"); ctx.chain = CHAINS[r.rec.st.chain]; ctx.dest = CHAINS[r.rec.st.dest]; h = { f, hit, running: true, msg: "", st: r.rec.st }; }
+  else { const r = await HM.findHop(ctx.store, f.stealth); if (!r) throw new Error("nothing to resume"); if (r.rec.st.chain !== C.key) throw new Error("This transfer belongs to " + (CHAINS[r.rec.st.chain] || {}).name + ": open the app on that chain to resume it."); ctx.chain = CHAINS[r.rec.st.chain]; ctx.dest = CHAINS[r.rec.st.dest]; h = { f, hit, running: true, msg: "", st: r.rec.st }; }
   hops.set(k, h); say("pay-hint", ""); renderHops(); render();
   const run = () => (o ? HM.startHop(ctx) : HM.runHop(ctx));
   let st;
   try { st = await (navigator.locks ? navigator.locks.request(key, { ifAvailable: true }, l => l ? run() : Promise.reject(new Error("This transfer is already running in another tab."))) : run()); }
   catch (e) { if (o) hops.delete(k); else h.running = false; renderHops(); render(); throw e; }
   h.st = st; h.running = false;
+  if (["DONE", "FAILED_IN"].includes(st.step)) HM.scrubFinished(ctx.store, f.stealth).catch(() => {});   // audit 1088 L-6: no stealth -> recipient link kept in the browser after the end
   // transient failures (network, RPC, quote service) resume on their own: 1, 2, 4, 8, 16 min; a deliberate stop (a failed check) waits for the user
   if (!TERMINAL.includes(st.step) && st.err && !st.halted && (autoTries.get(k) || 0) < 5) {
     const n = (autoTries.get(k) || 0) + 1; autoTries.set(k, n); h.retryAt = Date.now() + 60_000 * 2 ** (n - 1);
@@ -347,9 +355,15 @@ $("btn-wd").addEventListener("click", async () => {
     if (!(value > 0n) || value > all) throw new Error("amount must be within the balance");
     const hit = checkAnnouncement(keys, wd.eph, null);
     if (!hit || hit.stealth.toLowerCase() !== wd.stealth.toLowerCase()) throw new Error("could not re-derive the key for this address");
-    const info = await api("/usdc-domain");                       // the token's own domain separator, read server-side
-    if (String(info.domain_separator).toLowerCase() !== hex(domainSeparator()).toLowerCase()) throw new Error(SYM + " domain mismatch; refusing to sign");
-    if ($("wd-private").checked && !$("wd-priv-wrap").hidden) return await privateWithdraw(to, value, hit);
+    // audit 1086 L-4: the token's own DOMAIN_SEPARATOR() read from the chain RPC / the wallet (not from our indexer, which would only prove config drift)
+    const dsep = await chainRpc(C.rpc, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "eth_call", params: [{ to: USDC, data: "0x3644e515" }, "latest"] }) }).then(r => r.json()).then(j => j.result).catch(() => null);
+    if (String(dsep).toLowerCase() !== hex(domainSeparator()).toLowerCase()) throw new Error(SYM + " domain mismatch (or could not be read from the chain); refusing to sign");
+    if ($("wd-private").checked && !$("wd-priv-wrap").hidden) {
+      // audit 1087 M-3: the relayer only sees the 1Click deposit address, so the real recipient is screened here, before anything is signed (fail closed if the check cannot run)
+      const sc = await api("/relay/screen?addr=" + to).catch(() => null);
+      if (!sc || sc.listed !== false) throw new Error(sc && sc.listed ? "That recipient address is on a sanctions list; refusing." : "Could not check the recipient against the sanctions list; nothing was sent. Try again.");
+      return await privateWithdraw(to, value, hit);
+    }
     const now = Math.floor(Date.now() / 1000); const validBefore = BigInt(now + 3600); const nonce = randomBytes32();
     const struct = hex(TYPEHASH) + padAddr(wd.stealth) + padAddr(to) + pad(value) + pad(0n) + pad(validBefore) + nonce.slice(2);
     const digest = keccak(unhex("0x1901" + hex(domainSeparator()).slice(2) + hex(keccak(unhex(struct))).slice(2)));
@@ -368,7 +382,11 @@ $("btn-wd").addEventListener("click", async () => {
   } catch (e) { say("pay-hint", e.message || String(e), "bad"); }
 });
 async function waitReceipt(h) {
-  for (let i = 0; i < 60; i++) { const r = await api("/receipt?tx=" + h); if (r.status != null) return { ok: r.status === 1 }; await new Promise(z => setTimeout(z, 2000)); }
+  for (let i = 0; i < 60; i++) {
+    const r = await api("/receipt?tx=" + h); if (r.status != null) return { ok: r.status === 1 };
+    if (i % 3 === 2) { const s = await api("/relay/status?hash=" + h).catch(() => null); if (s && isHash(s.hash) && s.hash.toLowerCase() !== h.toLowerCase()) h = s.hash; }   // the relayer replaced a stuck transaction: follow its new hash
+    await new Promise(z => setTimeout(z, 2000));
+  }
   throw new Error("not mined yet: " + h);
 }
 
@@ -403,13 +421,14 @@ async function payGasless({ amount, raw: rawIn = null, d, ephLen, ephData, tagWo
   if (String(stats.stealthpay || "").toLowerCase() !== STEALTHPAY.toLowerCase()) throw new Error("The relayer serves a different StealthPay contract; refusing.");
   const raw = rawIn ?? BigInt(Math.round(amount * TUNIT)), fee = BigInt(stats.pay_fee), feeTo = stats.relayer;   // "you pay" = raw = what leaves the wallet; the fee comes out of it
   if (fee < 0n || fee >= raw) throw new Error("The amount is below the relayer fee (" + fmtTok(fee) + " " + SYM + ").");
+  if (!feeWithinCap(fee, raw, BigInt(TUNIT))) throw new Error("The relayer asks " + fmtTok(fee) + " " + SYM + " in fees for a " + fmtTok(raw) + " " + SYM + " payment, which is more than this page accepts (max 1.00 and half of the payment). Refusing.");   // audit 1086 L-1
   const bal = BigInt(await wallet("eth_call", [{ to: USDC, data: "0x70a08231" + padAddr(acct) }, "latest"]));
   if (bal < raw) throw new Error("Your wallet holds less than " + amount + " " + SYM + ".");
   const args = { chainId: C.chainId, stealthPay: STEALTHPAY, token: USDC, stealth: d.stealth, eph: d.ephPub, viewTag: d.viewTag, fee, feeRecipient: feeTo };
   const nonce = paymentNonce(args);
   const onchain = await wallet("eth_call", [{ to: STEALTHPAY, data: sel("paymentNonce(address,address,bytes,bytes1,uint256,address)") + padAddr(USDC) + padAddr(d.stealth) + pad(192n) + tagWord + pad(fee) + padAddr(feeTo) + ephLen + ephData }, "latest"]);
   if (String(onchain).toLowerCase() !== nonce.toLowerCase()) throw new Error("Payment nonce mismatch between this page and the contract; refusing to sign.");
-  const msg = "You send " + fmtTok(raw) + " " + SYM + ". The receiver gets " + fmtTok(raw - fee) + " " + SYM + ". The relayer fee for the gas is " + fmtTok(fee) + " " + SYM + ". You pay no gas.";
+  const msg = "You send " + fmtTok(raw) + " " + SYM + ". The receiver gets " + fmtTok(raw - fee) + " " + SYM + ". The relayer fee for the gas is " + fmtTok(fee) + " " + SYM + " (to " + feeTo + "). You pay no gas.";
   say("send-hint", msg + " Sign in your wallet…");
   if (!confirm(msg + "\n\nContinue and sign?")) throw new Error("Cancelled. Nothing was signed.");
   const validBefore = Math.floor(Date.now() / 1000) + 3600;
