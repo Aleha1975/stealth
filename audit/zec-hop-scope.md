@@ -36,5 +36,6 @@ Observer correlating deposit and payout (amount/time): mitigated by shielding, r
 ## Not verified without funds
 Real ZEC deposit address format from a non-dry ZEC-origin quote; `pczt_shield` + `pczt_sign` + `pczt_prove` on real UTXOs; Orchard->transparent send fee; txid byte order accepted by `/v0/deposit/submit`; real refund behaviour.
 
-## Open point
-WebZjs' thread library calls `eval` (js_sys::eval) at runtime, so the page needs `'unsafe-eval'`, not only `'wasm-unsafe-eval'`. Not applied in this branch (see report); options: patch the eval out and rebuild, or serve the hop in an isolated iframe with its own CSP.
+## eval in the wallet glue (resolved)
+WebZjs' thread library calls js_sys::eval with exactly two strings: "self" and a script_path() snippet that reads the glue module URL from a stack trace. ops/build_webzjs.sh (third patch) answers both without eval (`self`, `import.meta.url`) and throws on anything else, so the page keeps script-src 'self' 'wasm-unsafe-eval' without 'unsafe-eval'. module_workers_polyfill.min.js (imported by wasm_thread) contains `new Function` for browsers without module workers; under this CSP it cannot run there.
+Stored state: the IndexedDB record holds the wallet bytes (viewing keys and notes, not the seed: spending calls take the mnemonic each time) and the signed EIP-3009 authorization of the in-leg.
