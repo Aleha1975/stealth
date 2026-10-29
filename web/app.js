@@ -320,23 +320,24 @@ async function payGasless({ amount, d, ephLen, ephData, tagWord }) {
   say("send-hint", "Submitted, tx " + j.hash.slice(0, 12) + "… waiting for the block…");
   return j.hash;
 }
-// ---- amount: "I send" or "receiver gets"; the gasless fee (from the relayer) is shown live and added or taken accordingly
-let payFee = null;
+// ---- amount: two linked fields, "you pay" and "receiver gets"; editing one fills the other using the relayer's gasless fee
+let payFee = null, amtSrc = "amount";
 api("/relay/stats").then(s => { if (s.pay_enabled && s.pay_fee != null) payFee = BigInt(s.pay_fee); calc(); }).catch(() => {});
-/** Returns { send, get, fee } in token units for the current inputs, or null. */
+const curFee = () => $("token").value === "TOKEN" ? (payFee ?? 0n) : 0n, unit = () => $("token").value === "TOKEN" ? TUNIT : NUNIT;
+/** Returns { send, get, fee } in token units from the field the user last edited, or null. */
 function payAmounts() {
-  const v = Number($("amount").value); if (!(v > 0)) return null;
-  const raw = BigInt(Math.round(v * TUNIT)), fee = payFee ?? 0n;
-  return $("amt-mode").value === "get" ? { send: raw + fee, get: raw, fee } : { send: raw, get: raw - fee, fee };
+  const v = Number($(amtSrc).value); if (!(v > 0)) return null;
+  const raw = BigInt(Math.round(v * unit())), fee = curFee();
+  return amtSrc === "amount-get" ? { send: raw + fee, get: raw, fee } : { send: raw, get: raw - fee, fee };
 }
 function calc() {
-  const out = $("pay-calc"), a = payAmounts();
-  if ($("token").value !== "TOKEN") { out.textContent = a ? "Gas is paid from your wallet." : ""; return; }
-  if (!a) { out.textContent = payFee != null ? "Network fee " + fmtTok(payFee) + " " + SYM : ""; return; }
-  if (a.get <= 0n) { out.textContent = "Minimum is above the " + fmtTok(a.fee) + " " + SYM + " network fee."; return; }
-  out.textContent = "Receiver gets " + fmtTok(a.get) + " " + SYM + " (" + fmtTok(a.fee) + " network fee) · you send " + fmtTok(a.send);
+  const out = $("pay-calc"), a = payAmounts(), other = amtSrc === "amount" ? "amount-get" : "amount", u = unit();
+  $(other).value = a ? String(Number(amtSrc === "amount" ? a.get : a.send) / u) : "";
+  if (a && a.get <= 0n) { $(other).value = ""; out.textContent = "Minimum is above the " + fmtTok(a.fee) + " " + SYM + " network fee."; return; }
+  out.textContent = $("token").value !== "TOKEN" ? "Gas is paid from your wallet." : payFee != null ? "Network fee " + fmtTok(payFee) + " " + SYM + " included" : "";
 }
-["amount", "amt-mode", "token"].forEach(id => { $(id).addEventListener("input", calc); $(id).addEventListener("change", calc); });
+["amount", "amount-get"].forEach(id => $(id).addEventListener("input", () => { amtSrc = id; calc(); }));
+$("token").addEventListener("change", calc);
 async function doPay(own) {
   try {
     if (!acct && !(await connect())) return;
@@ -347,8 +348,8 @@ async function doPay(own) {
     const m = parseMeta(metaIn);
     await ensureChain();
     const token = $("token").value, a = payAmounts(); if (!a) throw new Error("enter an amount");
-    // "receiver gets" adds the fee on top for the gasless stablecoin path; the native coin has no fee in the amount
-    const amount = token === "TOKEN" ? Number(a.send) / TUNIT : Number($("amount").value);
+    const amount = Number(a.send) / unit();
+    if (a.get <= 0n) throw new Error("the amount is below the network fee");
     const d = deriveForPayment(m);
     say("send-hint", "Paying " + amount + " " + (token === "TOKEN" ? SYM : NAT) + " to a fresh address " + d.stealth.slice(0, 10) + "…");
     const tx = await payStealth({ token, amount, d, own });
