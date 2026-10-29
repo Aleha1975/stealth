@@ -39,6 +39,16 @@ W="$OUT.new/snippets"/wasm-bindgen-rayon-*/src/workerHelpers.js; T="$OUT.new/sni
 sed -i.bak "s#import('../../..')#import('../../../webzjs_wallet.js')#" $W
 sed -i.bak 's#from "../../../../../";#from "../../../../../webzjs_wallet.js";#' $T
 grep -q "webzjs_wallet.js')" $W && grep -q 'webzjs_wallet.js";' $T || { echo "import patches did not apply"; exit 1; }
+# third patch: wasm_thread calls js_sys::eval with exactly two strings: "self" and a script_path() snippet that reads this glue module's URL
+# from a stack trace; answer both without eval (import.meta.url is that URL) so the page keeps a CSP without 'unsafe-eval'
+G="$OUT.new/webzjs_wallet.js"
+python3 - "$G" <<'PY'
+import sys; p = sys.argv[1]; s = open(p).read()
+o = "const ret = eval(getStringFromWasm0(arg0, arg1));"
+n = 'const src = getStringFromWasm0(arg0, arg1); const ret = src === "self" ? self : /^\\/\\/\\/ Extracts current script file path[\\s\\S]*\\nscript_path\\(\\)$/.test(src) ? import.meta.url : (() => { throw new Error("eval is disabled: " + src.slice(0, 40)); })();'
+assert s.count(o) == 1, "eval patch did not apply"; open(p, "w").write(s.replace(o, n))
+PY
+grep -q '"eval is disabled' "$G" && ! grep -q "eval(" "$G" || { echo "eval patch did not apply"; exit 1; }
 find "$OUT.new" -name '*.bak' -delete
 # keep the committed files, swap in the new build
 for f in README.md SHA256SUMS; do [ -f "$OUT/$f" ] && cp "$OUT/$f" "$OUT.new/$f"; done

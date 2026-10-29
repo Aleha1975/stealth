@@ -53,9 +53,13 @@ try {
   ok("4 accounts, birthday near the Zcash tip, wallet bytes saved", out.accts.length === 4 && out.birthday > 3_000_000 && out.dbBytes > 1000, "birthday " + out.birthday + " db " + out.dbBytes);
   ok("page mnemonic = node golden", out.mn === "youth alone tissue bomb stock old thank speed tissue night ugly exchange lumber salute switch glance peanut among average exhibit parrot stove tool derive");
   ok("restored wallet: same t-address on account 0, 4 distinct addresses, empty", out.summary[0].t === out.tIn && new Set(out.summary.map(s => s.t)).size === 4 && out.summary.every(s => s.transparent === "0" && s.orchard === "0"));
-  ok("no relayer call, no non-dry quote", !reqs.some(r => r.includes("/relay")) && !seen.some(r => r.includes("/relay")));
+  // the page itself reads GET /relay/stats on load (fee display); only a POST to the relayer would submit anything
+  const isSubmit = r => /^POST .*\/relay(\/pay)?$/.test(r);
+  ok("no relayer call, no non-dry quote", !reqs.some(isSubmit) && !seen.some(isSubmit));
   ok("only dry 1Click quotes went out", reqs.filter(r => r.startsWith("POST") && r.includes("/v0/quote")).length === 1);
-  ok("no page errors, no CSP violations", errors.length === 0, errors.join(" | "));
+  // the local test server has no API and no favicon: those 404s are expected here
+  const real = errors.filter(e => !/404 \(Not Found\) http:\/\/127\.0\.0\.1:\d+\/(stealth-api\/rh\/relay\/stats|favicon\.svg)$/.test(e));
+  ok("no page errors, no CSP violations", real.length === 0, real.join(" | "));
   ok("wasm served from /stealth-zec/vendor/webzjs", seen.some(r => r.endsWith("webzjs_wallet_bg.wasm")));
 } catch (e) { console.log("ERROR", e.stack || e); fails++; }
 console.log(fails ? fails + " FAILED" : "all passed"); done(fails ? 1 : 0);
