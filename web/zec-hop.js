@@ -5,6 +5,7 @@
    Nothing here touches the DOM. Injected: fetchFn, sleep, store, loadZjs (WebZjs), words, waitReceipt, balance, rand, onProgress. */
 import { keccak, unhex, hex } from "./stealth-crypto.js";
 import * as PW from "./private-withdraw.js";
+import { postRelay } from "./relay-post.js";
 import { zcash as ZC } from "./chains.js";
 
 export const STEPS = ["QUOTE_IN", "DEPOSIT_IN", "WAIT_T", "SHIELD", "DELAY", "QUOTE_OUT", "SEND_OUT"];
@@ -285,7 +286,7 @@ export async function runHop(ctx) {
   const known = async raw => { try { return ctx.txKnown ? await ctx.txKnown(txidOf(raw)) : undefined; } catch { return undefined; } };      // true / false / undefined = cannot tell
   const relay = async () => {
     if (st.dry) throw new Error("dry run never calls the relayer");
-    const r = await fetchFn(ctx.api + "/relay", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(st.auth) }), d = await r.json().catch(() => ({}));
+    const { r, d } = await postRelay(fetchFn, ctx.api + "/relay", st.auth, { sleep: ctx.sleep, onBusy: m => ctx.onProgress && ctx.onProgress(m) });
     if (r.ok && d.hash) return d.hash;
     if (/already used/.test(d.error || "")) return null;         // this very authorization was sent before: the transfer exists
     throw new Error(d.error || "relayer error");

@@ -5,6 +5,7 @@
    Honest limits: the deposit and the payout are both public on-chain; with confidentiality "public" they can be matched by amount and time.
    confidentiality "basic" needs a User-Session token (sessionSignIn below) and is OFF in the app until SESSION_SIGNIN is switched on. */
 import { keccak, signDigest, unhex, hex } from "./stealth-crypto.js";
+import { postRelay } from "./relay-post.js";
 
 export const ONECLICK = "https://1click.chaindefuser.com";
 export const NEAR_RPCS = ["https://rpc.mainnet.near.org", "https://free.rpc.fastnear.com"];   // read-only: current_salt of intents.near
@@ -183,8 +184,8 @@ export async function runPart(ctx, amount, delayMs) {
   const validBefore = Math.floor(Date.now() / 1000) + 3600;
   const auth = signTransferAuth({ chain: ctx.from, priv: ctx.priv, from: ctx.stealth, to: q.depositAddress, value: amount, validBefore, nonce: ctx.randomNonce() });
   say("Sending through the relayer (no gas for you)…");
-  const r = await fetchFn(ctx.api + "/relay", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(auth) });
-  const d = await r.json().catch(() => ({})); if (!r.ok || d.error) throw new Error(d.error || "relayer error");
+  const { r, d } = await postRelay(fetchFn, ctx.api + "/relay", auth, { onBusy: m => say(m) });
+  if (!r.ok || d.error) throw new Error(d.error || "relayer error");
   say("Deposit sent (tx " + d.hash.slice(0, 12) + "…), waiting for the block…");
   const rc = await ctx.waitReceipt(d.hash); if (!rc.ok) throw new Error("the deposit transfer reverted (tx " + d.hash.slice(0, 12) + "…)");
   await submitDeposit({ base: ctx.base, txHash: d.hash, depositAddress: q.depositAddress, fetchFn }).catch(e => say("Could not notify NEAR Intents (" + e.message + "); it will still detect the deposit."));

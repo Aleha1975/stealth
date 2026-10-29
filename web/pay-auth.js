@@ -37,3 +37,13 @@ export function splitSig(sig) {
   let v = parseInt(h.slice(128), 16); if (v < 27) v += 27;
   return { r: "0x" + h.slice(0, 64), s: "0x" + h.slice(64, 128), v };
 }
+/** The two linked amount fields ("you pay" / "receiver gets"). `src` is the field the user typed in ("amount" = you pay, "amount-get" = receiver gets).
+ *  Exact decimal parsing (no floats). Typing in "you pay" means exactly that much leaves the wallet: send = typed, get = typed - fee (the fee is
+ *  taken OUT of it by StealthPay.payWithAuthorization). Typing in "receiver gets" means send = typed + fee. Returns {send,get,fee} in token units, or null. */
+export function payAmounts({ src, text, decimals, fee }) {
+  const m = /^(\d*)(?:\.(\d*))?$/.exec(String(text || "").trim().replace(",", "."));
+  if (!m || (!m[1] && !m[2])) return null;
+  const raw = BigInt((m[1] || "0") + (m[2] || "").slice(0, decimals).padEnd(decimals, "0"));
+  if (raw <= 0n) return null;
+  return src === "amount-get" ? { send: raw + fee, get: raw, fee } : { send: raw, get: raw - fee, fee };
+}

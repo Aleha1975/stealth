@@ -1,5 +1,6 @@
 import { keysFromSignature, keyRequestTypedData, metaAddress, parseMeta, deriveForPayment, checkAnnouncement, decodeMetadata, hex, unhex, keccak, signDigest, randomBytes32 } from "./stealth-crypto.js";
-import { paymentNonce, receiveTypedData, splitSig } from "./pay-auth.js";
+import { postRelay } from "./relay-post.js";
+import { paymentNonce, receiveTypedData, splitSig, payAmounts as calcAmounts } from "./pay-auth.js";
 import { CHAINS, pickChain, chainOfMeta, addChainParams } from "./chains.js";
 import * as PW from "./private-withdraw.js";
 import { hopCard, hopView, statusLine } from "./hop-card.js";
@@ -354,9 +355,8 @@ $("btn-wd").addEventListener("click", async () => {
     const digest = keccak(unhex("0x1901" + hex(domainSeparator()).slice(2) + hex(keccak(unhex(struct))).slice(2)));
     const sig = signDigest(digest, unhex(hit.stealthPriv));
     say("pay-hint", "Sending through the relayer…");
-    const r = await fetch(API + "/relay", { method: "POST", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ from: wd.stealth, to, value: value.toString(), validAfter: "0", validBefore: validBefore.toString(), nonce, v: sig.v, r: sig.r, s: sig.s }) });
-    const d = await r.json(); if (!r.ok || d.error) throw new Error(d.error || "relayer error");
+    const { r, d } = await postRelay(fetch, API + "/relay", { from: wd.stealth, to, value: value.toString(), validAfter: "0", validBefore: validBefore.toString(), nonce, v: sig.v, r: sig.r, s: sig.s }, { onBusy: m => say("pay-hint", m, "warn") });
+    if (!r.ok || d.error) throw new Error(d.error || "relayer error");
     $("withdraw").hidden = true;
     say("pay-hint", "Submitted: " + fmtTok(value) + " " + SYM + " → " + to.slice(0, 8) + "… waiting for the block…");
     const rc = await waitReceipt(d.hash);
@@ -375,12 +375,12 @@ async function waitReceipt(h) {
 // ---- pay someone: derive the one-time address, then hand off to payStealth() (the only code that builds/sends pay txs,
 //      so the flow can be swapped without touching the rest)
 /** Sends the payment + announcement from the payer's wallet. token: "TOKEN" (chain stablecoin) or "NATIVE". Returns the tx hash. */
-async function payStealth({ token, amount, d, own = false }) {
+async function payStealth({ token, amount, raw: rawIn = null, d, own = false }) {
   if (!STEALTHPAY) throw new Error("The pay contract is not deployed on " + C.name + " yet");
   const ephLen = pad(33n), ephData = d.ephPub.slice(2).padEnd(128, "0"), tagWord = d.viewTag.slice(2).padEnd(64, "0");
-  if (token === "TOKEN" && !own) return payGasless({ amount, d, ephLen, ephData, tagWord });
+  if (token === "TOKEN" && !own) return payGasless({ amount, raw: rawIn, d, ephLen, ephData, tagWord });
   if (token === "TOKEN") {
-    const raw = BigInt(Math.round(amount * TUNIT));
+    const raw = rawIn ?? BigInt(Math.round(amount * TUNIT));
     const al = BigInt(await wallet("eth_call", [{ to: USDC, data: "0xdd62ed3e" + padAddr(acct) + padAddr(STEALTHPAY) }, "latest"]));
     if (al < raw) {
       say("send-hint", "Approve " + amount + " " + SYM + " for the pay contract (1 of 2)…");
@@ -397,11 +397,11 @@ async function payStealth({ token, amount, d, own = false }) {
 }
 /** Token payment with ONE signature and no gas for the payer: EIP-3009 ReceiveWithAuthorization bound (via the nonce) to this exact
  *  stealth address, key, tag, fee and fee recipient; our relayer submits StealthPay.payWithAuthorization and takes `fee` from the amount. */
-async function payGasless({ amount, d, ephLen, ephData, tagWord }) {
+async function payGasless({ amount, raw: rawIn = null, d, ephLen, ephData, tagWord }) {
   const stats = await api("/relay/stats").catch(() => { throw new Error("The relayer is not reachable."); });
   if (!stats.pay_enabled || !isAddr(stats.relayer) || stats.pay_fee == null) throw new Error("Gasless payments are not available on " + C.name + " right now.");
   if (String(stats.stealthpay || "").toLowerCase() !== STEALTHPAY.toLowerCase()) throw new Error("The relayer serves a different StealthPay contract; refusing.");
-  const raw = BigInt(Math.round(amount * TUNIT)), fee = BigInt(stats.pay_fee), feeTo = stats.relayer;
+  const raw = rawIn ?? BigInt(Math.round(amount * TUNIT)), fee = BigInt(stats.pay_fee), feeTo = stats.relayer;   // "you pay" = raw = what leaves the wallet; the fee comes out of it
   if (fee < 0n || fee >= raw) throw new Error("The amount is below the relayer fee (" + fmtTok(fee) + " " + SYM + ").");
   const bal = BigInt(await wallet("eth_call", [{ to: USDC, data: "0x70a08231" + padAddr(acct) }, "latest"]));
   if (bal < raw) throw new Error("Your wallet holds less than " + amount + " " + SYM + ".");
@@ -416,10 +416,10 @@ async function payGasless({ amount, d, ephLen, ephData, tagWord }) {
   const typed = receiveTypedData({ token: TOK, chainId: C.chainId, from: acct, stealthPay: STEALTHPAY, amount: raw, validAfter: 0, validBefore, nonce });
   const sig = splitSig(await wallet("eth_signTypedData_v4", [acct, typed]));
   say("send-hint", "Sending through the relayer…");
-  const r = await fetch(API + "/relay/pay", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({
+  const { r, d: j } = await postRelay(fetch, API + "/relay/pay", {
     token: USDC, amount: raw.toString(), stealth: d.stealth, eph: d.ephPub, viewTag: d.viewTag, fee: fee.toString(), feeRecipient: feeTo,
-    auth: { from: acct, validAfter: "0", validBefore: String(validBefore), v: sig.v, r: sig.r, s: sig.s } }) });
-  const j = await r.json(); if (!r.ok || j.error) throw new Error((j.error || "relayer error") + ".");
+    auth: { from: acct, validAfter: "0", validBefore: String(validBefore), v: sig.v, r: sig.r, s: sig.s } }, { onBusy: m => say("send-hint", m, "warn") });
+  if (!r.ok || j.error) throw new Error((j.error || "relayer error") + ".");
   say("send-hint", "Submitted, tx " + j.hash.slice(0, 12) + "… waiting for the block…");
   return j.hash;
 }
@@ -429,9 +429,7 @@ api("/relay/stats").then(s => { if (s.pay_enabled && s.pay_fee != null) payFee =
 const curFee = () => $("token").value === "TOKEN" ? (payFee ?? 0n) : 0n, unit = () => $("token").value === "TOKEN" ? TUNIT : NUNIT;
 /** Returns { send, get, fee } in token units from the field the user last edited, or null. */
 function payAmounts() {
-  const v = Number($(amtSrc).value); if (!(v > 0)) return null;
-  const raw = BigInt(Math.round(v * unit())), fee = curFee();
-  return amtSrc === "amount-get" ? { send: raw + fee, get: raw, fee } : { send: raw, get: raw - fee, fee };
+  return calcAmounts({ src: amtSrc, text: $(amtSrc).value, decimals: Math.round(Math.log10(unit())), fee: curFee() });   // exact decimals, see pay-auth.js
 }
 function calc() {
   const out = $("pay-calc"), a = payAmounts(), other = amtSrc === "amount" ? "amount-get" : "amount", u = unit();
@@ -455,7 +453,7 @@ async function doPay(own) {
     if (a.get <= 0n) throw new Error("the amount is below the network fee");
     const d = deriveForPayment(m);
     say("send-hint", "Paying " + amount + " " + (token === "TOKEN" ? SYM : NAT) + " to a fresh address " + d.stealth.slice(0, 10) + "…");
-    const tx = await payStealth({ token, amount, d, own });
+    const tx = await payStealth({ token, amount, raw: token === "TOKEN" ? a.send : null, d, own });   // raw = exactly what leaves the wallet, no float round trip
     if (!(await waitReceipt(tx)).ok) throw new Error("the payment reverted: " + tx);
     say("send-hint", "Paid. tx " + tx.slice(0, 12) + "… The receiver will find it with their keys.", "ok");
   } catch (e) { say("send-hint", e.message || String(e), "bad"); }
