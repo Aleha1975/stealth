@@ -100,15 +100,22 @@ async function cachedFees() {
   feeCache.p = pub.estimateFeesPerGas().then(v => { feeCache = { t: Date.now(), v, p: null }; return v; }, e => { feeCache.p = null; throw e; });
   return feeCache.p;
 }
-async function submit(call, gasLimit) {
+const nonceOfHash = new Map();               // hash -> nonce нашей отправки: если транзакцию выбросил узел, закрываем дыру в nonce
+async function submit(call, gasLimit, retried = false) {
   try {
     const fees = await cachedFees();
     if (localNonce === null) localNonce = await pub.getTransactionCount({ address: account.address, blockTag: "pending" });
     const tx = { chainId: CC.id, nonce: localNonce, gas: gasLimit, to: call.address, value: 0n, data: encodeFunctionData({ abi: call.abi, functionName: call.functionName, args: call.args }),
       ...(fees.maxFeePerGas ? { type: "eip1559", maxFeePerGas: fees.maxFeePerGas, maxPriorityFeePerGas: fees.maxPriorityFeePerGas || 0n } : { type: "legacy", gasPrice: fees.gasPrice }) };
     const hash = await pub.sendRawTransaction({ serializedTransaction: await account.signTransaction(tx) });
-    localNonce++; return hash;
-  } catch (e) { localNonce = null; feeCache.t = 0; throw e; }
+    if (nonceOfHash.size > 500) nonceOfHash.clear();
+    nonceOfHash.set(hash, tx.nonce); localNonce++; return hash;
+  } catch (e) {
+    localNonce = null; feeCache.t = 0;
+    // локальный nonce устарел (ключ релеера использовал кто-то ещё, рестарт узла): один повтор с nonce, взятым заново с узла, вместо отказа клиенту
+    if (!retried && /nonce too low|nonce.*(lower|too low)|already known/i.test(String(e && (e.details || e.shortMessage || e.message) || e))) return submit(call, gasLimit, true);
+    throw e;
+  }
 }
 // отправка со сверкой по квитанции; возвращает hash сразу. spent: резерв заменяется фактом по квитанции
 const TRANSFER_CALL = args => ({ address: TOKEN, abi, functionName: "transferWithAuthorization", args });
@@ -123,6 +130,21 @@ async function sendAndTrack(call, gasLimit, reserve, from, tag, onRevert) {
     let rc;
     try { rc = await pub.waitForTransactionReceipt({ hash, timeout: STUCK_S * 1000 }); }
     catch {
+      const gone = await pub.getTransactionReceipt({ hash }).then(() => false, () => pub.getTransaction({ hash }).then(() => false, () => true));
+      if (gone) {                                              // узел выбросил транзакцию (не в пуле, не в блоке): закрыть дыру в nonce, иначе все следующие повиснут за ней
+        const n = nonceOfHash.get(hash); localNonce = null;
+        log("dropped", tag, hash, "nonce", n);
+        try {
+          if (n !== undefined && (await pub.getTransactionCount({ address: account.address, blockTag: "latest" })) <= n) {
+            const f = await cachedFees();
+            const up = (x) => x + x * BUMP_PCT / 100n + 1n;
+            const h = await wal.sendTransaction({ to: account.address, value: 0n, nonce: n, gas: 21000n, ...(f.maxFeePerGas ? { maxFeePerGas: up(f.maxFeePerGas), maxPriorityFeePerGas: up(f.maxPriorityFeePerGas || 0n) } : { gasPrice: up(f.gasPrice) }) });
+            log("nonce gap filled", n, h);
+          }
+        } catch (e) { log("ALERT nonce gap fill failed", n, String(e).slice(0, 80)); }
+        if (onRevert) onRevert(); else if (tag === "main") { if ((st.perFrom[from] || 0) > 1) st.perFrom[from]--; else delete st.perFrom[from]; }   // клиент может повторить: подпись не использована
+        save(); return;
+      }
       try {                                                    // застряла: та же nonce, комиссия выше -- один раз
         const tx = await pub.getTransaction({ hash });
         const up = (x) => x + x * BUMP_PCT / 100n + 1n;
