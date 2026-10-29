@@ -400,7 +400,10 @@ $("btn-wd").addEventListener("click", once(async () => {
     if (String(dsep).toLowerCase() !== hex(domainSeparator()).toLowerCase()) throw new Error(SYM + " domain mismatch (or could not be read from the chain); refusing to sign");
     if ($("wd-private").checked && !$("wd-priv-wrap").hidden) {
       // audit 1087 M-3: the relayer only sees the 1Click deposit address, so the real recipient is screened here, before anything is signed (fail closed if the check cannot run)
-      const sc = await api("/relay/screen?addr=" + to).catch(() => null);
+      // the whole list is fetched and checked here, so the recipient never reaches our server; /relay/screen only while a relayer without the list endpoint is live
+      const sl = await api("/relay/sanctions-list").catch(() => null);
+      const sc = sl && Array.isArray(sl.addresses) && sl.addresses.length === sl.count && sl.count > 0
+        ? { listed: sl.addresses.includes(to.toLowerCase()) } : await api("/relay/screen?addr=" + to).catch(() => null);
       if (!sc || sc.listed !== false) throw new Error(sc && sc.listed ? "That recipient address is on a sanctions list; refusing." : "Could not check the recipient against the sanctions list; nothing was sent. Try again.");
       return await privateWithdraw(to, value, hit);
     }

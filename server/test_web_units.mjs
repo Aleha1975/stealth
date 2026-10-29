@@ -122,6 +122,6 @@ const PRIV = new Uint8Array(32).fill(9), ACC = addressFromPriv(PRIV), A2 = "0x" 
 // M-2: no stealth address may reach our API (static check of the page code)
 { const src = fs.readFileSync(new URL("../web/app.js", import.meta.url), "utf8");
   t("1098 M-2: app.js never puts a stealth address in an API URL (no /balances, no addrs=)", !/\/balances/.test(src) && !/addrs=/.test(src));
-  t("1098 M-2: the only API reads left carry no stealth address (head, announcements, pages, relay stats/status/screen)", [...src.matchAll(/api\("([^"]*)"/g)].every(m => /^\/(head|announcements\?|relay\/stats|relay\/status\?hash=|relay\/screen\?addr=)/.test(m[1])));
+  t("1098 M-2: the only API reads left carry no stealth address (head, announcements, pages, relay stats/status/screen/sanctions-list)", [...src.matchAll(/api\("([^"]*)"/g)].every(m => /^\/(head|announcements\?|relay\/stats|relay\/status\?hash=|relay\/screen\?addr=|relay\/sanctions-list$)/.test(m[1])));
   t("1098 L-4: receipts are not read from our API any more", !/\/receipt\?/.test(src)); }
 console.log(fail ? "FAILED " + fail : "all passed"); process.exit(fail ? 1 : 0);
