@@ -269,11 +269,13 @@ $("wd-private").addEventListener("change", () => { $("wd-priv-opts").hidden = !$
 const walletRpc = async (_u, init) => { const { method, params } = JSON.parse(init.body); try { const result = await wallet(method, params); return { ok: true, json: async () => ({ result }) }; } catch (e) { return { ok: true, json: async () => ({ error: { message: String((e && e.message) || e) } }) }; } };
 // chain reads for the hop: the chain's public RPC directly (CORS open, listed in the page CSP), the wallet's RPC as a fallback
 const chainRpc = async (u, init) => { try { const r = await fetch(u, init); if (r.ok) { const j = await r.clone().json().catch(() => null); if (j && j.result !== undefined) return r; } } catch {} return walletRpc(u, init); };
-const hopCtx = async (HM, f, hit, o) => ({ authUsed: HM.makeAuthUsed(C, chainRpc), countPriorHops: HM.makeCountPriorHops(C, chainRpc), txKnown: HM.makeTxKnown(), store: HM.idbStore(), stealth: f.stealth, priv: hit.stealthPriv, chain: C, api: API, words: await HM.loadWords(), loadZjs: HM.sharedZjs, waitReceipt, randomNonce: randomBytes32,
+const hopCtx = async (HM, f, hit, o) => ({ getUtxos: HM.makeGetUtxos(), authUsed: HM.makeAuthUsed(C, chainRpc), countPriorHops: HM.makeCountPriorHops(C, chainRpc), txKnown: HM.makeTxKnown(), store: HM.idbStore(), stealth: f.stealth, priv: hit.stealthPriv, chain: C, api: API, words: await HM.loadWords(), loadZjs: HM.sharedZjs, waitReceipt, randomNonce: randomBytes32,
   balance: async () => BigInt(((await api("/balances?addrs=" + f.stealth))[f.stealth.toLowerCase()] || {}).usdc || "0"), onProgress: (s, m) => hopProgress(f, s, m), ...o });
+async function holdScreen() { try { return navigator.wakeLock ? await navigator.wakeLock.request("screen") : null; } catch { return null; } }
+document.addEventListener("visibilitychange", () => { for (const h of hops.values()) if (h.running) h.hidden = document.hidden; renderHops(); });
 function hopProgress(f, s, m) {
   const k = f.stealth.toLowerCase(), h = hops.get(k); if (!h) return;
-  h.st = s; h.msg = m || "";
+  h.st = s; h.msg = m || ""; h.beatAt = Date.now(); h.hidden = document.hidden;      // beatAt: the card says "no update for N s" if the machine goes quiet
   if (s.relayed && s.inQuote && !h.sp) {                          // the deposit leg has left the stealth address: stop showing its old balance
     h.sp = true; const amtIn = BigInt(s.inQuote.amountIn);
     spent.set(k, { left: f.usdc > amtIn ? f.usdc - amtIn : 0n, until: Date.now() + 120_000 }); render(); setTimeout(() => refreshBalances().catch(() => {}), 3000);
@@ -288,16 +290,18 @@ async function runHop(f, hit, o) {
   let h;
   if (o) h = { f, hit, running: true, msg: "", st: { step: "QUOTE_IN", chain: C.key, dest: o.dest.key, amount: o.amount.toString(), recipient: o.recipient, startedAt: Date.now() } };
   else { const r = await HM.findHop(ctx.store, f.stealth); if (!r) throw new Error("nothing to resume"); if (r.rec.st.chain !== C.key) throw new Error("This transfer belongs to " + (CHAINS[r.rec.st.chain] || {}).name + ": open the app on that chain to resume it."); ctx.chain = CHAINS[r.rec.st.chain]; ctx.dest = CHAINS[r.rec.st.dest]; h = { f, hit, running: true, msg: "", st: r.rec.st }; }
-  hops.set(k, h); say("pay-hint", ""); renderHops(); render();
+  h.beatAt = Date.now(); hops.set(k, h); say("pay-hint", ""); renderHops(); render();
+  const lock = await holdScreen();                                // a locked phone screen or a sleeping display freezes the tab and with it the transfer
   const run = () => (o ? HM.startHop(ctx) : HM.runHop(ctx));
   let st;
   try { st = await (navigator.locks ? navigator.locks.request(key, { ifAvailable: true }, l => l ? run() : Promise.reject(new Error("This transfer is already running in another tab."))) : run()); }
-  catch (e) { if (o) hops.delete(k); else h.running = false; renderHops(); render(); throw e; }
+  catch (e) { if (lock) lock.release().catch(() => {}); if (o) hops.delete(k); else h.running = false; renderHops(); render(); throw e; }
+  if (lock) lock.release().catch(() => {});
   h.st = st; h.running = false;
   if (["DONE", "FAILED_IN"].includes(st.step)) HM.scrubFinished(ctx.store, f.stealth).catch(() => {});   // audit 1088 L-6: no stealth -> recipient link kept in the browser after the end
-  // transient failures (network, RPC, quote service) resume on their own: 1, 2, 4, 8, 16 min; a deliberate stop (a failed check) waits for the user
-  if (!TERMINAL.includes(st.step) && st.err && !st.halted && (autoTries.get(k) || 0) < 5) {
-    const n = (autoTries.get(k) || 0) + 1; autoTries.set(k, n); h.retryAt = Date.now() + 60_000 * 2 ** (n - 1);
+  // transient failures (network, RPC, quote service) resume on their own (see below); a deliberate stop (a failed check) waits for the user
+  if (!TERMINAL.includes(st.step) && st.err && !st.halted && (autoTries.get(k) || 0) < 7) {
+    const n = (autoTries.get(k) || 0) + 1; autoTries.set(k, n); h.retryAt = Date.now() + Math.min(300_000, 15_000 * 2 ** (n - 1));      // 15 s, 30 s, 1, 2, 4, 5, 5 min; the card shows the cause and the countdown
     setTimeout(() => runHop(f, hit, null).catch(e => say("pay-hint", e.message || String(e), "bad")), h.retryAt - Date.now());
   } else if (TERMINAL.includes(st.step)) autoTries.delete(k);
   if (st.relayed && st.inQuote && !h.sp) { const amtIn = BigInt(st.inQuote.amountIn); spent.set(k, { left: f.usdc > amtIn ? f.usdc - amtIn : 0n, until: Date.now() + 120_000 }); }

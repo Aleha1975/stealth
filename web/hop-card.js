@@ -36,6 +36,11 @@ export function shownLeft(key, step, raw, now) {
   if (p && p.step === step) { const dt = now - p.at; if (dt >= 0) v = Math.min(raw, Math.max(p.v - dt, 0) + 60_000); }   // may not rise by more than 1 min over what the previous tick would now show
   v = Math.max(60_000, v); LEFT.set(key, { step, v, at: now }); return v;
 }
+export const STALE_MS = 30_000;
+/** one short line from a raw error (first line, no stack/URL noise, max 140 chars) */
+export const oneLine = e => String(e || "").split("\n")[0].replace(/https?:\/\/\S+/g, "…").replace(/\s+/g, " ").trim().slice(0, 140);
+/** the live sub-step text from the machine's last progress message; plain status echoes ("... : PENDING_DEPOSIT") and empty text give "" so the generic step line stays */
+export const subStep = m => { m = String(m || "").trim(); return !m || /: [A-Z_]+$/.test(m) || /^Private transfer/.test(m) ? "" : m.replace(/…$/, ""); };
 const el = (tag, cls, text) => { const e = document.createElement(tag); if (cls) e.className = cls; if (text != null) e.textContent = text; return e; };
 
 /** Everything the card says, as plain data (testable). */
@@ -45,7 +50,7 @@ export function hopView(h, now = Date.now()) {
   const m = st.mode ? modeOf(st.mode) : null, delayWait = m ? (m.totalMax >= 60 ? "random, spread over " + m.totalMin / 60 + "–" + m.totalMax / 60 + " h" : m.totalMin + "–" + m.totalMax + " min, random") : "2–10 min, random";
   const ui = { ...ui0, name: ui0.name + (inParts ? " · " + pl : ""), line: ui0.line + (inParts ? " (" + pl + ")" : ""), wait: st.step === "DELAY" ? delayWait : ui0.wait };
   const v = { idx, total: STEP_UI.length, stepName: ui.name, amountLine: amt(st.amount, tok.decimals) + " " + tok.symbol + " → " + short(st.recipient),
-    left: "", pct: 0, what: "", elapsed: st.startedAt ? fmtElapsed((st.doneAt || now) - st.startedAt) : "", kind: "run", title: "Private transfer in progress", line: "", body: "", detail: "", action: null, link: null };
+    left: "", pct: 0, what: "", elapsed: st.startedAt ? fmtElapsed((st.doneAt || now) - st.startedAt) : "", kind: "run", title: "Private transfer in progress", line: "", note: "", body: "", detail: "", action: null, link: null };
   if (st.step === "DONE") {
     const got = st.outTotal ? amt(st.outTotal, dtok.decimals) : st.outQuote ? amt(st.outQuote.amountOut, dtok.decimals) : amt(st.amount, tok.decimals), p = st.payoutTx;
     v.kind = "done"; v.pct = 100; v.title = "Sent privately: " + got + " " + dtok.symbol + " to " + short(st.recipient); v.amountLine = ""; v.idx = v.total;
@@ -61,11 +66,15 @@ export function hopView(h, now = Date.now()) {
     const hk = (st.stealth || "") + "#" + (st.n || 0), lm = shownLeft(hk, st.step, remainingMs(st, now), now); v.left = fmtLeft(lm); v.pct = shownPct(hk, st, lm, now);
     const m = /: ([A-Z_]+)$/.exec(h.msg || ""), left = st.step === "DELAY" && st.delayUntil ? Math.max(0, Math.ceil((st.delayUntil - now) / 1000)) : null;
     const state = m && (st.step === "DEPOSIT_IN" || st.step === "SEND_OUT") ? friendly(m[1]) : null;
-    v.what = ui.line + (state ? " · " + state : "");
+    const sub = subStep(h.msg), age = h.beatAt ? now - h.beatAt : 0;       // the live sub-step ("Waiting for Zcash confirmations (7/10)") replaces the generic step line
+    v.what = sub || ui.line + (state ? " · " + state : "");
     v.line = v.what + " · " + (left != null ? fmtElapsed(left * 1000) + " left" : ui.wait);
+    if (age > STALE_MS) v.note = "No update for " + Math.round(age / 1000) + " s" + (h.hidden ? ": this tab is in the background, so the browser slows it down. Bring it to the front and keep the screen on." : ". Still trying; if this stays, press Continue transfer after it pauses.");
+    else if (h.hidden) v.note = "This tab is in the background: updates may be slow. Keep it in front and the screen on.";
   } else {
     const early = idx < STEPS.indexOf("WAIT_T");               // nothing has left the stealth address yet / no ZEC exists yet
-    v.kind = "warn"; v.title = "Transfer paused"; v.body = (h.retryAt && h.retryAt > now ? "Network hiccup, retrying by itself in " + Math.max(1, Math.ceil((h.retryAt - now) / 60_000)) + " min. " : st.err ? "Stopped: " + st.err + ". " : "") + (early ? "Your money has not moved." : "Your funds are safe.") + " Press Continue transfer to try again.";
+    const cause = oneLine(st.err), wait = h.retryAt && h.retryAt > now ? Math.ceil((h.retryAt - now) / 1000) : 0;
+    v.kind = "warn"; v.title = "Transfer paused"; v.body = (wait ? "Problem: " + (cause || "network hiccup") + ". Retrying by itself in " + (wait < 120 ? wait + " s" : Math.ceil(wait / 60) + " min") + ". " : st.err ? "Stopped: " + cause + ". " : "") + (early ? "Your money has not moved." : "Your funds are safe.") + " Press Continue transfer to try again.";
     v.action = "continue"; v.detail = ""; v.zec = !early; v.pct = shownPct((st.stealth || "") + "#" + (st.n || 0), st, remainingMs(st, now), now);
   }
   return v;
@@ -85,6 +94,7 @@ export function hopCard(h, cb = {}, now = Date.now()) {
     if (v.kind !== "done") card.appendChild(el("div", "hop-step", "Step " + (v.idx + 1) + " of " + v.total + " · " + v.stepName));
   }
   if (v.line) card.appendChild(el("div", "hop-line", v.line));
+  if (v.note) card.appendChild(el("div", "note hop-stale", v.note));
   if (v.body) card.appendChild(el("div", "hop-line", v.body));
   if (v.link) { const a = el("a", "hop-link", v.link.text); a.href = v.link.href; a.target = "_blank"; a.rel = "noopener noreferrer"; card.appendChild(a); }
   if (h.running) card.appendChild(el("div", "note hop-foot", "Keep this tab open · " + v.elapsed + " elapsed"));

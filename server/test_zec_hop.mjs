@@ -162,9 +162,9 @@ for (const step of H.STEPS.slice(1)) {          // stop cleanly before every ste
   ok("resume of an old state (no tSeenHeight/stepAt) works and still waits for confirmations", r.step === "DONE" && !r.err && after.st.tSeenHeight > 0 && w.shieldHeights[0] >= after.st.tSeenHeight + H.T_CONFS && off - t0 >= (H.T_CONFS - 1) * 75000 && after.st.stepAt > 0, r.err || "");
   ok("progress says (n/10)", msgs.some(m => /Waiting for Zcash confirmations \(\d\/10\)/.test(m))); }
 { const w = makeWorld({ shieldFails: 3 }), s = H.memStore(); off = 0; const t0 = off; const st = await H.startHop(mkCtx(w, s));
-  ok("SHIELD retries InsufficientFunds every 60 s without halting", st.step === "DONE" && !st.err && w.shieldCalls === 4 && w.sig === 1, st.err || ""); }
+  ok("SHIELD retries InsufficientFunds every 10 s without halting", st.step === "DONE" && !st.err && w.shieldCalls === 4 && w.sig === 1, st.err || ""); }
 { const w = makeWorld({ shieldFails: 999 }), s = H.memStore(); off = 0; const st = await H.startHop(mkCtx(w, s)); const rec = await latest(s);
-  ok("SHIELD gives up after 30 min with a friendly Halt, state kept at SHIELD", st.step === "SHIELD" && /not spendable yet/.test(st.err) && !/InsufficientFunds/.test(st.err) && w.shieldCalls >= 30 && w.shieldCalls <= 33 && w.sig === 0, st.err + " calls " + w.shieldCalls);
+  ok("SHIELD gives up after 30 min with a friendly Halt, state kept at SHIELD", st.step === "SHIELD" && /not spendable yet/.test(st.err) && !/InsufficientFunds/.test(st.err) && w.shieldCalls >= 170 && w.shieldCalls <= 190 && w.sig === 0, st.err + " calls " + w.shieldCalls);
   w.shieldFails = 0; const r = await H.runHop(mkCtx(w, s)); ok("... and Continue finishes it", r.step === "DONE" && w.sig === 1); }
 { const w = makeWorld({ shieldFails: 1 }), s = H.memStore(); off = 0; w.Zjs.WebWallet.prototype.pczt_send = async () => { throw new Error("some other failure"); };
   const st = await H.startHop(mkCtx(w, s)); ok("SHIELD: other errors still halt at once", st.step === "SHIELD" && /other failure/.test(st.err)); }
@@ -360,6 +360,61 @@ for (const [name, tk] of [["no txKnown available", undefined], ["txKnown cannot 
   ok("M6 in-leg quote with a 50% slippage floor is refused before anything is signed", st.step === "QUOTE_IN" && /slippage/.test(st.err) && w.relays === 0); }
 { const w = makeWorld(), s = H.memStore(); off = 0; w.mutQuote = (q, isIn) => { if (!isIn) q.deadline = new Date(Date.now() + 30_000).toISOString(); }; const st = await H.startHop(mkCtx(w, s));
   ok("M6 out-leg quote expiring in 30 s is refused, nothing sent", st.step === "QUOTE_OUT" && /too soon/.test(st.err) && w.broadcasts === 0); }
+
+// ---- live sub-steps, stalls, errors with a cause (the card must never go quiet or lie) ----
+const tipAt = w => 3_500_000 + Math.floor((off - (w.off0 ?? off)) / 75000);
+const withUtxo = w => (o = {}) => ({ getUtxos: async a => { const v = w.tBal[a]; if (!v) return []; (w.uh ||= {})[a] ??= tipAt(w); return [{ value: v, height: w.uh[a] }]; }, ...o });
+const timed = (msgs, st) => (x, m) => msgs.push([off, m]);
+{ const w = makeWorld(), s = H.memStore(); off = 0; const msgs = [];
+  const st = await H.startHop(mkCtx(w, s, withUtxo(w)({ onProgress: timed(msgs) }))); const rec = await latest(s), seen = rec.st.tSeenHeight;
+  ok("UTXO gate: DONE, confirmations counted from the deposit block (tSeenHeight = block - 1), shield only once the block has 10 confirmations", st.step === "DONE" && !st.err && w.uh && Object.values(w.uh).some(h => h - 1 === seen) && w.shieldHeights[0] >= seen + H.T_CONFS, JSON.stringify([seen, w.shieldHeights, st.err]));
+  const conf = msgs.map(([, m]) => /Waiting for Zcash confirmations \((\d+)\/10\)/.exec(m)).filter(Boolean).map(x => +x[1]);
+  ok("sub-step 'Waiting for Zcash confirmations (n/10)' counts up 1..9 with no gap", conf.length >= 9 && conf.every((n, i) => i === 0 || n === conf[i - 1] || n === conf[i - 1] + 1) && conf.includes(9) && Math.max(...conf) === 9, conf.join());
+  ok("sub-step texts exist for waiting for ZEC, syncing, shielding", msgs.some(([, m]) => /^Syncing Zcash wallet \d+%/.test(m)) && msgs.some(([, m]) => /^Shielding/.test(m)));
+  // a status message at least every 10 s of (virtual) time from the first WAIT_T message to the shield
+  const end = msgs.findIndex(([, m]) => /timing link/.test(m)), t = msgs.slice(0, end < 0 ? undefined : end).filter(([, m]) => /ZEC to arrive|confirmations|Syncing|Shielding|spendable|shielded balance/.test(m)).map(x => x[0]); let gap = 0; for (let i = 1; i < t.length; i++) gap = Math.max(gap, t[i] - t[i - 1]);
+  ok("heartbeat: no silence longer than 10 s between status messages while waiting/shielding", t.length > 20 && gap <= 10000, "max gap " + gap + " ms over " + t.length + " msgs"); }
+{ const w = makeWorld(), s = H.memStore(); off = 0; w.tBal = {};   // ZEC visible in the UTXO list while the wallet sync is slow to see it: arrival must not wait for the wallet
+  const msgs = []; let wb = 0; const orig = w.Zjs.WebWallet.prototype.get_wallet_summary; w.Zjs.WebWallet.prototype.get_wallet_summary = async function () { wb++; return orig.call(this); };
+  await H.startHop(mkCtx(w, s, withUtxo(w)({ stopAt: "WAIT_T" }))); const r = await H.runHop(mkCtx(w, s, withUtxo(w)({ onProgress: timed(msgs) })));
+  ok("arrival is decided by the UTXO query (few wallet syncs while waiting)", r.step === "DONE" && wb < 40, "summary calls " + wb); }
+{ const w = makeWorld(), s = H.memStore(); off = 0; const msgs = [];                       // percent + block count from the summary, live while the real sync runs
+  const proto = w.Zjs.WebWallet.prototype, sum = proto.get_wallet_summary; proto.get_wallet_summary = async function () { const r = await sum.call(this); return { ...r, chain_tip_height: 3_500_040, fully_scanned_height: 3_500_000 }; };
+  proto.sync = async () => new Promise(r => setTimeout(r, 150));
+  await H.startHop(mkCtx(w, s, { beatMs: 5, onProgress: timed(msgs), stopAt: "SHIELD" })); const rec0 = await latest(s); rec0.st.step = "SHIELD"; await s.put(STEALTH + "#0", rec0);
+  proto.sync = async () => new Promise(r => setTimeout(r, 40)); await H.runHop(mkCtx(w, s, { beatMs: 5, onProgress: timed(msgs), stopAt: "DELAY" }));
+  const sy = msgs.map(([, m]) => /^Syncing Zcash wallet (\d+)% \((\d+) blocks\) · (\d+) s$/.exec(m)).filter(Boolean), rp = msgs.map(([, m]) => /^Syncing Zcash wallet (\d+)% \(a repeat refresh takes ~(\d+) min\) · (\d+) s$/.exec(m)).filter(Boolean);
+  ok("first sync status: 'Syncing Zcash wallet N% (40 blocks) · s', refreshed during the sync, never above 95%", sy.length >= 3 && sy.every(x => +x[1] <= 95 && +x[2] === 40) && new Set(sy.map(x => x[1])).size >= 2, sy.length + " lines");
+  ok("later syncs say honestly that a repeat refresh takes minutes (measured 145 s per account set)", rp.length >= 1 && rp.every(x => +x[1] <= 95 && +x[2] >= 3), rp.length + " lines"); }
+{ const w = makeWorld(), s = H.memStore(); off = 0; const msgs = []; let hang = 2, ctor = 0;       // the wallet sync hangs twice: cut by the timeout, shown as a problem, retried on a wallet restored from the saved bytes
+  const proto = w.Zjs.WebWallet.prototype, sync0 = proto.sync, Ctor = w.Zjs.WebWallet; w.Zjs.WebWallet = class extends Ctor { constructor(...a) { super(...a); ctor++; } };
+  proto.sync = async function () { if (hang > 0 && w.tBal && Object.values(w.tBal).some(v => v > 0n)) { hang--; return new Promise(() => {}); } return sync0.call(this); };
+  const st = await H.startHop(mkCtx(w, s, withUtxo(w)({ syncMaxMs: 30, onProgress: timed(msgs) })));
+  ok("stalled wallet sync: cut after the limit, 'Problem: ... timed out · retrying' shown, hop still finishes", st.step === "DONE" && !st.err && hang === 0 && msgs.some(([, m]) => /Problem: Zcash wallet sync timed out after \d+ s · retrying/.test(m)), st.err || msgs.slice(-3).join("|"));
+  ok("... on a wallet restored from the saved bytes (no new accounts created)", ctor >= 2 && w.created === H.accountsFor("fast"), "ctor " + ctor + " created " + w.created); }
+{ const w = makeWorld(), s = H.memStore(); off = 0; const msgs = []; const gu = withUtxo(w)().getUtxos; let fail = 3;   // the UTXO service errors: falls back to the wallet, no crash
+  const st = await H.startHop(mkCtx(w, s, { getUtxos: async a => { if (fail-- > 0) throw new Error("lightwalletd 502"); return gu(a); }, onProgress: timed(msgs) }));
+  ok("UTXO query failing 3 times: wallet balance is the fallback, hop finishes", st.step === "DONE" && !st.err, st.err || ""); }
+{ const w = makeWorld(), s = H.memStore(); off = 0; w.tBal = {}; const HOUR = 3600e3;               // ZEC never arrives: a clear Halt after 45 min, not a silent wait
+  w.inOutcome = "SUCCESS"; const orig = w.fetch; w.fetch = async (u, i) => { const r = await orig(u, i); return r; };
+  const gu = async () => []; const proto = w.Zjs.WebWallet.prototype; const sum = proto.get_wallet_summary; proto.get_wallet_summary = async function () { const r = await sum.call(this); for (const a of r.account_balances) { a[1].unshielded_balance = 0; } return r; };
+  const msgs = []; const st = await H.startHop(mkCtx(w, s, { getUtxos: gu, onProgress: timed(msgs) }));
+  ok("ZEC never seen: Halt 'ZEC to arrive is taking too long' after ~45 min, status kept alive meanwhile", st.step === "WAIT_T" && /taking too long/.test(st.err) && st.halted && off - 0 < HOUR, st.err + " " + off); }
+{ const C2 = await import("../web/hop-card.js"), now = 1_000_000_000_000, M = 60000;
+  const mk = (step, extra = {}) => ({ running: true, msg: "", st: { step, chain: "rh", dest: "base", amount: "5000000", recipient: A, stealth: STEALTH, n: 0, startedAt: now - 20 * M, stepAt: now - 5 * M, mode: "fast" }, ...extra });
+  C2.resetLeft(); const v1 = C2.hopView(mk("WAIT_T", { msg: "Waiting for Zcash confirmations (7/10) · ~4 min", beatAt: now - 2000 }), now);
+  ok("card: live sub-step replaces the generic line (confirmations 7/10), pct/left present", v1.what === "Waiting for Zcash confirmations (7/10) · ~4 min" && v1.line.startsWith(v1.what) && v1.pct > 0 && v1.left && !v1.note);
+  C2.resetLeft(); const v2 = C2.hopView(mk("WAIT_T", { msg: "Syncing Zcash wallet 43% (60 blocks) · 9 s", beatAt: now - 2000 }), now);
+  ok("card: 'Syncing Zcash wallet 43%'", /Syncing Zcash wallet 43%/.test(v2.what) && C2.statusLine(v2).includes("Syncing Zcash wallet 43%"));
+  C2.resetLeft(); ok("card: a plain status echo or empty message keeps the step line", C2.hopView(mk("DEPOSIT_IN", { msg: "Converting: PENDING_DEPOSIT", beatAt: now }), now).what.startsWith("Converting to ZEC") && C2.hopView(mk("SHIELD", { msg: "", beatAt: now }), now).what === "Moving the ZEC into the shielded pool");
+  C2.resetLeft(); const v3 = C2.hopView(mk("SHIELD", { msg: "Shielding: building the zero-knowledge proof · 20 s", beatAt: now - 45_000 }), now);
+  ok("card: silence over 30 s says 'No update for N s'", /^No update for 45 s/.test(v3.note));
+  C2.resetLeft(); const v4 = C2.hopView(mk("SHIELD", { msg: "Shielding…", beatAt: now - 45_000, hidden: true }), now);
+  ok("card: silence in a background tab says so and tells what to do", /background/.test(v4.note) && /front/.test(v4.note));
+  C2.resetLeft(); const v5 = C2.hopView(mk("WAIT_T", { running: false, retryAt: now + 30_000, st: { ...mk("WAIT_T").st, err: "Zcash wallet sync timed out after 150 s\n    at foo (https://x.y/z.js:1:2)" } }), now);
+  ok("card: error = one-line cause + auto-retry countdown", v5.kind === "warn" && v5.body.startsWith("Problem: Zcash wallet sync timed out after 150 s. Retrying by itself in 30 s.") && !/\n|https?:/.test(v5.body), v5.body);
+  C2.resetLeft(); const v6 = C2.hopView(mk("WAIT_T", { running: false, st: { ...mk("WAIT_T").st, err: "ZEC to arrive is taking too long" } }), now);
+  ok("card: a deliberate stop shows the cause and the Continue button", /^Stopped: ZEC to arrive is taking too long\./.test(v6.body) && v6.action === "continue"); }
 
 Date.now = realNow;
 console.log(fails ? fails + " FAILED" : "all passed"); process.exit(fails ? 1 : 0);

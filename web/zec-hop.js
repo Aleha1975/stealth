@@ -213,6 +213,9 @@ export const makeCountPriorHops = (chain, fetchFn = fetch) => async stealth => {
   return n;
 };
 /** ctx.txKnown(txid) -> true / false (lightwalletd GetTransaction through the gRPC-web proxy, like zec-return.js); throws when it cannot tell. */
+/** UTXOs of a t-address straight from lightwalletd (one cheap call, no wallet sync): [{ value, height }]. Times out after 20 s so a hung proxy cannot freeze the wait loop. */
+export const makeGetUtxos = (fetchFn = fetch, base = ZC.lightwalletd) => async addr => withTimeout((async () => (await import("./zec-return.js")).getUtxos(base, addr, fetchFn))(), 20000, "lightwalletd UTXO query");
+export const withTimeout = (p, ms, what) => { let t; return Promise.race([p, new Promise((_, rej) => { t = setTimeout(() => rej(new Error(what + " timed out after " + Math.round(ms / 1000) + " s")), ms); })]).finally(() => clearTimeout(t)); };
 export const makeTxKnown = (fetchFn = fetch, base = ZC.lightwalletd) => async txid => (await import("./zec-return.js")).txKnown(base, txid, fetchFn);
 
 // ---------------------------------------------------------------- storage: key = "<stealth>#<n>", value = { st, db } (db = wallet bytes)
@@ -272,15 +275,29 @@ export async function runHop(ctx) {
     return W;
   };
   const saveWallet = async () => { rec.db = await W.db_to_bytes(); await save(); };
+  // Sync with a live status line. MEASURED against mainnet (Chrome, WebZjs Ironwood build): the first sync() of a wallet that has never synced takes 5-15 s (~0.1 s per block + 2 s subtree roots),
+  // but EVERY later sync() of a wallet that already scanned takes 145-156 s with 1 account and ~340 s with 4 (a fresh WebWallet restored from saved bytes behaves the same). So: the wallet is synced as rarely
+  // as possible (waits use the lightwalletd UTXO query), and a slow sync is shown honestly. WebZjs has no progress callback and blocks get_wallet_summary while syncing, so the percent is an estimate.
+  const beatMs = ctx.beatMs || 5000, syncMax = ctx.syncMaxMs || 15 * 60_000;
+  const syncW = async () => {
+    const w = await wallet(); let blocks = null;
+    try { const s0 = await withTimeout(w.get_wallet_summary(), 15000, "wallet summary"); if (s0 && s0.chain_tip_height > 0 && s0.fully_scanned_height > 0) blocks = s0.chain_tip_height - s0.fully_scanned_height; if (blocks <= 0) blocks = null; } catch {}
+    const again = !!st.syncedOnce, t0 = Date.now(), n = (st.accts || []).length || 1;
+    const est = again ? 100_000 + 60_000 * n : 4000 + (blocks == null ? 100 : blocks) * 120;
+    const line = () => { const e = Date.now() - t0; return "Syncing Zcash wallet " + Math.min(95, Math.floor(100 * e / est)) + "%" + (again ? " (a repeat refresh takes ~" + Math.round(est / 60_000) + " min)" : blocks != null ? " (" + blocks + " blocks)" : "") + " · " + Math.round(e / 1000) + " s"; };
+    say(line()); const iv = setInterval(() => say(line()), beatMs);
+    try { await withTimeout(w.sync(), syncMax, "Zcash wallet sync"); st.syncedOnce = true; } catch (e) { if (/timed out/.test(e.message)) { W = null; say("Problem: " + e.message + " · retrying"); } throw e; } finally { clearInterval(iv); }   // W = null: the next call restores a fresh wallet from the last saved bytes
+  };
   const bal = async i => {                                       // sync, then the balances of account i
-    const w = await wallet(); await retry(() => w.sync());
+    await retry(() => syncW()); const w = await wallet();
     const e = ((await w.get_wallet_summary()).account_balances.find(x => x[0] === st.accts[i]) || [0, {}])[1];
     return { t: BigInt(e.unshielded_balance || 0), o: BigInt(e.orchard_balance || 0) + BigInt(e.ironwood_balance || 0), p: BigInt(e.pending_change || 0) + BigInt(e.pending_spendable || 0) };
   };
   const taddr = async i => (await wallet()).get_current_address_transparent(st.accts[i]);
-  const tip = async () => { const w = await wallet(); return Number(await retry(() => w.get_latest_block())); };
+  const tip = async () => { const w = await wallet(); return Number(await retry(() => withTimeout(w.get_latest_block(), 20000, "Zcash tip query"))); };
+  const utxoOf = async a => { if (!ctx.getUtxos) return undefined; try { const u = (await ctx.getUtxos(a)).filter(x => x.height > 0); return { sum: u.reduce((s, x) => s + BigInt(x.value), 0n), height: u.reduce((m, x) => Math.max(m, x.height), 0) }; } catch { return undefined; } };   // undefined = cannot tell
   const allocAcct = async () => { const a = st.nextAcct || MAX_OUT + 1; if (a >= st.accts.length) throw new Halt("no fresh hop account left for a refund address; nothing was sent"); st.nextAcct = a + 1; await save(); return a; };
-  const until = async (what, ms, fn, every = 20000) => { const t0 = Date.now(); for (;;) { if (await fn()) return; if (Date.now() - t0 > ms) throw new Halt(what + " is taking too long"); say("Waiting for " + what + "…"); await sleep(every); } };
+  const until = async (what, ms, fn, every = 10000) => { const t0 = Date.now(); for (;;) { if (await fn()) return; if (Date.now() - t0 > ms) throw new Halt(what + " is taking too long"); say("Waiting for " + what + "… " + Math.round((Date.now() - t0) / 1000) + " s"); await sleep(every); } };
   const status = async (a, f) => { const r = await f(base + "/v0/status?depositAddress=" + encodeURIComponent(a), { cache: "no-store" }).catch(() => null); return r && r.ok ? (await r.json().catch(() => ({}))).status || PENDING : PENDING; };
   const poll = async (a, label, ms, f) => { try { return await PW.pollStatus({ base, depositAddress: a, fetchFn: f, sleep, intervalMs: 4000, timeoutMs: ms, onUpdate: s => say(label + ": " + s.status) }); } catch (e) { throw new Halt(e.message); } };
   const txidOf = raw => hex(unhex(raw).slice(0, 32).reverse()).slice(2);
@@ -335,16 +352,22 @@ export async function runHop(ctx) {
       const fin = await poll(q.depositAddress, "Swap to ZEC", 40 * 60_000, fIn); await go(afterIn(fin.status).step, afterIn(fin.status));
     },
     async WAIT_T() {
-      const need = st.attempt ? MIN_SHIELD : BigInt(st.inQuote.minOut) * 9n / 10n;
-      let last = null;
-      await until("ZEC to arrive", 45 * 60_000, async () => { last = await bal(st.attempt); return last.t >= need || last.o >= ZC.minIn; });
-      if (!(last.o >= ZC.minIn && last.t < MIN_SHIELD)) {        // coins on the t-address: they become spendable only after T_CONFS confirmations
-        if (st.tSeenHeight == null) { st.tSeenHeight = await tip(); st.tSeenAt = Date.now(); await save(); }   // also fills in states saved before this fix
+      const need = st.attempt ? MIN_SHIELD : BigInt(st.inQuote.minOut) * 9n / 10n, ta = ctx.getUtxos ? await taddr(st.attempt) : null;
+      let last = null, utxo = null, k = 0;
+      // 1) arrival: the cheap lightwalletd UTXO query decides (1 s) and gives the exact block; the slow wallet sync is only a second opinion (first pass, then every 6th)
+      await until("ZEC to arrive", 45 * 60_000, async () => {
+        utxo = ta ? await utxoOf(ta) : undefined; if (utxo && utxo.sum >= need) return true;
+        if (utxo === undefined || k++ % 6 === 0) { last = await bal(st.attempt); return last.t >= need || last.o >= ZC.minIn; }
+        return false;
+      });
+      if (!(last && last.o >= ZC.minIn && last.t < MIN_SHIELD)) {   // coins on the t-address: they become spendable only after T_CONFS confirmations
+        if (st.tSeenHeight == null) { st.tSeenHeight = utxo && utxo.height ? utxo.height - 1 : await tip(); st.tSeenAt = Date.now(); await save(); }   // the block of the deposit when known (it counts as confirmation 1), else the tip when first seen
         const t0 = Date.now();
         for (;;) {
           const n = Math.max(0, Math.min(T_CONFS, (await tip()) - st.tSeenHeight)); if (n >= T_CONFS) break;
           if (Date.now() - t0 > 45 * 60_000) throw new Halt("Zcash confirmations are taking too long");
-          say("Waiting for Zcash confirmations (" + n + "/" + T_CONFS + ")"); await sleep(20000);
+          say("Waiting for Zcash confirmations (" + n + "/" + T_CONFS + ") · ~" + Math.max(1, Math.round((T_CONFS - n) * 1.25)) + " min");
+          await sleep(beatMs * 2);
         }
       }
       await go("SHIELD");
@@ -354,17 +377,23 @@ export async function runHop(ctx) {
       for (;;) {
         const b = await bal(i); if (b.t < MIN_SHIELD) break;     // nothing left to shield (already sent: a resume skips this)
         try {
-          say("Shielding…"); const w = await wallet(), seed = await mnemonicSeed(mn);
+          say("Shielding: preparing the transaction…"); const w = await wallet(), seed = await mnemonicSeed(mn);
           let p = await w.pczt_shield(st.accts[i]);
           p = await Z.pczt_sign(ZC.network, p, new Z.UnifiedSpendingKey(ZC.network, seed, i), new Z.SeedFingerprint(seed));
-          await w.pczt_send(await w.pczt_prove(p, null)); await saveWallet(); break;
+          const tp = Date.now(), iv = setInterval(() => say("Shielding: building the zero-knowledge proof · " + Math.round((Date.now() - tp) / 1000) + " s"), beatMs); say("Shielding: building the zero-knowledge proof…");
+          let pr; try { pr = await withTimeout(w.pczt_prove(p, null), 10 * 60_000, "Shield proof"); } finally { clearInterval(iv); }
+          say("Shielding: sending to the Zcash network…"); await w.pczt_send(pr); await saveWallet(); break;
         } catch (e) {
           if (!/InsufficientFunds/.test(String((e && e.message) || e))) throw e;          // coins not spendable yet (confirmations): wait and try again
           if (Date.now() - t0 > 30 * 60_000) throw new Halt("The ZEC has arrived but is not spendable yet. Press Continue in a few minutes.");
-          say("Waiting for the ZEC to become spendable…"); await sleep(60_000);
+          say("Waiting for the ZEC to become spendable in the wallet… " + Math.round((Date.now() - t0) / 1000) + " s"); await sleep(10000);
         }
       }
-      await until("the shielded balance (1 confirmation)", 40 * 60_000, async () => { const x = await bal(i); await saveWallet(); return x.o >= ZC.minIn && x.p === 0n && x.t < MIN_SHIELD; }, 15000);
+      const tShield = ctx.getUtxos ? await taddr(i) : null;
+      await until("the shielded balance (1 confirmation)", 40 * 60_000, async () => {
+        if (tShield) { const u = await utxoOf(tShield); if (u && u.sum >= MIN_SHIELD) return false; }           // the shield is not mined yet (the t-coins are still there): no need for a slow wallet sync
+        const x = await bal(i); await saveWallet(); return x.o >= ZC.minIn && x.p === 0n && x.t < MIN_SHIELD;
+      }, 10000);
       if (partsOn()) { const p = P(); p.acct = i; p.refundAcct = null; p.at = Date.now() + delayMs(ctx.rand); await go("DELAY", { delayUntil: p.at }); }      // a refunded part is shielded again: short own delay, then sent from this account
       else if (st.mode) {                                        // H-1: split the shielded balance into random parts, each with its own random time
         const parts = planParts({ orchard: (await bal(i)).o, reserve: BigInt(st.reserve), mode: st.mode, rand: ctx.rand, now: Date.now(), acct: i });
@@ -374,7 +403,7 @@ export async function runHop(ctx) {
     async DELAY() {
       const at = () => partsOn() ? P().at : st.delayUntil, lbl = partsLabel(st);
       if (partsOn()) st.delayUntil = P().at;
-      while (Date.now() < at()) { const left = at() - Date.now(); say((lbl ? lbl + ": waiting " : "Waiting ") + Math.ceil(left / 1000) + " s to break the timing link…"); await sleep(Math.min(left > 120_000 ? 15000 : 5000, left)); }
+      while (Date.now() < at()) { const left = at() - Date.now(); say((lbl ? lbl + ": waiting " : "Waiting ") + Math.ceil(left / 1000) + " s to break the timing link…"); await sleep(Math.min(left > 120_000 ? 10000 : 5000, left)); }
       await go("QUOTE_OUT");
     },
     async QUOTE_OUT() {
@@ -382,7 +411,7 @@ export async function runHop(ctx) {
       if (p.quote && (p.raw || Date.now() < p.quote.deadlineMs - 120_000)) return go("SEND_OUT");
       if (st.waitExpiry) { await until("the earlier unsent Zcash transaction to expire", 70 * 60_000, async () => (await tip()) > st.waitExpiry); st.waitExpiry = null; await save(); }
       const reserve = BigInt(p.reserve || st.reserve);
-      if (partsOn()) await until("the shielded change to confirm", 40 * 60_000, async () => { const x = await bal(p.acct); return x.p === 0n && x.o >= (p.tries ? ZC.minIn : BigInt(p.amount)) + reserve; }, 15000);
+      if (partsOn()) await until("the shielded change to confirm", 40 * 60_000, async () => { const x = await bal(p.acct); return x.p === 0n && x.o >= (p.tries ? ZC.minIn : BigInt(p.amount)) + reserve; }, 10000);
       const b = await bal(p.acct), amount = partsOn() && !p.tries ? BigInt(p.amount) : outAmount(b.o, reserve);
       if (!amount || amount < ZC.minIn) throw new Halt("only " + b.o + " zatoshi are shielded, below the 1Click minimum; they stay in the hop wallet");
       if (partsOn() && p.refundAcct == null) { p.refundAcct = await allocAcct(); await save(); }            // a fresh hop t-address per part and attempt: the refund address is never reused

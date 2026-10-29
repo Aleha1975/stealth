@@ -36,7 +36,7 @@ try {
   ok("app loaded under COOP/COEP, cross-origin isolated", await ev("crossOriginIsolated === true && typeof SharedArrayBuffer === 'function'"));
   ok("UI: Private checkbox present, speed selector, old split/delay options gone", await ev("!!document.getElementById('wd-private') && !document.getElementById('wd-parts') && !document.getElementById('wd-delay') && !!document.getElementById('wd-mode') && /^\\s*Private\\s*$/.test(document.getElementById('wd-private').parentElement.textContent)"));
   const t0 = Date.now();
-  const tmo = setTimeout(() => { console.log('TIMEOUT errors:', errors, 'last reqs:', reqs.slice(-12)); done(3); }, 120000);
+  const tmo = setTimeout(() => { console.log('TIMEOUT errors:', errors, 'last reqs:', reqs.slice(-12)); done(3); }, 240000);
   const out = JSON.parse(await ev(`(async () => {
     const HM = await import("./zec-hop.js"), { CHAINS } = await import("./chains.js"), words = await HM.loadWords();
     const bad = u => { throw new Error("forbidden call in a dry run: " + u); };
@@ -51,12 +51,28 @@ try {
   ok("dry hop stops at WAIT_T without error", out.step === "WAIT_T" && !out.err, out.step + " " + (out.err || "") + " " + (Date.now() - t0) + " ms");
   ok("valid t-address, dry quote recorded (no deposit address)", /^t1[1-9A-HJ-NP-Za-km-z]{33}$/.test(out.tIn) && out.inQuote && out.inQuote.depositAddress === null && BigInt(out.inQuote.amountOut) > 132000n, out.tIn + " zats " + out.inQuote?.amountOut);
   ok("accounts for the mode (" + out.nAccts + "), birthday near the Zcash tip, wallet bytes saved", out.accts.length === out.nAccts && out.nAccts >= 3 && out.birthday > 3_000_000 && out.dbBytes > 1000, "birthday " + out.birthday + " db " + out.dbBytes);
+  // live sub-steps against the real wasm wallet + mainnet lightwalletd: continue the same state as a real (non-dry) hop that is waiting for its ZEC. Nothing is signed or sent; the ZEC never "arrives".
+  const tmo2 = setTimeout(() => { console.log('TIMEOUT in live wait', errors); done(3); }, 150000);
+  const wait = JSON.parse(await ev(`(async () => {
+    const HM = await import("./zec-hop.js"), words = await HM.loadWords(), store = HM.idbStore("zec-smoke2-" + Date.now()), msgs = [];
+    const ctx0 = { store, stealth: "0x" + "cd".repeat(20), priv: "0x" + "46".repeat(32), chain: (await import("./chains.js")).CHAINS.rh, dest: (await import("./chains.js")).CHAINS.base, recipient: "0x" + "11".repeat(20), amount: 5000000n, dry: true, stopAt: "WAIT_T",
+      api: "http://127.0.0.1:1", words, loadZjs: HM.sharedZjs, waitReceipt: () => { throw new Error("no"); }, onProgress: () => {} };
+    await HM.startHop(ctx0); const f = await HM.findHop(store, ctx0.stealth); f.rec.st.dry = false; f.rec.st.err = null; await store.put(f.key, f.rec);
+    let sleeps = 0, t0 = performance.now(), firstSync = null;
+    const ctx = { ...ctx0, dry: false, stopAt: undefined, beatMs: 1000, getUtxos: async () => [], onProgress: (st, m) => { msgs.push(m); if (firstSync == null && /^Syncing/.test(m)) firstSync = performance.now(); },
+      sleep: async ms => { if (++sleeps > 3) throw new HM.Halt("smoke: stop waiting"); await new Promise(r => setTimeout(r, 300)); } };
+    const st = await HM.runHop(ctx);
+    return JSON.stringify({ step: st.step, err: st.err, msgs, syncMs: Math.round(performance.now() - t0), sleeps });
+  })()`));
+  clearTimeout(tmo2);
+  ok("live wait: real wallet syncs from the birthday, shows 'Syncing Zcash wallet N%' then 'Waiting for ZEC to arrive… N s' heartbeats, stays at WAIT_T", wait.step === "WAIT_T" && /smoke: stop waiting/.test(wait.err || "") && wait.msgs.some(m => /^Syncing Zcash wallet \d+%( \(\d+ blocks\))? · \d+ s$/.test(m)) && wait.msgs.filter(m => /^Waiting for ZEC to arrive… \d+ s$/.test(m)).length >= 2, wait.syncMs + " ms, " + wait.msgs.slice(0, 4).join(" | "));
+  ok("live wait: first sync from the birthday finished in under 60 s", wait.syncMs < 60000, wait.syncMs + " ms");
   ok("page mnemonic = node golden", out.mn === "youth alone tissue bomb stock old thank speed tissue night ugly exchange lumber salute switch glance peanut among average exhibit parrot stove tool derive");
   ok("restored wallet: same t-address on account 0, all addresses distinct, empty", out.summary[0].t === out.tIn && new Set(out.summary.map(s => s.t)).size === out.summary.length && out.summary.length === out.nAccts && out.summary.every(s => s.transparent === "0" && s.orchard === "0"));
   // the page itself reads GET /relay/stats on load (fee display); only a POST to the relayer would submit anything
   const isSubmit = r => /^POST .*\/relay(\/pay)?$/.test(r);
   ok("no relayer call, no non-dry quote", !reqs.some(isSubmit) && !seen.some(isSubmit));
-  ok("only dry 1Click quotes went out", reqs.filter(r => r.startsWith("POST") && r.includes("/v0/quote")).length === 1);
+  ok("only dry 1Click quotes went out", reqs.filter(r => r.startsWith("POST") && r.includes("/v0/quote")).length === 2);
   // the local test server has no API and no favicon: those 404s are expected here
   const real = errors.filter(e => !/404 \(Not Found\) http:\/\/127\.0\.0\.1:\d+\/(stealth-api\/rh\/relay\/stats|favicon\.svg)$/.test(e));
   ok("no page errors, no CSP violations", real.length === 0, real.join(" | "));
