@@ -263,7 +263,7 @@ export async function runHop(ctx) {
   const bal = async i => {                                       // sync, then the balances of account i
     const w = await wallet(); await retry(() => w.sync());
     const e = ((await w.get_wallet_summary()).account_balances.find(x => x[0] === st.accts[i]) || [0, {}])[1];
-    return { t: BigInt(e.unshielded_balance || 0), o: BigInt(e.orchard_balance || 0), p: BigInt(e.pending_change || 0) + BigInt(e.pending_spendable || 0) };
+    return { t: BigInt(e.unshielded_balance || 0), o: BigInt(e.orchard_balance || 0) + BigInt(e.ironwood_balance || 0), p: BigInt(e.pending_change || 0) + BigInt(e.pending_spendable || 0) };
   };
   const taddr = async i => (await wallet()).get_current_address_transparent(st.accts[i]);
   const tip = async () => { const w = await wallet(); return Number(await retry(() => w.get_latest_block())); };
@@ -440,5 +440,5 @@ export async function hopSummary(ctx, rec = null) {
   let ids = rec && rec.st.accts;
   if (!ids) { const bd = rec && rec.st.birthday != null ? rec.st.birthday : birthdayFromTime(ctx.blockTimeSec, Number(await w.get_latest_block())); ids = []; for (let i = 0; i < (rec && rec.st.nAccts || MAX_OUT + 1); i++) ids.push(await w.create_account("hop" + i, mn, i, bd)); }
   await w.sync(); const s = await w.get_wallet_summary();
-  return Promise.all(ids.map(async (id, i) => { const e = (s.account_balances.find(x => x[0] === id) || [0, {}])[1]; return { account: i, t: await w.get_current_address_transparent(id), transparent: BigInt(e.unshielded_balance || 0), orchard: BigInt(e.orchard_balance || 0) }; }));
+  return Promise.all(ids.map(async (id, i) => { const e = (s.account_balances.find(x => x[0] === id) || [0, {}])[1]; return { account: i, t: await w.get_current_address_transparent(id), transparent: BigInt(e.unshielded_balance || 0), orchard: BigInt(e.orchard_balance || 0) + BigInt(e.ironwood_balance || 0) }; }));
 }

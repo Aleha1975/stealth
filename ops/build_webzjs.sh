@@ -1,17 +1,24 @@
 #!/usr/bin/env bash
-# Reproduces the WebZjs wallet build used by the hidden Zcash hop (web/zec-hop.js) into web/vendor/webzjs/ and writes web/vendor/webzjs/SHA256SUMS.
-# Pins: ChainSafe/WebZjs a50df944c32243cb8da9f86e7d52cb65ac926439 · rust nightly-2025-01-07 (from the repo's rust-toolchain.toml) · clang 18.1.8 · wasm-bindgen-cli 0.2.100.
-# Usage: ops/build_webzjs.sh                 full build in $WORK (default ~/.cache/webzjs-build): installs rustup/just/wasm-pack/wasm-bindgen-cli/clang there, no system changes
-#        PKG_DIR=<dir> ops/build_webzjs.sh   skip the build, only patch + copy + hash an existing wasm-pack output (packages/webzjs-wallet)
-# The 60 MB wasm and the generated JS are NOT committed (.gitignore); only SHA256SUMS and README.md are. The build is not bit-for-bit reproducible: SHA256SUMS records the audited artifact.
+# Ironwood (NU6.3) build of the WebZjs browser wallet.
+# Reproduces the WebZjs wallet build into web/vendor/webzjs/ and writes web/vendor/webzjs/SHA256SUMS.
+# Pins: ChainSafe/WebZjs a50df944c32243cb8da9f86e7d52cb65ac926439 + webzjs-ironwood.patch (librustzcash 0.25, vendored zcash_client_memory ported to Ironwood)
+#       rust nightly-2025-06-20 = rustc 1.89.0-nightly (set by the patch in rust-toolchain.toml; librustzcash 0.25 MSRV is 1.89, nightly-2025-01-07 is too old; NEWER nightlies (tested 2026-10-28) make wasm-bindgen 0.2.100 skip its threads transform -> non-shared memory, DataCloneError)
+#       clang 18.1.8 · wasm-bindgen-cli 0.2.100 (= wasm-bindgen in Cargo.lock) · just/wasm-pack from stable.
+# Usage: ops/build_webzjs_ironwood.sh                 full build in $WORK (default ~/.cache/webzjs-build); no system changes
+#        PKG_DIR=<dir> ops/build_webzjs_ironwood.sh   skip the build, only patch + copy + hash an existing wasm-pack output (packages/webzjs-wallet)
+# PATCH (default: next to this script) = the diff a50df94..spike/ironwood; its sha256 is checked against PATCH_SHA256.
+# The ~60 MB wasm and generated JS are NOT committed; only SHA256SUMS and README.md are. The build is not bit-for-bit reproducible.
 set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"; OUT="$ROOT/web/vendor/webzjs"
-COMMIT=a50df944c32243cb8da9f86e7d52cb65ac926439; CLANG=18.1.8; WBG=0.2.100
+COMMIT=a50df944c32243cb8da9f86e7d52cb65ac926439; CLANG=18.1.8; WBG=0.2.100; NIGHTLY=nightly-2025-06-20
+PATCH="${PATCH:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/webzjs-ironwood.patch}"; PATCH_SHA256="${PATCH_SHA256:-cace4fc171f132b9e1f0b35936bf788e03f88b1b821bbb33ee34f7670f5d62f0}"
 WORK="${WORK:-$HOME/.cache/webzjs-build}"
 sha() { if command -v sha256sum >/dev/null; then sha256sum "$@"; else shasum -a 256 "$@"; fi; }
 if [ -z "${PKG_DIR:-}" ]; then
   mkdir -p "$WORK"; export RUSTUP_HOME="$WORK/rustup" CARGO_HOME="$WORK/cargo"; export PATH="$WORK/llvm/bin:$CARGO_HOME/bin:$PATH"
-  if [ ! -x "$WORK/llvm/bin/clang" ]; then       # clang 18 (the system clang is too old/new for the zcash C deps on wasm32)
+  if [ -s "$PATCH" ]; then [ "$PATCH_SHA256" = "$(sha "$PATCH" | cut -d' ' -f1)" ] || { echo "patch hash mismatch (set PATCH_SHA256 after reviewing $PATCH)"; exit 1; }
+  else echo "missing patch $PATCH"; exit 1; fi
+  if [ ! -x "$WORK/llvm/bin/clang" ]; then       # clang 18 (the system clang has no usable wasm32 backend for the C deps: secp256k1, blake2 ...)
     case "$(uname -s)-$(uname -m)" in
       Darwin-arm64) T="clang+llvm-$CLANG-arm64-apple-macos11";; Linux-x86_64) T="clang+llvm-$CLANG-x86_64-linux-gnu-ubuntu-18.04";; *) echo "unsupported platform; put clang $CLANG in $WORK/llvm"; exit 1;;
     esac
@@ -19,7 +26,8 @@ if [ -z "${PKG_DIR:-}" ]; then
   fi
   [ -x "$CARGO_HOME/bin/rustup" ] || { curl -fsSL https://sh.rustup.rs | sh -s -- -y --no-modify-path --profile minimal; }
   rustup toolchain list | grep -q '^stable' || rustup toolchain install stable --profile minimal
-  # tools are built with STABLE: nightly-2025-01-07 is too old for current icu/time crates (rustc 1.88)
+  rustup toolchain list | grep -q "^$NIGHTLY" || rustup toolchain install "$NIGHTLY" --profile minimal -c rust-src -t wasm32-unknown-unknown
+  # build tools with STABLE (they need a newer rustc than any old nightly)
   [ -x "$CARGO_HOME/bin/just" ] || cargo +stable install --locked just
   [ -x "$CARGO_HOME/bin/wasm-pack" ] || cargo +stable install --locked wasm-pack
   [ "$(wasm-bindgen --version 2>/dev/null)" = "wasm-bindgen $WBG" ] || cargo +stable install --locked wasm-bindgen-cli --version "$WBG" --force
@@ -27,9 +35,11 @@ if [ -z "${PKG_DIR:-}" ]; then
   export CC_wasm32_unknown_unknown="$WORK/llvm/bin/clang" AR_wasm32_unknown_unknown="$WORK/llvm/bin/llvm-ar"
   SRC="$WORK/WebZjs"
   [ -d "$SRC/.git" ] || git clone https://github.com/ChainSafe/WebZjs "$SRC"
-  git -C "$SRC" fetch -q origin && git -C "$SRC" checkout -q --detach "$COMMIT"
+  git -C "$SRC" fetch -q origin && git -C "$SRC" reset -q --hard && git -C "$SRC" clean -qfd && git -C "$SRC" checkout -q --detach "$COMMIT"
   [ "$(git -C "$SRC" rev-parse HEAD)" = "$COMMIT" ] || { echo "wrong commit"; exit 1; }
-  ( cd "$SRC" && just build-wallet )              # wasm-pack build -t web --release --features "wasm wasm-parallel" -Z build-std (nightly from rust-toolchain.toml), then add-worker-module.sh
+  git -C "$SRC" apply --index "$PATCH"            # Cargo.lock is part of the patch: crates are resolved exactly as audited
+  # one cargo at a time, 4 jobs max; rust-toolchain.toml (from the patch) selects $NIGHTLY
+  ( cd "$SRC" && CARGO_BUILD_JOBS=4 nice just build-wallet )   # wasm-pack build -t web --release --features "wasm wasm-parallel" -Z build-std, then add-worker-module.sh
   PKG_DIR="$SRC/packages/webzjs-wallet"
 fi
 [ -f "$PKG_DIR/webzjs_wallet_bg.wasm" ] || { echo "no wasm in $PKG_DIR"; exit 1; }
