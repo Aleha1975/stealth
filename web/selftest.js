@@ -40,8 +40,8 @@ try {
   // chain-independent key domain: no chainId anywhere, so every chain gives the same keys and wallets accept the request
   const td = JSON.parse(keyRequestTypedData(account));
   check("key domain has no chainId", !("chainId" in KEY_DOMAIN) && !("chainId" in td.domain) && !td.types.EIP712Domain.some(f => f.name === "chainId"));
-  check("chain configs", CHAINS.base.chainId === 8453 && CHAINS.base.chainHex === "0x2105" && CHAINS.rh.chainId === 4663 && CHAINS.rh.chainHex === "0x1237" && CHAINS.rh.token.symbol === "USDG" && CHAINS.rh.stealthPay === null);
-  check("chain select", pickChain("?chain=rh").key === "rh" && pickChain("").key === "base" && pickChain("?to=st:rh:0xab").key === "rh" && chainOfMeta("st:rh:0x1").key === "rh" && chainOfMeta("0x1") === null);
+  check("chain configs", CHAINS.base.chainId === 8453 && CHAINS.base.chainHex === "0x2105" && CHAINS.rh.chainId === 4663 && CHAINS.rh.chainHex === "0x1237" && CHAINS.rh.token.symbol === "USDG" && /^0x[0-9a-fA-F]{40}$/.test(CHAINS.rh.stealthPay));
+  check("chain select", pickChain("?chain=rh").key === "rh" && pickChain("").key === "rh" && pickChain("?chain=base").key === "base" && pickChain("?to=st:rh:0xab").key === "rh" && chainOfMeta("st:rh:0x1").key === "rh" && chainOfMeta("0x1") === null);
   check("meta prefix per chain", metaAddress(k1, "rh").startsWith("st:rh:0x") && metaAddress(k1).startsWith("st:base:0x"));
   // one-signature payment: nonce must equal the value computed by `cast abi-encode` + `cast keccak` (== StealthPay.paymentNonce)
   check("paymentNonce matches cast", paymentNonce({ chainId: 4663, stealthPay: "0x1111111111111111111111111111111111111111", token: "0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168", stealth: "0x2222222222222222222222222222222222222222", eph: "0x03" + "33".repeat(32), viewTag: "0x2a", fee: 50000n, feeRecipient: "0x4444444444444444444444444444444444444444" }) === "0x59b5c6887352a734851ed214c94808287ce1973432bd9756ff0ce0c95b38879b");

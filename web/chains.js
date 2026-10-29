@@ -1,7 +1,7 @@
 /* Per-chain configuration. The ONLY place chain-specific values live (ids, token, explorer, contracts).
    Selection: ?chain=rh in the URL, else the chain named in a st:<chain>: link (?to=), else DEFAULT_CHAIN.
    Meta-address prefix is st:<key>: . */
-export const DEFAULT_CHAIN = "base";
+export const DEFAULT_CHAIN = "rh";
 export const CHAINS = {
   base: {
     key: "base", name: "Base", chainId: 8453, chainHex: "0x2105",
@@ -19,7 +19,7 @@ export const CHAINS = {
     native: { symbol: "ETH", name: "Ether", decimals: 18 },
     token: { symbol: "USDG", address: "0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168", decimals: 6, domainName: "Global Dollar", domainVersion: "1" },
     explorer: "https://robinhoodchain.blockscout.com", explorerName: "Blockscout",
-    stealthPay: null,                                   // not deployed yet
+    stealthPay: "0x6f488f9036519b9eb0f3db98b76c2c1b02b08ac7",   // v3, deployed 2026-10-29, Sourcify exact match
     rpc: "https://rpc.mainnet.chain.robinhood.com",
     api: "/stealth-api/rh",                              // nginx: /stealth-api/rh/ -> RH indexer :3883 / relayer :3884
     privateWithdraw: true,
