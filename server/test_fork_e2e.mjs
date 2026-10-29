@@ -4,7 +4,7 @@
    its temp dir. Uses the already DEPLOYED StealthPay v3 on the fork; balances are faked with anvil_setStorageAt / anvil_setBalance; every key is
    freshly generated: nothing is ever sent to the live chain. Prints a PASS/FAIL table; exit code 0 only if every row passes.
      A) happy paths   B) negative / abuse   C) "you pay 10" leaves exactly 10 (UI amount math + on-chain debit) */
-import { spawn } from "child_process"; import fs from "fs"; import os from "os"; import path from "path"; import net from "net"; import httpServer from "http"; import { fileURLToPath } from "url";
+import { spawn, spawnSync } from "child_process"; import fs from "fs"; import os from "os"; import path from "path"; import net from "net"; import httpServer from "http"; import { fileURLToPath } from "url";
 import { createPublicClient, createWalletClient, http, parseAbi, parseEventLogs, keccak256, encodeAbiParameters, toHex, getAddress } from "viem";
 import { generatePrivateKey, privateKeyToAccount } from "viem/accounts";
 import { paymentNonce as jsPaymentNonce, payAmounts, splitSig } from "../web/pay-auth.js";
@@ -83,7 +83,7 @@ try {
     const logf = path.join(tmp, name + ".log");
     const p = spawn("nice", ["-n", "10", "node", path.join(HERE, "relayer.mjs")], { env: { ...process.env, STEALTH_ENV_ONLY: "1", STEALTH_CHAIN: "rh", STEALTH_RPC: RPC, STEALTHPAY: SP, RELAYER_KEY: rk, STEALTH_RELAY_PORT: String(port),
       STEALTH_RELAY_STATE: path.join(tmp, name + ".json"), STEALTH_RELAY_LOG: logf, STEALTH_SANCTIONS_FILE: sanctFile, STEALTH_INDEXER: "http://127.0.0.1:" + IPORT,
-      STEALTH_RELAY_PAY_FEE: String(FEE), STEALTH_RELAY_PAY_FEE_MIN: String(FEE), STEALTH_RELAY_GAS_BUDGET_WEI: "1000000000000000000", STEALTH_RELAY_MAX_PER_IP: "1000", ...env }, stdio: ["ignore", "pipe", "inherit"] });
+      STEALTH_RELAY_PAY_FEE: String(FEE), STEALTH_RELAY_PAY_FEE_MIN: String(FEE), STEALTH_RELAY_GAS_BUDGET_WEI: "1000000000000000000", STEALTH_RELAY_MAX_PER_IP: "1000", STEALTH_RELAY_FAIL_PER_IP: "100000", STEALTH_RELAY_FAIL_PER_MIN: "100000", STEALTH_RELAY_GONE_GAP_MS: "1500", STEALTH_RELAY_REFUSED_LOG_PER_MIN: "100000", ...env }, stdio: ["ignore", "pipe", "inherit"] });
     procs.push(p); await new Promise(r => p.stdout.on("data", d => { if (String(d).includes("stealth relayer")) r(); }));
     return { addr, logf, p, state: path.join(tmp, name + ".json"), log: () => fs.readFileSync(logf, "utf8") };
   };
@@ -157,7 +157,7 @@ try {
   eq("A2 payer debited exactly 5.000000", usd(a1 - await bal(A.address)), "5.000000");
   eq("A2 stealth got the full 5.000000 (fee 0)", usd(await bal(d2.stealth)), "5.000000");
   // extra stealth payments (own gas, cheap) that the negative tests will withdraw from
-  const W = {}; for (const k of ["rep", "dom", "dom2", "exp", "amt", "feelow", "nofee", "sanc", "par", "stuck", "drop", "nonce", "after", "dup", "dup2"]) { W[k] = newDest(); await payOwnGas(A, W[k], 3n * U); }
+  const W = {}; for (const k of ["rep", "dom", "dom2", "exp", "amt", "feelow", "nofee", "sanc", "par", "stuck", "drop", "nonce", "after", "dup", "dup2", "alk", "ntl", "rd"]) { W[k] = newDest(); await payOwnGas(A, W[k], 3n * U); }
   await mine(3);
   // B scans announcements through the indexer
   let annRows = []; for (let i = 0; i < 90; i++) { try { annRows = (await (await fetch(IDX + "/announcements?since=0&limit=2000")).json()).rows; } catch {} if (annRows.length >= 2 + Object.keys(W).length) break; await sleep(500); }
@@ -199,7 +199,7 @@ try {
   const refused = async (name, resP, re, st0, extra = []) => { const r = await resP; const s1 = await snap(extra); ok(name, r.status === 400 && re.test(r.error || "") && same(st0, s1), JSON.stringify(r).slice(0, 140)); };
 
   // B1 replay of the same pay authorization (payload accepted above in A1)
-  { const s0 = await snap([d1.stealth]); await refused("B1 replay of a used pay authorization refused, nothing moved", post(RELAY, "/relay/pay", payBody(A, d1, am.send, FEE, R1.addr, au1), nip()), /already used|nonce|mismatch/, s0, [d1.stealth]); }
+  { const s0 = await snap([d1.stealth]); const rp = await post(RELAY, "/relay/pay", payBody(A, d1, am.send, FEE, R1.addr, au1), nip()); ok("B1 replay of a used pay authorization: the original hash comes back (audit 1099 L-1), nothing moves", rp.status === 200 && rp.hash === p1.hash && same(s0, await snap([d1.stealth])), JSON.stringify(rp)); }
   // B1b replay of a withdrawal
   { const dd = newDest(); await payOwnGas(A, dd, 3n * U); await mine(3); for (let i = 0; i < 60 && !(await known(dd.stealth)); i++) await sleep(500);
     const x = checkAnnouncement(keys, dd.ephPub, dd.viewTag); const acc = privateKeyToAccount(x.stealthPriv);
@@ -207,7 +207,9 @@ try {
     const sg = async (to, v, n) => { const q = splitSig(await acc.signTypedData({ domain: dom(), types: TT, primaryType: "TransferWithAuthorization", message: { from: acc.address, to, value: v, validAfter: 0n, validBefore: BigInt(vb), nonce: n } })); return { v: q.v, r: q.r, s: q.s }; };
     const body = { from: acc.address, to: C, value: String(U), validAfter: "0", validBefore: String(vb), nonce: n1, ...(await sg(C, U, n1)), feeAuth: { value: FEE.toString(), validAfter: "0", validBefore: String(vb), nonce: n2, ...(await sg(R1.addr, FEE, n2)) } };
     const w1 = await post(RELAY, "/relay", body, nip()); await pub.waitForTransactionReceipt({ hash: w1.hash }); await pub.waitForTransactionReceipt({ hash: w1.feeHash });
-    const s0 = await snap([acc.address]); await refused("B1b replay of a used withdrawal refused, nothing moved", post(RELAY, "/relay", body, nip()), /already used/, s0, [acc.address]); }
+    const s0 = await snap([acc.address]); const rw = await post(RELAY, "/relay", body, nip()); ok("B1b replay of a used withdrawal: the original hashes come back (audit 1099 L-1), nothing moves", rw.status === 200 && rw.hash === w1.hash && rw.feeHash === w1.feeHash && same(s0, await snap([acc.address])), JSON.stringify(rw));
+    // a replay under a fresh nonce is a different authorization and is refused as before (here: the address is empty)
+    const rn = await post(RELAY, "/relay", { ...body, nonce: rnd32() }, nip()); ok("B1b a changed nonce is not a replay: refused (signature no longer matches)", rn.status === 400 && /signature does not match/.test(rn.error), JSON.stringify(rn)); }
 
   // B2 wrong chainId / wrong verifyingContract in the signed domain (relayer pre-check for pay; contract-level for both)
   { const dd = newDest(); const s0 = await snap();
@@ -356,15 +358,17 @@ try {
     for (const h of [d1.feeHash, d1.hash]) await pub.waitForTransactionReceipt({ hash: h, timeout: 15000 }).catch(() => {});
     await sleep(800);
     eq("B11a money moved exactly once: C +2.00", usd((await bal(C)) - c0), "2.000000");
-    const d3 = await post(RELAY, "/relay", body, nip()); ok("B11a after mining a repeat is a normal refusal (no longer answered from the in-flight table), nothing moves", d3.status === 400 && /already used|holds less/.test(d3.error) && (await bal(C)) - c0 === 2n * U, JSON.stringify(d3));
+    const d3 = await post(RELAY, "/relay", body, nip()); ok("B12 L-1: a repeat AFTER mining gets the original hashes (dedupe kept 24 h), nothing moves again", d3.status === 200 && d3.hash === d1.hash && d3.feeHash === d1.feeHash && (await bal(C)) - c0 === 2n * U, JSON.stringify(d3));
     // revert must not give the allowance back: the payer empties the wallet after the relayer accepted the payment, so it reverts on chain
     const P = await newPayer(2n * U), dA = newDest(), aA = await payAuth(P, dA, 2n * U, FEE, R1.addr);
     await rpc("evm_setAutomine", [false]);
-    const pa = await post(RELAY, "/relay/pay", payBody(P, dA, 2n * U, FEE, R1.addr, aA), nip());
+    const pbody = payBody(P, dA, 2n * U, FEE, R1.addr, aA);
+    const pa = await post(RELAY, "/relay/pay", pbody, nip());
     ok("B11b the payment passes the simulation (unmined)", pa.status === 200, JSON.stringify(pa).slice(0, 200));
     await fundTok(P.address, 0n); await rpc("evm_setAutomine", [true]); await mine(2);
     let rv = false; for (let i = 0; i < 40 && !rv; i++) { rv = /reverted pay/.test(R1.log()); if (!rv) await sleep(500); }
     ok("B11b the payment reverted on chain", rv);
+    { const pa2 = await post(RELAY, "/relay/pay", pbody, nip()); ok("B12 L-1: a pay retry after the (reverted) inclusion gets the original hash, not an error", pa2.status === 200 && pa2.hash === pa.hash, JSON.stringify(pa2)); }
     await sleep(500); const st3 = JSON.parse(fs.readFileSync(R1.state, "utf8"));
     ok("B11b the revert did NOT refund the payer's daily allowance (still 1)", st3.perPayer[P.address] === 1, JSON.stringify(st3.perPayer[P.address]));
     // IPv6: addresses of one /64 count as one network (R2 allows 3 per network)
@@ -372,12 +376,86 @@ try {
     const v6r = []; for (let i = 0; i < 4; i++) v6r.push(await v6(i));
     ok("B11c IPv6: 4 addresses in one /64 share the per-network cap (3 ok, 4th refused)", v6r.slice(0, 3).every(r => r.status === 200) && v6r[3].status === 400 && /too many requests/.test(v6r[3].error), JSON.stringify(v6r.map(r => r.status)));
     // log injection: a forged ALERT line must not become a line of its own
-    await post(RELAY, "/relay", { from: "0xdead\n2099-01-01T00:00:00.000Z ALERT forged line", to: C }, nip());
+    await post(RELAY, "/relay/pay", { token: TOKEN, amount: "x\n2099-01-01T00:00:00.000Z ALERT forged line", stealth: C, eph: "0x02" + "11".repeat(32), viewTag: "0x11", fee: "0", feeRecipient: ZERO, auth: { from: C, r: "0x" + "11".repeat(32), s: "0x" + "11".repeat(32), v: 27, validBefore: "9999999999" } }, nip());
     const lg = R1.log().split("\n");
     ok("B11d log injection: no log line starts with the forged timestamp, the attempt is on one line", !lg.some(l => l.startsWith("2099-")) && lg.some(l => / refused .*forged line/.test(l)));
     // routing by the parsed pathname, not by the end of the raw URL
     const r1 = await fetch(RELAY + "/relay?x=/relay/pay", { method: "POST", body: "{}" }), r2 = await fetch(RELAY + "/relay/pay?x=/relay", { method: "POST", body: "{}" }), r3 = await fetch(RELAY + "/relay/stats?x=1");
     ok("B11e POST with a query string is not routed (404); GET /relay/stats with a query still works", r1.status === 404 && r2.status === 404 && r3.status === 200, [r1.status, r2.status, r3.status].join()); }
+
+  // B12 audit 1099: log tokens (M-1), failure budgets (M-2), no-RPC validation, nonce-retry without a second send (L-2), RPC errors are not "dropped" (L-3)
+  { const knownWait = async a => { for (let i = 0; i < 60 && !(await known(a)); i++) await sleep(500); };
+    const pyCount = (lines) => Number(spawnSync("python3", ["-B", "-c", "import sys,importlib.util\nspec=importlib.util.spec_from_file_location('w',sys.argv[1]); m=importlib.util.module_from_spec(spec); spec.loader.exec_module(m)\nprint(sum(1 for l in sys.stdin.read().splitlines() if m.LOG_TEMPLATE.match(l)))", path.join(HERE, "stealth_watch.py")], { input: lines.join("\n"), encoding: "utf8" }).stdout);
+    // M-1: hostile tokens in the request must not become watchdog lines
+    await post(RELAY, "/relay", "ALERT", nip()); await post(RELAY, "/relay", { from: "ALERT", to: C }, nip()); await post(RELAY, "/relay", { from: C, to: C, endRecipient: "reverted" }, nip());
+    await post(RELAY, "/relay/pay", { token: TOKEN, amount: "ALERT", stealth: C, eph: "0x02" + "11".repeat(32), viewTag: "0x11", fee: "0", feeRecipient: ZERO, auth: { from: C, r: "0x" + "11".repeat(32), s: "0x" + "11".repeat(32), v: 27, validBefore: "9999999999" } }, nip());
+    await post(RELAY, "/relay", '{"from":"ALERT relayer balance low"}', nip());
+    const refusedLn = R1.log().split("\n").filter(l => / refused /.test(l)), hostile = refusedLn.filter(l => /A_LERT|rev_erted/.test(l));
+    ok("B12 M-1 hostile ALERT / reverted tokens are broken up in the log (no raw ALERT or reverted in any refused line)", hostile.length >= 2 && refusedLn.every(l => !/ALERT|reverted/i.test(l.replace(/A_LERT|rev_erted/gi, ""))), hostile.length + " lines");
+    eq("B12 M-1 the watchdog's fixed templates match none of the refused lines", pyCount(refusedLn), 0);
+    eq("B12 M-1 ...but still match the real ones (ALERT relayer balance low / reverted main)", pyCount(["2026-10-29T10:00:00.000Z ALERT relayer balance low: 0.1 ETH", "2026-10-29T10:00:00.000Z reverted main 0x" + "ab".repeat(32), "2026-10-29T10:00:00.000Z refused 1.2.3.4 \"ALERT relayer balance low\"", "2026-10-29T10:00:00.000Z ALERT anything the client typed"]), 2);
+    // M-2 / I-5 / status: unknown hashes cost no RPC, anchored route
+    { const sj = await fetch(RELAY + "/relay/status?hash=0x" + "ab".repeat(32)); ok("B12 M-2 /relay/status answers only for hashes the relayer sent", sj.status === 400 && /unknown hash/.test((await sj.json()).error)); }
+    { const sl = await fetch(RELAY + "/relay/sanctions-list"), j = await sl.json();
+      ok("B12 GET /relay/sanctions-list: lowercase address array + updated/count + cache header, includes the test entry", sl.status === 200 && /max-age/.test(sl.headers.get("cache-control") || "") && j.count === j.addresses.length && j.addresses.includes(sanctioned.toLowerCase()) && j.addresses.every(a => a === a.toLowerCase()) && "updated" in j, JSON.stringify(j).slice(0, 150)); }
+    ok("B12 I-5 a path that only ENDS in /relay/stats is not routed", (await fetch(RELAY.replace("/stealth-api", "/x/stealth-api") + "/relay/stats")).status === 404);
+    // M-2 state writes: a failing request writes nothing synchronously and leaves no zero keys behind
+    const p3 = await freePort(), R3 = await startRelayer("r3", p3, { STEALTH_RELAY_FAIL_PER_IP: "5", STEALTH_RELAY_REFUSED_LOG_PER_MIN: "20" }), RELAY3 = "http://127.0.0.1:" + p3 + "/stealth-api";
+    { const P0 = await newPayer(0n), dd = newDest(), au = await payAuth(P0, dd, 2n * U, FEE, R3.addr), body = payBody(P0, dd, 2n * U, FEE, R3.addr, au);
+      const r = await post(RELAY3, "/relay/pay", body, "3.3.3.3");
+      ok("B12 M-2 a request that fails after the counters were taken: 400 and NO synchronous state write", r.status === 400 && /holds less/.test(r.error) && !fs.existsSync(R3.state), JSON.stringify(r));
+      await sleep(2500);
+      const j = fs.existsSync(R3.state) ? JSON.parse(fs.readFileSync(R3.state, "utf8")) : null;
+      ok("B12 M-2 ...the state is flushed a moment later, and the counters of the failed request are gone (no zero keys)", j && !("3.3.3.3" in j.perIp) && !(P0.address in j.perPayer), JSON.stringify(j).slice(0, 160)); }
+    // per-network failure budget (5/hour on R3), independent of nginx; the /64 is one network
+    { const junk = ip => post(RELAY3, "/relay", { garbage: 1 }, ip);
+      const a = []; for (let i = 0; i < 6; i++) a.push(await junk("4.4.4.4"));
+      ok("B12 M-2 per-IP failure budget: 5 failures answered 400, the 6th is refused with 429 before any work", a.slice(0, 5).every(r => r.status === 400) && a[5].status === 429 && /too many failed/.test(a[5].error), a.map(r => r.status).join());
+      ok("B12 M-2 ...another network is not affected", (await junk("4.4.4.5")).status === 400);
+      const b = []; for (let i = 0; i < 5; i++) b.push(await junk("2001:db8:9:9:" + (i + 1) + "::1")); b.push(await junk("2001:db8:9:9:ffff::5"));
+      ok("B12 M-2 IPv6: failures from different addresses of one /64 share the budget", b.slice(0, 5).every(r => r.status === 400) && b[5].status === 429, b.map(r => r.status).join());
+      const many = []; for (let i = 0; i < 30; i++) many.push(await junk("5.5." + i + ".1"));
+      const nref = R3.log().split("\n").filter(l => / refused /.test(l)).length;
+      ok("B12 M-2 refusal log lines are rate limited (30 more failures: still at most 20 'refused' lines in the minute), requests still answered", many.every(r => r.status === 400) && nref <= 20 && nref >= 10, "lines " + nref); }
+    // global failure rate: after 8 failures in a minute, networks that already failed are refused, clean ones still pass
+    { const p5 = await freePort(), R5 = await startRelayer("r5", p5, { STEALTH_RELAY_FAIL_PER_MIN: "8" }), RELAY5 = "http://127.0.0.1:" + p5 + "/stealth-api";
+      for (let i = 0; i < 10; i++) await post(RELAY5, "/relay", { garbage: 1 }, "6.1.1." + i);
+      const again = await post(RELAY5, "/relay", { garbage: 1 }, "6.1.1.0"), fresh = await post(RELAY5, "/relay", { garbage: 1 }, "6.1.2.1");
+      ok("B12 M-2 global failure rate: a network that already failed is refused (429), a clean one is still served (400)", again.status === 429 && /busy/.test(again.error) && fresh.status === 400, again.status + "/" + fresh.status); }
+    // fault-injecting RPC in front of anvil, for R4: counts calls, can fail receipt reads, can answer a send with an error AFTER it was accepted
+    const fault = { calls: 0, failReads: false, dupErr: null };
+    const fwd = async o => { fault.calls++; if (fault.failReads && /^eth_getTransaction(Receipt|ByHash)$/.test(o.method)) return { jsonrpc: "2.0", id: o.id, error: { code: -32005, message: "rate limited" } };
+      const j = await fetch(RPC, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(o) }).then(r => r.json());
+      if (o.method === "eth_sendRawTransaction" && fault.dupErr && !j.error) return { jsonrpc: "2.0", id: o.id, error: { code: -32000, message: fault.dupErr } };
+      return j; };
+    const fproxy = httpServer.createServer((q, r) => { let b = ""; q.on("data", c => b += c); q.on("end", async () => { try { const j = JSON.parse(b); const out = Array.isArray(j) ? await Promise.all(j.map(fwd)) : await fwd(j); r.writeHead(200, { "content-type": "application/json" }); r.end(JSON.stringify(out)); } catch (e) { r.writeHead(502); r.end(String(e)); } }); });
+    const fpPort = await freePort(); await new Promise(r => fproxy.listen(fpPort, "127.0.0.1", r)); procs.push({ kill: () => fproxy.close() });
+    const p4 = await freePort(), R4 = await startRelayer("r4", p4, { STEALTH_RPC: "http://127.0.0.1:" + fpPort, STEALTH_RELAY_STUCK_S: "3", STEALTH_RELAY_GONE_GAP_MS: "1000" }), RELAY4 = "http://127.0.0.1:" + p4 + "/stealth-api";
+    await rpc("evm_setAutomine", [true]); await mine(1);
+    for (const k of ["alk", "ntl", "rd"]) await knownWait(W[k].stealth);
+    // cheap validation: bad signature / expired authorization are refused with ZERO RPC calls (and no address lock taken)
+    { const c0 = fault.calls, bad = await post(RELAY4, "/relay", await wbody(W.alk.stealth, C, 2n * U, null, { domain: { chainId: 1 } }), nip());
+      const P = await newPayer(), dd = newDest(), au = await payAuth(P, dd, 2n * U, FEE, R4.addr, { domain: { chainId: 1 } }), badPay = await post(RELAY4, "/relay/pay", payBody(P, dd, 2n * U, FEE, R4.addr, au), nip());
+      const exp = await post(RELAY4, "/relay", await wbody(W.alk.stealth, C, 2n * U, null, { validBefore: now() + 5 }), nip());
+      ok("B12 M-2 forged signature / expired authorization: refused with no RPC call at all (withdraw and pay)", bad.status === 400 && /signature does not match/.test(bad.error) && badPay.status === 400 && /signature does not match/.test(badPay.error) && exp.status === 400 && /expires too soon/.test(exp.error) && fault.calls === c0, fault.calls - c0 + " calls; " + bad.error + " | " + badPay.error + " | " + exp.error); }
+    // L-2: the node accepted our transaction but the answer was an error ("already known" / "nonce too low"): no second send, the ORIGINAL hash is returned
+    for (const [k, err] of [["alk", "already known"], ["ntl", "nonce too low"]]) {
+      const c0 = await bal(C), n0 = await nonceOf(R4.addr); fault.dupErr = err;
+      const w = await post(RELAY4, "/relay", await wbody(W[k].stealth, C, 2n * U, null), nip()); fault.dupErr = null;
+      let rc = null; if (w.hash) rc = await pub.waitForTransactionReceipt({ hash: w.hash, timeout: 15000 }).catch(() => null);
+      await sleep(1200);
+      ok("B12 L-2 '" + err + "' after an accepted send: success with the original hash, exactly one transaction, money moved once", w.status === 200 && rc && rc.status === "success" && (await nonceOf(R4.addr)) - n0 === 1 && (await bal(C)) - c0 === 2n * U && !/reverted/.test(R4.log()), JSON.stringify(w) + " nonce+" + ((await nonceOf(R4.addr)) - n0)); }
+    // L-3: an RPC error while asking for the receipt is "unknown", not "dropped": no gap fill, no replacement of a live transaction
+    { const c0 = await bal(C), n0 = await nonceOf(R4.addr);
+      await rpc("evm_setAutomine", [false]); fault.failReads = true;
+      const w = await post(RELAY4, "/relay", await wbody(W.rd.stealth, C, 2n * U, null), nip());
+      await sleep(9000);
+      const lg = R4.log();
+      ok("B12 L-3 receipt reads failing (RPC errors): the live transaction is NOT treated as dropped (no 'dropped', no gap fill), nonce untouched", w.status === 200 && !/dropped|nonce gap filled/.test(lg) && (await nonceOf(R4.addr)) === n0, JSON.stringify(w) + " " + lg.split("\n").slice(-3).join(" | ").slice(0, 200));
+      fault.failReads = false; await rpc("evm_setAutomine", [true]); await mine(2);
+      const rc = await pub.waitForTransactionReceipt({ hash: w.hash, timeout: 15000 }).catch(() => null); await sleep(800);
+      ok("B12 L-3 ...and it still executes exactly once", rc && rc.status === "success" && (await bal(C)) - c0 === 2n * U, usd((await bal(C)) - c0)); }
+  }
 
   // ===================================================================================== C) UI pay amount
   sect("C) UI pay amount: 'you pay 10' = 10 leaves the wallet");

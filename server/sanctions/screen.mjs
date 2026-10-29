@@ -7,7 +7,7 @@ export const SANCTIONS_ERROR = "address is on a sanctions list";
 export function makeScreen(file = process.env.STEALTH_SANCTIONS_FILE || path.join(HERE, "evm.json"), log = console.log) {
   let set = null, mtime = 0, checked = 0, meta = {};
   // audit 1087 L-3: old list = persistent ALERT (at most hourly; stealth_watch forwards it), refusal to serve would turn a broken timer into an outage for everyone
-  let staleAt = 0;
+  let staleAt = 0, failLogAt = 0;
   const stale = () => {
     const maxDays = Number(process.env.STEALTH_SANCTIONS_MAX_AGE_DAYS || 14), t = Date.parse(meta.fetched || "");
     if (Number.isFinite(t) && Date.now() - t > maxDays * 86400000 && Date.now() - staleAt > 3600_000) { staleAt = Date.now(); log("ALERT sanctions list is older than", maxDays, "days (fetched " + meta.fetched + "): the daily updater is not running"); }
@@ -24,7 +24,7 @@ export function makeScreen(file = process.env.STEALTH_SANCTIONS_FILE || path.joi
       log("sanctions list loaded:", set.size, "addresses, published", j.published);
       stale();
     } catch (e) {
-      if (set) { log("ALERT sanctions list reload failed, keeping previous:", String(e).slice(0, 80)); return; }
+      if (set) { if (now - failLogAt > 3600_000) { failLogAt = now; log("ALERT sanctions list reload failed, keeping previous:", String(e).slice(0, 80)); } return; }   // audit 1099 I-4: at most hourly, not on every call
       if (process.env.STEALTH_SANCTIONS_OPTIONAL === "1" && e.code === "ENOENT") { log("ALERT sanctions list missing, screening is OFF (STEALTH_SANCTIONS_OPTIONAL=1: lab use only)"); set = new Set(); return; }
       throw new Error("sanctions list unavailable: " + String(e).slice(0, 80));   // fail closed
     }
@@ -38,5 +38,7 @@ export function makeScreen(file = process.env.STEALTH_SANCTIONS_FILE || path.joi
       for (const [role, a] of Object.entries(roles)) if (a && set.has(String(a).toLowerCase())) { log("sanctions refused", role, a, "ip", ip || "-"); throw new Error(SANCTIONS_ERROR); }
     },
     meta: () => (reload(), meta),
+    /** full list for local screening in the browser: sorted lowercase addresses + meta */
+    list: () => (reload(), { addresses: [...set].sort(), updated: meta.fetched || meta.published || null, count: set.size }),
   };
 }

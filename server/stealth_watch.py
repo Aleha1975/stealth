@@ -22,6 +22,9 @@ E = os.environ
 STATE_FILE = E.get("STEALTH_WATCH_STATE", "/opt/stealth/data-watch/watch_state.json")
 REPEAT_S = int(E.get("STEALTH_WATCH_REPEAT_S", str(6 * 3600)))
 MAX_AGE = int(E.get("STEALTH_WATCH_MAX_AGE_S", "120"))
+ALERT_TEMPLATES = ("relayer balance low", "state save failed", "nonce gap fill failed", "sanctions list is older than", "sanctions list reload failed", "sanctions list missing",
+                   "receipt wait failed", "fee sent but main failed")
+LOG_TEMPLATE = re.compile(r"^\d{4}-\d\d-\d\dT[\d:.]+Z (?:ALERT (" + "|".join(re.escape(t) for t in ALERT_TEMPLATES) + r")|reverted (?:main|fee|pay) 0x[0-9a-fA-F]{64}$)")
 DEFAULT_CHAINS = ("base=http://127.0.0.1:3873|http://127.0.0.1:3874|/opt/stealth/relayer.base.log|0.0003;"
                   "rh=http://127.0.0.1:3883|http://127.0.0.1:3884|/opt/stealth/data-rh/relayer.rh.log|0.0003")
 
@@ -121,11 +124,15 @@ def check_chain(c, st):
             with open(c["log"], "rb") as f:
                 f.seek(pos); chunk = f.read(256 * 1024).decode("utf8", "replace")
                 st["log_pos"][c["log"]] = f.tell()
-            bad = [l for l in chunk.splitlines() if re.search(r"ALERT|reverted", l)]
-            if bad:
-                # the key includes the line kind, not the time: repeated identical alerts stay deduplicated for 6 h
-                kind = "ALERT" if any("ALERT" in l for l in bad) else "reverted"
-                probs[n + ":log-" + kind] = "[%s] relayer log: %d new ALERT/reverted line(s); last: %s" % (n, len(bad), bad[-1][:200])
+            # audit 1099 M-1: only the relayer's FIXED line templates count ("<ISO time> ALERT <template> ..." / "<ISO time> reverted ..."); user-influenced text
+            # is logged only as later arguments, never at the template position, and the relayer breaks up the words ALERT/reverted inside it
+            bad = {}
+            for l in chunk.splitlines():
+                m = LOG_TEMPLATE.match(l)
+                if m: bad.setdefault((m.group(1) or "reverted").strip().replace(" ", "-"), []).append(l)
+            for kind, ls in bad.items():
+                # one key per template: a different real alert is never swallowed by an earlier one; repeated identical alerts stay deduplicated for 6 h
+                probs[n + ":log-" + kind] = "[%s] relayer log: %d new '%s' line(s); last: %s" % (n, len(ls), kind, ls[-1][:200])
         except Exception as e:
             probs[n + ":log-read"] = "[%s] cannot read relayer log: %s" % (n, str(e)[:80])
     return probs
@@ -146,7 +153,7 @@ def main():
             st["alerts"][k]["msg"] = msg                          # still firing, already told within 6 h
     rec = []
     for k in list(st["alerts"]):
-        if k not in probs and not k.endswith(("log-ALERT", "log-reverted")):
+        if k not in probs and ":log-" not in k:
             rec.append("RECOVERED " + st["alerts"].pop(k)["msg"])
         elif k not in probs:                                     # log-based alerts clear after one quiet run, no "recovered" noise
             if now - st["alerts"][k]["sent"] >= REPEAT_S: st["alerts"].pop(k)
