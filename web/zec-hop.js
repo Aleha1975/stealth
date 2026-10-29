@@ -197,9 +197,16 @@ export const makeAuthUsed = (chain, fetchFn = fetch) => async (authorizer, nonce
 };
 /** ctx.countPriorHops(stealth) -> number of AuthorizationUsed events of this stealth address on the token (every private withdraw spends exactly one). Counts every EIP-3009 use of the address, so it
  *  can only over-count (e.g. after a public withdraw), which skips a counter value but never reuses one. Same answer on every device. */
+// RPCs cap eth_getLogs at 10M blocks per call; a stealth address cannot authorize anything before the pay contract existed, so scan from there in windows.
+export const LOG_SPAN = 9_000_000, PAY_FROM_BLOCK = { rh: 100_761_230 };
 export const makeCountPriorHops = (chain, fetchFn = fetch) => async stealth => {
-  const r = await rpcCall(fetchFn, chain.rpc, "eth_getLogs", [{ address: chain.token.address, fromBlock: "0x0", toBlock: "latest", topics: [AUTH_USED_TOPIC, "0x" + pad32(stealth)] }]);
-  if (!Array.isArray(r)) throw new Error("unexpected logs answer"); return r.length;
+  const tip = Number(await rpcCall(fetchFn, chain.rpc, "eth_blockNumber", [])); if (!Number.isFinite(tip)) throw new Error("unexpected block number");
+  let n = 0;
+  for (let a = PAY_FROM_BLOCK[chain.key] || 0; a <= tip; a += LOG_SPAN) {
+    const r = await rpcCall(fetchFn, chain.rpc, "eth_getLogs", [{ address: chain.token.address, fromBlock: "0x" + a.toString(16), toBlock: "0x" + Math.min(tip, a + LOG_SPAN - 1).toString(16), topics: [AUTH_USED_TOPIC, "0x" + pad32(stealth)] }]);
+    if (!Array.isArray(r)) throw new Error("unexpected logs answer"); n += r.length;
+  }
+  return n;
 };
 /** ctx.txKnown(txid) -> true / false (lightwalletd GetTransaction through the gRPC-web proxy, like zec-return.js); throws when it cannot tell. */
 export const makeTxKnown = (fetchFn = fetch, base = ZC.lightwalletd) => async txid => (await import("./zec-return.js")).txKnown(base, txid, fetchFn);
