@@ -8212,10 +8212,10 @@ index 0000000..f220285
 +}
 diff --git a/vendor/zcash_client_memory/src/input_source.rs b/vendor/zcash_client_memory/src/input_source.rs
 new file mode 100644
-index 0000000..b313b03
+index 0000000..360a899
 --- /dev/null
 +++ b/vendor/zcash_client_memory/src/input_source.rs
-@@ -0,0 +1,579 @@
+@@ -0,0 +1,566 @@
 +use std::num::NonZeroU32;
 +
 +use zcash_client_backend::{
@@ -8610,30 +8610,24 @@ index 0000000..b313b03
 +                return Ok(Vec::new());
 +            }
 +        };
-+        // First grab all eligible (unspent, spendable, fully scanned) notes into a vec.
-+        let mut eligible_notes = self
-+            .received_notes
-+            .iter()
-+            .filter(|note| note.account_id == account)
-+            .filter(|note| note.note.pool() == *pool)
-+            .filter(|note| {
-+                !self.output_excluded_by_lock(
-+                    &OutputRef::new(note.txid, PoolType::Shielded(*pool), note.output_index),
-+                    target_height,
-+                    lock_filter,
-+                )
-+            })
-+            .filter(|note| {
-+                self.note_is_spendable(
-+                    note,
-+                    birthday_height,
-+                    target_height,
-+                    confirmations_policy,
-+                    exclude,
-+                )
-+                .unwrap_or(false)
-+            })
-+            .collect::<Vec<_>>();
++        // First grab all eligible (unspent, spendable, fully scanned) notes into a vec. An error from
++        // note_is_spendable is returned as is (not turned into "unspendable"), so the real cause is visible.
++        let mut eligible_notes = Vec::new();
++        for note in self.received_notes.iter() {
++            if note.account_id != account || note.note.pool() != *pool {
++                continue;
++            }
++            if self.output_excluded_by_lock(
++                &OutputRef::new(note.txid, PoolType::Shielded(*pool), note.output_index),
++                target_height,
++                lock_filter,
++            ) {
++                continue;
++            }
++            if self.note_is_spendable(note, birthday_height, target_height, confirmations_policy, exclude)? {
++                eligible_notes.push(note);
++            }
++        }
 +
 +        // sort by oldest first (use location in commitment tree since this gives a total order)
 +        eligible_notes.sort_by_key(|a| a.commitment_tree_position);
@@ -8645,15 +8639,17 @@ index 0000000..b313b03
 +                return Err(Error::Other("send-max (AllFunds) selection is not supported".into()))
 +            }
 +        };
++        // take notes (oldest first) while the sum so far is still below the target; stop as soon as it covers it
 +        let mut value_acc = Zatoshis::ZERO;
-+        let selection: Vec<_> = eligible_notes
-+            .into_iter()
-+            .take_while(|note| {
-+                let take = value_acc <= target;
-+                value_acc = (value_acc + note.note.value()).unwrap_or(value_acc);
-+                take
-+            })
-+            .collect();
++        let mut selection = Vec::new();
++        for note in eligible_notes {
++            if value_acc >= target {
++                break;
++            }
++            value_acc = (value_acc + note.note.value())
++                .ok_or_else(|| Error::Other("note value overflow during selection".into()))?;
++            selection.push(note);
++        }
 +
 +        Ok(selection)
 +    }
@@ -8728,37 +8724,28 @@ index 0000000..b313b03
 +                return Ok(None);
 +            }
 +        };
-+        let (count, total) = self
-+            .received_notes
-+            .iter()
-+            .filter(|note| note.account_id == account)
-+            .filter(|note| note.note.pool() == protocol)
-+            .filter(|note| {
-+                !self.output_excluded_by_lock(
-+                    &OutputRef::new(note.txid, PoolType::Shielded(protocol), note.output_index),
-+                    target_height,
-+                    lock_filter,
-+                )
-+            })
-+            .filter(|note| {
-+                self.note_is_spendable(
-+                    note,
-+                    birthday_height,
-+                    target_height,
-+                    confirmations_policy,
-+                    exclude,
-+                )
-+                .unwrap_or(false)
-+            })
-+            .filter(|note| {
-+                self.matches_note_filter(note, filter)
-+                    .ok()
-+                    .flatten()
-+                    .is_some_and(|b| b)
-+            })
-+            .fold((0, Zatoshis::ZERO), |(count, total), note| {
-+                (count + 1, (total + note.note.value()).unwrap_or(total))
-+            });
++        let (mut count, mut total) = (0, Zatoshis::ZERO);
++        for note in self.received_notes.iter() {
++            if note.account_id != account || note.note.pool() != protocol {
++                continue;
++            }
++            if self.output_excluded_by_lock(
++                &OutputRef::new(note.txid, PoolType::Shielded(protocol), note.output_index),
++                target_height,
++                lock_filter,
++            ) {
++                continue;
++            }
++            if !self.note_is_spendable(note, birthday_height, target_height, confirmations_policy, exclude)? {
++                continue;
++            }
++            // a filter that cannot be evaluated here (percentiles) is ignored, like inside Combine/Attempt
++            if !self.matches_note_filter(note, filter)?.unwrap_or(true) {
++                continue;
++            }
++            count += 1;
++            total = (total + note.note.value()).unwrap_or(total);
++        }
 +
 +        Ok(Some(PoolMeta::new(count, total)))
 +    }
@@ -12009,10 +11996,10 @@ index 0000000..1cf67c5
 +}
 diff --git a/vendor/zcash_client_memory/src/types/memory_wallet/mod.rs b/vendor/zcash_client_memory/src/types/memory_wallet/mod.rs
 new file mode 100644
-index 0000000..4a4d17c
+index 0000000..55f4567
 --- /dev/null
 +++ b/vendor/zcash_client_memory/src/types/memory_wallet/mod.rs
-@@ -0,0 +1,1422 @@
+@@ -0,0 +1,1437 @@
 +#![allow(dead_code)]
 +
 +mod serialization;
@@ -12543,6 +12530,34 @@ index 0000000..4a4d17c
 +        Ok(spent)
 +    }
 +
++    /// The ONE definition of "this note sits in a not-yet-scanned region" used by both note selection
++    /// (`note_is_spendable`) and the wallet summary. The scan-queue ranges are translated to *Sapling*
++    /// tree positions, so the position test only applies to Sapling notes (Orchard and Ironwood have their
++    /// own position number spaces); ranges that start above the anchor or end at/below the birthday are ignored.
++    pub(crate) fn note_in_unscanned_range(
++        &self,
++        note: &ReceivedNote,
++        birthday_height: BlockHeight,
++        anchor_height: BlockHeight,
++    ) -> bool {
++        if note.pool() != zcash_protocol::PoolType::SAPLING {
++            return false;
++        }
++        let Some(pos) = note.commitment_tree_position else {
++            return false;
++        };
++        self.unscanned_ranges()
++            .iter()
++            .any(|(start_height, end_height, start, end_exclusive)| {
++                let in_range = if let (Some(start), Some(end_exclusive)) = (start, end_exclusive) {
++                    pos >= *start && pos < *end_exclusive
++                } else {
++                    true
++                };
++                in_range && *end_height > birthday_height && *start_height <= anchor_height
++            })
++    }
++
 +    /// To be spendable a note must be:
 +    /// - unspent (obviously)
 +    /// - not dust (value > 5000 ZATs)
@@ -12572,22 +12587,9 @@ index 0000000..4a4d17c
 +            .get(&note.txid())
 +            .ok_or_else(|| Error::TransactionNotFound(note.txid()))?;
 +
-+        let unscanned_ranges = self.unscanned_ranges();
 +        let anchor_height = target_height - u32::from(confirmations_policy.trusted());
-+
 +        let note_in_unscanned_range =
-+            unscanned_ranges
-+                .iter()
-+                .any(|(start_height, end_height, start, end_exclusive)| {
-+                    let in_range = note.commitment_tree_position.is_some_and(|pos| {
-+                        if let (Some(start), Some(end_exclusive)) = (start, end_exclusive) {
-+                            pos >= *start && pos < *end_exclusive
-+                        } else {
-+                            true
-+                        }
-+                    });
-+                    in_range && *end_height > birthday_height && *start_height <= anchor_height
-+                });
++            self.note_in_unscanned_range(note, birthday_height, anchor_height.into());
 +
 +        Ok(!self.note_is_spent(note, target_height)?
 +            && !note_in_unscanned_range
@@ -16312,10 +16314,10 @@ index 0000000..315fb6c
 +}
 diff --git a/vendor/zcash_client_memory/src/wallet_read.rs b/vendor/zcash_client_memory/src/wallet_read.rs
 new file mode 100644
-index 0000000..0bd04c1
+index 0000000..3c13c4d
 --- /dev/null
 +++ b/vendor/zcash_client_memory/src/wallet_read.rs
-@@ -0,0 +1,973 @@
+@@ -0,0 +1,972 @@
 +use std::{
 +    collections::{HashMap, hash_map::Entry},
 +    num::NonZeroU32,
@@ -16578,13 +16580,12 @@ index 0000000..0bd04c1
 +            if self.note_is_spent(note, target_height)? {
 +                continue;
 +            }
-+            // don't count notes in unscanned ranges. The ranges are Sapling tree positions, so they
-+            // only apply to Sapling notes (Orchard/Ironwood positions are separate number spaces).
-+            if note.pool() == PoolType::SAPLING
-+                && self.unscanned_ranges().into_iter().any(|(_, _, start, end)| {
-+                    note.commitment_tree_position >= start && note.commitment_tree_position < end
-+                })
-+            {
++            // don't count notes in unscanned ranges: the same predicate note selection uses (note_is_spendable)
++            if self.note_in_unscanned_range(
++                note,
++                birthday_height,
++                BlockHeight::from(target_height) - u32::from(confirmations_policy.trusted()),
++            ) {
 +                continue;
 +            }
 +            // don't count notes of unmined transactions that have expired (nExpiryHeight 0 = never)

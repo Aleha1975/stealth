@@ -5,7 +5,8 @@
 #       rust nightly-2025-06-20 = rustc 1.89.0-nightly (set by the patch in rust-toolchain.toml; librustzcash 0.25 MSRV is 1.89, nightly-2025-01-07 is too old; NEWER nightlies (tested 2026-10-28) make wasm-bindgen 0.2.100 skip its threads transform -> non-shared memory, DataCloneError)
 #       clang 18.1.8 · wasm-bindgen-cli 0.2.100 (= wasm-bindgen in Cargo.lock) · just/wasm-pack from stable.
 # Usage: ops/build_webzjs.sh                 full build in $WORK (default ~/.cache/webzjs-build); no system changes
-#        PKG_DIR=<dir> ops/build_webzjs.sh   skip the build, only patch + copy + hash an existing wasm-pack output (packages/webzjs-wallet)
+#        PKG_DIR=<dir> ops/build_webzjs.sh   skip the build, only patch + copy + hash an existing wasm-pack output (packages/webzjs-wallet); BUILD_INFO then says "UNVERIFIED BUILD" (no patch/toolchain check was done)
+# web/vendor/webzjs/BUILD_INFO records the provenance of the output (patch sha256, WebZjs commit, tool versions, verified or not); it is listed in SHA256SUMS.
 # PATCH (default: next to this script) = the diff a50df94..spike/ironwood; its sha256 is checked against PATCH_SHA256.
 # The ~60 MB wasm and generated JS are NOT committed; only SHA256SUMS and README.md are. The build is not bit-for-bit reproducible, so this script (re)writes SHA256SUMS and the two hashes
 # in web/zec-hop.js (WEBZJS_SHA256); ops/deploy_lab.sh refuses to ship files that do not match SHA256SUMS and loadZjs() refuses to run a wasm/glue that does not match WEBZJS_SHA256.
@@ -14,7 +15,7 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"; OUT="$ROOT/web/vendor/w
 COMMIT=a50df944c32243cb8da9f86e7d52cb65ac926439; CLANG=18.1.8; WBG=0.2.100; NIGHTLY=nightly-2025-06-20; JUST=1.59.0; WASMPACK=0.15.0
 # sha256 of the downloads; empty = not recorded yet: the script prints the hash it got and refuses until it is filled in (CLANG_SHA256_<platform>, RUSTUP_INIT_SHA256)
 CLANG_SHA256_Darwin_arm64="${CLANG_SHA256_Darwin_arm64:-4573b7f25f46d2a9c8882993f091c52f416c83271db6f5b213c93f0bd0346a10}"; CLANG_SHA256_Linux_x86_64="${CLANG_SHA256_Linux_x86_64:-}"; RUSTUP_INIT_SHA256="${RUSTUP_INIT_SHA256:-9502b514362a21096210d498f143b8cdacda365d3dfcf45e8f5541e089ccafc0}"
-PATCH="${PATCH:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/webzjs-ironwood.patch}"; PATCH_SHA256="${PATCH_SHA256:-f5bcc597e900498b2b32a3b0c3b27b106aee574db921853443742d19ea5c6906}"
+PATCH="${PATCH:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/webzjs-ironwood.patch}"; PATCH_SHA256="${PATCH_SHA256:-7e75b593ce1fda49d241965675b0e4996abbb0572e2ea64e20562c2498edac98}"
 WORK="${WORK:-$HOME/.cache/webzjs-build}"
 sha() { if command -v sha256sum >/dev/null; then sha256sum "$@"; else shasum -a 256 "$@"; fi; }
 if [ -z "${PKG_DIR:-}" ]; then
@@ -51,7 +52,13 @@ if [ -z "${PKG_DIR:-}" ]; then
   git -C "$SRC" apply --index "$PATCH"            # Cargo.lock is part of the patch: crates are resolved exactly as audited
   # one cargo at a time, 4 jobs max; rust-toolchain.toml (from the patch) selects $NIGHTLY
   ( cd "$SRC" && CARGO_BUILD_JOBS=4 nice just build-wallet )   # wasm-pack build -t web --release --features "wasm wasm-parallel" -Z build-std, then add-worker-module.sh
-  PKG_DIR="$SRC/packages/webzjs-wallet"
+  PKG_DIR="$SRC/packages/webzjs-wallet"; PROV="verified build: patch sha256 $PATCH_SHA256 applied to WebZjs $COMMIT by this script
+rustc $(rustc +$NIGHTLY --version 2>/dev/null || echo "$NIGHTLY") | $(wasm-pack --version) | $(wasm-bindgen --version) | just $JUST | clang $CLANG | host $(uname -sm)
+builder $(whoami)@$(hostname -s) at $(date -u +%FT%TZ) (the build is not bit-for-bit reproducible: compare behaviour, not bytes)"
+else
+  PROV="UNVERIFIED BUILD: PKG_DIR=$PKG_DIR was used as is; the patch hash, WebZjs commit and toolchain were NOT checked by this script
+builder $(whoami)@$(hostname -s) at $(date -u +%FT%TZ)${PROV_NOTE:+
+note (from the builder, not checked): $PROV_NOTE}"; echo "WARNING: UNVERIFIED BUILD (PKG_DIR given): the output is hashed as is and marked in BUILD_INFO" >&2
 fi
 [ -f "$PKG_DIR/webzjs_wallet_bg.wasm" ] || { echo "no wasm in $PKG_DIR"; exit 1; }
 rm -rf "$OUT.new"; mkdir -p "$OUT.new"; rsync -a --exclude .gitignore "$PKG_DIR/" "$OUT.new/"
@@ -71,6 +78,7 @@ assert s.count(o) == 1, "eval patch did not apply"; open(p, "w").write(s.replace
 PY
 grep -q '"eval is disabled' "$G" && ! grep -q "eval(" "$G" || { echo "eval patch did not apply"; exit 1; }
 find "$OUT.new" -name '*.bak' -delete
+printf '%s\n' "$PROV" > "$OUT.new/BUILD_INFO"
 # keep the committed files, swap in the new build
 for f in README.md SHA256SUMS; do [ -f "$OUT/$f" ] && cp "$OUT/$f" "$OUT.new/$f"; done
 rm -rf "$OUT"; mv "$OUT.new" "$OUT"

@@ -241,7 +241,7 @@ export async function startHop(ctx) {
   await ctx.store.put(ctx.stealth.toLowerCase() + "#" + n, { st, db: null });
   return runHop(ctx);
 }
-const WEBZJS_SHA256 = { "webzjs_wallet.js": "a907bca3e7acbe1757e41e2c4d7f7d3ffa65a654cacdcabfb151c921c8b6264f", "webzjs_wallet_bg.wasm": "128604dfaed593b69ba63fd77602bcdeb9652fc152b345981937ae07d7b77f7c" };   // keep in step with web/vendor/webzjs/SHA256SUMS
+const WEBZJS_SHA256 = { "webzjs_wallet.js": "66e5bb0537784ba61b47b68e0ee48848b52711c54b5d26b4717ede29b61db0eb", "webzjs_wallet_bg.wasm": "386148364d7578d8520bb674bb6618ba726ebdde2c62c6682ca59b25a2b7c067" };   // keep in step with web/vendor/webzjs/SHA256SUMS
 export async function loadZjs(base = new URL("./vendor/webzjs/", import.meta.url)) {
   if (!self.crossOriginIsolated) throw new Error("this page is not cross-origin isolated (COOP/COEP), so the Zcash wallet cannot run here");
   // The wasm below receives the seed phrase: refuse to run any bytes other than the audited build (hashes = web/vendor/webzjs/SHA256SUMS; ops/build_webzjs.sh refreshes them).

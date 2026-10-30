@@ -1,0 +1,3 @@
+UNVERIFIED BUILD: PKG_DIR=/Users/christinakotrutsa/.cache/webzjs-build/WebZjs/packages/webzjs-wallet was used as is; the patch hash, WebZjs commit and toolchain were NOT checked by this script
+builder christinakotrutsa@MacBook-Air-Christina-2 at 2026-10-30T07:31:57Z
+note (from the builder, not checked): built from build-tree branch spike/ironwood commit 44dbb61 whose diff against a50df94 is exactly ops/webzjs-ironwood.patch (sha256 checked); nightly-2025-06-20 via rust-toolchain.toml; just build-wallet
