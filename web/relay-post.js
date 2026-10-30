@@ -26,7 +26,7 @@ export async function postRelay(fetchFn, url, body, { sleep = ms => new Promise(
         if (used !== false) throw new Error("The relayer may or may not have received your signed request, and the chain could not be read to find out. Do not pay again yet: wait a minute and check your balance and the explorer.");
       }
     }
-    if (i >= delays.length) throw new Error(ambiguous ? "The relayer did not answer, and the request was NOT found on chain. It may still be processing: wait a minute and check before paying again." : "The relayer is busy right now. Nothing was sent; please try again in a minute.");
+    if (i >= delays.length) throw new Error(ambiguous ? "The relayer did not answer, and the request was NOT found on chain. It may still be processing: wait a minute and check before paying again." : "The relayer is busy right now or could not confirm the send, so a transaction may be out. Wait a minute and check the explorer and your balance before paying again.");
     onBusy(ambiguous ? "No answer, not on chain yet; retrying the same signed request… (" + (i + 1) + "/" + delays.length + ")" : "Busy, retrying… (" + (i + 1) + "/" + delays.length + ")");
     await sleep(delays[i]);
   }

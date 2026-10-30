@@ -145,7 +145,8 @@ async function getPages(man) {
 // After a withdraw the indexer's balance cache (~15 s) can still show the old amount: cap it by what we know is left.
 // 1109 L-1: armed BEFORE the request leaves, kept until the signed authorization expires (validBefore) and persisted, so a reload or a second tab does not lose it. Cleared only by a confirmed outcome.
 const PW_KEY = "stealth-pending-wd";
-const pendingWd = { _m() { try { return JSON.parse(localStorage.getItem(PW_KEY) || "{}") || {}; } catch { return this._mem || {}; } }, _w(m) { this._mem = m; try { localStorage.setItem(PW_KEY, JSON.stringify(m)); } catch {} },
+// 1121 L-1: the in-memory copy is ALWAYS consulted too (per key the later expiry wins), so a storage that reads fine but refuses writes cannot hide an armed guard.
+const pendingWd = { _m() { let s = {}; try { s = JSON.parse(localStorage.getItem(PW_KEY) || "{}") || {}; } catch {} const m = { ...(this._mem || {}) }; for (const k of Object.keys(s)) if (!(Number(m[k]) >= Number(s[k]))) m[k] = s[k]; return m; }, _w(m) { this._mem = m; try { localStorage.setItem(PW_KEY, JSON.stringify(m)); } catch {} },
   get(k) { const v = Number(this._m()[k]); return v > Date.now() ? v : 0; }, set(k, until) { const m = this._m(); m[k] = until; this._w(m); }, delete(k) { const m = this._m(); delete m[k]; this._w(m); } };
 const spent = new Map();   // stealth -> { left, until }
 async function scan() {
@@ -275,7 +276,10 @@ async function finishSweep(HM, h, step, sw) {
   if (note) step("Sent" + note);
   const fin = await PW.pollStatus({ depositAddress: sw.deposit, timeoutMs: 60 * 60_000, intervalMs: 10_000, onUpdate: s => step("Returning · " + s.status.toLowerCase().replace(/_/g, " ") + " · usually 10–20 min" + note) });
   step(fin.status === "SUCCESS" ? "Done: ≈ " + (Number(sw.amountOut) / 1e6).toFixed(2) + " " + SYM + " sent to your wallet." : "Swap ended as " + fin.status + ". The ZEC is back on the hop address; press Return money again.");
-  if (fin.status === "SUCCESS") await hideHop(HM, h);
+  if (fin.status === "SUCCESS") {      // 1122 L-3: the transparent return worked, but the card goes away only when the hop wallet holds nothing at all (shielded ZEC included); a failed check keeps the card
+    let left = null; try { const r = await HM.findHop(HM.idbStore(), h.f.stealth); left = await HM.hopSummary(await hopCtx(HM, h.f, h.hit, null), r && r.rec); } catch {}
+    if (left && !left.some(x => x.transparent + x.orchard > 0n)) await hideHop(HM, h); else step("Done: the payout was sent. The hop wallet may still hold some ZEC, so the card stays: press Return money again.");
+  }
   else await underHopLock(h.f.stealth, async () => { const r = await HM.findHop(HM.idbStore(), h.f.stealth); if (r && r.rec.st.sweep && r.rec.st.sweep.txid === sw.txid) { r.rec.st = { ...r.rec.st, sweep: { ...r.rec.st.sweep, ended: fin.status, endedAt: Date.now() } }; await HM.idbStore().put(r.key, r.rec); } }).catch(() => {});      // 1110 L-1: the intent is settled (no endless resume), but kept so "empty" is not counted while the refund is still on its way
 }
 // A transfer from the first version (before Ironwood) could never shield, so its ZEC only ever sat on the hop t-addresses:
@@ -464,8 +468,10 @@ $("btn-wd").addEventListener("click", once(async () => {
     say("pay-hint", "Sending through the relayer…");
     const { r, d } = await postRelay(fetch, API + "/relay", { from: w.stealth, to, value: value.toString(), validAfter: "0", validBefore: validBefore.toString(), nonce, v: sig.v, r: sig.r, s: sig.s },
       { onBusy: m => say("pay-hint", m, "warn"), check: () => authorizationUsed(rpcOne, USDC, w.stealth, nonce) });
-    if (!r.ok || d.error) { if (d.error) pendingWd.delete(w.stealth.toLowerCase()); throw new Error(d.error || "relayer error"); }      // a JSON error is the relayer's own refusal: nothing was sent
-    if (d.used) d.hash = await txOfLogs({ address: USDC, topics: [AUTH_USED_TOPIC, "0x" + padAddr(w.stealth), nonce] }, () => true);      // 1101 L-1: found by THIS request's nonce, not by "an identical transfer"
+    // 1121 L-2: the guard is cleared only by a DEFINITE refusal (400/403/429 JSON, not "already used"). "authorization already used" means an earlier attempt of this same request went through (lost answer, then the retry): follow it like d.used.
+    const usedErr = !!d.error && /authorization already used/i.test(String(d.error));
+    if (!usedErr && (!r.ok || d.error)) { if (d.error && [400, 403, 429].includes(r.status)) pendingWd.delete(w.stealth.toLowerCase()); throw new Error(d.error || "relayer error"); }
+    if (d.used || usedErr) d.hash = await txOfLogs({ address: USDC, topics: [AUTH_USED_TOPIC, "0x" + padAddr(w.stealth), nonce] }, () => true);      // 1101 L-1: found by THIS request's nonce, not by "an identical transfer"
     if (!isHash(d.hash)) throw new Error("the relayer answered without a valid transaction hash; check the explorer before sending again");
     $("withdraw").hidden = true;
     say("pay-hint", "Submitted: " + fmtTok(value) + " " + SYM + " → " + to.slice(0, 8) + "… waiting for the block…");

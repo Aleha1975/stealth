@@ -6,7 +6,7 @@
 #       clang 18.1.8 · wasm-bindgen-cli 0.2.100 (= wasm-bindgen in Cargo.lock) · just/wasm-pack from stable.
 # Usage: ops/build_webzjs.sh                 full build in $WORK (default ~/.cache/webzjs-build); no system changes
 #        PKG_DIR=<dir> ops/build_webzjs.sh   skip the build, only patch + copy + hash an existing wasm-pack output (packages/webzjs-wallet); BUILD_INFO then says "UNVERIFIED BUILD" and the pins in web/zec-hop.js are NOT rewritten (no patch/toolchain check was done)
-# web/vendor/webzjs/BUILD_INFO records the provenance (patch sha256, commit, tool versions); "verified build" only if this run checked the patch sha256 and the toolchain pins, else "UNVERIFIED BUILD". Reproducibility is measured by ops/check_repro.sh, not claimed. Env: OUT, PIN_JS=0 (do not rewrite web/zec-hop.js).
+# web/vendor/webzjs/BUILD_INFO records the provenance (patch sha256, commit, tool versions); "verified build" means only that this run checked the patch sha256, the WebZjs commit, the clang/rustup download hashes and the version strings of the pinned tools (wasm-opt, the stable rustc and the tool binaries are NOT pinned; BUILD_INFO says so), else "UNVERIFIED BUILD". Reproducibility is measured by ops/check_repro.sh, not claimed. Env: OUT, PIN_JS=0 (do not rewrite web/zec-hop.js).
 # PATCH (default: next to this script) = the diff a50df94..spike/ironwood; its sha256 is checked against PATCH_SHA256.
 # The ~60 MB wasm and generated JS are NOT committed; only SHA256SUMS and README.md are. The build is meant to be bit-for-bit reproducible (paths are remapped to /build), and this script (re)writes SHA256SUMS and the pinned hashes
 # in web/zec-hop.js (WEBZJS_SHA256); ops/deploy_lab.sh refuses to ship files that do not match SHA256SUMS and loadZjs() refuses to run a wasm/glue that does not match WEBZJS_SHA256.
@@ -17,6 +17,10 @@ COMMIT=a50df944c32243cb8da9f86e7d52cb65ac926439; CLANG=18.1.8; WBG=0.2.100; NIGH
 CLANG_SHA256_Darwin_arm64="${CLANG_SHA256_Darwin_arm64:-4573b7f25f46d2a9c8882993f091c52f416c83271db6f5b213c93f0bd0346a10}"; CLANG_SHA256_Linux_x86_64="${CLANG_SHA256_Linux_x86_64:-}"; RUSTUP_INIT_SHA256="${RUSTUP_INIT_SHA256:-9502b514362a21096210d498f143b8cdacda365d3dfcf45e8f5541e089ccafc0}"
 PATCH="${PATCH:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/webzjs-ironwood.patch}"; PATCH_SHA256=af76b20dbcb2e9ee432a6aa08667a4d56b997558d464468961e6b0847952eecc   # fixed: the audited patch (not overridable by the environment)
 WORK="${WORK:-$HOME/.cache/webzjs-build}"
+# 1123 I-3: OUT and WORK are removed / reset by this script, so refuse the obviously wrong values: OUT must be absent, empty or a previous output of this script; neither may be /, $HOME or the repo root
+safe_dir() { local d; d="$(cd "$1" 2>/dev/null && pwd -P || echo "$1")"; [ -n "$d" ] && [ "$d" != "/" ] && [ "$d" != "$HOME" ] && [ "$d" != "$ROOT" ] || { echo "refusing to use $1 (too broad)"; exit 1; }; }
+safe_dir "$OUT"; safe_dir "$WORK"
+if [ -d "$OUT" ] && [ -n "$(ls -A "$OUT" 2>/dev/null)" ] && [ ! -f "$OUT/webzjs_wallet_bg.wasm" ] && [ ! -f "$OUT/BUILD_INFO" ] && [ ! -f "$OUT/SHA256SUMS" ]; then echo "OUT=$OUT is not empty and does not look like an earlier output of this script; refusing to replace it"; exit 1; fi
 sha() { if command -v sha256sum >/dev/null; then sha256sum "$@"; else shasum -a 256 "$@"; fi; }
 if [ -z "${PKG_DIR:-}" ]; then
   unset RUSTFLAGS CARGO_ENCODED_RUSTFLAGS CARGO_BUILD_RUSTFLAGS   # a caller's RUSTFLAGS would REPLACE the patch's .cargo/config.toml flags (+atomics, getrandom backend)
@@ -29,7 +33,7 @@ if [ -z "${PKG_DIR:-}" ]; then
       Darwin-arm64) T="clang+llvm-$CLANG-arm64-apple-macos11";; Linux-x86_64) T="clang+llvm-$CLANG-x86_64-linux-gnu-ubuntu-18.04";; *) echo "unsupported platform; put clang $CLANG in $WORK/llvm"; exit 1;;
     esac
     curl -fL -o "$WORK/$T.tar.xz" "https://github.com/llvm/llvm-project/releases/download/llvmorg-$CLANG/$T.tar.xz"
-    want="$(eval echo "\${CLANG_SHA256_$(uname -s)_$(uname -m | tr - _):-}")"; got="$(sha "$WORK/$T.tar.xz" | cut -d' ' -f1)"
+    cv="CLANG_SHA256_$(uname -s)_$(uname -m | tr - _)"; want="${!cv:-}"; got="$(sha "$WORK/$T.tar.xz" | cut -d' ' -f1)"
     [ -n "$want" ] && [ "$want" = "$got" ] || { echo "clang tarball sha256 $got does not match the recorded one ('$want'); review it and set CLANG_SHA256_$(uname -s)_$(uname -m | tr - _)"; rm -f "$WORK/$T.tar.xz"; exit 1; }
     tar -xJ -C "$WORK" -f "$WORK/$T.tar.xz" && mv "$WORK/$T" "$WORK/llvm" && rm -f "$WORK/$T.tar.xz"
   fi
@@ -61,9 +65,9 @@ if [ -z "${PKG_DIR:-}" ]; then
   if [ "$WORK_RAW" != "$WORK" ]; then RM="$RM --remap-path-prefix=$WORK_RAW=/build"; CM="$CM -ffile-prefix-map=$WORK_RAW=/build"; fi   # also the non-canonical spelling
   export RUSTFLAGS="$FLAGS $RM"; export CFLAGS_wasm32_unknown_unknown="$CM"
   ( cd "$SRC" && CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-4}" nice just build-wallet )   # wasm-pack build -t web --release --features "wasm wasm-parallel" -Z build-std, then add-worker-module.sh
-  PKG_DIR="$SRC/packages/webzjs-wallet"; PROV="verified build: this run checked the patch sha256 $PATCH_SHA256 and the toolchain pins (rustc, clang, just, wasm-pack, wasm-bindgen-cli), applied to WebZjs $COMMIT
+  PKG_DIR="$SRC/packages/webzjs-wallet"; PROV="verified build: this run checked the patch sha256 $PATCH_SHA256, the WebZjs commit $COMMIT, the clang tarball sha256, the rustup installer sha256, and the exact version strings of rustc ($NIGHTLY), just, wasm-pack, wasm-bindgen-cli and clang (version strings, not binary hashes)
 $RUSTC_PIN | wasm-pack $WASMPACK | wasm-bindgen $WBG | just $JUST | clang $CLANG
-not pinned: the wasm-opt that wasm-pack downloads at build time. built $(date -u +%FT%TZ) (paths remapped to /build)"
+NOT pinned: the wasm-opt that wasm-pack downloads at build time, the stable rustc that compiles just/wasm-pack/wasm-bindgen-cli, and the binaries of those tools. So 'verified' means these inputs were checked, not that third parties get the same wasm bytes. built $(date -u +%FT%TZ) (paths remapped to /build)"
 else
   UNVERIFIED=1; PROV="UNVERIFIED BUILD: PKG_DIR=$PKG_DIR was used as is; the patch hash, WebZjs commit and toolchain were NOT checked by this script
 built $(date -u +%FT%TZ)${PROV_NOTE:+

@@ -178,7 +178,7 @@ const PRIV = new Uint8Array(32).fill(9), ACC = addressFromPriv(PRIV), A2 = "0x" 
   // 1109 L-1: the guard is armed BEFORE the request leaves, persisted, and cleared only by a confirmed outcome
   const wdSrc = src.slice(src.indexOf('$("btn-wd").addEventListener("click"'), src.indexOf("async function waitReceipt"));
   t("1109 L-1: pendingWd is set (until the authorization expires) before postRelay, and persisted", wdSrc.indexOf("pendingWd.set(") > 0 && wdSrc.indexOf("pendingWd.set(") < wdSrc.indexOf("await postRelay(") && /\(now \+ 3600 \+ 60\) \* 1000/.test(wdSrc) && /localStorage\.setItem\(PW_KEY/.test(src));
-  t("1109 L-1: it is cleared only on the relayer's own JSON refusal, a revert or success (not on an unknown outcome)", /if \(d\.error\) pendingWd\.delete/.test(wdSrc) && (wdSrc.match(/pendingWd\.delete/g) || []).length === 3 && !/Date\.now\(\) \+ 600_000/.test(src));
+  t("1109 L-1: it is cleared only on the relayer's own JSON refusal, a revert or success (not on an unknown outcome)", /if \(d\.error && \[400, 403, 429\]\.includes\(r\.status\)\) pendingWd\.delete/.test(wdSrc) && (wdSrc.match(/pendingWd\.delete/g) || []).length === 3 && !/Date\.now\(\) \+ 600_000/.test(src));
   // 1109 L-3, I-1, I-2, I-5, I-6
   t("1109 L-3: a failed log read inside txOfLogs is retried; the final message says the withdrawal is already on chain", /try \{ l = \(await recentLogs\(rpcOne, filter\)\)/.test(src) && /already on chain \(its authorization is used\)/.test(src));
   t("1109 I-1/I-2: the left-over uses the captured amount; a non-bigint balance is refused", /left: all - value/.test(src) && /typeof all !== "bigint" \|\| !\(value > 0n\)/.test(src) && !/left: w\.usdc - value/.test(src));
@@ -190,4 +190,25 @@ const PRIV = new Uint8Array(32).fill(9), ACC = addressFromPriv(PRIV), A2 = "0x" 
   const rz = src.slice(src.indexOf("async function returnZec"), src.indexOf("async function staleV1"));
   t("1110 L-1: an unresolved sweep intent is followed in the empty branch BEFORE any empty observation, and an ended one only pauses it", rz.indexOf("const sp = await prevOf()") > 0 && rz.indexOf("const sp = await prevOf()") < rz.indexOf("noteEmptyFor(HM, h, true)") && /if \(!sp\.ended\) return await finishSweep/.test(rz) && /ended: fin\.status/.test(rz));
   t("1110 L-2: no second sweep before the first one's expiry height has passed (the intent stores it)", /expiry: sw\.expiry/.test(rz) && /tipNow <= until/.test(rz) && /!prev\.ended/.test(rz)); }
+
+// ---- round 5 (audit 1121): pendingWd memory fallback, lost-answer retry, honest busy text
+{ const src = fs.readFileSync(new URL("../web/app.js", import.meta.url), "utf8");
+  const a = src.indexOf("const PW_KEY"), b = src.indexOf("const spent = new Map()"), code = src.slice(a, b);
+  const mk = ls => new Function("localStorage", "Date", code + "; return pendingWd;")(ls, Date);
+  const until = Date.now() + 3600_000;
+  const writeFails = { getItem: () => null, setItem: () => { throw new Error("QuotaExceededError"); } };      // reads fine, writes throw
+  const p1 = mk(writeFails); p1.set("0xaa", until);
+  t("1121 L-1: storage that reads fine but refuses writes still keeps the guard armed (memory copy is consulted)", p1.get("0xaa") === until);
+  p1.delete("0xaa"); t("1121 L-1: ... and delete clears it", p1.get("0xaa") === 0);
+  const store = {}; const ok1 = { getItem: k => store[k] ?? null, setItem: (k, v) => { store[k] = v; } };
+  const p2 = mk(ok1); p2.set("0xbb", until); const p3 = mk(ok1);
+  t("1121 L-1: normal storage still shares the guard across instances (reload / second tab)", p3.get("0xbb") === until);
+  const broken = { getItem: () => { throw new Error("denied"); }, setItem: () => { throw new Error("denied"); } }; const p4 = mk(broken); p4.set("0xcc", until);
+  t("1121 L-1: storage that throws everywhere falls back to memory", p4.get("0xcc") === until);
+  const wdSrc = src.slice(src.indexOf('$("btn-wd").addEventListener("click"'), src.indexOf("async function waitReceipt"));
+  t("1121 L-2: 'authorization already used' is followed on chain (txOfLogs) and never clears the guard; only a 400/403/429 JSON refusal clears it",
+    /usedErr = !!d\.error && \/authorization already used\/i/.test(wdSrc) && /if \(!usedErr && \(!r\.ok \|\| d\.error\)\)/.test(wdSrc) && /if \(d\.used \|\| usedErr\) d\.hash = await txOfLogs/.test(wdSrc) && !/if \(d\.error\) pendingWd\.delete/.test(wdSrc));
+  const rp = fs.readFileSync(new URL("../web/relay-post.js", import.meta.url), "utf8");
+  t("1121 I-2: a busy/503 final message no longer says 'Nothing was sent'", !/Nothing was sent/.test(rp) && /may be out/.test(rp));
+  t("1122 L-3: a SUCCESS return hides the card only after a hopSummary shows nothing left (shielded included)", /left && !left\.some\(x => x\.transparent \+ x\.orchard > 0n\)\) await hideHop/.test(src)); }
 console.log(fail ? "FAILED " + fail : "all passed"); process.exit(fail ? 1 : 0);

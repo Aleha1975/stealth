@@ -237,16 +237,19 @@ export async function findHop(store, stealth) {
   return ks.length ? { key: ks[ks.length - 1], rec: await store.get(ks[ks.length - 1]) } : null;
 }
 /** Is there spendable ZEC on the transparent addresses of hop wallet n (the same 4 x 3 addresses the Return flow sweeps)? Anything unreadable counts as "yes" through the thrown error. */
-async function hopHoldsZec(ctx, n) {
-  const ZR = await import("./zec-return.js"), seed = await mnemonicSeed(await mnemonicFor(ctx.priv, ctx.words, n));
+async function hopHoldsZec(ctx, n, rec = null) {
+  const ZR = await import("./zec-return.js"), seed = await withTimeout(mnemonicSeed(await mnemonicFor(ctx.priv, ctx.words, n)), 30000, "Seed derivation");      // 1122 I-2
   for (let a = 0; a < 4; a++) for (let i = 0; i < 3; i++) { const raw = await ctx.getUtxos(ZR.deriveT(seed, ZR.tPath(a, i)).addr); if (ZR.sweepSet(raw).length || raw.truncated) return true; }
+  // 1122 L-3: shielded ZEC counts too (the hop wallet is restored from its saved bytes and synced; any failure throws = "could not check", so nothing is started)
+  if (rec && rec.db && (ctx.Zjs || ctx.loadZjs)) {      // no saved wallet = none was ever set up, so nothing could have been shielded
+    const left = await hopSummary(ctx, rec); if (left.some(x => x.transparent + x.orchard > 0n)) return true; }
   return false;
 }
 export async function startHop(ctx) {
   const old = await findHop(ctx.store, ctx.stealth);
   if (old && !["DONE", "FAILED_IN"].includes(old.rec.st.step) && old.rec.st.hidden !== true) throw new Error("an earlier private transfer from this address is unfinished: resume it first");
   if (old && old.rec.st.hidden === true && !["DONE", "FAILED_IN"].includes(old.rec.st.step) && ctx.getUtxos) {      // 1111 L-4: a hidden record must not orphan ZEC that arrived (or stayed) on its hop wallet
-    let holds; try { holds = await hopHoldsZec(ctx, old.rec.st.n || 0); } catch (e) { throw new Error("could not check whether the earlier transfer from this address still holds ZEC (" + e.message + "); nothing was started"); }
+    let holds; try { holds = await hopHoldsZec(ctx, old.rec.st.n || 0, old.rec); } catch (e) { throw new Error("could not check whether the earlier transfer from this address still holds ZEC (" + e.message + "); nothing was started"); }
     if (holds) { await ctx.store.put(old.key, { ...old.rec, st: { ...old.rec.st, hidden: false, step: "FAILED", earlierFunds: true } });
       throw Object.assign(new Error("Finish or return the earlier transfer first: it still holds ZEC. Press Return money on its card."), { code: "EARLIER_HOP" }); }
   }
@@ -279,10 +282,11 @@ export async function loadZjs(base = new URL("./vendor/webzjs/", import.meta.url
     const SN = "snippets/wasm-bindgen-rayon-38edf6e439f6d70d/src/workerHelpers.js", MS = "snippets/wasm_thread-8ee53d0673203880/src/wasm32/js/module_worker_start.js", PF = "snippets/wasm_thread-8ee53d0673203880/src/wasm32/js/module_workers_polyfill.min.js";
     const swap = (text, from, to, what) => { if (!text.includes(from)) throw new Error("unexpected shape of " + what + "; refusing to load it"); return text.split(from).join(to); };
     // worker-spawning URLs inside the snippets would resolve against a blob: point them at the real (hash-checked) vendor files
-    const helpers = swap(dec.decode(by[SN]), "new URL('./workerHelpers.js', import.meta.url)", JSON.stringify(abs(SN)), "workerHelpers.js").replace("import('../../../webzjs_wallet.js')", "import(" + JSON.stringify(abs("webzjs_wallet.js")) + ")");
+    const helpers = swap(dec.decode(by[SN]), "new URL('./workerHelpers.js', import.meta.url)", JSON.stringify(abs(SN)), "workerHelpers.js");
+    const helpers2 = swap(helpers, "import('../../../webzjs_wallet.js')", "import(" + JSON.stringify(abs("webzjs_wallet.js")) + ")", "workerHelpers.js (wallet import)");      // 1123 I-4: a replace that matches nothing is an error, not a silent no-op
     const start = swap(dec.decode(by[MS]), "new URL('./web_worker_module.bundler.js', import.meta.url)", JSON.stringify(abs("snippets/wasm_thread-8ee53d0673203880/src/wasm32/js/web_worker_module.bundler.js")), "module_worker_start.js");
     let glue = dec.decode(by["webzjs_wallet.js"]);
-    glue = swap(glue, "from './" + SN + "'", "from " + JSON.stringify(blob(helpers)), "the glue (rayon import)");
+    glue = swap(glue, "from './" + SN + "'", "from " + JSON.stringify(blob(helpers2)), "the glue (rayon import)");
     glue = swap(glue, "from './" + MS + "'", "from " + JSON.stringify(blob(start)), "the glue (thread start import)");
     glue = swap(glue, "from './" + PF + "'", "from " + JSON.stringify(blob(dec.decode(by[PF]))), "the glue (polyfill import)");
     glue = glue.split("import.meta.url").join(JSON.stringify(abs("webzjs_wallet.js")));
@@ -313,12 +317,14 @@ export async function runHop(ctx) {
   const wallet = async () => {                                   // restore from the saved bytes, or create the accounts at the stored birthday (re-creating gives the same addresses)
     if (W) return W; Z = ctx.Zjs || (ctx.Zjs = await ctx.loadZjs());
     const nw = W = new Z.WebWallet(ZC.network, ZC.lightwalletd, 1, 1, rec.db || null);        // 1111 L-1: setup works on its own object; a timeout that drops W mid-way makes this attempt fail and the outer retry build a fresh one
+    try {                                                       // 1122 L-1: ANY failed setup (not only a timeout) drops the half-built wallet, so the retry builds a complete one
     if (!rec.db) {
       if (st.birthday == null) { st.birthday = Number(await retry(() => wc(() => nw.get_latest_block(), 20000, "Zcash tip query"))) - 10; await save(); }
       st.accts = []; for (let i = 0; i < (st.nAccts || MAX_OUT + 1); i++) st.accts.push(await wc(() => nw.create_account("hop" + i, mn, i, st.birthday), 60000, "Zcash account setup"));
       rec.db = await wc(() => nw.db_to_bytes(), 60000, "Zcash wallet save"); await save();
     }
     if (W !== nw) throw new Error("the Zcash wallet was reset while it was being set up; retrying");
+    } catch (e) { if (W === nw) W = null; throw e; }
     return nw;
   };
   const saveWallet = async () => { const w = await wallet(); rec.db = await wc(() => w.db_to_bytes(), 60000, "Zcash wallet save"); await save(); };
@@ -431,17 +437,19 @@ export async function runHop(ctx) {
     async SHIELD() {
       const i = st.attempt, t0 = Date.now();
       for (;;) {
-        const b = await bal(i); if (b.t < MIN_SHIELD) break;     // nothing left to shield (already sent: a resume skips this)
+        const b = await bal(i); if (b.t < MIN_SHIELD) { if (st.shieldTry) { st.shieldTry = null; st.shieldAcct = null; await save(); } break; }     // nothing left to shield (already sent / mined: a resume skips this). 1122 L-2: the marker is cleared here too
+        if (st.shieldTry && st.shieldAcct != null && st.shieldAcct !== i) { st.shieldTry = null; st.shieldAcct = null; await save(); }      // 1122 L-2: the marker belongs to one account
         if (st.shieldTry && Date.now() - st.shieldTry < 15 * 60_000) { say("Waiting to see whether the earlier shield broadcast went out… " + Math.round((Date.now() - st.shieldTry) / 1000) + " s"); await sleep(10000); continue; }     // 1111 L-3: an earlier broadcast got no answer and may still have gone out: no second shield for 15 min
         try {
-          say("Shielding: preparing the transaction…"); const w = await wallet(), seed = await mnemonicSeed(mn);
+          say("Shielding: preparing the transaction…"); const w = await wallet(), seed = await wc(() => mnemonicSeed(mn), 30000, "Seed derivation");      // 1122 I-2
           let p = await wc(() => w.pczt_shield(st.accts[i]), 120000, "Shield preparation");
           p = await withTimeout(Promise.resolve().then(() => Z.pczt_sign(ZC.network, p, new Z.UnifiedSpendingKey(ZC.network, seed, i), new Z.SeedFingerprint(seed))), 120000, "Shield signing");
           const tp = Date.now(), iv = setInterval(() => say("Shielding: building the zero-knowledge proof · " + Math.round((Date.now() - tp) / 1000) + " s"), beatMs); say("Shielding: building the zero-knowledge proof…");
           let pr; try { pr = await withTimeout(w.pczt_prove(p, null), 10 * 60_000, "Shield proof"); } finally { clearInterval(iv); }
           say("Shielding: sending to the Zcash network…");
-          try { await wc(() => w.pczt_send(pr), 120000, "Shield broadcast"); } catch (e2) { if (isTimeout(e2)) { st.shieldTry = Date.now(); await save(); } throw e2; }      // 1111 L-3: record "may have gone out" before failing
-          await saveWallet(); st.shieldTry = null; break;
+          st.shieldTry = Date.now(); st.shieldAcct = i; await save();      // 1122 L-2: "may have gone out" is recorded BEFORE the broadcast, so a failing wallet save afterwards or any non-definite error leaves it armed
+          try { await wc(() => w.pczt_send(pr), 120000, "Shield broadcast"); } catch (e2) { if (/InsufficientFunds/.test(String((e2 && e2.message) || e2))) { st.shieldTry = null; st.shieldAcct = null; await save(); } throw e2; }      // a definite "not spendable yet" refusal sent nothing
+          await saveWallet(); st.shieldTry = null; st.shieldAcct = null; await save(); break;
         } catch (e) {
           if (!/InsufficientFunds/.test(String((e && e.message) || e))) throw e;          // coins not spendable yet (confirmations): wait and try again
           if (Date.now() - t0 > 30 * 60_000) throw new Halt("The ZEC has arrived but is not spendable yet. Press Continue in a few minutes.");

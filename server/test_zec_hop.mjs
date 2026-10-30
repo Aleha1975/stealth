@@ -520,5 +520,34 @@ for (const name of ["create_proposed_transactions", "db_to_bytes", "get_current_
   let k = 0; const gu = withUtxo(w3)().getUtxos; const st3 = await H.startHop(mkCtx(w3, s3, { getUtxos: async a => (k++ < 12 ? [] : gu(a)) }));
   ok("1111 L-4 an earlier hop wallet that is really empty does not block a new hop", st3.step === "DONE" && (await s3.keys()).length === 2, st3.step + " " + st3.err); }
 
+// ---------- round 5 (audits 1122 / 1123 follow-ups) ----------
+{ // 1122 L-1: a non-timeout failure while the accounts are created must not leave a half-built wallet behind; the retry builds a complete one
+  const w = makeWorld(), s = H.memStore(); off = 0; const proto = w.Zjs.WebWallet.prototype, ca = proto.create_account; let n = 0;
+  proto.create_account = async function (...a) { if (++n === 3) throw new Error("account setup broke once"); return ca.apply(this, a); };
+  const st = await H.startHop(mkCtx(w, s, { walletTimeoutMs: 5000 })); const rec = await latest(s);
+  ok("1122 L-1 a failed account setup is retried on a fresh wallet; the saved wallet has all the accounts", st.step === "DONE" && !st.err && JSON.parse(Buffer.from(rec.db).toString()).accts.length === rec.st.nAccts && rec.st.accts.length === rec.st.nAccts && rec.st.nAccts >= 2, st.step + " " + st.err + " " + rec.st.nAccts + "/" + (rec.st.accts || []).length); }
+{ // 1122 L-2: the shield marker is written BEFORE the broadcast, survives any non-definite error, is bound to the account, and is cleared once the transparent balance is gone
+  const w = makeWorld(), s = H.memStore(); off = 0; const proto = w.Zjs.WebWallet.prototype, ps = proto.pczt_send; let n = 0;
+  let armed = null;
+  proto.pczt_send = async function (p) { if (n++ === 0) { const r0 = await latest(s); armed = [r0.st.shieldTry, r0.st.shieldAcct]; await ps.call(this, p); throw new Error("connection reset after the server accepted it"); } return ps.call(this, p); };
+  const st = await H.startHop(mkCtx(w, s)); const rec = await latest(s);
+  ok("1122 L-2 the marker is saved (account-bound) BEFORE the broadcast", armed && armed[0] > 0 && armed[1] === 0, JSON.stringify(armed));
+  ok("1122 L-2 an error after an accepted broadcast: no second shield, and once the transparent balance is gone the marker is cleared", st.step === "DONE" && !st.err && w.sig === 1 && w.shieldCalls === 1 && !rec.st.shieldTry && rec.st.shieldAcct == null, st.step + " " + st.err + " sig=" + w.sig + " calls=" + w.shieldCalls); }
+{ const w = makeWorld(), s = H.memStore(); off = 0; await H.startHop(mkCtx(w, s, { stopAt: "SHIELD" })); let rec = await latest(s);
+  rec.st.shieldTry = Date.now(); rec.st.shieldAcct = 7; await s.put(STEALTH.toLowerCase() + "#0", rec);       // a marker left by another account must not delay this one
+  const r = await H.runHop(mkCtx(w, s)); ok("1122 L-2 a marker of another account does not delay the shield", r.step === "DONE" && w.sig === 1, r.step + " " + r.err); }
+{ // 1122 L-3: a hidden unfinished record whose hop wallet holds only SHIELDED ZEC still blocks a new hop
+  const w = makeWorld(), s = H.memStore(), key = STEALTH.toLowerCase() + "#0"; off = 0; await H.startHop(mkCtx(w, s, { stopAt: "SHIELD" })); const rec = await latest(s);
+  const d = JSON.parse(Buffer.from(rec.db).toString()); w.oBal[d.addr[d.accts[0]]] = 50_000n; w.tBal = {};
+  await s.put(key, { st: { ...rec.st, step: "FAILED", result: "RETURNED", hidden: true }, db: rec.db });
+  let err = null; try { await H.startHop(mkCtx(w, s, { getUtxos: async () => [] })); } catch (e) { err = e; }
+  const after = await s.get(key);
+  ok("1122 L-3 shielded-only ZEC on a hidden record refuses a new hop, un-hides it", err && err.code === "EARLIER_HOP" && after.st.hidden === false && after.st.earlierFunds === true && (await s.keys()).length === 1, err && err.message);
+  w.oBal = {}; off = w.off0; await s.put(key, { st: { ...rec.st, step: "FAILED", result: "RETURNED", hidden: true }, db: rec.db });
+  const st2 = await H.startHop(mkCtx(w, s, { getUtxos: async () => [] })); ok("1122 L-3 ... and with nothing in the shielded pool either the new hop starts", st2.step === "DONE" && st2.n === 1, st2.step + " " + st2.err); }
+{ // 1122 I-2: the seed derivation is bounded
+  const src = fs.readFileSync(path.join(WEB, "zec-hop.js"), "utf8");
+  ok("1122 I-2 mnemonicSeed is wrapped in the timeout helpers (hop check and SHIELD)", /withTimeout\(mnemonicSeed\(/.test(src) && /wc\(\(\) => mnemonicSeed\(mn\)/.test(src) && !/await mnemonicSeed\(/.test(src)); }
+
 Date.now = realNow;
 console.log(fails ? fails + " FAILED" : "all passed"); process.exit(fails ? 1 : 0);
