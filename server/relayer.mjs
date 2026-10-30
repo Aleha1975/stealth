@@ -13,11 +13,12 @@
    Audit 1099 notes. (1) End-recipient screening is an HONOUR SYSTEM: endRecipient is screened only when the client sends it (the web app screens the recipient itself via
    GET /relay/screen); the relayer cannot see the real beneficiary of a 1Click deposit address. Accepted risk, documented, not a compliance control.
    (2) Logging: the first argument of log() is a fixed template, user text only as later arguments (neutralised); stealth_watch.py matches only the fixed templates.
-   (3) Failing requests are metered here, independent of nginx: per-/64 and global failure budgets, concurrency cap, coalesced state writes, rate-limited refusal log lines.
+   (3) Abuse limits are metered here, independent of nginx, and are PER KEY only (IPv4 or IPv6 /64; audit 1108): hourly failure counter, token bucket on RPC-costly requests; globally only
+   the concurrency cap and the daily gas budget. No shared failure ceiling exists (it was the source of three rounds of lockout findings). Also coalesced state writes, rate-limited refusal log lines.
    API 127.0.0.1:3874: POST /stealth-api/relay {from,to,value,validAfter,validBefore,nonce,v,r,s[,feeAuth:{value,validAfter,validBefore,nonce,v,r,s}]}
    -> {hash[,feeHash]}; GET /stealth-api/relay/stats */
 import { makeScreen } from "./sanctions/screen.mjs";
-import { cleanLog, neutral, safeIp, capMap, makeFailBudget, makeLineLimiter, ipKey, parseEnvLine, isLowS, failWeight, isCostly, Refusal, Upstream } from "./relay-util.mjs";
+import { cleanLog, neutral, safeIp, capMap, makeFailBudget, makeTokenBucket, makeLineLimiter, ipKey, parseEnvLine, isLowS, failWeight, classifyError, Refusal, Upstream } from "./relay-util.mjs";
 import http from "http"; import fs from "fs"; import path from "path"; import { fileURLToPath, pathToFileURL } from "url";
 import { createPublicClient, createWalletClient, http as vhttp, fallback, parseAbi, formatEther, getAddress, defineChain, encodeAbiParameters, encodeFunctionData, keccak256, toHex, recoverTypedDataAddress, isAddress } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
@@ -62,7 +63,11 @@ const GAS_PAD_PCT = 125n;                                                       
 const MAX_PER_FROM = Math.max(1, Number(E.STEALTH_RELAY_PER_FROM || 3));
 const GONE_GAP_MS = Number(E.STEALTH_RELAY_GONE_GAP_MS || 4000);                                // audit 1099 L-3: second "not found" probe this much later
 const FAIL_PER_IP = Number(E.STEALTH_RELAY_FAIL_PER_IP || 30);                                    // audit 1099 M-2: failed requests per network (/64) per hour
-const FAIL_PER_MIN = Number(E.STEALTH_RELAY_FAIL_PER_MIN || 120);                                 // ... and globally per minute (then networks that already failed are refused before any RPC)
+const RPC_BURST = Number(E.STEALTH_RELAY_RPC_BURST || 20), RPC_REFILL_MS = Number(E.STEALTH_RELAY_RPC_REFILL_MS || 10_000);   // audit 1108: per-network token bucket on RPC-costly requests (no global failure state)
+// STEALTH_RELAY_ALLOW_KEYS: comma-separated IPs or /64 keys (empty by default). Those networks skip the per-key buckets, the per-IP / per-payer daily counters and the failure counter;
+// every validation, the sanctions check, MAX_CONCURRENT and the daily gas budget still apply. One fixed log line per allowed request.
+const ALLOW = new Set(String(E.STEALTH_RELAY_ALLOW_KEYS || "").split(",").map(x => x.trim()).filter(Boolean).map(x => safeIp(ipKey(x))));
+const LOCK_MS = Number(E.STEALTH_RELAY_LOCK_MS || 40_000);                                        // audit 1108 L-2: one deadline for everything done while the nonce lock is held
 const MAX_CONCURRENT = Number(E.STEALTH_RELAY_MAX_CONCURRENT || 64);                              // requests in progress at once
 const DEDUPE_MS = Number(E.STEALTH_RELAY_DEDUPE_MS || 24 * 3600 * 1000);                          // audit 1099 L-1: a finished authorization keeps answering with its hash this long
 const INDEXER = E.STEALTH_INDEXER || "http://127.0.0.1:3873";
@@ -81,10 +86,11 @@ const sleep = ms => new Promise(r => setTimeout(r, ms));
 const day = () => Math.floor(Date.now() / 86400000);
 export const screen = makeScreen(undefined, log);                    // OFAC SDN EVM addresses (sanctions/evm.json), reloaded on file change
 
+const unsure = new Map();                    // ukey (from:nonce) -> { h, nonce, t, counted }: a transaction sent (or possibly sent) and not yet seen mined; persisted (audit 1108 L-1), TTL DEDUPE_MS
 // ---- счётчики суток: gas = потрачено + зарезервировано под ещё не сверённые транзакции; пишутся в файл атомарно
 export let st = { day: day(), gas: 0n, perIp: {}, perFrom: {}, perPayer: {} };
 const save = () => {
-  try { const tmp = STATE_FILE + ".tmp"; fs.writeFileSync(tmp, JSON.stringify({ day: st.day, gas: st.gas.toString(), perIp: st.perIp, perFrom: st.perFrom, perPayer: st.perPayer })); fs.renameSync(tmp, STATE_FILE); }
+  try { const tmp = STATE_FILE + ".tmp"; fs.writeFileSync(tmp, JSON.stringify({ day: st.day, gas: st.gas.toString(), perIp: st.perIp, perFrom: st.perFrom, perPayer: st.perPayer, unsure: [...unsure] })); fs.renameSync(tmp, STATE_FILE); }
   catch (e) { log("ALERT state save failed", String(e).slice(0, 80)); }
 };
 // audit 1099 M-2: failing requests must not write the whole state synchronously; they mark it dirty and a timer flushes it (also on exit)
@@ -95,7 +101,9 @@ process.on("exit", () => { if (saveTimer) save(); });
 const dec = (o, k) => { if (o[k] > 1) o[k]--; else delete o[k]; };            // audit 1099 M-2: a counter back at zero is removed, so the maps cannot grow with failed requests
 const migFrom = (o) => { const r = {}; for (const [k, v] of Object.entries(o || {})) { const n = v === true ? 1 : Number(v); if (Number.isFinite(n) && n > 0) r[k] = Math.floor(n); } return r; };   // старый формат: true -> 1
 export const load = () => {
-  try { const j = JSON.parse(fs.readFileSync(STATE_FILE, "utf8")); if (j.day === day()) st = { day: j.day, gas: BigInt(j.gas), perIp: j.perIp || {}, perFrom: migFrom(j.perFrom), perPayer: j.perPayer || {} }; } catch {}
+  try { const j = JSON.parse(fs.readFileSync(STATE_FILE, "utf8"));
+    for (const [k, v] of Array.isArray(j.unsure) ? j.unsure : []) if (v && /^0x[0-9a-fA-F]{64}$/.test(v.h) && Date.now() - v.t < DEDUPE_MS) unsure.set(k, { h: v.h, nonce: v.nonce, t: v.t, counted: !!v.counted });   // audit 1108 L-1: survives a restart (also across midnight)
+    if (j.day === day()) st = { day: j.day, gas: BigInt(j.gas), perIp: j.perIp || {}, perFrom: migFrom(j.perFrom), perPayer: j.perPayer || {} }; } catch {}
 };
 load();
 const roll = () => { if (st.day !== day()) { st = { day: day(), gas: 0n, perIp: {}, perFrom: {}, perPayer: {} }; save(); } };
@@ -110,8 +118,11 @@ const dedupeSet = (k, res) => { pendingAuth.delete(k); pendingAuth.set(k, { res,
 // audit "stuck tx": исходный хеш -> хеш замены; клиент спрашивает GET /relay/status?hash= и идёт по цепочке
 const issued = new Map();                   // audit 1099 M-2: hashes we sent (and their replacements): /relay/status answers only for these, so it cannot be used as a free RPC proxy
 const replacedBy = new Map(); const remember = (h, h2) => { replacedBy.set(h.toLowerCase(), h2); capMap(replacedBy, 2000); issued.set(h2.toLowerCase(), 1); capMap(issued, 5000); };   // audit 1099 I-2: drop the oldest, not everything
+const rpcBucket = makeTokenBucket({ cap: RPC_BURST, refillMs: RPC_REFILL_MS });
+// audit 1108 M-3: an error that is neither a refusal, a revert nor transport trouble is charged to the key (weight 1, no refund); its text goes to the log only (rate limited), never to the client
+const noteUnknown = (err, ip) => { if (err.unknown) { const t = refusedLines.take(); if (t.log) log("unclassified error", ip, JSON.stringify(err.detail)); } };
 let nonceLock = Promise.resolve();
-let lastAlert = 0;
+let lastAlert = 0, lastLockAlert = 0;
 const alertOnce = (...a) => { if (Date.now() - lastAlert > 60000) { lastAlert = Date.now(); log("ALERT", ...a); } };
 const HEX32 = /^0x[0-9a-fA-F]{64}$/;
 
@@ -151,23 +162,30 @@ async function findTx(h, polls, deadline) {
   }
   return false;
 }
-const unsure = new Map();                    // ukey (from:nonce) -> { h, nonce, t }: a send whose outcome could not be established
-async function submit(call, gasLimit, used, retried = false, prevHash = null, ukey = null) {
+// audit 1108 L-1/L-2: the hash of a signed transaction is written to `unsure` (and the state file) BEFORE it is sent, and removed only when it is mined or proven gone. A retry, also after a
+// restart, looks for THAT transaction first, so a second one is never signed for the same authorization. ctl.dead = the nonce-lock deadline passed: such a holder must not send any more.
+async function submit(call, gasLimit, used, retried = false, prevHash = null, ukey = null, ctl = { dead: false }, info = {}) {
   let h = null, nonce = null;
   const u = ukey && unsure.get(ukey);
   if (u) {
+    const found = await findTx(u.h, 1, Date.now() + RECOVER_MS);
+    if (ctl.dead) throw new Upstream("relayer busy, try again shortly");
+    if (found) { capMap(nonceOfHash, 500); nonceOfHash.set(u.h, u.nonce); info.counted = !!u.counted; log("earlier unconfirmed send found", u.h); return u.h; }
     unsure.delete(ukey);
-    if (await findTx(u.h, 1, Date.now() + RECOVER_MS)) { capMap(nonceOfHash, 500); nonceOfHash.set(u.h, u.nonce); log("earlier unconfirmed send found", u.h); return u.h; }
     if (used && await used().catch(() => false)) throw new Refusal("authorization already used", { honest: true, costly: true });
     if (Date.now() - u.t < UNSURE_MS) { unsure.set(ukey, u); throw new Refusal("a previous attempt for this authorization is still being confirmed, try again in a minute", { honest: true, costly: true }); }
   }
   try {
     const fees = await cachedFees();
-    if (localNonce === null) localNonce = await pub.getTransactionCount({ address: account.address, blockTag: "pending" });
+    if (localNonce === null) { const n0 = await pub.getTransactionCount({ address: account.address, blockTag: "pending" }); if (ctl.dead) throw new Upstream("relayer busy, try again shortly"); localNonce = n0; }
     const tx = { chainId: CC.id, nonce: localNonce, gas: gasLimit, to: call.address, value: 0n, data: encodeFunctionData({ abi: call.abi, functionName: call.functionName, args: call.args }),
       ...(fees.maxFeePerGas ? { type: "eip1559", maxFeePerGas: fees.maxFeePerGas, maxPriorityFeePerGas: fees.maxPriorityFeePerGas || 0n } : { type: "legacy", gasPrice: fees.gasPrice }) };
-    const ser = await account.signTransaction(tx); nonce = tx.nonce; h = keccak256(ser);
+    const ser = await account.signTransaction(tx);
+    if (ctl.dead) throw new Upstream("relayer busy, try again shortly");                // audit 1108 L-2: no send after the deadline
+    nonce = tx.nonce; h = keccak256(ser);
+    if (ukey) { unsure.set(ukey, { h, nonce, t: Date.now() }); capMap(unsure, 2000); save(); }
     const hash = await pub.sendRawTransaction({ serializedTransaction: ser });
+    if (ctl.dead) return hash;                                                          // released meanwhile: the new holder owns localNonce; the retry finds this hash in `unsure`
     capMap(nonceOfHash, 500);
     nonceOfHash.set(hash, tx.nonce); localNonce++; return hash;
   } catch (e) {
@@ -179,13 +197,15 @@ async function submit(call, gasLimit, used, retried = false, prevHash = null, uk
     if (h && !/nonce too low|nonce.*(lower|too low)/i.test(msg)) {
       const amb = AMBIGUOUS.test(msg) || /^(HttpRequestError|TimeoutError|WebSocketRequestError)$/.test(String(e && e.name));
       if (await findTx(h, amb ? POLLS : 1, Date.now() + RECOVER_MS)) { capMap(nonceOfHash, 500); nonceOfHash.set(h, nonce); log("send answer lost, transaction found", h); return h; }
-      if (amb && ukey) { unsure.set(ukey, { h, nonce, t: Date.now() }); capMap(unsure, 2000); }
+      if (!amb && ukey) { unsure.delete(ukey); save(); }                              // the node refused it outright: nothing is out there
+      if (amb) throw new Upstream("the send could not be confirmed, try again in a minute");   // audit 1108 M-3: lost answer of OUR transaction (entry stays in `unsure`): infrastructure trouble, not the caller's
     }
     // локальный nonce устарел (ключ релеера использовал кто-то ещё, рестарт узла): один повтор с nonce, взятым заново с узла, вместо отказа клиенту
     if (!retried && /nonce too low|nonce.*(lower|too low)/i.test(msg)) {
-      for (const c of [h, prevHash]) if (c && await seenTx(c)) return c;
+      for (const c of [h, prevHash]) if (c && await seenTx(c)) { if (ukey && c !== h) unsure.set(ukey, { h: c, nonce: nonce ?? 0, t: Date.now() }); return c; }
+      if (ukey) { unsure.delete(ukey); save(); }
       if (used && await used().catch(() => false)) throw new Refusal("authorization already used", { honest: true, costly: true });
-      return submit(call, gasLimit, used, true, h, ukey);
+      return submit(call, gasLimit, used, true, h, ukey, ctl, info);
     }
     throw e;
   }
@@ -200,15 +220,21 @@ async function probeTx(hash) {
   try { await pub.getTransaction({ hash }); return false; } catch (e) { if (!isNF(e, "TransactionNotFoundError")) return null; }
   return true;
 }
-async function sendAndTrack(call, gasLimit, reserve, from, tag, onRevert, onGone = () => {}, used, ukey = null) {
+async function sendAndTrack(call, gasLimit, reserve, from, tag, onRevert, onGone = () => {}, used, ukey = null, info = {}) {
   const d0 = st.day;
   let hash;
   const tq = Date.now(); let tw = 0;
-  await (nonceLock = nonceLock.then(() => {}, () => {}).then(async () => { tw = Date.now() - tq; hash = await submit(call, gasLimit, used, false, null, ukey); }));   // the previous holder's failure must not skip THIS send (was: onRejected swallowed the turn -> spurious "send failed")
+  const ctl = { dead: false };                                           // audit 1108 L-2: ONE deadline for the whole hold; on expiry the lock is released with an ALERT line and this holder can never send
+  await (nonceLock = nonceLock.then(() => {}, () => {}).then(() => new Promise((res, rej) => {   // the previous holder's failure must not skip THIS send
+    tw = Date.now() - tq;
+    const timer = setTimeout(() => { ctl.dead = true; localNonce = null; feeCache.t = 0; if (Date.now() - lastLockAlert > 60000) { lastLockAlert = Date.now(); log("ALERT nonce lock deadline exceeded", tag, "after", LOCK_MS, "ms"); } rej(new Upstream("relayer busy, try again shortly")); }, LOCK_MS);
+    submit(call, gasLimit, used, false, null, ukey, ctl, info).then(h => { clearTimeout(timer); hash = h; res(); }, e => { clearTimeout(timer); rej(e); });
+  })));
   tmStats.n++; tmStats.wait += tw; tmStats.maxWait = Math.max(tmStats.maxWait, tw); tmStats.send += Date.now() - tq - tw;   // lock wait vs send time (see /relay/stats)
   // nonceLock не должен залипать после ошибки одной отправки: ошибка уходит вызывающему через throw ниже
   if (!hash) throw new Error("send failed");
   issued.set(hash.toLowerCase(), 1); capMap(issued, 5000);
+  const clearUnsure = () => { const x = ukey && unsure.get(ukey); if (x && x.h === hash) unsure.delete(ukey); };   // mined or proven gone: no longer "unconfirmed"
   const watch = async () => {
     let rc;
     try { rc = await pub.waitForTransactionReceipt({ hash, timeout: STUCK_S * 1000 }); }
@@ -231,7 +257,7 @@ async function sendAndTrack(call, gasLimit, reserve, from, tag, onRevert, onGone
           } catch (e) { log("ALERT nonce gap fill failed", n, String(e).slice(0, 80)); }
         }, () => {}));
         if (onRevert) onRevert(); else if (tag === "main") dec(st.perFrom, from);   // клиент может повторить: подпись не использована
-        adj(d0, -reserve); onGone(); save(); return;                     // audit 1087 L-4c: транзакции нет ни в пуле, ни в блоке -- газа не потрачено, резерв возвращается
+        adj(d0, -reserve); onGone(); clearUnsure(); save(); return;                     // audit 1087 L-4c: транзакции нет ни в пуле, ни в блоке -- газа не потрачено, резерв возвращается
       }
       try {                                                    // застряла: та же nonce, комиссия выше -- один раз
         const tx = await pub.getTransaction({ hash });
@@ -245,6 +271,7 @@ async function sendAndTrack(call, gasLimit, reserve, from, tag, onRevert, onGone
       try { rc = await pub.waitForTransactionReceipt({ hash, timeout: 180_000, onReplaced: r => { log("replaced", hash, "->", r.transaction.hash, r.reason); remember(hash, r.transaction.hash); } }); }
       catch (e) { log("ALERT receipt wait failed", tag, hash, String(e).slice(0, 80)); return; }   // резерв остаётся (консервативно)
     }
+    clearUnsure();
     const spent = rc.gasUsed * (rc.effectiveGasPrice || 0n); adj(d0, spent - reserve);
     // audit 1087 M-1: откат НЕ возвращает лимит на адрес/плательщика (раньше возвращал -- можно было гонять откаты бесконечно за наш газ); возвращается только пропажа транзакции (выше)
     if (rc.status !== "success") log("reverted", tag, hash); else log("mined", tag, hash, "gas", formatEther(spent), "ETH");
@@ -270,25 +297,28 @@ export async function relay(b, ip) {
     fee = parseAuth(b.feeAuth, " (fee)");
     if (fee.value < FEE_MIN) throw new Error("fee below the minimum");
   } else if (FEE_MIN > 0n) throw new Error("fee authorization required");
-  // audit 1099 L-1: a repeat of an authorization we already sent gets the original hash(es), also after it was mined (kept DEDUPE_MS); no RPC, no counters
-  const dupKey = (from + ":" + main.nonce).toLowerCase(), dup = dedupeGet(dupKey);
-  if (dup) return dup;
-  // audit 1099 M-2/I-6: everything that can be decided without the network is decided now: validity window and the EIP-712 signature (so a stranger cannot take the address lock, and junk costs no RPC)
-  const nowS = BigInt(Math.floor(Date.now() / 1000));
-  for (const a of fee ? [main, fee] : [main]) { if (a.validBefore <= nowS + 30n) throw new Refusal("authorization expires too soon", { honest: true }); if (a.validAfter > nowS) throw new Refusal("authorization not valid yet", { honest: true }); }
+  // audit 1099 M-2/I-6: everything that can be decided without the network is decided now: the EIP-712 signature (so a stranger cannot take the address lock, and junk costs no RPC)
   for (const [a, dst] of fee ? [[main, to], [fee, account.address]] : [[main, to]]) {
     const signer = await recoverTypedDataAddress({ domain: { name: CC.domain.name, version: CC.domain.version, chainId: CC.id, verifyingContract: TOKEN }, types: TRANSFER_TYPES, primaryType: "TransferWithAuthorization",
       message: { from, to: dst, value: a.value, validAfter: a.validAfter, validBefore: a.validBefore, nonce: a.nonce }, signature: { r: a.r, s: a.s, v: BigInt(a.v) } }).catch(() => null);
     if (signer !== from) throw new Error("signature does not match the address");
   }
+  // audit 1099 L-1 / 1108 M-2: a repeat of an authorization we already sent (and whose signature checks out) gets the original hash(es), also after it was mined (kept DEDUPE_MS).
+  // No RPC, no counters, no budget of any kind is touched by a hit.
+  const dupKey = (from + ":" + main.nonce).toLowerCase(), dup = dedupeGet(dupKey);
+  if (dup) return dup;
+  const nowS = BigInt(Math.floor(Date.now() / 1000));
+  for (const a of fee ? [main, fee] : [main]) { if (a.validBefore <= nowS + 30n) throw new Refusal("authorization expires too soon", { honest: true }); if (a.validAfter > nowS) throw new Refusal("authorization not valid yet", { honest: true }); }
   roll();
   const d0 = st.day;
   // ---- синхронный блок: проверки суток и замок адреса без await между проверкой и записью
-  if ((st.perIp[ip] || 0) >= MAX_PER_IP_PER_DAY) throw new Refusal("too many requests from this network today", { honest: true });
+  const allowed = ALLOW.has(ip);
+  if (!allowed && (st.perIp[ip] || 0) >= MAX_PER_IP_PER_DAY) throw new Refusal("too many requests from this network today", { honest: true });
   if ((st.perFrom[from] || 0) >= MAX_PER_FROM) throw new Refusal("this address reached its withdrawal limit today; try tomorrow", { honest: true });
   if (inflight.has(from)) throw new Refusal("a withdrawal from this address is already in progress", { honest: true });
   if (st.gas >= GAS_BUDGET_WEI_PER_DAY) throw new Refusal("relayer gas budget for today is spent", { honest: true });
-  inflight.add(from); st.perIp[ip] = (st.perIp[ip] || 0) + 1;
+  if (!allowed && !rpcBucket.take(ip)) throw new Refusal("too many requests from this network, try again shortly", { honest: true });   // audit 1108: per-key admission of RPC-costly work
+  inflight.add(from); if (!allowed) st.perIp[ip] = (st.perIp[ip] || 0) + 1;
   let reserve = 0n, used = 0n, sent = false;
   try {
     const known = await fetch(INDEXER + "/stealth-api/known?addr=" + from, { signal: AbortSignal.timeout(5000) }).then(r => { if (!r.ok) throw new Error("indexer " + r.status); return r.json(); }).catch(e => { throw new Upstream("indexer unavailable: " + String(e && e.message || e).slice(0, 60)); });   // audit 1107 M-1: an indexer outage is not the caller's failure
@@ -315,19 +345,22 @@ export async function relay(b, ip) {
     for (let i = 0; i < calls.length; i++) {                 // комиссия первой; резерв делится поровну между транзакциями
       const [tag, args] = calls[i]; const part = i === calls.length - 1 ? left : reserve / n; left -= part;
       const last = i === calls.length - 1;       // освободить запись о подписи, когда смайнена (или потеряна) последняя транзакция
-      try { hashes[tag] = await sendAndTrack(TRANSFER_CALL(args), lims[i], part, from, tag, undefined, last ? () => pendingAuth.delete(dupKey) : undefined, usedOf(from, args[5]), from + ":" + args[5]); }
+      const uk = from + ":" + args[5], info = {};
+      try { hashes[tag] = await sendAndTrack(TRANSFER_CALL(args), lims[i], part, from, tag, undefined, last ? () => pendingAuth.delete(dupKey) : undefined, usedOf(from, args[5]), uk, info); }
       catch (e) { if (sent) log("ALERT fee sent but main failed", from, String(e).slice(0, 80)); throw e; }
       sent = true; used += part;
-      if (tag === "main") { st.perFrom[from] = (st.perFrom[from] || 0) + 1; save(); }
+      if (tag === "main") { if (!info.counted) st.perFrom[from] = (st.perFrom[from] || 0) + 1; const x = unsure.get(uk); if (x) x.counted = true; save(); }   // audit 1108 I-1: a send recovered from an earlier attempt that was already counted counts once
     }
     log("relay", from, "->", to, (Number(value) / 1e6).toFixed(6), CC.token_symbol, hashes.main, fee ? "fee " + (Number(fee.value) / 1e6).toFixed(6) + " " + hashes.fee : "", "ip", ip);
     const res = fee ? { hash: hashes.main, feeHash: hashes.fee } : { hash: hashes.main };
     dedupeSet(dupKey, res); return res;
   } catch (e) {
+    const err = classifyError(e);                               // audit 1108 M-3: by cause; only demonstrable transport trouble is Upstream
     adj(d0, -(reserve - used));                                 // неотправленная часть резерва возвращается (в том же дне)
-    if (!sent) dec(st.perIp, ip);                               // до отправки ничего не потрачено: вернуть и счётчик IP
+    if (err instanceof Upstream && !sent && !allowed) { dec(st.perIp, ip); rpcBucket.refund(ip); }   // audit 1108: ONLY infrastructure trouble is refunded to the key
+    noteUnknown(err, ip);
     if (sent) save(); else saveSoon();                          // audit 1099 M-2: a failed request never writes the state synchronously
-    throw e instanceof Refusal ? e : new Upstream(String(e && (e.shortMessage || e.message) || e).slice(0, 100));   // audit 1107 M-1: anything but a deliberate refusal after the offline checks is infrastructure trouble
+    throw err;
   } finally { inflight.delete(from); }
 }
 
@@ -355,24 +388,27 @@ export async function relayPay(b, ip) {
   if (fee > 0n ? feeTo !== account.address : feeTo !== "0x0000000000000000000000000000000000000000") throw new Error("fee recipient must be the relayer");
   if (stealth === STEALTHPAY || stealth === TOKEN || stealth === account.address || stealth === from) throw new Error("bad destination");
   roll();
-  const nonce = localPaymentNonce(token, stealth, eph, tag, fee, feeTo), dupKey = ("pay:" + from + ":" + nonce).toLowerCase(), dup = dedupeGet(dupKey);
-  if (dup) return dup;                                                  // audit 1087 M-1 / 1099 L-1: the same payment already sent: the same hash, also after it was mined
-  // audit 1099 M-2/I-6: validity window and signature are decided offline, before the lock and before any RPC
-  const now = BigInt(Math.floor(Date.now() / 1000));
-  if (auth.validBefore <= now + 30n) throw new Refusal("authorization expires too soon", { honest: true });
-  if (auth.validAfter > now) throw new Refusal("authorization not valid yet", { honest: true });
+  const nonce = localPaymentNonce(token, stealth, eph, tag, fee, feeTo), dupKey = ("pay:" + from + ":" + nonce).toLowerCase();
+  // audit 1099 M-2/I-6: the signature is decided offline, before the lock and before any RPC
   const signer = await recoverTypedDataAddress({
     domain: { name: CC.domain.name, version: CC.domain.version, chainId: CC.id, verifyingContract: TOKEN }, types: RECEIVE_TYPES, primaryType: "ReceiveWithAuthorization",
     message: { from, to: STEALTHPAY, value: amount, validAfter: auth.validAfter, validBefore: auth.validBefore, nonce },
     signature: { r: auth.r, s: auth.s, v: BigInt(auth.v) } }).catch(() => null);
   if (!signer || signer !== from) throw new Error("signature does not match the payer");
+  const dup = dedupeGet(dupKey);
+  if (dup) return dup;                                                  // audit 1087 M-1 / 1099 L-1 / 1108 M-2: the same (signed) payment already sent: the same hash, also after it was mined; touches no budget
+  const now = BigInt(Math.floor(Date.now() / 1000));
+  if (auth.validBefore <= now + 30n) throw new Refusal("authorization expires too soon", { honest: true });
+  if (auth.validAfter > now) throw new Refusal("authorization not valid yet", { honest: true });
   const d0 = st.day;
-  if ((st.perIp[ip] || 0) >= MAX_PER_IP_PER_DAY) throw new Refusal("too many requests from this network today", { honest: true });
-  if ((st.perPayer[from] || 0) >= MAX_PER_PAYER_PER_DAY) throw new Refusal("too many payments from this wallet today", { honest: true });
+  const allowed = ALLOW.has(ip);
+  if (!allowed && (st.perIp[ip] || 0) >= MAX_PER_IP_PER_DAY) throw new Refusal("too many requests from this network today", { honest: true });
+  if (!allowed && (st.perPayer[from] || 0) >= MAX_PER_PAYER_PER_DAY) throw new Refusal("too many payments from this wallet today", { honest: true });
   const lockKey = "pay:" + from;
   if (inflight.has(lockKey)) throw new Refusal("a payment from this wallet is already in progress", { honest: true });
   if (st.gas >= GAS_BUDGET_WEI_PER_DAY) throw new Refusal("relayer gas budget for today is spent", { honest: true });
-  inflight.add(lockKey); st.perIp[ip] = (st.perIp[ip] || 0) + 1; st.perPayer[from] = (st.perPayer[from] || 0) + 1;
+  if (!allowed && !rpcBucket.take(ip)) throw new Refusal("too many requests from this network, try again shortly", { honest: true });   // audit 1108
+  inflight.add(lockKey); if (!allowed) { st.perIp[ip] = (st.perIp[ip] || 0) + 1; st.perPayer[from] = (st.perPayer[from] || 0) + 1; }
   let reserve = 0n, sent = false;
   try {
     // независимые чтения -- одним залпом (раньше ~6 последовательных RPC на заявку); проверки применяются в прежнем порядке
@@ -398,8 +434,10 @@ export async function relayPay(b, ip) {
     log("relay-pay", from, "->", stealth, (Number(amount) / 1e6).toFixed(6), CC.token_symbol, "fee", (Number(fee) / 1e6).toFixed(6), hash, "ip", ip);
     return { hash };
   } catch (e) {
-    if (!sent) { adj(d0, -reserve); dec(st.perIp, ip); dec(st.perPayer, from); saveSoon(); }   // audit 1099 M-2: no synchronous write for a failed request
-    throw e instanceof Refusal ? e : new Upstream(String(e && (e.shortMessage || e.message) || e).slice(0, 100));   // audit 1107 M-1
+    const err = classifyError(e);                                                            // audit 1108 M-3
+    if (!sent) { adj(d0, -reserve); if (err instanceof Upstream && !allowed) { dec(st.perIp, ip); dec(st.perPayer, from); rpcBucket.refund(ip); } saveSoon(); }   // audit 1099 M-2: no synchronous write; 1108: only Upstream is refunded
+    noteUnknown(err, ip);
+    throw err;
   } finally { inflight.delete(lockKey); }
 }
 
@@ -418,7 +456,7 @@ export async function statusOf(h) {
 }
 export const stats = () => { roll(); return { chain: CHAIN, relayer: account.address, gas_spent_today_eth: formatEther(st.gas), gas_budget_eth: formatEther(GAS_BUDGET_WEI_PER_DAY), fee_min: FEE_MIN.toString(), pay_enabled: !!STEALTHPAY, stealthpay: STEALTHPAY, pay_fee: PAY_FEE.toString(), pay_fee_min: PAY_FEE_MIN.toString(), sends: tmStats.n, avg_lock_wait_ms: tmStats.n ? Math.round(tmStats.wait / tmStats.n) : 0, max_lock_wait_ms: tmStats.maxWait, avg_send_ms: tmStats.n ? Math.round(tmStats.send / tmStats.n) : 0 }; };
 
-const fails = makeFailBudget({ perKey: FAIL_PER_IP, perMin: FAIL_PER_MIN }), refusedLines = makeLineLimiter(Number(E.STEALTH_RELAY_REFUSED_LOG_PER_MIN || 20)); let active = 0;
+const fails = makeFailBudget({ perKey: FAIL_PER_IP }), refusedLines = makeLineLimiter(Number(E.STEALTH_RELAY_REFUSED_LOG_PER_MIN || 20)); let active = 0;
 function serve() {
   http.createServer((req, res) => {
     const send = (code, obj) => { const s = JSON.stringify(obj); res.writeHead(code, { "Content-Type": "application/json", "Cache-Control": "no-store", "Content-Length": Buffer.byteLength(s) }); res.end(s); };
@@ -439,20 +477,22 @@ function serve() {
     if (req.method !== "POST" || !route || (route[1] && !isPay) || u.search) return send(404, { error: "not found" });
     const ip = String(req.headers["x-forwarded-for"] || req.socket.remoteAddress || "").split(",")[0].trim(), ipk = safeIp(ipKey(ip));
     // audit 1099 M-2: failure budgets and the concurrency cap are checked before the body is even read, independent of nginx
-    const why = fails.check(ipk); if (why) return send(429, { error: why });
+    const allowedNet = ALLOW.has(ipk);
+    if (allowedNet) log("allow-listed request", ipk, isPay ? "pay" : "relay");
+    const why = allowedNet ? null : fails.check(ipk); if (why) return send(429, { error: why });
     if (active >= MAX_CONCURRENT) return send(503, { error: "busy, try again shortly" });
     active++; let released = false; const release = () => { if (!released) { released = true; active--; } };
     res.on("close", release);
     let body = ""; req.on("data", c => { body += c; if (body.length > 8192) req.destroy(); });
     req.on("end", async () => {
-      try { const r = await (isPay ? relayPay : relay)(JSON.parse(body), ip); fails.ok(ipk); send(200, r); }
+      try { const r = await (isPay ? relayPay : relay)(JSON.parse(body), ip); send(200, r); }
       catch (e) {
         const msg = String(e && (e.shortMessage || e.message) || e).slice(0, 160);
         if (e instanceof Upstream) {                           // audit 1107 M-1: RPC / indexer trouble: 503, no failure budget consumed (an outage must not lock honest users out)
           const t = refusedLines.take(); if (t.log) log("upstream trouble", ipk, JSON.stringify(msg));
           return send(503, { error: "network busy, try again shortly" });
         }
-        fails.fail(ipk, failWeight(e), isCostly(e));           // audit 1107 L-1: weight by error CLASS, never by message text
+        if (!allowedNet) fails.fail(ipk, failWeight(e));                      // audit 1107 L-1: weight by error CLASS, never by message text
         const t = refusedLines.take();   // audit 1099 M-2: at most 20 refusal lines a minute, the rest is summarised
         if (t.summary) log("refused lines suppressed", t.summary);
         if (t.log) log("refused", ipk, JSON.stringify(msg));   // audit 1099 M-1: msg is data (later argument): neutralised; JSON.stringify: audit 1087 L-1, one line per refusal

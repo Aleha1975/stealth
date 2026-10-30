@@ -12,7 +12,7 @@ import { deriveForPayment, metaAddress, parseMeta, checkAnnouncement, decodeMeta
 import { CHAINS } from "../web/chains.js";
 import { postRelay } from "../web/relay-post.js";
 import { keccak } from "../web/stealth-crypto.js";
-import { makeFailBudget, failWeight, isLowS, SECP_N, ipKey, Refusal } from "./relay-util.mjs";
+import { makeFailBudget, makeTokenBucket, classifyError, failWeight, isLowS, SECP_N, ipKey, Refusal, Upstream } from "./relay-util.mjs";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const FORK_URL = "https://rpc.mainnet.chain.robinhood.com", FORK_BLOCK = 101173445;     // fixed block: anvil caches the state it fetches
@@ -80,13 +80,13 @@ try {
   const sanctioned = privateKeyToAccount(generatePrivateKey()).address;
   const sanctFile = path.join(tmp, "evm.json"); fs.writeFileSync(sanctFile, JSON.stringify({ published: "test", addresses: [sanctioned.toLowerCase()] }));
   const startRelayer = async (name, port, env) => {
-    const rk = generatePrivateKey(), addr = privateKeyToAccount(rk).address; await rpc("anvil_setBalance", [addr, toHex(10n ** 18n)]);
+    const rk = env.RELAYER_KEY || generatePrivateKey(), addr = privateKeyToAccount(rk).address; await rpc("anvil_setBalance", [addr, toHex(10n ** 18n)]);
     const logf = path.join(tmp, name + ".log");
     const p = spawn("nice", ["-n", "10", "node", path.join(HERE, "relayer.mjs")], { env: { ...process.env, STEALTH_ENV_ONLY: "1", STEALTH_CHAIN: "rh", STEALTH_RPC: RPC, STEALTHPAY: SP, RELAYER_KEY: rk, STEALTH_RELAY_PORT: String(port),
       STEALTH_RELAY_STATE: path.join(tmp, name + ".json"), STEALTH_RELAY_LOG: logf, STEALTH_SANCTIONS_FILE: sanctFile, STEALTH_INDEXER: "http://127.0.0.1:" + IPORT,
-      STEALTH_RELAY_PAY_FEE: String(FEE), STEALTH_RELAY_PAY_FEE_MIN: String(FEE), STEALTH_RELAY_GAS_BUDGET_WEI: "1000000000000000000", STEALTH_RELAY_MAX_PER_IP: "1000", STEALTH_RELAY_FAIL_PER_IP: "100000", STEALTH_RELAY_FAIL_PER_MIN: "100000", STEALTH_RELAY_GONE_GAP_MS: "1500", STEALTH_RELAY_REFUSED_LOG_PER_MIN: "100000", ...env }, stdio: ["ignore", "pipe", "inherit"] });
+      STEALTH_RELAY_PAY_FEE: String(FEE), STEALTH_RELAY_PAY_FEE_MIN: String(FEE), STEALTH_RELAY_GAS_BUDGET_WEI: "1000000000000000000", STEALTH_RELAY_MAX_PER_IP: "1000", STEALTH_RELAY_FAIL_PER_IP: "100000", STEALTH_RELAY_RPC_BURST: "100000", STEALTH_RELAY_GONE_GAP_MS: "1500", STEALTH_RELAY_REFUSED_LOG_PER_MIN: "100000", ...env }, stdio: ["ignore", "pipe", "inherit"] });
     procs.push(p); await new Promise(r => p.stdout.on("data", d => { if (String(d).includes("stealth relayer")) r(); }));
-    return { addr, logf, p, state: path.join(tmp, name + ".json"), log: () => fs.readFileSync(logf, "utf8") };
+    return { addr, key: rk, logf, p, state: path.join(tmp, name + ".json"), log: () => fs.readFileSync(logf, "utf8") };
   };
   const R1 = await startRelayer("r1", RPORT, { STEALTH_RELAY_FEE_MIN: String(FEE), STEALTH_RELAY_STUCK_S: "3" });
   const R2 = await startRelayer("r2", R2PORT, { STEALTH_RELAY_MAX_PER_IP: "3", STEALTH_RELAY_PAY_PER_PAYER: "2" });
@@ -158,7 +158,7 @@ try {
   eq("A2 payer debited exactly 5.000000", usd(a1 - await bal(A.address)), "5.000000");
   eq("A2 stealth got the full 5.000000 (fee 0)", usd(await bal(d2.stealth)), "5.000000");
   // extra stealth payments (own gas, cheap) that the negative tests will withdraw from
-  const W = {}; for (const k of ["rep", "dom", "dom2", "exp", "amt", "feelow", "nofee", "sanc", "par", "stuck", "drop", "nonce", "after", "dup", "dup2", "alk", "ntl", "rd", "lst", "pl1", "pl2"]) { W[k] = newDest(); await payOwnGas(A, W[k], 3n * U); }
+  const W = {}; for (const k of ["rep", "dom", "dom2", "exp", "amt", "feelow", "nofee", "sanc", "par", "stuck", "drop", "nonce", "after", "dup", "dup2", "alk", "ntl", "rd", "lst", "pl1", "pl2", "rs"]) { W[k] = newDest(); await payOwnGas(A, W[k], 3n * U); }
   await mine(3);
   // B scans announcements through the indexer
   let annRows = []; for (let i = 0; i < 90; i++) { try { annRows = (await (await fetch(IDX + "/announcements?since=0&limit=2000")).json()).rows; } catch {} if (annRows.length >= 2 + Object.keys(W).length) break; await sleep(500); }
@@ -407,7 +407,7 @@ try {
       ok("B12 M-2 a request that fails after the counters were taken: 400 and NO synchronous state write", r.status === 400 && /holds less/.test(r.error) && !fs.existsSync(R3.state), JSON.stringify(r));
       await sleep(2500);
       const j = fs.existsSync(R3.state) ? JSON.parse(fs.readFileSync(R3.state, "utf8")) : null;
-      ok("B12 M-2 ...the state is flushed a moment later, and the counters of the failed request are gone (no zero keys)", j && !("3.3.3.3" in j.perIp) && !(P0.address in j.perPayer), JSON.stringify(j).slice(0, 160)); }
+      ok("B12 M-2 ...the state is flushed a moment later; a refusal (not Upstream) stays charged to the per-IP daily counter (1108: refund only for Upstream)", j && j.perIp["3.3.3.3"] === 1, JSON.stringify(j).slice(0, 160)); }
     // per-network failure budget (5/hour on R3), independent of nginx; the /64 is one network
     { const junk = ip => post(RELAY3, "/relay", { garbage: 1 }, ip);
       const a = []; for (let i = 0; i < 6; i++) a.push(await junk("4.4.4.4"));
@@ -418,28 +418,29 @@ try {
       const many = []; for (let i = 0; i < 30; i++) many.push(await junk("5.5." + i + ".1"));
       const nref = R3.log().split("\n").filter(l => / refused /.test(l)).length;
       ok("B12 M-2 refusal log lines are rate limited (30 more failures: still at most 20 'refused' lines in the minute), requests still answered", many.every(r => r.status === 400) && nref <= 20 && nref >= 10, "lines " + nref); }
-    // global failure rate (audit 1107 M-1): only RPC-COSTLY failures (passed the offline checks: here a signed payment from an empty wallet) count; offline junk does not
-    { const p5 = await freePort(), R5 = await startRelayer("r5", p5, { STEALTH_RELAY_FAIL_PER_MIN: "8" }), RELAY5 = "http://127.0.0.1:" + p5 + "/stealth-api";
-      for (let i = 0; i < 40; i++) await post(RELAY5, "/relay", { garbage: 1 }, "6.0.1." + i);
-      const junkFresh = await post(RELAY5, "/relay", { garbage: 1 }, "6.0.9.9"), junkAgain = await post(RELAY5, "/relay", { garbage: 1 }, "6.0.1.0");
-      ok("B12 1107 M-1 40 offline-rejected junk requests from 40 networks do not trip the global ceiling: a failed-before network and a fresh one are both still answered 400", junkFresh.status === 400 && junkAgain.status === 400, junkFresh.status + "/" + junkAgain.status);
+    // audit 1108: no global failure state at all. A flood of failing requests (offline junk AND RPC-costly) from many networks must not block a fresh honest network
+    { const p5 = await freePort(), R5 = await startRelayer("r5", p5, { STEALTH_RELAY_FAIL_PER_IP: "5" }), RELAY5 = "http://127.0.0.1:" + p5 + "/stealth-api";
       const costly = async ip => { const P0 = await newPayer(0n), dd = newDest(), au = await payAuth(P0, dd, 2n * U, FEE, R5.addr); return post(RELAY5, "/relay/pay", payBody(P0, dd, 2n * U, FEE, R5.addr, au), ip); };
-      for (let i = 0; i < 10; i++) await costly("6.1.1." + i);
-      const again = await post(RELAY5, "/relay", { garbage: 1 }, "6.1.1.0"), fresh = await post(RELAY5, "/relay", { garbage: 1 }, "6.1.2.1");
-      ok("B12 M-2 global failure rate (costly failures): a network that already failed is refused (429), a clean one is still served (400)", again.status === 429 && /busy/.test(again.error) && fresh.status === 400, again.status + "/" + fresh.status); }
+      for (let i = 0; i < 300; i++) await post(RELAY5, "/relay", { garbage: 1 }, "6.0." + Math.floor(i / 200) + "." + (i % 200));
+      for (let i = 0; i < 40; i++) await costly("6.1.1." + i);
+      const again = await post(RELAY5, "/relay", { garbage: 1 }, "6.1.1.0"), junkFresh = await post(RELAY5, "/relay", { garbage: 1 }, "6.0.9.9");
+      const P = await newPayer(), dd = newDest(), au = await payAuth(P, dd, 2n * U, FEE, R5.addr), honest = await post(RELAY5, "/relay/pay", payBody(P, dd, 2n * U, FEE, R5.addr, au), "6.1.9.9");
+      ok("B12 1108 M-1 a flood from 340 networks (300 offline junk, 40 RPC-costly failures) cannot block a fresh honest network: it is served (200 with a hash) and fresh junk still gets its normal 400",
+        honest.status === 200 && !!honest.hash && junkFresh.status === 400, JSON.stringify(honest).slice(0, 100) + " " + junkFresh.status);
+      ok("B12 1108 M-1 ...while a network that failed before is limited only by its OWN budget (429 after its per-key failures)", again.status === 400 || again.status === 429, String(again.status)); }
     // fault-injecting RPC in front of anvil, for R4: counts calls, can fail receipt reads, can answer a send with an error AFTER it was accepted
     const fault = { calls: 0, failReads: false, dupErr: null, failCalls: false, hide: 0 };
-    const fwd = async o => { fault.calls++; if (fault.failCalls && o.method === "eth_call") return { jsonrpc: "2.0", id: o.id, error: { code: -32603, message: "internal error" } };
+    const fwd = async o => { fault.calls++; if (fault.failCalls && o.method === "eth_call") return { __http: 502 };   // 1108: a real transport/5xx failure
       if (fault.hide > 0 && /^eth_getTransaction(Receipt|ByHash)$/.test(o.method)) { fault.hide--; return { jsonrpc: "2.0", id: o.id, result: null }; }   // 1107 L-2: our own transaction is "not visible yet" on this backend
       if (fault.failReads && /^eth_getTransaction(Receipt|ByHash)$/.test(o.method)) return { jsonrpc: "2.0", id: o.id, error: { code: -32005, message: "rate limited" } };
       const j = await fetch(RPC, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(o) }).then(r => r.json());
       if (o.method === "eth_sendRawTransaction" && fault.dupErr && !j.error) return { jsonrpc: "2.0", id: o.id, error: { code: -32000, message: fault.dupErr } };
       return j; };
-    const fproxy = httpServer.createServer((q, r) => { let b = ""; q.on("data", c => b += c); q.on("end", async () => { try { const j = JSON.parse(b); const out = Array.isArray(j) ? await Promise.all(j.map(fwd)) : await fwd(j); r.writeHead(200, { "content-type": "application/json" }); r.end(JSON.stringify(out)); } catch (e) { r.writeHead(502); r.end(String(e)); } }); });
+    const fproxy = httpServer.createServer((q, r) => { let b = ""; q.on("data", c => b += c); q.on("end", async () => { try { const j = JSON.parse(b); const out = Array.isArray(j) ? await Promise.all(j.map(fwd)) : await fwd(j); if ([].concat(out).some(x => x && x.__http)) { r.writeHead(502); return r.end("bad gateway"); } r.writeHead(200, { "content-type": "application/json" }); r.end(JSON.stringify(out)); } catch (e) { r.writeHead(502); r.end(String(e)); } }); });
     const fpPort = await freePort(); await new Promise(r => fproxy.listen(fpPort, "127.0.0.1", r)); procs.push({ kill: () => fproxy.close() });
     const p4 = await freePort(), R4 = await startRelayer("r4", p4, { STEALTH_RPC: "http://127.0.0.1:" + fpPort, STEALTH_RELAY_STUCK_S: "3", STEALTH_RELAY_GONE_GAP_MS: "1000" }), RELAY4 = "http://127.0.0.1:" + p4 + "/stealth-api";
     await rpc("evm_setAutomine", [true]); await mine(1);
-    for (const k of ["alk", "ntl", "rd", "lst", "pl1", "pl2"]) await knownWait(W[k].stealth);
+    for (const k of ["alk", "ntl", "rd", "lst", "pl1", "pl2", "rs"]) await knownWait(W[k].stealth);
     // cheap validation: bad signature / expired authorization are refused with ZERO RPC calls (and no address lock taken)
     { const c0 = fault.calls, bad = await post(RELAY4, "/relay", await wbody(W.alk.stealth, C, 2n * U, null, { domain: { chainId: 1 } }), nip());
       const P = await newPayer(), dd = newDest(), au = await payAuth(P, dd, 2n * U, FEE, R4.addr, { domain: { chainId: 1 } }), badPay = await post(RELAY4, "/relay/pay", payBody(P, dd, 2n * U, FEE, R4.addr, au), nip());
@@ -476,6 +477,8 @@ try {
     { const P = await newPayer(), ip = "9.8.7.6"; fault.failCalls = true; const codes = [];
       for (let i = 0; i < 35; i++) { const dd = newDest(), au = await payAuth(P, dd, 2n * U, FEE, R4.addr); const r = await post(RELAY4, "/relay/pay", payBody(P, dd, 2n * U, FEE, R4.addr, au), ip); codes.push(r.status + (r.status === 503 && /network busy/.test(r.error) ? "" : "!")); }
       fault.failCalls = false;
+      await sleep(2200); const jo = JSON.parse(fs.readFileSync(R4.state, "utf8"));
+      ok("B12 1108 M-3 ...and an Upstream failure is refunded to the per-IP daily counter (no entry for that network, none for the payer)", !(ip in jo.perIp) && !(P.address in jo.perPayer), JSON.stringify(jo.perIp).slice(0, 120));
       const dd = newDest(), au = await payAuth(P, dd, 2n * U, FEE, R4.addr), after = await post(RELAY4, "/relay/pay", payBody(P, dd, 2n * U, FEE, R4.addr, au), ip);
       ok("B12 1107 M-1 RPC outage: 35 requests from one network all 503 'network busy' (no 429), and the same network is served as soon as the RPC is back", codes.every(c => c === "503") && after.status === 200 && !!after.hash, codes.slice(0, 5).join() + " ... " + JSON.stringify(after)); }
     // 1107 L-2: ambiguous send error + our transaction not visible on the first poll: polled again ~1 s later, found, the ORIGINAL hash returned, exactly one transaction
@@ -494,20 +497,109 @@ try {
       ok("B12 1107 L-2 retry of the same authorization finds the first transaction (same tx, no second send): one transaction on chain, money moved once", w2.status === 200 && rc && rc.status === "success" && (await nonceOf(R4.addr)) - n0 === 1 && (await bal(C)) - c0 === 2n * U, JSON.stringify(w2) + " nonce+" + ((await nonceOf(R4.addr)) - n0) + " | " + R4.log().split("\n").slice(-4).join(" / ").slice(-400)); }
   }
 
+  // ===================================================================================== B12b) audit 1108: per-key limits only, errors classified by cause, restart, lock deadline
+  sect("B12b) 1108: per-key token bucket, classification by cause, dedupe touches no budget, restart safety, lock deadline");
+  { const pyCount = (lines) => Number(spawnSync("python3", ["-B", "-c", "import sys,importlib.util\nspec=importlib.util.spec_from_file_location('w',sys.argv[1]); m=importlib.util.module_from_spec(spec); spec.loader.exec_module(m)\nprint(sum(1 for l in sys.stdin.read().splitlines() if m.LOG_TEMPLATE.match(l)))", path.join(HERE, "stealth_watch.py")], { input: lines.join("\n"), encoding: "utf8" }).stdout);
+    // the fault proxy is declared inside the B12 block above: rebuild a small one here for the 1108 relayers (revert / odd error / slow nonce / HTTP 502 switches)
+    const fa = { m: {}, calls: 0, http502: false, revert: false, odd: false, slowNonce: 0 };
+    const fw = async o => { fa.calls++; if (fa.revert || fa.odd) fa.m[o.method] = (fa.m[o.method] || 0) + 1; if (fa.http502 && o.method === "eth_call") return { __http: 502 };
+      if (fa.revert && /^eth_(estimateGas|fillTransaction)$/.test(o.method)) return { jsonrpc: "2.0", id: o.id, error: { code: 3, message: "execution reverted", data: "0x" } };
+      if (fa.odd && /^eth_(estimateGas|fillTransaction)$/.test(o.method)) return { jsonrpc: "2.0", id: o.id, error: { code: -32000, message: "some-odd-node-secret-text" } };
+      if (fa.slowNonce && o.method === "eth_getTransactionCount") await sleep(fa.slowNonce);
+      return fetch(RPC, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(o) }).then(r => r.json()); };
+    const fpx = httpServer.createServer((q, r) => { let b = ""; q.on("data", c => b += c); q.on("end", async () => { try { const j = JSON.parse(b); const out = Array.isArray(j) ? await Promise.all(j.map(fw)) : await fw(j);
+      if ([].concat(out).some(x => x && x.__http)) { r.writeHead(502); return r.end("bad gateway"); } r.writeHead(200, { "content-type": "application/json" }); r.end(JSON.stringify(out)); } catch (e) { r.writeHead(502); r.end(String(e)); } }); });
+    const fxPort = await freePort(); await new Promise(r => fpx.listen(fxPort, "127.0.0.1", r)); procs.push({ kill: () => fpx.close() });
+    await rpc("evm_setAutomine", [true]); await mine(1);
+    const p7 = await freePort(), R7 = await startRelayer("r7", p7, { STEALTH_RPC: "http://127.0.0.1:" + fxPort, STEALTH_RELAY_FAIL_PER_IP: "3", STEALTH_RELAY_RPC_BURST: "3", STEALTH_RELAY_RPC_REFILL_MS: "3600000" }), RELAY7 = "http://127.0.0.1:" + p7 + "/stealth-api";
+    const mk = async R => { const P = await newPayer(), dd = newDest(), au = await payAuth(P, dd, 2n * U, FEE, R.addr); return { P, dd, au, body: payBody(P, dd, 2n * U, FEE, R.addr, au) }; };
+    const payReq = async (ip) => { const q = await mk(R7); return post(RELAY7, "/relay/pay", q.body, ip); };
+    const stateOf = async R => { await sleep(2200); return JSON.parse(fs.readFileSync(R.state, "utf8")); };
+    // a) Upstream (HTTP 502): 503, nothing charged, bucket token and daily counter refunded: 8 outage requests > burst 3, and the same network is then served 3 times
+    fa.http502 = true; const outage = []; for (let i = 0; i < 8; i++) outage.push(await payReq("7.1.1.1")); fa.http502 = false;
+    ok("B12b 1108 M-3 transport failure (HTTP 502): 503 'network busy' for all 8 requests although the burst is 3 (token refunded), never charged (no 429)", outage.every(r => r.status === 503 && /network busy/.test(r.error)), outage.map(r => r.status).join());
+    const j7 = await stateOf(R7);
+    ok("B12b 1108 M-3 ...and the per-IP daily counter was refunded only because it was Upstream", !("7.1.1.1" in j7.perIp));
+    const s3 = []; for (let i = 0; i < 3; i++) s3.push(await payReq("7.1.1.1")); const s4 = await payReq("7.1.1.1"), other = await payReq("7.1.1.2");
+    ok("B12b 1108 token bucket: burst 3 per network served, the 4th from the same network is refused ('too many requests from this network'), another network is unaffected",
+      s3.every(r => r.status === 200 && r.hash) && s4.status === 400 && /too many requests from this network/.test(s4.error) && other.status === 200, JSON.stringify([s3.map(r => r.status), s4, other.status]).slice(0, 200));
+    // b) a simulation revert is a costly Refusal charged to the key (weight 1; FAIL_PER_IP 3): 3 x 400, then 429; the per-IP daily counter is NOT refunded
+    fa.revert = true; const rv = []; for (let i = 0; i < 4; i++) rv.push(await payReq("7.2.2.2")); fa.revert = false;
+    ok("B12b 1108 M-3 estimateGas revert: 400 'would fail on chain' (not 503), charged to the key: the 4th request is 429", rv.slice(0, 3).every(r => r.status === 400 && /would fail on chain/.test(r.error)) && rv[3].status === 429, JSON.stringify(rv).slice(0, 300) + " methods " + JSON.stringify(fa.m));
+    const j7b = await stateOf(R7);
+    ok("B12b 1108 M-3 ...and the revert is not refunded to the per-IP daily counter", j7b.perIp["7.2.2.2"] === 3, JSON.stringify(j7b.perIp));
+    // c) unknown error: charged at weight 1, never refunded, its text is NOT sent to the client, only logged
+    fa.odd = true; const od = []; for (let i = 0; i < 4; i++) od.push(await payReq("7.3.3.3")); fa.odd = false;
+    ok("B12b 1108 M-3 unknown error: 400 generic text without the node's wording, charged at weight 1 (4th is 429), detail only in the log",
+      od.slice(0, 3).every(r => r.status === 400 && /could not be processed/.test(r.error) && !/odd-node/.test(JSON.stringify(r))) && od[3].status === 429 && /unclassified error/.test(R7.log()) && /odd-node/.test(R7.log()), od.map(r => r.status).join());
+    // d) a dedupe hit changes NO budget: no token, no counter, no gas, no state write; a garbage signature gets no hash (M-2)
+    { const ipd = "7.4.4.4", q = await mk(R7), first = await post(RELAY7, "/relay/pay", q.body, ipd);
+      if (first.hash) await pub.waitForTransactionReceipt({ hash: first.hash }); await sleep(2200);
+      const snap = async () => { const j = JSON.parse(fs.readFileSync(R7.state, "utf8")); return JSON.stringify({ g: j.gas, i: j.perIp, p: j.perPayer, f: j.perFrom }) + (await (await fetch(RELAY7 + "/relay/stats")).json()).gas_spent_today_eth; };
+      const before = await snap(); const hits = []; for (let i = 0; i < 20; i++) hits.push(await post(RELAY7, "/relay/pay", q.body, i % 2 ? ipd : "7.4.5." + i));
+      const forged = await post(RELAY7, "/relay/pay", { ...q.body, auth: { ...q.body.auth, r: "0x" + "12".repeat(32), s: "0x" + "34".repeat(32) } }, "7.4.6.6");
+      await sleep(2200); const after = await snap();
+      ok("B12b 1108 M-2 20 dedupe hits: all 200 with the ORIGINAL hash, and the budget state (daily gas, per-IP/payer counters, stats) is byte-identical", first.status === 200 && hits.every(r => r.status === 200 && r.hash === first.hash) && before === after, before.slice(0, 80) + " | " + after.slice(0, 80));
+      ok("B12b 1108 M-2 a garbage signature for a known authorization gets no hash (400 'signature does not match'): the signature is checked before the dedupe lookup", forged.status === 400 && /signature does not match/.test(forged.error) && !forged.hash, JSON.stringify(forged));
+      const n1 = await payReq(ipd), n2 = await payReq(ipd), n3 = await payReq(ipd);
+      ok("B12b 1108 M-2 ...and the 20 hits took no bucket token: the same network still gets its remaining 2 of the burst (3 - 1 real request), the 3rd new one is refused", n1.status === 200 && n2.status === 200 && n3.status === 400 && /too many requests/.test(n3.error), [n1.status, n2.status, n3.status].join()); }
+    // e) L-2: the nonce lock has ONE deadline. A stalled getTransactionCount: 503 within the deadline, ALERT line (watchdog template), NOTHING sent, the next request works
+    { const p8 = await freePort(), R8 = await startRelayer("r8", p8, { STEALTH_RPC: "http://127.0.0.1:" + fxPort, STEALTH_RELAY_LOCK_MS: "1500" }), RELAY8 = "http://127.0.0.1:" + p8 + "/stealth-api";
+      const q = await mk(R8); fa.slowNonce = 8000; const t0 = Date.now(); const w = await post(RELAY8, "/relay/pay", q.body, "8.1.1.1"); const dt = Date.now() - t0; fa.slowNonce = 0;
+      await sleep(8500);
+      const alertLn = R8.log().split("\n").filter(l => / ALERT nonce lock deadline exceeded /.test(l));
+      ok("B12b 1108 L-2 stalled nonce read: 503 at the lock deadline (~1.5 s, not 8 s), one ALERT line that the watchdog template matches, and NO transaction was sent", w.status === 503 && dt < 6000 && alertLn.length === 1 && pyCount(alertLn) === 1 && (await nonceOf(R8.addr)) === 0, dt + " ms " + JSON.stringify(w) + " nonce " + (await nonceOf(R8.addr)) + " alerts " + alertLn.length + " py " + pyCount(alertLn));
+      const w2 = await post(RELAY8, "/relay/pay", q.body, "8.1.1.1"); if (w2.hash) await pub.waitForTransactionReceipt({ hash: w2.hash });
+      ok("B12b 1108 L-2 ...the lock was released: the retry of the same payment is sent once (nonce 0 -> 1) and mined", w2.status === 200 && (await nonceOf(R8.addr)) === 1, JSON.stringify(w2)); }
+    // g) STEALTH_RELAY_ALLOW_KEYS: skips buckets, daily counters and the failure counter; validation still applies; one fixed log line per request
+    { const p10 = await freePort(), R10 = await startRelayer("r10", p10, { STEALTH_RELAY_ALLOW_KEYS: "7.9.9.9, 2001:db8:77:77::1", STEALTH_RELAY_FAIL_PER_IP: "2", STEALTH_RELAY_RPC_BURST: "1", STEALTH_RELAY_RPC_REFILL_MS: "3600000", STEALTH_RELAY_MAX_PER_IP: "1" }), RELAY10 = "http://127.0.0.1:" + p10 + "/stealth-api";
+      const pq = async ip => { const q = await mk(R10); return post(RELAY10, "/relay/pay", q.body, ip); };
+      const al = []; for (let i = 0; i < 4; i++) al.push(await pq(i % 2 ? "7.9.9.9" : "2001:db8:77:77:" + i + "::5"));
+      const jj = []; for (let i = 0; i < 5; i++) jj.push(await post(RELAY10, "/relay", { garbage: 1 }, "7.9.9.9"));
+      const bad = await post(RELAY10, "/relay/pay", { ...(await mk(R10)).body, amount: "500000" }, "7.9.9.9");
+      const n1 = await pq("7.8.8.8"), n2 = await pq("7.8.8.8");
+      const j10 = await stateOf(R10);
+      ok("B12b allow-list: 4 payments from allowed keys (IPv4 and IPv6 /64) pass although burst=1 and MAX_PER_IP=1; 5 junk requests are all 400 (no 429); no counter was written for them",
+        al.every(r => r.status === 200) && jj.every(r => r.status === 400) && !("7.9.9.9" in j10.perIp) && !Object.keys(j10.perIp).some(k => k.startsWith("2001")), JSON.stringify([al.map(r => r.status), jj.map(r => r.status), j10.perIp]));
+      ok("B12b allow-list: validation still applies (tampered amount -> signature error), and a non-listed network is still limited (2nd request refused)", bad.status === 400 && /signature/.test(bad.error) && n1.status === 200 && n2.status === 400, JSON.stringify([bad, n1.status, n2]).slice(0, 200));
+      ok("B12b allow-list: exactly one fixed 'allow-listed request' log line per allowed request (4 payments + 5 junk + 1 tampered = 10)", R10.log().split("\n").filter(l => / allow-listed request /.test(l)).length === 10); }
+    // f) L-1 / I-1: restart between send and confirm. The signed hash is persisted BEFORE the send; the retry after a restart finds THAT transaction (no second one), the withdrawal counts once
+    { await rpc("evm_setAutomine", [false]);
+      const p9 = await freePort(), R9 = await startRelayer("r9", p9, {}), body = await wbody(W.rs.stealth, C, 2n * U, null);
+      const c0 = await bal(C), n0 = await nonceOf(R9.addr), w1 = await post("http://127.0.0.1:" + p9 + "/stealth-api", "/relay", body, nip());
+      const s1 = JSON.parse(fs.readFileSync(R9.state, "utf8")); R9.p.kill("SIGKILL"); await sleep(500);
+      ok("B12b 1108 L-1 the unconfirmed send is in the state file with its hash (24 h TTL), the transaction is pending (not mined)", w1.status === 200 && Array.isArray(s1.unsure) && s1.unsure.length === 1 && s1.unsure[0][1].h === w1.hash && (await nonceOf(R9.addr)) === n0 && s1.perFrom[body.from] === 1, JSON.stringify(s1).slice(0, 200));
+      const p9b = await freePort(), R9b = await startRelayer("r9", p9b, { RELAYER_KEY: R9.key }), w2 = await post("http://127.0.0.1:" + p9b + "/stealth-api", "/relay", body, nip());
+      await rpc("evm_setAutomine", [true]); await mine(2); let rc = null; if (w2.hash) rc = await pub.waitForTransactionReceipt({ hash: w2.hash, timeout: 15000 }).catch(() => null); await sleep(2200);
+      const s2 = JSON.parse(fs.readFileSync(R9b.state, "utf8"));
+      ok("B12b 1108 L-1 restart + retry of the same authorization: the SAME hash, exactly one transaction on chain, money moved once", w2.status === 200 && w2.hash === w1.hash && rc && rc.status === "success" && (await nonceOf(R9.addr)) - n0 === 1 && (await bal(C)) - c0 === 2n * U && /earlier unconfirmed send found/.test(R9b.log()), JSON.stringify(w2) + " nonce+" + ((await nonceOf(R9.addr)) - n0));
+      ok("B12b 1108 I-1 ...and the recovered send counts ONCE against the address's daily withdrawals (perFrom 1, not 2); the entry is gone once mined", s2.perFrom[body.from] === 1 && s2.unsure.length === 0, JSON.stringify(s2).slice(0, 200)); }
+  }
+
   // ===================================================================================== B13) audit 1102 units
-  sect("B13) 1102 M-1 / L-1 units: shared ceiling, honest-refusal weight, nginx map");
-  { let t = 0; const fb = makeFailBudget({ perKey: 30, perMin: 10, now: () => t });
-    for (let i = 0; i < 20; i++) fb.fail("k" + i, 1, true);                              // 20 distinct networks with RPC-costly failures in one minute (hardMin = 2 x perMin)
-    ok("1102/1107 M-1 shared ceiling: a network with NO earlier failure is refused once RPC-costly failures hit the ceiling", fb.check("fresh") !== null && /busy/.test(fb.check("fresh")) && fb.check("k0") !== null);
-    fb.ok("honest");
-    ok("1107 M-1 ...but a key with a recent success keeps reserved capacity (also a key that failed before)", fb.check("honest") === null && (fb.ok("k0"), fb.check("k0")) === null);
-    const fbj = makeFailBudget({ perKey: 30, perMin: 10, now: () => t });
-    for (let i = 0; i < 40; i++) for (let j = 0; j < 30; j++) fbj.fail("junk" + i, 1, false);   // 1200 offline-rejected junk requests from 40 networks
-    ok("1107 M-1 offline-rejected junk never trips the global ceiling: a fresh key is served; the junk keys hit their own per-key budget", fbj.check("fresh") === null && fbj.check("junk0") !== null && /too many failed/.test(fbj.check("junk0")));
-    const fb2 = makeFailBudget({ perKey: 30, perMin: 10, now: () => t });
-    for (let i = 0; i < 12; i++) fb2.fail("k" + i, 1, true);
-    ok("1102 M-1 below the ceiling a clean network still passes while a failed one is refused", fb2.check("fresh") === null && fb2.check("k0") !== null);
-    t += 61_000; ok("1102 M-1 the window resets after a minute", fb.check("fresh") === null);
+  sect("B13) units: per-key limits (no global state), classification by cause, honest-refusal weight, nginx map");
+  { let t = 0; const fb = makeFailBudget({ perKey: 30, now: () => t });
+    for (let i = 0; i < 400; i++) for (let j = 0; j < 30; j++) fb.fail("k" + i, 1);          // 12 000 failures from 400 networks inside one minute
+    ok("1108 M-1 no global failure state: after a flood from 400 networks a fresh key is served, each flooding key is limited by its OWN budget only", fb.check("fresh") === null && fb.check("k0") !== null && /too many failed/.test(fb.check("k399")) && fb.ok === undefined);
+    t += 3601_000; ok("1108 per-key failure counter resets after an hour", fb.check("k0") === null);
+    const fbs = makeFailBudget({ perKey: 30, maxKeys: 100, now: () => t }); for (let i = 0; i < 1000; i++) fbs.fail("m" + i, 1);
+    ok("1108 the key map stays bounded (maxKeys)", fbs.size() <= 100, String(fbs.size()));
+    let tb = 0; const bk = makeTokenBucket({ cap: 3, refillMs: 1000, maxKeys: 50, now: () => tb });
+    const first = [bk.take("a"), bk.take("a"), bk.take("a"), bk.take("a")]; const indep = bk.take("b");
+    tb += 1000; const refilled = bk.take("a"), notYet = bk.take("a"); bk.refund("a"); const afterRefund = bk.take("a");
+    for (let i = 0; i < 200; i++) bk.take("x" + i);
+    ok("1108 token bucket: burst, refusal when empty, per-key independence, refill by time, refund, bounded keys", first.join() === "true,true,true,false" && indep && refilled && !notYet && afterRefund && bk.size() <= 50, first.join() + " " + bk.size());
+    const named = (name, cause, extra = {}) => Object.assign(new Error(name + " boom"), { name, ...(cause ? { cause } : {}), ...extra });
+    const cls = e => classifyError(e);
+    ok("1108 M-3 transport errors (HttpRequestError, TimeoutError, status 5xx, fetch failed) -> Upstream, also nested in viem wrappers",
+      [named("HttpRequestError"), named("TimeoutError"), named("X", null, { status: 503 }), named("TypeError", null, { message: "fetch failed" }), named("ContractFunctionExecutionError", named("HttpRequestError"))].every(e => cls(e) instanceof Upstream));
+    const rv = [named("ContractFunctionRevertedError"), named("EstimateGasExecutionError", named("ExecutionRevertedError")), Object.assign(new Error("x"), { details: "execution reverted: nope" })].map(cls);
+    ok("1108 M-3 simulation reverts -> Refusal{costly}, weight 1, a fixed message (no node text)", rv.every(r => r instanceof Refusal && r.costly && !r.unknown && failWeight(r) === 1 && r.message === "the transaction would fail on chain"));
+    const un = cls(new Error("something-secret-from-the-node")), pass = new Refusal("x", { honest: true });
+    ok("1108 M-3 unknown errors -> Refusal{unknown}, weight 1, node text not in the message; a Refusal/Upstream passes through unchanged; a transport error whose body says 'execution reverted' is still Upstream",
+      un instanceof Refusal && un.unknown && failWeight(un) === 1 && !/secret/.test(un.message) && /secret/.test(un.detail) && cls(pass) === pass && cls(named("HttpRequestError", null, { details: "execution reverted" })) instanceof Upstream);
+    const srcU = fs.readFileSync(path.join(HERE, "relay-util.mjs"), "utf8"), srcR = fs.readFileSync(path.join(HERE, "relayer.mjs"), "utf8");
+    ok("1108 the old ceiling is gone: no hardMin / recentGood / good-map / ok() / isCostly / FAIL_PER_MIN / winN anywhere", !/hardMin|recentGood|isCostly|FAIL_PER_MIN|winN|fails\.ok|goodMs/.test(srcU + srcR) && !/\bok\(k\)/.test(srcU));
     const fb3 = makeFailBudget({ perKey: 30, now: () => t });
     const honest = new Refusal("a withdrawal from this address is already in progress", { honest: true });
     for (let i = 0; i < 100; i++) fb3.fail("shared", failWeight(honest));
@@ -546,10 +638,12 @@ def run(): return sorted(k for k in m.check_chain(c,st) if ':log-' in k)
 open(lg,'w').write('x'*10+'\\n'); r0=run()
 open(lg,'a').write(A(1)); r1=run()
 os.rename(lg,lg+'.1'); open(lg,'w').write(A(2)+A(3)+A(4)+A(5)+'y\\n'); r2=run()
-print(json.dumps([r0,r1,r2]))`;
+open(lg,'w').write(A(6)+'p'*400+'\\n'); r3=run()
+print(json.dumps([r0,r1,r2,r3]))`;
     const o = spawnSync("python3", ["-B", "-c", py, path.join(HERE, "stealth_watch.py"), lg], { encoding: "utf8" });
     let r = null; try { r = JSON.parse(o.stdout); } catch {}
     ok("1107 I-3 watchdog: first run reads nothing, a new ALERT is seen, and after a rotation the regrown file (larger than the old offset) is still read from its start", r && r[0].length === 0 && r[1].length === 1 && r[2].length === 1, (o.stdout + o.stderr).slice(0, 300));
+    ok("1108 I-2 watchdog: copytruncate (same inode, file regrown past the old offset, new first line) is detected and read from its start", r && r[3].length === 1, (o.stdout + o.stderr).slice(0, 300));
     fs.rmSync(dir, { recursive: true, force: true }); }
 
   // ===================================================================================== C) UI pay amount

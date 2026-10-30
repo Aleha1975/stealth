@@ -33,36 +33,32 @@ export const safeIp = ip => (/^[0-9a-fA-F:.\/]{1,64}$/.test(String(ip)) ? String
 /** Audit 1099 I-2: keep a Map bounded by dropping the OLDEST entries (insertion order), never clear it wholesale. */
 export function capMap(m, max) { while (m.size > max) m.delete(m.keys().next().value); }
 
-/** Audit 1099 M-2 / 1107 M-1: failure budgets, independent of nginx. Per network key (ipKey): at most `perKey` failures per hour (all failures, also offline-rejected junk).
- *  Globally only RPC-COSTLY failures (those that passed the offline checks) count towards the minute window: offline junk is limited by the per-key budget and nginx alone,
- *  so it can never lock honest users out. A key with a recent success (within `goodMs`) is never refused by the global window (reserved capacity); the per-key budget still applies.
- *  Memory bounded by `maxKeys`. */
-export function makeFailBudget({ perKey = 30, perMin = 120, hardMin = perMin * 2, maxKeys = 10000, goodMs = 3600_000, now = () => Date.now() } = {}) {
-  const per = new Map(), good = new Map(); let winStart = 0, winN = 0;
+/** Audit 1099 M-2 / 1108: abuse limits are PER KEY only (key = ipKey: IPv4 or IPv6 /64). Nothing here is global state, so no party can lock out another key.
+ *  makeFailBudget: a cheap counter of failed requests per key and hour (offline-rejected junk costs ~0 to refuse; nginx limits the rate). Memory bounded by `maxKeys`.
+ *  makeTokenBucket: admission of RPC-costly requests per key (burst `cap`, one token back every `refillMs`). */
+export function makeFailBudget({ perKey = 30, maxKeys = 10000, now = () => Date.now() } = {}) {
+  const per = new Map();
   const cur = k => { const e = per.get(k); if (!e) return 0; if (now() - e.t > 3600_000) { per.delete(k); return 0; } return e.n; };
-  const recentGood = k => { const t = good.get(k); if (t === undefined) return false; if (now() - t > goodMs) { good.delete(k); return false; } return true; };
   return {
     /** null if allowed, else the refusal text */
-    check(k) {
-      const n = cur(k);
-      if (n >= perKey) return "too many failed requests from this network, try again later";
-      const hot = now() - winStart < 60_000;
-      if (hot && !recentGood(k)) {
-        if (n > 0 && winN >= perMin) return "the relayer is busy with failing requests, try again later";
-        if (winN >= hardMin) return "the relayer is busy with failing requests, try again later";   // shared ceiling for keys without a recent success (a /48 has 65k fresh keys)
-      }
-      return null;
-    },
-    /** w = weight toward the per-key hour budget (honest state refusals, audit 1102 L-1); costly = the request reached the RPC (audit 1107 M-1): only those count in the global window */
-    fail(k, w = 1, costly = false) {
-      const t = now();
-      if (costly) { if (t - winStart >= 60_000) { winStart = t; winN = 0; } winN++; }
-      const e = per.get(k); if (e && t - e.t <= 3600_000) e.n += w; else { per.delete(k); per.set(k, { n: w, t }); }
+    check(k) { return cur(k) >= perKey ? "too many failed requests from this network, try again later" : null; },
+    /** w = weight toward the per-key hour budget (honest state refusals weigh less, audit 1102 L-1) */
+    fail(k, w = 1) {
+      const t = now(), e = per.get(k);
+      if (e && t - e.t <= 3600_000) e.n += w; else { per.delete(k); per.set(k, { n: w, t }); }
       capMap(per, maxKeys);
     },
-    /** a completed request (hash returned): the key gets reserved capacity */
-    ok(k) { good.delete(k); good.set(k, now()); capMap(good, maxKeys); },
     size: () => per.size,
+  };
+}
+export function makeTokenBucket({ cap = 20, refillMs = 10_000, maxKeys = 10000, now = () => Date.now() } = {}) {
+  const m = new Map();
+  const level = k => { const e = m.get(k), t = now(); if (!e) return cap; return Math.min(cap, e.n + (t - e.t) / refillMs); };
+  const put = (k, n) => { m.delete(k); m.set(k, { n, t: now() }); capMap(m, maxKeys); };
+  return {
+    take(k) { const n = level(k); if (n < 1) return false; put(k, n - 1); return true; },
+    refund(k) { if (m.has(k)) put(k, Math.min(cap, level(k) + 1)); },
+    size: () => m.size,
   };
 }
 
@@ -78,12 +74,28 @@ export const SECP_N = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8C
 export const isLowS = s => { try { const x = BigInt(s); return x > 0n && x <= SECP_N / 2n; } catch { return false; } };
 
 /** Audit 1107 L-1: a refusal thrown by the state-dependent checks. honest = depends on the caller's own state (weight 0.2 against the shared per-network budget, so one abuser
- *  behind a shared IPv4 cannot lock honest users out with ordinary errors); costly = the request already touched the RPC (counts in the global minute window).
- *  failWeight looks at this class, never at message text (messages can embed user input, e.g. BigInt SyntaxErrors). */
+ *  behind a shared IPv4 cannot lock honest users out with ordinary errors); costly = the request already touched the RPC. failWeight looks at the class, never at message text
+ *  (messages can embed user input, e.g. BigInt SyntaxErrors). */
 export class Refusal extends Error {
-  constructor(msg, { honest = false, costly = false } = {}) { super(msg); this.name = "Refusal"; this.honest = honest; this.costly = costly; }
+  constructor(msg, { honest = false, costly = false, unknown = false } = {}) { super(msg); this.name = "Refusal"; this.honest = honest; this.costly = costly; this.unknown = unknown; }
 }
-/** Audit 1107 M-1: infrastructure trouble (RPC / indexer down or slow) after the offline checks. Answered 503; consumes no failure budget. */
+/** Infrastructure trouble (RPC / indexer down or slow) after the offline checks. Answered 503; consumes no failure budget. */
 export class Upstream extends Error { constructor(msg) { super(msg); this.name = "Upstream"; } }
 export const failWeight = e => (e instanceof Refusal && e.honest ? 0.2 : 1);
-export const isCostly = e => e instanceof Refusal && e.costly;
+
+/** Audit 1108 M-3: classify an error by CAUSE (viem error names along the .cause chain, never the caller's text). Demonstrable transport trouble -> Upstream (503, nothing charged);
+ *  a simulation revert -> Refusal{costly} (charged to the key); anything else -> Refusal{unknown} (charged at weight 1, never refunded). */
+const TRANSPORT = /^(HttpRequestError|TimeoutError|WebSocketRequestError|SocketClosedError)$/;
+const REVERT = /^(ContractFunctionRevertedError|ExecutionRevertedError)$/;
+export function classifyError(e) {
+  if (e instanceof Refusal || e instanceof Upstream) return e;
+  let transport = false, revert = false;
+  for (let x = e, i = 0; x && i < 8; i++, x = x.cause) {
+    const n = String(x.name || "");
+    if (TRANSPORT.test(n) || (typeof x.status === "number" && x.status >= 500) || (n === "TypeError" && /fetch failed/i.test(String(x.message)))) transport = true;
+    if (REVERT.test(n) || /execution reverted/i.test(String(x.details || x.shortMessage || ""))) revert = true;
+  }
+  if (transport) return new Upstream(String(e && (e.shortMessage || e.message) || e).slice(0, 100));
+  if (revert) return new Refusal("the transaction would fail on chain", { costly: true });
+  return Object.assign(new Refusal("the request could not be processed", { costly: true, unknown: true }), { detail: String(e && ((e.details ? e.shortMessage + " / " + e.details : e.shortMessage) || e.message) || e).slice(0, 160) });
+}
