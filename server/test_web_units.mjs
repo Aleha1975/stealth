@@ -190,7 +190,13 @@ const PRIV = new Uint8Array(32).fill(9), ACC = addressFromPriv(PRIV), A2 = "0x" 
   // 1110 L-1 / L-2 (returnZec lives in app.js: checked on its text, like the other sweep guards)
   const rz = src.slice(src.indexOf("async function returnZec"), src.indexOf("async function staleV1"));
   t("1110 L-1: an unresolved sweep intent is followed in the empty branch BEFORE any empty observation, and an ended one only pauses it", rz.indexOf("const sp = await prevOf()") > 0 && rz.indexOf("const sp = await prevOf()") < rz.indexOf("noteEmptyFor(HM, h, true)") && /if \(!sp\.ended\) return await finishSweep/.test(rz) && /ended: fin\.status/.test(rz));
-  t("1110 L-2: no second sweep before the first one's expiry height has passed (the intent stores it)", /expiry: sw\.expiry/.test(rz) && /tipNow <= until/.test(rz) && /!prev\.ended/.test(rz)); }
+  t("1110 L-2: no second sweep before the first one's expiry height has passed (the intent stores it)", /expiry: sw\.expiry/.test(rz) && /tipNow <= until/.test(rz) && /!prev\.ended/.test(rz));
+  // 1137 M-1 / L-1 / L-2
+  const lk = rz.slice(rz.indexOf("const saved = await underHopLock"), rz.indexOf("if (!saved)")), fs_ = src.slice(src.indexOf("async function finishSweep"), src.indexOf("async function staleV1"));
+  t("1137 M-1: inside the lock the intent is re-read and a different unended one refuses, before set() and the broadcast", lk.indexOf("sweepIntents.get(h)") > 0 && lk.indexOf("sweepIntents.get(h)") < lk.indexOf("sweepIntents.set(h, intent)") && /cur\.txid !== intent\.txid\) return "busy"/.test(lk) && /saved === "busy"/.test(rz));
+  t("1137 M-1: only a definite refusal marks the stored intent not-sent; an unknown outcome stays live; a not-sent intent is not followed", /catch \(e\) \{ if \(\/\^Rejected by network\|different txid\/\.test/.test(lk) && /notSent: true/.test(lk) && /prevOk\(sp\) && !sp\.notSent/.test(rz) && !/notSent: true[^\n]*\n[^\n]*else/.test(lk) && /throw e; \}/.test(lk));
+  t("1137 L-1: every end (SUCCESS too) settles the intent with ended + endedAt, before the Done text; an ended SUCCESS is not reported as a refund on its way", fs_.indexOf("ended: fin.status, endedAt") > 0 && fs_.indexOf("ended: fin.status, endedAt") < fs_.indexOf('"Done: ') && /sp\.ended !== "SUCCESS" && Date\.now\(\) - \(sp\.endedAt/.test(rz));
+  t("1137 L-2: a lost wallet's found shielded value is read before the card is forgotten and said in the Done text", /const sh = h\.lost && lost\.get\(h\.lost\) && lost\.get\(h\.lost\)\.shielded;/.test(fs_) && fs_.indexOf("const sh =") < fs_.indexOf("lostForget(h.lost)") && /\(sh \? " Shielded ZEC[^"]*may remain/.test(fs_)); }
 
 // ---- round 5 (audit 1121): pendingWd memory fallback, lost-answer retry, honest busy text
 { const src = fs.readFileSync(new URL("../web/app.js", import.meta.url), "utf8");

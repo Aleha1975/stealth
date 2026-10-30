@@ -349,9 +349,9 @@ async function returnZec(h, card) {
   if (!utxos.length) {                                   // the server lists nothing: that is an ANSWER of an untrusted server, not proof (1100 M-1). Never hide on one answer.
     // 1110 L-1: an unresolved sweep intent means the inputs are gone because the sweep went out: follow its swap (never count "empty" observations, never hide) until NEAR ends it
     const sp = await prevOf();
-    if (prevOk(sp)) {
+    if (prevOk(sp) && !sp.notSent) {
       if (!sp.ended) return await finishSweep(HM, h, step, { txid: sp.txid, deposit: sp.deposit, amountOut: sp.amountOut });
-      if (Date.now() - (sp.endedAt || 0) < 3600_000) { step("The swap ended as " + sp.ended + ". The refund is on its way back to the hop address: press Return money again in a few minutes."); return; }
+      if (sp.ended !== "SUCCESS" && Date.now() - (sp.endedAt || 0) < 3600_000) { step("The swap ended as " + sp.ended + ". The refund is on its way back to the hop address: press Return money again in a few minutes."); return; }
     }
     if (h.lost) { lostForget(h.lost); step("Nothing is listed on the transparent addresses now (moved already, or the server is behind). Scan checks again; the shielded balance has its own button."); return; }      // no record to count empty observations in: the card just goes, and is found again if the ZEC is still there
     step("Checking the shielded balance…");
@@ -386,8 +386,13 @@ async function returnZec(h, card) {
   const intent = { txid: sw.txid, deposit: j.quote.depositAddress, amountOut: j.quote.amountOut, at: Date.now(), expiry: sw.expiry };
   // 1133 L-3: the hop lock is held from recording the intent through the broadcast, so a resume (Halt / auto-retry) cannot shield the same outputs meanwhile. Nothing inside takes the lock again; the broadcast is bounded by its own request timeouts plus 5 min
   const saved = await underHopLock(h.f.stealth, async () => {
+    const cur = sweepIntents.get(h);      // 1137 M-1: re-read under the lock: another tab / stale card may have recorded and sent its own sweep while this one waited for the quote
+    if (prevOk(cur) && !cur.ended && !cur.notSent && cur.txid !== intent.txid) return "busy";
     if (!sweepIntents.set(h, intent)) return false;      // recorded BEFORE broadcasting
-    await HM.withTimeout(ZR.sendAndConfirm(ZC.lightwalletd, sw.raw, undefined, sw.txid), 5 * 60_000, "Zcash broadcast"); return true; });        // 1100 L-2: the node must hand our exact bytes back before this counts as sent
+    try { await HM.withTimeout(ZR.sendAndConfirm(ZC.lightwalletd, sw.raw, undefined, sw.txid), 5 * 60_000, "Zcash broadcast"); }
+    catch (e) { if (/^Rejected by network|different txid/.test(String((e && e.message) || ""))) sweepIntents.set(h, { ...intent, ended: "NOT_SENT", notSent: true, endedAt: Date.now() }); throw e; }      // only a DEFINITE refusal un-tracks it; an unknown outcome stays a live intent
+    return true; });        // 1100 L-2: the node must hand our exact bytes back before this counts as sent
+  if (saved === "busy") throw new Error("Another return for this wallet is already in progress (another tab?). Nothing was sent; press Return money again in a minute.");
   if (!saved) throw new Error("Could not record the return before sending it (the transfer may be running in another tab). Nothing was sent; try again in a minute.");
   await finishSweep(HM, h, step, intent);
 }
@@ -395,13 +400,15 @@ async function finishSweep(HM, h, step, sw) {
   let note = ""; await PW.submitDeposit({ txHash: sw.txid, depositAddress: sw.deposit }).catch(e => { note = " (could not notify NEAR Intents: " + ((e && e.message) || e) + ")"; });
   if (note) step("Sent" + note);
   const fin = await PW.pollStatus({ depositAddress: sw.deposit, timeoutMs: 60 * 60_000, intervalMs: 10_000, onUpdate: s => step("Returning · " + s.status.toLowerCase().replace(/_/g, " ") + " · usually 10–20 min" + note) });
-  step(fin.status === "SUCCESS" ? "Done: ≈ " + (Number(sw.amountOut) / 1e6).toFixed(2) + " " + SYM + " sent to your wallet." : "Swap ended as " + fin.status + ". The ZEC is back on the hop address; press Return money again.");
+  await underHopLock(h.f.stealth, async () => { const cur = sweepIntents.get(h); if (!cur || cur.txid === sw.txid) sweepIntents.set(h, { ...sw, ended: fin.status, endedAt: Date.now() }); }).catch(() => {});      // 1137 L-1 / 1110 L-1: every end settles the intent (SUCCESS too, so a later Return round sweeps instead of replaying "Done")
+  const sh = h.lost && lost.get(h.lost) && lost.get(h.lost).shielded;      // 1137 L-2: a shielded finding is dropped with the card, so the Done text says it may remain
+  step(fin.status === "SUCCESS" ? "Done: ≈ " + (Number(sw.amountOut) / 1e6).toFixed(2) + " " + SYM + " sent to your wallet." + (sh ? " Shielded ZEC was found on this wallet earlier and may remain: press Check shielded balance." : "") : "Swap ended as " + fin.status + ". The ZEC is back on the hop address; press Return money again.");
   if (fin.status === "SUCCESS" && h.lost) { lostForget(h.lost); checkLost().catch(() => {}); }      // a lost wallet has no card to keep: it is looked for again, and any other wallet of this address shows up with its own Return
   else if (fin.status === "SUCCESS") {      // 1122 L-3: the transparent return worked, but the card goes away only when the hop wallet holds nothing at all (shielded ZEC included); a failed check keeps the card
     let left = null; try { const r = await HM.findHop(HM.idbStore(), h.f.stealth); left = await HM.hopSummary(await hopCtx(HM, h.f, h.hit, null), r && r.rec); } catch {}
     if (left && !HM.holdsZec(left)) await hideHop(HM, h); else step("Done: the payout was sent. The hop wallet may still hold some ZEC, so the card stays: press Return money again.");
   }
-  else await underHopLock(h.f.stealth, async () => { const cur = sweepIntents.get(h); if (!cur || cur.txid === sw.txid) sweepIntents.set(h, { ...sw, ended: fin.status, endedAt: Date.now() }); }).catch(() => {});      // 1110 L-1: the intent is settled (no endless resume), but kept so "empty" is not counted while the refund is still on its way
+      // 1110 L-1: a non-SUCCESS intent is settled above (no endless resume) but kept so "empty" is not counted while the refund is still on its way
 }
 // A transfer from the first version (before Ironwood) could never shield, so its ZEC only ever sat on the hop t-addresses:
 // once those are empty (returned) the record is history and shows nothing. Later versions are never hidden this way.
