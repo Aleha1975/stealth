@@ -486,7 +486,7 @@ async function resumeFast() {
     try { if (navigator.locks) await navigator.locks.request("fast-wd:" + k, { ifAvailable: true }, l => l ? go() : undefined); else await go(); } catch (e) { box.hidden = false; box.textContent = "Earlier private withdraw: " + (e.message || e); continue; }
     const chain = CHAINS[rec.chain] || C, sums = PW.fastSummary(rec, v => (Number(v) / 10 ** chain.token.decimals).toFixed(2), chain.token.symbol);
     box.hidden = false; box.textContent = "Earlier private withdraw (" + chain.name + "):\n" + sums.join("\n");
-    if (PW.fastDone(rec)) { fastRecs.del(k); pendingWd.delete(k); }
+    if (PW.fastDone(rec)) { fastRecs.del(k); if (!rec.parts.some(p => p.state === "UNKNOWN")) pendingWd.delete(k); }   // UNKNOWN: the signed transfer may still land, the guard stays until its authorization expires
   }
 }
 // ---- unfinished hops of the payments found: banner with Resume (needs the keys, so it appears after Scan)

@@ -11,7 +11,7 @@ import { zcash as ZC } from "./chains.js";
 
 export const STEPS = ["QUOTE_IN", "DEPOSIT_IN", "WAIT_T", "SHIELD", "DELAY", "QUOTE_OUT", "SEND_OUT"];
 export const DONE_STEPS = new Set(["DONE", "FAILED_IN", "FAILED"]);
-export const HOP_TAG = "stealth-zec-hop/v1", MAX_OUT = 3, PART_TRIES = 2, PENDING = "PENDING_DEPOSIT", ETA_MIN = 35, T_CONFS = 3;   // T_CONFS: confirmations of the hop wallet's own t-deposit before we try to shield. The wallet policy (constructor args, 1/1 below) already allows 1; 3 blocks (~4 min) keep a shallow reorg from hitting the shield. A too-early shield only raises InsufficientFunds, which SHIELD retries every 60 s
+export const HOP_TAG = "stealth-zec-hop/v1", MAX_OUT = 3, PART_TRIES = 2, PENDING = "PENDING_DEPOSIT", ETA_MIN = 35, T_CONFS = 3;   // T_CONFS: confirmations of the hop wallet's own t-deposit before we try to shield. The wallet policy (constructor args, 1/1 below) already allows 1; 3 blocks (~4 min) keep a shallow reorg from hitting the shield. A too-early shield only raises InsufficientFunds, which SHIELD retries every 10 s
 export const STEP_MIN = { QUOTE_IN: 0.5, DEPOSIT_IN: 4, WAIT_T: 4, SHIELD: 3, DELAY: 6, QUOTE_OUT: 0.5, SEND_OUT: 8 };   // typical minutes per step (sum 26.5)
 /** Payout modes (audit H-1): the shielded balance is paid out in k parts of random size, each with its own random delay, quote and deposit.
  *  Limit (1105 L-7): the split defeats a match on ONE amount only. The parts sum to the in-leg amount minus known fees, all go to the same recipient, and the pipeline latency is

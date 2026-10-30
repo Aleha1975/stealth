@@ -211,4 +211,5 @@ const PRIV = new Uint8Array(32).fill(9), ACC = addressFromPriv(PRIV), A2 = "0x" 
   const rp = fs.readFileSync(new URL("../web/relay-post.js", import.meta.url), "utf8");
   t("1121 I-2: a busy/503 final message no longer says 'Nothing was sent'", !/Nothing was sent/.test(rp) && /may be out/.test(rp));
   t("1122 L-3: a SUCCESS return hides the card only after a hopSummary shows nothing left (shielded included)", /left && !left\.some\(x => x\.transparent \+ x\.orchard > 0n\)\) await hideHop/.test(src)); }
+  t("fast route: an UNKNOWN part keeps the pendingWd guard after a reload", /if \(!rec\.parts\.some\(p => p\.state === "UNKNOWN"\)\) pendingWd\.delete\(k\)/.test(fs.readFileSync(new URL("../web/app.js", import.meta.url), "utf8")));
 console.log(fail ? "FAILED " + fail : "all passed"); process.exit(fail ? 1 : 0);
