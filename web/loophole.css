@@ -29,7 +29,7 @@ main.app{position:relative;z-index:1;background:#000}
 .tabs{display:flex;gap:4px;margin:12px 0 20px;background:rgba(255,255,255,.05);border-radius:999px;padding:4px}
 .tabs button{flex:1;background:none;border:0;border-radius:999px;color:var(--ink-soft);font:inherit;font-size:14px;padding:9px 8px;cursor:pointer;transition:background .2s,color .2s}
 .tabs button[aria-selected=true]{color:#000;background:#fff}
-.pane[hidden]{display:none}
+[hidden]{display:none!important}
 .btn{display:inline-block;background:#fff;color:#000;padding:11px 22px;border-radius:999px;border:1px solid #fff;font:inherit;font-size:14px;font-weight:500;cursor:pointer;transition:opacity .2s}
 .btn:hover{opacity:.88}.btn:disabled{opacity:.4;cursor:default}
 .btn.ghost{background:none;color:#fff;border:1px solid var(--line-strong)}.btn.ghost:hover{background:rgba(255,255,255,.08);opacity:1}
