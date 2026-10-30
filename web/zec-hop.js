@@ -527,7 +527,8 @@ export async function runHop(ctx) {
 export async function scrubFinished(store, stealth) {
   const f = await findHop(store, stealth); if (!f || !["DONE", "FAILED_IN"].includes(f.rec.st.step)) return false;
   const st = f.rec.st; await store.put(f.key, { st: { v: st.v, n: st.n, stealth: st.stealth, chain: st.chain, dest: st.dest, step: st.step, result: st.result, doneAt: st.doneAt, amount: st.amount, hidden: st.hidden, scrubbed: true,
-    ...(st.step === "FAILED_IN" ? { inDeposit: st.inQuote && st.inQuote.depositAddress, txIn: st.txIn } : {}) }, db: null });   // 1105 L-6: support needs the in-leg deposit address and hash return true;
+    ...(st.step === "FAILED_IN" ? { inDeposit: st.inQuote && st.inQuote.depositAddress, txIn: st.txIn } : {}) }, db: null });   // 1105 L-6: support needs the in-leg deposit address and hash
+  return true;
 }
 
 /** Funds left in the hop wallet: per account t-address and balances. Works from the saved wallet, or from the keys alone (fallback birthday from the payment's block time). */
