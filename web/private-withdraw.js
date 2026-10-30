@@ -171,12 +171,13 @@ export function signTransferAuth({ chain, priv, from, to, value, validBefore, no
 
 /** The relayer's answer, read the same way by the standard route (app.js) and the fast route (1121 L-2, 1125 F-3).
  *  -> { kind: "used" }  the authorization is already used on chain (lost answer, then the retry): follow the transaction, do not give up;
- *     { kind: "error", message, definite }  definite = a JSON 400/403/429 refusal: the relayer did NOT take it, so the double-send guard may be cleared;
+ *     { kind: "error", message, definite }  definite = a JSON 400 that carries the relayer's explicit `definite: true` (refused by offline validation, before any broadcast; 1130 M-1): only then may the
+ *       double-send guard be cleared. Every other error (a 400 "still being confirmed" / "in progress", 403, 429, 5xx) may follow an earlier broadcast of the same authorization and counts as in progress;
  *     { kind: "ok" }. */
 export function relayOutcome(r, d) {
   const usedErr = !!d.error && /authorization already used/i.test(String(d.error));
   if (d.used || usedErr) return { kind: "used" };
-  if (!r.ok || d.error) return { kind: "error", message: d.error || "relayer error", definite: !!d.error && [400, 403, 429].includes(r.status) };
+  if (!r.ok || d.error) return { kind: "error", message: d.error || "relayer error", definite: !!d.error && r.status === 400 && d.definite === true };
   return { kind: "ok" };
 }
 /** One part: optional delay -> real quote -> stealth key signs the transfer to the deposit address -> relayer -> receipt -> submit -> poll.
@@ -247,15 +248,18 @@ export async function runFast(ctx, rec, save = () => {}, { resume = false } = {}
     if (p.state === "SIGNED" && resume) { p.state = "UNKNOWN"; save(rec); continue; }
     if (p.state === "PLANNED" && resume) { p.state = "NOT_SENT"; save(rec); continue; }
     if (p.state === "DEPOSITED") {
-      const fin = await pollStatus({ base: ctx.base, depositAddress: p.depositAddress, fetchFn: ctx.fetchFn, sleep: ctx.sleep, intervalMs: ctx.pollMs || 3000, onUpdate: s => say(tag + "Status: " + s.status) });
-      p.state = fin.status; save(rec); continue;
+      // 1130 M-2: a poll that gives up (10 errors in a row, or no terminal status within its bound) PARKS the part in STUCK (not in FAST_OPEN, depositAddress kept for the note): it must not block later fast withdraws forever
+      try { const fin = await pollStatus({ base: ctx.base, depositAddress: p.depositAddress, fetchFn: ctx.fetchFn, sleep: ctx.sleep, intervalMs: ctx.pollMs || 3000, timeoutMs: ctx.pollTimeoutMs, onUpdate: s => say(tag + "Status: " + s.status) }); p.state = fin.status; }
+      catch (e) { p.state = "STUCK"; p.stuckWhy = String((e && e.message) || e).slice(0, 160); }
+      save(rec); continue;
     }
     if (p.state !== "PLANNED") continue;
     const c = { ...ctx, onProgress: m => say(tag + m),
       onSigned: info => { p.state = "SIGNED"; p.depositAddress = info.depositAddress; save(rec); if (ctx.onSigned) ctx.onSigned({ ...info, index: i }); },
       onDeposited: info => { p.state = "DEPOSITED"; p.depositAddress = info.depositAddress; p.txHash = info.txHash; save(rec); if (ctx.onDeposited) ctx.onDeposited({ ...info, index: i }); } };
     try { const r = await runPart(c, BigInt(p.amount), p.delayMs); p.state = r.status; p.final = r.status; save(rec); }
-    catch (e) { if (p.state === "PLANNED" || (p.state === "SIGNED" && e.refused)) p.state = "NOT_SENT"; for (const q of rec.parts) if (q.state === "PLANNED") q.state = "NOT_SENT"; save(rec); throw e; }      // the parts after a failed one are not started
+    catch (e) { if (p.state === "PLANNED" || (p.state === "SIGNED" && e.refused)) p.state = "NOT_SENT"; else if (p.state === "DEPOSITED") { p.state = "STUCK"; p.stuckWhy = String((e && e.message) || e).slice(0, 160); }      // DEPOSITED + a throw = the 1Click poll gave up (1130 M-2)
+       for (const q of rec.parts) if (q.state === "PLANNED") q.state = "NOT_SENT"; save(rec); throw e; }      // the parts after a failed one are not started
   }
   return rec;
 }
@@ -265,6 +269,7 @@ export function fastSummary(rec, amountFmt = v => v.toString(), sym = "") {
   rec.parts.forEach((p, i) => {
     const m = { SUCCESS: "was sent to the recipient.", REFUNDED: "was refunded by NEAR Intents: the money is back on the stealth address.", FAILED: "failed: check the status of deposit address " + p.depositAddress + ".",
       NOT_SENT: "was not sent: the money is still on the stealth address.", UNKNOWN: "was signed, but the deposit was not seen confirmed. Check the explorer and deposit address " + p.depositAddress + " before sending again.",
+      STUCK: "was handed to NEAR Intents but no final status was seen. Check the status of deposit address " + p.depositAddress + " (the money may still arrive, be refunded to the stealth address, or need NEAR Intents support).",
       DEPOSITED: "is with NEAR Intents (deposit address " + p.depositAddress + ") and still swapping.", SIGNED: "was signed and handed to the relayer; the result is not known yet.", PLANNED: "has not started yet." }[p.state] || p.state;
     out.push(lbl(i) + " " + m);
   });
@@ -273,3 +278,10 @@ export function fastSummary(rec, amountFmt = v => v.toString(), sym = "") {
 /** 1125 F-1: a stored record that still has an open part (a new withdraw from the same address must not replace it) */
 export const fastOpenRec = rec => !!rec && Array.isArray(rec.parts) && rec.parts.some(p => FAST_OPEN.has(p.state));
 export const fastDone = rec => rec.parts.every(p => !FAST_OPEN.has(p.state));
+
+/** 1130 M-2: the explicit "abandon this record" action. Every open part gets the state that tells the truth about it and closes it: DEPOSITED -> STUCK (deposit address kept for the note),
+ *  SIGNED -> UNKNOWN (the transfer may still land), PLANNED -> NOT_SENT. The caller keeps the notes and the double-send guard (UNKNOWN). Returns rec. */
+export function abandonRec(rec, save = () => {}) {
+  for (const p of rec.parts) { if (p.state === "DEPOSITED") p.state = "STUCK"; else if (p.state === "SIGNED") p.state = "UNKNOWN"; else if (p.state === "PLANNED") p.state = "NOT_SENT"; }
+  save(rec); return rec;
+}

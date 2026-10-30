@@ -263,8 +263,10 @@ async function fastUnit() {
     await PW.runFast(mk(x), r, () => {}, { resume: true });
     ok("a REFUNDED part is reported as refunded to the stealth address", r.parts[0].state === "REFUNDED" && PW.fastSummary(r)[0].includes("refunded") && PW.fastDone(r)); }
   // 1125 F-3: the fast route reads the relayer's answer like the standard route (PW.relayOutcome)
-  { const w = world({ relay: () => ({ ok: false, status: 400, json: async () => ({ error: "bad signature" }) }) }), r = rec(2); let err = null, refused = 0; try { await PW.runFast(mk(w, { onRefused: () => refused++ }), r, () => {}); } catch (e) { err = e; }
+  { const w = world({ relay: () => ({ ok: false, status: 400, json: async () => ({ error: "bad signature", definite: true }) }) }), r = rec(2); let err = null, refused = 0; try { await PW.runFast(mk(w, { onRefused: () => refused++ }), r, () => {}); } catch (e) { err = e; }
     ok("1125 F-3: a definite relayer refusal (400 JSON) -> part NOT_SENT (not 'signed'), guard hook onRefused called, nothing after it started", err && err.message === "bad signature" && refused === 1 && r.parts.map(p => p.state).join() === "NOT_SENT,NOT_SENT" && w.relays.length === 1 && PW.fastDone(r)); }
+  { const w = world({ relay: () => ({ ok: false, status: 400, json: async () => ({ error: "a previous attempt for this authorization is still being confirmed" }) }) }), r = rec(1); let refused = 0; try { await PW.runFast(mk(w, { onRefused: () => refused++ }), r, () => {}); } catch {}
+    ok("1130 M-1: a plain 400 ('still being confirmed', no definite flag) keeps the part SIGNED and the guard armed", refused === 0 && r.parts[0].state === "SIGNED"); }
   { const w = world({ relay: () => ({ ok: false, status: 500, json: async () => ({ error: "boom" }) }) }), r = rec(1); let refused = 0; try { await PW.runFast(mk(w, { onRefused: () => refused++ }), r, () => {}); } catch {}
     ok("1125 F-3: a 500 is NOT a definite refusal: part stays SIGNED, guard not cleared", refused === 0 && r.parts[0].state === "SIGNED"); }
   { const w = world({ relay: () => ({ ok: false, status: 400, json: async () => ({ error: "Authorization already used" }) }) }), r = rec(2), found = [];

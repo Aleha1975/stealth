@@ -23,11 +23,26 @@ export const fmtLeft = ms => ms >= 600_000 ? "≈ " + Math.ceil(ms / 60_000) + "
 const LEFT = new Map();   // hop -> last shown remainder; keeps the countdown from jumping up (never +1 min between ticks, except when the step changes)
 const PCT = new Map();
 export const resetLeft = () => { LEFT.clear(); PCT.clear(); };
-/** progress percent from time: elapsed / (elapsed + time left), 1..99 until done, never decreasing */
-export function shownPct(key, st, leftMs, now) {
-  const i = Math.max(0, STEPS.indexOf(st.step)), typ = STEPS.slice(0, i).reduce((a, k) => a + STEP_MIN[k] * 60_000, 0) + Math.max(0, now - (st.stepAt || now));
-  const el = st.startedAt ? Math.max(0, now - st.startedAt) : typ, p = Math.min(99, Math.max(1, Math.floor(100 * el / (el + leftMs))));
-  const v = Math.max(p, PCT.get(key) || 0); PCT.set(key, v); return v;
+/** 1129 / owner: the percent is a function of REAL progress only: steps that are completed, plus sub-progress inside the current step that comes from something the machine has actually seen (Zcash confirmations n/T, the payout part index,
+ *  and the mixing delay's own timer while the machine is alive). It never advances on elapsed time alone: a step that has not finished stays below its end, and a stuck hop stays where it is. Weights are the typical step times.
+ *  The three payout steps are shared by the payout parts: part j of k contributes j/k of them done before it starts. 1..99 until done; it never goes down within a run. */
+export function realProgress(st, sub = 0) {
+  const i = Math.max(0, STEPS.indexOf(st.step)), w = k => STEP_MIN[k], di = STEPS.indexOf("DELAY"), parts = Array.isArray(st.parts) ? st.parts.length : 0, pIdx = st.partIdx || 0;
+  const pre = STEPS.slice(0, di).reduce((a, k) => a + w(k), 0), pay = STEPS.slice(di).reduce((a, k) => a + w(k), 0), total = pre + pay, f = Math.min(0.95, Math.max(0, sub));
+  let done;
+  if (i < di) done = STEPS.slice(0, i).reduce((a, k) => a + w(k), 0) + f * w(st.step);
+  else { const k = Math.max(1, parts), inPart = STEPS.slice(di, i).reduce((a, x) => a + w(x), 0) + f * w(st.step); done = pre + pay * (Math.min(pIdx, k - 1) + inPart / pay) / k; }
+  return Math.min(99, Math.max(1, Math.floor(100 * done / total)));
+}
+/** sub-progress 0..1 inside the current step, only from facts: "(n/T)" in the last message of the confirmation wait; the delay's elapsed share of its own scheduled length while the machine is alive */
+export function subProgress(h, now = Date.now()) {
+  const st = h.st, m = /\((\d+)\/(\d+)\)/.exec(h.msg || "");
+  if (st.step === "WAIT_T" && m && Number(m[2]) > 0) return Number(m[1]) / Number(m[2]);
+  if (st.step === "DELAY" && st.delayUntil && st.stepAt && h.running && h.beatAt && now - h.beatAt <= STALE_MS) { const len = st.delayUntil - st.stepAt; return len > 0 ? Math.min(1, Math.max(0, (now - st.stepAt) / len)) : 0; }
+  return 0;
+}
+export function shownPct(key, st, sub, now) {
+  const v = Math.max(realProgress(st, sub), PCT.get(key) || 0); PCT.set(key, v); return v;
 }
 /** one line for the status area: "● 42% · ≈ 18 min left · Waiting for ..." */
 export const statusLine = v => "● " + v.pct + "% · " + v.left + " · " + v.what;
@@ -49,7 +64,7 @@ export function hopView(h, now = Date.now()) {
   const idx = Math.max(0, STEP_ORDER.indexOf(st.step)), ui0 = STEP_UI[idx], pl = partsLabel(st), inParts = pl && idx >= STEP_ORDER.indexOf("DELAY");    // "payout 2 of 3" on the three payout steps
   const m = st.mode ? modeOf(st.mode) : null, delayWait = m ? (m.totalMax >= 60 ? "random, spread over " + m.totalMin / 60 + "–" + m.totalMax / 60 + " h" : m.totalMin + "–" + m.totalMax + " min, random") : "2–10 min, random";
   const ui = { ...ui0, name: ui0.name + (inParts ? " · " + pl : ""), line: ui0.line + (inParts ? " (" + pl + ")" : ""), wait: st.step === "DELAY" ? delayWait : ui0.wait };
-  const v = { idx, total: STEP_UI.length, stepName: ui.name, amountLine: amt(st.amount, tok.decimals) + " " + tok.symbol + " → " + short(st.recipient),
+  const v = { idx, total: STEP_UI.length, stepName: ui.name, amountLine: st.rebuilt ? (Number(st.zecFound || 0) / 1e8) + " ZEC (found on the chain)" + (st.recipient ? " → " + short(st.recipient) : "") : amt(st.amount, tok.decimals) + " " + tok.symbol + " → " + short(st.recipient),
     left: "", pct: 0, what: "", elapsed: st.startedAt ? fmtElapsed((st.doneAt || now) - st.startedAt) : "", kind: "run", title: "Private transfer in progress", line: "", note: "", body: "", detail: "", action: null, link: null };
   if (st.step === "DONE") {
     const got = st.outTotal ? amt(st.outTotal, dtok.decimals) : st.outQuote ? amt(st.outQuote.amountOut, dtok.decimals) : amt(st.amount, tok.decimals), p = st.payoutTx;
@@ -65,7 +80,7 @@ export function hopView(h, now = Date.now()) {
     v.kind = "bad"; v.title = "Transfer stopped"; v.body = "Your funds are safe. Any ZEC left sits in a temporary wallet that can be rebuilt from this payment's key."; v.action = "funds";
     v.detail = "Last swap ended as " + (st.result || "unknown") + (st.outQuote && st.outQuote.depositAddress ? " (deposit address " + st.outQuote.depositAddress + ")" : "") + "." + (h.extra ? "\n" + h.extra : "");
   } else if (h.running) {
-    const hk = (st.stealth || "") + "#" + (st.n || 0), lm = shownLeft(hk, st.step, remainingMs(st, now), now); v.left = fmtLeft(lm); v.pct = shownPct(hk, st, lm, now);
+    const hk = (st.stealth || "") + "#" + (st.n || 0), lm = shownLeft(hk, st.step, remainingMs(st, now), now); v.left = fmtLeft(lm); v.pct = shownPct(hk, st, subProgress(h, now), now);
     const m = /: ([A-Z_]+)$/.exec(h.msg || ""), left = st.step === "DELAY" && st.delayUntil ? Math.max(0, Math.ceil((st.delayUntil - now) / 1000)) : null;
     const state = m && (st.step === "DEPOSIT_IN" || st.step === "SEND_OUT") ? friendly(m[1]) : null;
     const sub = subStep(h.msg), age = h.beatAt ? now - h.beatAt : 0;       // the live sub-step ("Waiting for Zcash confirmations (7/10)") replaces the generic step line
@@ -77,7 +92,7 @@ export function hopView(h, now = Date.now()) {
     const early = idx < STEPS.indexOf("WAIT_T");               // nothing has left the stealth address yet / no ZEC exists yet
     const cause = oneLine(st.err), wait = h.retryAt && h.retryAt > now ? Math.ceil((h.retryAt - now) / 1000) : 0;
     v.kind = "warn"; v.title = "Transfer paused"; v.body = (wait ? "Problem: " + (cause || "network hiccup") + ". Retrying by itself in " + (wait < 120 ? wait + " s" : Math.ceil(wait / 60) + " min") + ". " : st.err ? "Stopped: " + cause + ". " : "") + (early && !(st.auth || st.relayed || st.txIn) ? "Your money has not moved." : early ? "The deposit may already be on its way: your funds are safe, but do not send from this address again until this transfer finishes." : "Your funds are safe.") + " Press Continue transfer to try again.";
-    v.action = "continue"; v.detail = ""; v.zec = !early; v.pct = shownPct((st.stealth || "") + "#" + (st.n || 0), st, remainingMs(st, now), now);
+    v.action = "continue"; v.detail = ""; v.zec = !early; v.pct = shownPct((st.stealth || "") + "#" + (st.n || 0), st, 0, now);
   }
   return v;
 }

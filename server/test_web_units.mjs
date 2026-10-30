@@ -179,7 +179,7 @@ const PRIV = new Uint8Array(32).fill(9), ACC = addressFromPriv(PRIV), A2 = "0x" 
   // 1109 L-1: the guard is armed BEFORE the request leaves, persisted, and cleared only by a confirmed outcome
   const wdSrc = src.slice(src.indexOf('$("btn-wd").addEventListener("click"'), src.indexOf("async function waitReceipt"));
   t("1109 L-1: pendingWd is set (until the authorization expires) before postRelay, and persisted", wdSrc.indexOf("pendingWd.set(") > 0 && wdSrc.indexOf("pendingWd.set(") < wdSrc.indexOf("await postRelay(") && /\(now \+ 3600 \+ 60\) \* 1000/.test(wdSrc) && /localStorage\.setItem\(PW_KEY/.test(src));
-  t("1109 L-1: it is cleared only on the relayer's own JSON refusal, a revert or success (not on an unknown outcome)", /if \(ans\.definite\) pendingWd\.delete/.test(wdSrc) && /\[400, 403, 429\]\.includes\(r\.status\)/.test(fs.readFileSync(new URL("..\/web\/private-withdraw.js", import.meta.url), "utf8")) && (wdSrc.match(/pendingWd\.delete/g) || []).length === 3 && !/Date\.now\(\) \+ 600_000/.test(src));
+  t("1109 L-1: it is cleared only on the relayer's own JSON refusal, a revert or success (not on an unknown outcome)", /if \(ans\.definite\) pendingWd\.delete/.test(wdSrc) && /d\.definite === true/.test(fs.readFileSync(new URL("..\/web\/private-withdraw.js", import.meta.url), "utf8")) && (wdSrc.match(/pendingWd\.delete/g) || []).length === 3 && !/Date\.now\(\) \+ 600_000/.test(src));
   // 1109 L-3, I-1, I-2, I-5, I-6
   t("1109 L-3: a failed log read inside txOfLogs is retried; the final message says the withdrawal is already on chain", /try \{ l = \(await recentLogs\(rpcOne, filter\)\)/.test(src) && /already on chain \(its authorization is used\)/.test(src));
   t("1109 I-1/I-2: the left-over uses the captured amount; a non-bigint balance is refused", /left: all - value/.test(src) && /typeof all !== "bigint" \|\| !\(value > 0n\)/.test(src) && !/left: w\.usdc - value/.test(src));
@@ -211,12 +211,12 @@ const PRIV = new Uint8Array(32).fill(9), ACC = addressFromPriv(PRIV), A2 = "0x" 
     /PW\.relayOutcome\(r, d\)/.test(wdSrc) && /if \(ans\.kind === "error"\) \{ if \(ans\.definite\) pendingWd\.delete/.test(wdSrc) && /if \(ans\.kind === "used"\) d\.hash = await txOfLogs/.test(wdSrc) && !/if \(d\.error\) pendingWd\.delete/.test(wdSrc) && /authorization already used/i.test(fs.readFileSync(new URL("../web/private-withdraw.js", import.meta.url), "utf8")));
   const rp = fs.readFileSync(new URL("../web/relay-post.js", import.meta.url), "utf8");
   t("1121 I-2: a busy/503 final message no longer says 'Nothing was sent'", !/Nothing was sent/.test(rp) && /may be out/.test(rp));
-  t("1122 L-3: a SUCCESS return hides the card only after a hopSummary shows nothing left (shielded included)", /left && !left\.some\(x => x\.transparent \+ x\.orchard > 0n\)\) await hideHop/.test(src)); }
+  t("1122 L-3: a SUCCESS return hides the card only after a hopSummary shows nothing left (shielded included)", /left && !HM\.holdsZec\(left\)\) await hideHop/.test(src)); }
   t("fast route: an UNKNOWN part keeps the pendingWd guard after a reload", /if \(!rec\.parts\.some\(p => p\.state === "UNKNOWN"\)\) pendingWd\.delete\(k\)/.test(fs.readFileSync(new URL("../web/app.js", import.meta.url), "utf8")));
 // ---- audit 1125 (round 6)
 { const src = fs.readFileSync(new URL("../web/app.js", import.meta.url), "utf8");
   const a = src.indexOf("const FAST_KEY"), b = src.indexOf("async function fastWithdraw"), code = src.slice(a, b);
-  const mkStore = () => { const st = {}; return { getItem: k => st[k] ?? null, setItem: (k, v) => { st[k] = v; }, removeItem: k => { delete st[k]; } }; };
+  const mkStore = () => { const st = {}; return { getItem: k => st[k] ?? null, setItem: (k, v) => { st[k] = v; }, removeItem: k => { delete st[k]; }, key: i => Object.keys(st)[i] ?? null, get length() { return Object.keys(st).length; } }; };
   const mk = ls => new Function("localStorage", "PW", "$", code + "; return { fastRecs, fastClaim, fastNotes, fastNeedsNote };")(ls, PWm, () => ({}));
   const ls = mkStore(), A = mk(ls), S = "0x" + "ab".repeat(20);
   const recOf = (st, extra = {}) => ({ v: 1, stealth: S, startedAt: 1, parts: [{ amount: "3000000", state: st, depositAddress: "0x" + "e1".repeat(20), txHash: null }], ...extra });
@@ -231,15 +231,51 @@ const PRIV = new Uint8Array(32).fill(9), ACC = addressFromPriv(PRIV), A2 = "0x" 
   const src2 = src.slice(src.indexOf("async function fastWithdraw"), src.indexOf("async function resumeFast"));
   t("1125 F-1: the record is claimed INSIDE the lock (a refused tab writes nothing) and the unclaimed run never touches guard or notes", /const run = \(\) => \{ fastClaim\(rec\); claimed = true;/.test(src2) && !/save\(rec\); const run/.test(src2) && /const settleGuard = \(\) => \{ if \(claimed/.test(src2));
   // F-2
-  const N1 = mkStore(), M1 = mk(N1).fastNotes; M1.add("addr 0xe1"); M1.add("addr 0xe1"); M1.add("other");
-  t("1125 F-2: notes with a deposit address persist across a reload, are not duplicated, and are listed together", mk(N1).fastNotes.read().join("|") === "addr 0xe1|other");
-  M1.clear(); t("1125 F-2: ... until dismissed", mk(N1).fastNotes.read().length === 0);
-  t("1125 F-2: only UNKNOWN/FAILED parts with a deposit address need a note", A.fastNeedsNote(recOf("UNKNOWN")) && A.fastNeedsNote(recOf("FAILED")) && !A.fastNeedsNote(recOf("SUCCESS")) && !A.fastNeedsNote(recOf("NOT_SENT")));
+  const N1 = mkStore(), M1 = mk(N1).fastNotes, ACC = "0xAAAA000000000000000000000000000000000001"; M1.add("addr 0xe1", ACC); M1.add("addr 0xe1", ACC); M1.add("other", ACC);
+  t("1125 F-2: notes with a deposit address persist across a reload, are not duplicated, and are listed together", mk(N1).fastNotes.read(ACC).map(x => x.t).join("|") === "addr 0xe1|other");
+  M1.drop(M1.read(ACC).map(x => x.id), ACC); t("1125 F-2: ... until dismissed", mk(N1).fastNotes.read(ACC).length === 0);
+  // 1130 L-3: per account, no silent drop at 20, Dismiss removes only what was on screen
+  { const N = mkStore(), F = mk(N).fastNotes, B = "0xBBBB000000000000000000000000000000000002";
+    F.add("for A", ACC); F.add("for B", B); for (let i = 0; i < 30; i++) F.add("n" + i, ACC);
+    t("1130 L-3: notes are scoped to the wallet account (B never sees A's deposit addresses)", F.read(B).map(x => x.t).join() === "for B" && F.read(ACC).every(x => x.t !== "for B"));
+    t("1130 L-3: the 21st note no longer drops the oldest (cap is 200)", F.read(ACC).length === 31 && F.read(ACC)[0].t === "for A");
+    const shown = F.read(ACC).map(x => x.id); F.add("arrived after the user looked", ACC); F.drop(shown, ACC);
+    t("1130 L-3: Dismiss removes only the notes that were shown; one that arrived later stays", F.read(ACC).map(x => x.t).join() === "arrived after the user looked");
+    N.setItem("stealth-fast-notes", JSON.stringify(["old plain note"])); t("1130 L-3: an old string-array store is still read (shown to every account until dismissed)", mk(N).fastNotes.read(B).map(x => x.t).join() === "old plain note"); }
+  t("1125 F-2: only UNKNOWN/FAILED parts with a deposit address need a note", A.fastNeedsNote(recOf("UNKNOWN")) && A.fastNeedsNote(recOf("FAILED")) && A.fastNeedsNote(recOf("STUCK")) && !A.fastNeedsNote(recOf("SUCCESS")) && !A.fastNeedsNote(recOf("NOT_SENT")));
   const rsrc = src.slice(src.indexOf("async function resumeFast"), src.indexOf("// ---- unfinished hops"));
-  t("1125 F-2: resumeFast lists every summary (no overwrite of box.textContent per record), keeps address notes, dismiss button exists", /if \(fastNeedsNote\(rec\)\) fastNotes\.add\(text\); else extra\.push\(text\)/.test(rsrc) && !/box\.textContent = "Earlier private withdraw \("/.test(rsrc) && /showFastBox\(extra\)/.test(rsrc) && /id="btn-fast-dismiss"/.test(fs.readFileSync(new URL("../web/app.html", import.meta.url), "utf8")));
+  t("1125 F-2: resumeFast lists every summary (no overwrite of box.textContent per record), keeps address notes, dismiss button exists", /if \(fastNeedsNote\(rec\)\) fastNotes\.add\(text, acct\); else extra\.push\(text\)/.test(rsrc) && !/box\.textContent = "Earlier private withdraw \("/.test(rsrc) && /showFastBox\(extra\)/.test(rsrc) && /id="btn-fast-dismiss"/.test(fs.readFileSync(new URL("../web/app.html", import.meta.url), "utf8")));
+  // 1130 L-1: one key per address, storage failure surfaced, start refused when the record cannot persist
+  { const L = mkStore(), X = mk(L), S2 = "0x" + "cd".repeat(20);
+    X.fastRecs.put({ ...recOf("PLANNED"), stealth: S }); X.fastRecs.put({ ...recOf("PLANNED"), stealth: S2 });
+    t("1130 L-1: each address has its own storage key, so a write for one never rewrites the other (no shared map)", L.getItem("stealth-fast-wd:" + S) && L.getItem("stealth-fast-wd:" + S2) && L.getItem("stealth-fast-wd") == null && Object.keys(X.fastRecs.read()).length === 2);
+    const before = L.getItem("stealth-fast-wd:" + S2); X.fastRecs.put({ ...recOf("DEPOSITED"), stealth: S }); t("1130 L-1: ... a put for A leaves B's stored bytes untouched", L.getItem("stealth-fast-wd:" + S2) === before);
+    L.setItem("stealth-fast-wd", JSON.stringify({ ["0x" + "11".repeat(20)]: { ...recOf("PLANNED"), stealth: "0x" + "11".repeat(20) } })); const mig = X.fastRecs.read();
+    t("1130 L-1: an old single-map record is migrated to its own key and the old key removed", mig["0x" + "11".repeat(20)] && L.getItem("stealth-fast-wd:" + "0x" + "11".repeat(20)) && L.getItem("stealth-fast-wd") == null);
+    const bad = mkStore(); bad.setItem = () => { throw new Error("QuotaExceededError"); }; const Y = mk(bad); let e1 = null; try { Y.fastClaim(recOf("PLANNED", { stealth: S })); } catch (e) { e1 = e.message; }
+    t("1130 L-1: when the record cannot be stored the withdraw is refused with a clear message (nothing is sent)", /Could not save the withdraw record/.test(e1 || "") && /QuotaExceeded/.test(e1 || "") && Object.keys(Y.fastRecs.read()).length === 0);
+    const silent = mkStore(); silent.setItem = () => {}; let e2 = null; try { mk(silent).fastClaim(recOf("PLANNED")); } catch (e) { e2 = e.message; }
+    t("1130 L-1: storage that swallows writes silently is caught by the read-back", /nothing was sent/.test(e2 || "")); }
+  { const src3 = src.slice(src.indexOf("async function fastWithdraw"), src.indexOf("async function resumeFast"));
+    t("1130 L-1: the in-run save surfaces a storage failure (no empty catch)", /const save = r => \{ try \{ fastRecs\.put\(r\); \} catch \(e\) \{ say\("pay-hint"/.test(src3)); }
+  // 1130 M-2: abandon + STUCK are not open
+  { const r = { parts: [{ amount: "1", state: "DEPOSITED", depositAddress: "0xd" }, { amount: "1", state: "SIGNED", depositAddress: "0xs" }, { amount: "1", state: "PLANNED" }, { amount: "1", state: "SUCCESS" }] };
+    t("1130 M-2: STUCK is not in FAST_OPEN (a parked part no longer blocks later fast withdraws)", !PWm.FAST_OPEN.has("STUCK") && PWm.fastDone({ parts: [{ state: "STUCK" }]}) && !PWm.fastOpenRec({ parts: [{ state: "STUCK" }] }));
+    PWm.abandonRec(r); t("1130 M-2: abandon parks DEPOSITED as STUCK (deposit address kept), SIGNED as UNKNOWN, PLANNED as NOT_SENT, leaves SUCCESS", r.parts.map(p => p.state).join() === "STUCK,UNKNOWN,NOT_SENT,SUCCESS" && r.parts[0].depositAddress === "0xd" && PWm.fastDone(r) && /deposit address 0xd/.test(PWm.fastSummary(r)[0])); }
+  { const appSrc = src.slice(src.indexOf("$(\"btn-fast-abandon\")"), src.indexOf("// ---- unfinished hops"));
+    t("1130 M-2: an explicit 'Abandon this record' button exists, asks first, skips records another tab runs, and keeps the deposit address in a note", /id="btn-fast-abandon"/.test(fs.readFileSync(new URL("../web/app.html", import.meta.url), "utf8")) && /confirm\(/.test(appSrc) && /ifAvailable: true/.test(appSrc) && /PW\.abandonRec/.test(appSrc) && /fastNotes\.add\(/.test(appSrc)); }
+  // 1130 L-2: the log window follows validBefore
+  { const nowS = 1_800_000_000, vb = nowS + 3600;
+    t("1130 L-2: logSpanSince: a fresh authorization needs at least 5000 blocks, an old one more, capped", CR.logSpanSince(vb, nowS) >= 5000 && CR.logSpanSince(vb, nowS) < CR.logSpanSince(vb, nowS + 3 * 3600) && CR.logSpanSince(vb, nowS + 100 * 3600) === 200000 && CR.logSpanSince(vb, nowS - 999) === 5000);
+    const asked = []; const rpcF = async (m, p) => { if (m === "eth_blockNumber") return "0x" + (1_000_000).toString(16); asked.push(Number(BigInt(p[0].fromBlock))); if (asked.length === 1) throw new Error("range too large"); return []; };
+    await CR.recentLogs(rpcF, { address: "0x" + "11".repeat(20), topics: [], span: 150000 });
+    t("1130 L-2: a node that refuses the wide window still gets the 5000-block one", asked.length === 2 && asked[0] === 850000 && asked[1] === 995000);
+    t("1130 L-2: both call sites pass the window derived from validBefore", (src.match(/span: logSpanSince\(/g) || []).length === 2); }
   // F-3
   const ro = PWm.relayOutcome;
-  t("1125 F-3: relayOutcome: 400/403/429 JSON = definite refusal; 500, no-JSON, 'already used', d.used are not; ok passes", ro({ ok: false, status: 400 }, { error: "x" }).definite === true && ro({ ok: false, status: 429 }, { error: "x" }).definite === true
+  t("1130 M-1: relayOutcome: only a 400 with the explicit definite:true is a definite refusal; plain 400 / 403 / 429 / 500 / no-JSON are in progress; 'already used', d.used, ok unchanged", ro({ ok: false, status: 400 }, { error: "x", definite: true }).definite === true && ro({ ok: false, status: 400 }, { error: "x" }).definite === false
+    && ro({ ok: false, status: 429 }, { error: "x", definite: true }).definite === false && ro({ ok: false, status: 403 }, { error: "x" }).definite === false && ro({ ok: false, status: 400 }, { error: "a previous attempt for this authorization is still being confirmed" }).definite === false
+    && ro({ ok: false, status: 400 }, { error: "a withdrawal from this address is already in progress" }).definite === false
     && ro({ ok: false, status: 500 }, { error: "x" }).definite === false && ro({ ok: false, status: 400 }, { error: "Authorization already used" }).kind === "used" && ro({ ok: true, status: 202 }, { used: true }).kind === "used" && ro({ ok: true, status: 200 }, { hash: "0x1" }).kind === "ok" && ro({ ok: false, status: 400 }, {}).definite === false);
   // F-4 / F-6
   t("1125 F-4: the per-address guard stays armed between parts (cleared on the last part, on a definite refusal, or when nothing is left signed)", /onDeposited: info => \{ if \(info\.index === rec\.parts\.length - 1\) pendingWd\.delete\(k\)/.test(src2) && /onRefused: \(\) => pendingWd\.delete\(k\)/.test(src2));

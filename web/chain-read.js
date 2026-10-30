@@ -66,8 +66,14 @@ export const hasPaid = (rc, { stealthPay, stealth, token = null, amount = null }
 /** Recent logs (last `span` blocks) of one address and topic list: how a request whose answer was lost is matched to its transaction. */
 export async function recentLogs(rpc, { address, topics, span = 5000 }) {
   const tip = Number(word(await rpc("eth_blockNumber", [])));
-  const r = await rpc("eth_getLogs", [{ address, topics, fromBlock: "0x" + Math.max(0, tip - span).toString(16), toBlock: "0x" + tip.toString(16) }]);
-  if (!Array.isArray(r)) throw new Error("unexpected logs answer"); return r.filter(l => l && isHash(l.transactionHash));
+  const get = async sp => { const r = await rpc("eth_getLogs", [{ address, topics, fromBlock: "0x" + Math.max(0, tip - sp).toString(16), toBlock: "0x" + tip.toString(16) }]); if (!Array.isArray(r)) throw new Error("unexpected logs answer"); return r; };
+  let r; try { r = await get(span); } catch (e) { if (span <= 5000) throw e; r = await get(5000); }      // 1130 L-2: a node that refuses the wide range still gets the old 5000-block one
+  return r.filter(l => l && isHash(l.transactionHash));
+}
+/** 1130 L-2: how many blocks back to look for an authorization signed with `validBefore` (it was signed 3600 s before that, plus a margin). Assumes up to 4 blocks/s, never less than 5000, at most 200000. */
+export function logSpanSince(validBeforeSec, nowSec = Math.floor(Date.now() / 1000), lifeSec = 3600) {
+  const elapsed = Math.max(0, nowSec - (Number(validBeforeSec) - lifeSec)) + 120;
+  return Math.min(200000, Math.max(5000, Math.ceil(elapsed * 4)));
 }
 /** Wait for the final receipt of `hash` on the chain. `expect(receipt)` must be true for a success, otherwise a mined transaction does not count as the thing we wanted.
  *  A replacement hash offered by the API (`follow()` -> hash) is polled only if the chain says it came from the same sender with the same nonce as the original transaction.

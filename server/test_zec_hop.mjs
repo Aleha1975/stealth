@@ -42,7 +42,7 @@ ok("birthday is conservative", H.birthdayFromTime(1_000_000, 3_500_000, 1_000_00
 const st0 = H.newState({ stealth: STEALTH.toUpperCase().replace("0X", "0x"), chain: rh, dest: base, recipient: A, amount: 5n, now: 1 });
 ok("transitions", H.afterIn("SUCCESS").step === "WAIT_T" && H.afterIn("REFUNDED").step === "FAILED_IN" && H.afterIn("FAILED").step === "FAILED_IN" && H.afterOut(st0, "SUCCESS").step === "DONE"
   && H.afterOut(st0, "REFUNDED").step === "WAIT_T" && H.afterOut(st0, "REFUNDED").attempt === 1 && H.afterOut({ ...st0, attempt: H.MAX_OUT - 1 }, "REFUNDED").step === "FAILED" && H.afterOut(st0, "FAILED").step === "FAILED" && st0.step === "QUOTE_IN");
-ok("texts", H.progressText({ step: "WAIT_T" }) === "Private transfer: step 3/7 · keep this tab open · ~35 min" && /unfinished|Resume/.test(H.recoveryText({ step: "SHIELD", err: "x" })) && /back on the stealth/.test(H.recoveryText({ step: "FAILED_IN", result: "REFUNDED" })));
+ok("texts", H.progressText({ step: "WAIT_T" }) === "Private transfer: step 3/7 · keep this tab open · ~" + H.ETA_MIN + " min" && /unfinished|Resume/.test(H.recoveryText({ step: "SHIELD", err: "x" })) && /back on the stealth/.test(H.recoveryText({ step: "FAILED_IN", result: "REFUNDED" })));
 { let n = 0, slept = []; const v = await H.retry(async () => { if (++n < 3) throw new Error("x"); return 7; }, { sleep: async ms => slept.push(ms) });
   let m = 0; await H.retry(async () => { m++; throw new H.Halt("h"); }, { sleep: async () => {} }).catch(() => {});
   let k = 0; await H.retry(async () => { k++; throw new Error("e"); }, { sleep: async () => {} }).catch(() => {});
@@ -143,7 +143,7 @@ for (const step of H.STEPS.slice(1)) {          // stop cleanly before every ste
   const st = await H.runHop(mkCtx(w, s)); ok("expired auth + stealth already debited: no second signature/relay", w.relays === 0 && st.step === "DEPOSIT_IN", st.err || st.step); }
 // ---- ETA / countdown (remainingMs) ----
 { const M = 60_000, now = 10_000_000, S = H.STEP_MIN, sum = Object.values(S).reduce((a, b) => a + b, 0);
-  ok("STEP_MIN covers every step, sums to 25-35 min, ETA_MIN 35", H.STEPS.every(k => S[k] > 0) && sum >= 25 && sum <= 35 && H.ETA_MIN === 35, String(sum));
+  ok("STEP_MIN covers every step, includes the wallet-sync allowance (1129 F-3), ETA_MIN is its rounded sum", H.STEPS.every(k => S[k] > 0) && sum >= 35 && sum <= 45 && H.ETA_MIN === Math.round(sum) && S.SHIELD >= 3 + H.SYNC_MIN && S.QUOTE_OUT >= 0.5 + H.SYNC_MIN && H.SYNC_MIN >= 5, String(sum));
   ok("T_CONFS = 3 (the hop wallet policy is 1/1; 3 blocks = WAIT_T minutes at ~75 s each)", H.T_CONFS === 3 && Math.abs(S.WAIT_T - H.T_CONFS * 1.25) <= 0.5, S.WAIT_T + " min");
   let prev = Infinity, mono = true;
   for (const k of H.STEPS) { const r = H.remainingMs({ step: k, stepAt: now }, now); if (k !== "DELAY" && r !== Math.max(M, S[k] * M) + H.STEPS.slice(H.STEPS.indexOf(k) + 1).reduce((a, x) => a + S[x] * M, 0)) mono = false; if (r >= prev) mono = false; prev = r; }
@@ -209,7 +209,7 @@ const patchSend = (w, fn) => { const orig = w.Zjs.WebWallet.prototype.send_autho
   for (let sd = 1; sd <= 300; sd++) { const m = H.planParts({ orchard: 50_000_000n, rand: mulberry(sd + 77), now: 0 }); const asc = m.every((x, i) => i === 0 || x.at > m[i - 1].at);
     if (m.length !== 2 || m[1].at < 5 * 60_000 || m[1].at > 12 * 60_000 || m[0].at > 6 * 60_000 || !asc) maxOk = false; }
   ok("owner 30.10 max mode (the default): exactly 2 payouts, last send 5..12 min, first within 6 min, ascending", maxOk && H.DEFAULT_MODE === "max" && H.newState({ stealth: STEALTH, chain: rh, dest: base, recipient: A, amount: 1n }).mode === "max");
-  ok("max ETA is computed from the constants and stays within 35 min; old modes still readable", (e => e[0] >= 25 && e[1] <= 35 && e[0] <= e[1])(H.etaRangeMin("max")) && H.modeOf("fast").kMax === 2 && H.modeOf("private").kMax === 3 && H.MODES.max.kMax === 2 && H.accountsFor("private") === 7);
+  ok("max ETA is computed from the constants (sync time included, 1129 F-3): 45-60 min; old modes still readable", (e => e[0] >= 45 && e[1] <= 60 && e[0] <= e[1])(H.etaRangeMin("max")) && H.modeOf("fast").kMax === 2 && H.modeOf("private").kMax === 3 && H.MODES.max.kMax === 2 && H.accountsFor("private") === 7);
   ok("H1 modes: fast = 1..2 parts, last send 3..10 min; private = 2..3 parts, last send 8..15 min, ascending own times", fastOk && privOk);
   ok("H1 plan: parts get distinct fields (own delay, no quote yet)", (p => new Set(p.map(x => x.at)).size === p.length && p.every(x => x.quote === null && x.refundAcct === null))(H.planParts({ orchard: 50_000_000n, mode: "private", rand: mulberry(7), now: 0 }))); }
 { const w = makeWorld(), s = H.memStore(); off = 0; const msgs = [], t0 = Date.now(); const st = await H.startHop(mkCtx(w, s, { mode: "private", rand: mulberry(42), onProgress: (x, m) => msgs.push(m) })); const rec = await latest(s), P = rec.st.parts, o = outQuotes(w);
@@ -239,8 +239,8 @@ const patchSend = (w, fn) => { const orig = w.Zjs.WebWallet.prototype.send_autho
     && H.remainingMs({ step: "DELAY", mode: "private", partIdx: 0, parts, delayUntil: now - 1, stepAt: now }, now) === 7200_000 + send);
   ok("H1 ETA: private plan not made yet is longer than fast and within 1 h; legacy state unchanged", H.remainingMs({ step: "QUOTE_IN", mode: "private", stepAt: now }, now) > H.remainingMs({ step: "QUOTE_IN", mode: "fast", stepAt: now }, now) && H.remainingMs({ step: "QUOTE_IN", mode: "private", stepAt: now }, now) <= 60 * M && H.remainingMs({ step: "QUOTE_IN", mode: "fast", stepAt: now }, now) < 50 * M
     && H.remainingMs({ step: "QUOTE_IN", stepAt: now }, now) === (M + (Object.values(S).reduce((a, b) => a + b, 0) - S.QUOTE_IN * 1) * M));
-  ok("H1 labels: ETA text per mode, progress text with 'payout 2 of 3'", H.etaLabel("max") === "31–35 min" && H.etaLabel("fast") === "23–34 min" && H.etaLabel("private") === "33–42 min"
-    && /\(payout 2 of 3\)/.test(H.progressText({ step: "DELAY", mode: "private", partIdx: 1, parts: [{}, {}, {}] })) && H.progressText({ step: "WAIT_T" }) === "Private transfer: step 3/7 · keep this tab open · ~35 min");
+  ok("H1 labels: ETA text per mode, progress text with 'payout 2 of 3'", H.etaLabel("max") === "49–53 min" && H.etaLabel("fast") === "35–52 min" && H.etaLabel("private") === "51–66 min"
+    && /\(payout 2 of 3\)/.test(H.progressText({ step: "DELAY", mode: "private", partIdx: 1, parts: [{}, {}, {}] })) && H.progressText({ step: "WAIT_T" }) === "Private transfer: step 3/7 · keep this tab open · ~" + H.ETA_MIN + " min");
   const C = await import("../web/hop-card.js"); C.resetLeft();
   const v = C.hopView({ running: true, msg: "", st: { step: "SEND_OUT", chain: "rh", dest: "base", amount: "5000000", recipient: A, stealth: STEALTH, startedAt: now - 3600_000, stepAt: now, mode: "private", partIdx: 1, parts: [{}, { at: now }, { at: now + 1 }] } }, now);
   C.resetLeft(); const v0 = C.hopView({ running: true, msg: "", st: { step: "SEND_OUT", chain: "rh", dest: "base", amount: "5000000", recipient: A, stealth: STEALTH, startedAt: now - 3600_000, stepAt: now } }, now);
@@ -379,7 +379,7 @@ const timed = (msgs, st) => (x, m) => msgs.push([off, m]);
   ok("sub-step texts exist for waiting for ZEC, syncing, shielding", msgs.some(([, m]) => /^Syncing Zcash wallet \d+%/.test(m)) && msgs.some(([, m]) => /^Shielding/.test(m)));
   // a status message at least every 10 s of (virtual) time from the first WAIT_T message to the shield
   const end = msgs.findIndex(([, m]) => /timing link/.test(m)), t = msgs.slice(0, end < 0 ? undefined : end).filter(([, m]) => /ZEC to arrive|confirmations|Syncing|Shielding|spendable|shielded balance/.test(m)).map(x => x[0]); let gap = 0; for (let i = 1; i < t.length; i++) gap = Math.max(gap, t[i] - t[i - 1]);
-  ok("heartbeat: no silence longer than 10 s between status messages while waiting/shielding", t.length > 20 && gap <= 10000, "max gap " + gap + " ms over " + t.length + " msgs"); }
+  ok("heartbeat: no silence longer than 10 s between status messages while waiting/shielding", t.length > 15 && gap <= 10000, "max gap " + gap + " ms over " + t.length + " msgs"); }
 { const w = makeWorld(), s = H.memStore(); off = 0; w.tBal = {};   // ZEC visible in the UTXO list while the wallet sync is slow to see it: arrival must not wait for the wallet
   const msgs = []; let wb = 0; const orig = w.Zjs.WebWallet.prototype.get_wallet_summary; w.Zjs.WebWallet.prototype.get_wallet_summary = async function () { wb++; return orig.call(this); };
   await H.startHop(mkCtx(w, s, withUtxo(w)({ stopAt: "WAIT_T" }))); const r = await H.runHop(mkCtx(w, s, withUtxo(w)({ onProgress: timed(msgs) })));
@@ -554,6 +554,99 @@ for (const name of ["create_proposed_transactions", "db_to_bytes", "get_current_
 { // 1122 I-2: the seed derivation is bounded
   const src = fs.readFileSync(path.join(WEB, "zec-hop.js"), "utf8");
   ok("1122 I-2 mnemonicSeed is wrapped in the timeout helpers (hop check and SHIELD)", /withTimeout\(mnemonicSeed\(/.test(src) && /wc\(\(\) => mnemonicSeed\(mn\)/.test(src) && !/await mnemonicSeed\(/.test(src)); }
+
+// ---------- round 1130 / 1129 (D F-1, E F-4/F-2/F-3/I-2/I-3, F honest progress, G lost-record recovery) ----------
+const ZRm = await import("../web/zec-return.js");
+const tAddrOf = async (n, a, i = 0) => ZRm.deriveT(await H.mnemonicSeed(await H.mnemonicFor(PRIV, words, n)), ZRm.tPath(a, i)).addr;
+{ // D / 1129 F-1: one rule for the account range; max mode uses accounts 0-4 and every scanner covers them
+  ok("1129 F-1 scanAccts: saved nAccts wins, else the mode, else the default (max = 5 accounts, 0-4)", H.scanAccts({ nAccts: 7 }) === 7 && H.scanAccts({ mode: "private" }) === 7 && H.scanAccts(null) === H.accountsFor("max") && H.accountsFor("max") === 5 && H.scanAccts({ v: 1 }) === 5);
+  const a4 = await tAddrOf(0, 4);
+  const s = H.memStore(), key = STEALTH.toLowerCase() + "#0"; await s.put(key, { st: { v: 2, n: 0, stealth: STEALTH, chain: "rh", dest: "base", step: "FAILED", result: "RETURNED", hidden: true, mode: "max", nAccts: 5 }, db: null });
+  let err = null; try { await H.startHop(mkCtx(makeWorld(), s, { getUtxos: async a => (a === a4 ? [{ txid: "cd".repeat(32), n: 0, value: 50_000n, height: 3_500_000 }] : []) })); } catch (e) { err = e; }
+  ok("1129 F-1 the hidden-record pre-scan sees ZEC on account 4 (it only looked at 0-3 before): new hop refused", err && err.code === "EARLIER_HOP", err && err.message);
+  const src = fs.readFileSync(path.join(WEB, "app.js"), "utf8");
+  ok("1129 F-1 Return and the v1 pre-scan take their range from HM.scanAccts, no hard-coded 4 left", (src.match(/HM\.scanAccts\(/g) || []).length >= 2 && !/a < 4 &&/.test(src) && !/a < 4;/.test(fs.readFileSync(path.join(WEB, "zec-hop.js"), "utf8"))); }
+{ // E / 1129 F-4: the deposit disappears during the confirmation wait -> back to WAIT_T; a moved deposit restarts the count
+  const w = makeWorld(), s = H.memStore(); off = 0; const stage = { reorged: false, calls: 0 }; const gu = withUtxo(w)().getUtxos; const msgs = [];
+  const st = await H.startHop(mkCtx(w, s, withUtxo(w)({ onProgress: (x, m) => msgs.push(m), getUtxos: async a => { const r = await gu(a); if (r.length && !stage.reorged && ++stage.calls === 3) { stage.reorged = true; stage.hide = 3; } if (stage.hide > 0 && r.length) { stage.hide--; return []; } return r; } })));
+  ok("1129 F-4 deposit gone for 3 reads during the wait: hop goes back to WAIT_T (says so) and still finishes", stage.reorged && msgs.some(m => /no longer on the Zcash chain/.test(m)) && st.step === "DONE" && !st.err, st.step + " " + st.err);
+  const w2 = makeWorld(), s2 = H.memStore(); off = 0; let n2 = 0, moved = null; const gu2 = withUtxo(w2)().getUtxos;
+  const st2 = await H.startHop(mkCtx(w2, s2, withUtxo(w2)({ stopAt: "SHIELD", getUtxos: async a => { const r = await gu2(a); if (r.length) { if (++n2 === 3) moved = r[0].height + 2; if (moved) return [{ ...r[0], height: moved }]; } return r; } }))), rec2 = await latest(s2);
+  ok("1129 F-4 a deposit re-mined at a later height moves tSeenHeight (confirmations count from the new block)", moved && rec2.st.tSeenHeight === moved - 1, JSON.stringify([moved, rec2.st.tSeenHeight, st2.step]));
+  const w3 = makeWorld(), s3 = H.memStore(); off = 0; const gone = { v: false }; const gu3 = withUtxo(w3)().getUtxos;
+  const msgs3 = []; const proto = w3.Zjs.WebWallet.prototype, ps = proto.pczt_send; let sends = 0;
+  const st3 = await H.startHop(mkCtx(w3, s3, withUtxo(w3)({ onProgress: (x, m) => msgs3.push(m), stopAt: "DELAY" })));
+  ok("1129 F-4 control: a normal run shields once and reaches DELAY", st3.step === "DELAY" && w3.sig === 1);
+  // SHIELD fallback: nothing transparent, nothing shielded, no shield of ours: two empty reads send the hop back to WAIT_T
+  const w4 = makeWorld(), s4 = H.memStore(); off = 0; await H.startHop(mkCtx(w4, s4, { stopAt: "SHIELD" })); const r4 = await latest(s4); w4.tBal = {}; await s4.put(STEALTH.toLowerCase() + "#0", r4);
+  const m4 = []; const p4 = w4.Zjs.WebWallet.prototype.get_wallet_summary; let flip = 0; w4.Zjs.WebWallet.prototype.get_wallet_summary = async function () { const r = await p4.call(this); return r; };
+  const st4 = await H.runHop(mkCtx(w4, s4, { stopAt: "WAIT_T", onProgress: (x, m) => m4.push(m) })); const after4 = await latest(s4);
+  ok("1129 F-4 SHIELD with neither transparent nor shielded ZEC (and no shield in flight) falls back to WAIT_T instead of a 40-min wait ending in a wrong Halt", st4.step === "WAIT_T" && after4.st.tSeenHeight == null, st4.step + " " + st4.err);
+  const rec4b = JSON.parse(JSON.stringify({ shieldDone: true })); const w5 = makeWorld(), s5 = H.memStore(); off = 0; await H.startHop(mkCtx(w5, s5, { stopAt: "SHIELD" })); const r5 = await latest(s5); r5.st.shieldDone = true; w5.tBal = {}; await s5.put(STEALTH.toLowerCase() + "#0", r5);
+  const st5 = await H.runHop(mkCtx(w5, s5, { stopAt: "WAIT_T" }));
+  ok("1129 F-4 ... but never after a shield of ours went out (shieldDone): then it keeps waiting for the shielded balance and Halts honestly", st5.step === "SHIELD" && /taking too long/.test(st5.err) && /Continue|Return/.test(st5.err), st5.step + " " + st5.err); }
+{ // E: F-2 honest text, F-3 ETA, I-2 dust, I-3 preview
+  const src = fs.readFileSync(path.join(WEB, "app.js"), "utf8");
+  ok("1129 F-2 the max route note no longer promises random times for both payouts", /one after the other/.test(src) && !/paid out in 2 parts at random times/.test(src));
+  ok("1129 F-3 ETA includes the sync time: max is no longer 31-35 min and is above 45", H.etaRangeMin("max")[0] >= 45);
+  ok("1129 I-2 dust below the fee floor does not count as ZEC held; a real amount does", !H.holdsZec([{ transparent: 3000n, orchard: 5000n }]) && H.holdsZec([{ transparent: 0n, orchard: H.HOLD_DUST }]) && H.HOLD_DUST === 10_000n);
+  const zec = 600_000n; ok("1129 I-3 preview out-amount reserves one fee per payout part (max = 2 parts)", H.previewOut(zec) === H.outAmount(zec - H.SHIELD_FEE) - 20000n && H.previewOut(zec, "fast") === H.outAmount(zec - H.SHIELD_FEE) - 20000n && H.previewOut(zec, "private") < H.previewOut(zec)); }
+{ // fewer syncs: QUOTE_OUT and the plan reuse the balance just read
+  const w = makeWorld(), s = H.memStore(); off = 0; let syncs = 0; const proto = w.Zjs.WebWallet.prototype, sy = proto.sync; proto.sync = async function () { syncs++; return sy.call(this); };
+  const st = await H.startHop(mkCtx(w, s)); ok("1129 F-3 a full run does not sync the wallet twice in a row for the same balance (<= 9 syncs for 2 parts)", st.step === "DONE" && syncs <= 9, "syncs " + syncs); }
+{ // F: honest progress
+  const C = await import("../web/hop-card.js"), now = 5_000_000, M = 60_000; C.resetLeft();
+  const mk = (step, o = {}) => ({ st: { step, chain: "rh", dest: "rh", amount: "1000000", recipient: A, stealth: STEALTH, startedAt: now - 90 * M, stepAt: now - 80 * M, ...o.st }, running: true, msg: o.msg || "", beatAt: o.beatAt ?? now - 1000 });
+  const p0 = C.hopView(mk("SEND_OUT", { st: { startedAt: now - 5 * M, stepAt: now - 5 * M, parts: [{}, {}], partIdx: 0 } }), now).pct; C.resetLeft();
+  const p1 = C.hopView(mk("SEND_OUT", { st: { startedAt: now - 500 * M, stepAt: now - 480 * M, parts: [{}, {}], partIdx: 0 } }), now).pct; C.resetLeft();
+  ok("progress: a stuck step 480 minutes in shows the same percent as 5 minutes in (elapsed time never moves it)", p0 === p1 && p1 < 80, p0 + " vs " + p1);
+  const a = C.realProgress({ step: "WAIT_T" }), b = C.realProgress({ step: "SHIELD" }), c = C.realProgress({ step: "SEND_OUT", parts: [{}, {}], partIdx: 0 }), d = C.realProgress({ step: "SEND_OUT", parts: [{}, {}], partIdx: 1 });
+  ok("progress: a function of completed steps: grows step by step, last payout part is the last", a < b && b < c && c < d && d <= 99 && C.realProgress({ step: "QUOTE_IN" }) >= 1);
+  ok("progress: sub-progress stays inside its step (never reaches the next step's value)", C.realProgress({ step: "WAIT_T" }, 5) < C.realProgress({ step: "SHIELD" }) && C.realProgress({ step: "WAIT_T" }, 0.5) > a);
+  C.resetLeft(); const v1 = C.hopView(mk("WAIT_T", { msg: "Waiting for Zcash confirmations (1/3) · ~3 min", st: { startedAt: now - 40 * M } }), now), v2 = C.hopView(mk("WAIT_T", { msg: "Waiting for Zcash confirmations (2/3) · ~2 min", st: { startedAt: now - 4000 * M } }), now);
+  ok("progress: real sub-progress (confirmations 1/3 -> 2/3) moves it, wall-clock does not", v2.pct > v1.pct); C.resetLeft();
+  const dl = C.hopView(mk("DELAY", { st: { delayUntil: now + 5 * M, stepAt: now - 5 * M } }), now).pct; C.resetLeft(); const dlStale = C.hopView(mk("DELAY", { beatAt: now - 5 * 60_000, st: { delayUntil: now + 5 * M, stepAt: now - 5 * M } }), now).pct; C.resetLeft();
+  ok("progress: the delay's own timer counts only while the machine is alive (a silent tab does not creep forward)", dl > dlStale);
+  const stuck = C.hopView(mk("SHIELD", { beatAt: now - 200_000 }), now); ok("progress: 'No update for N s' is kept for a silent run", /No update for 200 s/.test(stuck.note)); C.resetLeft(); }
+{ // G: lost-record recovery
+  const FOUND = 123_456n, W = {}; let calls = 0;
+  const a02 = await tAddrOf(0, 2), a1 = await tAddrOf(1, 0), a40 = await tAddrOf(0, 4, 0);
+  const gu = map => async addr => { calls++; return (map[addr] || []); };
+  const base0 = { stealth: STEALTH, priv: PRIV, words, sleep: async () => {}, gapMs: 0 };
+  const sA = H.memStore(); calls = 0;
+  const none = await H.findLostFunds({ ...base0, store: sA, getUtxos: gu({}) });
+  ok("G not found: nothing reported, every lookup was a cheap UTXO query (4 hop wallets x 5 accounts x 3 indexes)", none.found && none.found.length === 0 && none.total === 0n && calls === 4 * 5 * 3, JSON.stringify(none, (k, v) => typeof v === "bigint" ? v.toString() : v) + " calls " + calls);
+  const f1 = await H.findLostFunds({ ...base0, store: sA, getUtxos: gu({ [a40]: [{ txid: "11".repeat(32), n: 0, value: FOUND, height: 3_500_100 }] }) });
+  ok("G found on account 4 of hop wallet 0 (max mode range)", f1.found.length === 1 && f1.found[0].n === 0 && f1.found[0].account === 4 && f1.found[0].index === 0 && f1.total === FOUND && f1.found[0].height === 3_500_100 && f1.found[0].addr === a40, JSON.stringify(f1, (k, v) => typeof v === "bigint" ? v.toString() : v));
+  const f2 = await H.findLostFunds({ ...base0, store: sA, getUtxos: gu({ [a1]: [{ txid: "22".repeat(32), n: 0, value: 50_000n, height: 3_500_100 }], [a02]: [{ txid: "33".repeat(32), n: 0, value: 80_000n, height: 3_500_050 }] }) });
+  ok("G several hop wallets: the one with the most ZEC is offered", f2.found[0].n === 0 && f2.total === 80_000n);
+  const dust = await H.findLostFunds({ ...base0, store: sA, getUtxos: gu({ [a1]: [{ txid: "22".repeat(32), n: 0, value: 3000n, height: 3_500_100 }] }) });
+  ok("G dust below the fee floor is not a finding", dust.found.length === 0);
+  ok("G bounded by the AuthorizationUsed count: none signed -> no lookups at all; one -> only hop wallet 0", await (async () => { calls = 0; const r0 = await H.findLostFunds({ ...base0, store: sA, priorHops: 0, getUtxos: gu({}) }); const c0 = calls; calls = 0; await H.findLostFunds({ ...base0, store: sA, priorHops: 1, getUtxos: gu({}) }); return c0 === 0 && calls === 15 && r0.found.length === 0; })());
+  const err1 = await H.findLostFunds({ ...base0, store: sA, getUtxos: async () => { throw new Error("proxy down"); } });
+  ok("G an unreadable proxy is an error result, never 'nothing found'", err1.error === "proxy down" && !err1.found);
+  const gaps = []; await H.findLostFunds({ ...base0, gapMs: 150, sleep: async ms => gaps.push(ms), store: sA, priorHops: 1, getUtxos: gu({}) });
+  ok("G lookups are rate limited (a pause after every query)", gaps.length === 15 && gaps.every(g => g === 150));
+  const sB = H.memStore(); await sB.put(STEALTH.toLowerCase() + "#0", { st: { v: 2, n: 0, stealth: STEALTH, step: "SHIELD", marker: "mine" }, db: null }); calls = 0;
+  const skip = await H.findLostFunds({ ...base0, store: sB, getUtxos: gu({ [a40]: [{ txid: "11".repeat(32), n: 0, value: FOUND, height: 3_500_100 }] }) });
+  ok("G a payment that has a local hop record is left alone (no lookups, nothing offered)", skip.skipped === "record" && calls === 0);
+  // adopt
+  const sC = H.memStore(); const r1 = await H.adoptLostHop({ store: sC, stealth: STEALTH }, { as: "return", n: 0, zats: FOUND, chain: rh, dest: rh }); const rec1 = await H.findHop(sC, STEALTH);
+  ok("G Return: a stopped card (FAILED, earlierFunds, no recipient) is written so the existing sweep path can work on it", r1.created && rec1.rec.st.step === "FAILED" && rec1.rec.st.earlierFunds === true && rec1.rec.st.rebuilt === true && rec1.rec.st.recipient == null && rec1.rec.st.n === 0);
+  const r1b = await H.adoptLostHop({ store: sC, stealth: STEALTH }, { as: "continue", n: 0, recipient: A, chain: rh, dest: rh });
+  ok("G no double record: adopting again never overwrites or adds a record", !r1b.created && (await sC.keys()).length === 1 && (await H.findHop(sC, STEALTH)).rec.st.step === "FAILED");
+  const sD = H.memStore(); const bad1 = await H.adoptLostHop({ store: sD, stealth: STEALTH }, { as: "continue", n: 0, recipient: "0x12", chain: rh, dest: rh }).then(() => null, e => e.message);
+  ok("G Continue needs a valid recipient address (nothing is written without one)", /valid recipient/.test(bad1 || "") && (await sD.keys()).length === 0);
+  await H.adoptLostHop({ store: sD, stealth: STEALTH }, { as: "continue", n: 0, account: 2, birthday: 3_499_990, zats: FOUND, recipient: A, chain: rh, dest: rh }); const rec2 = (await H.findHop(sD, STEALTH)).rec;
+  ok("G Continue: a hop at SHIELD for the account that holds the ZEC, birthday from the found block, recipient kept, mode max, no keys in the record", rec2.st.step === "SHIELD" && rec2.st.attempt === 2 && rec2.st.birthday === 3_499_990 && rec2.st.recipient === A && rec2.st.rebuilt && rec2.st.mode === "max" && rec2.st.nAccts === 5 && !JSON.stringify(rec2).includes(PRIV.slice(2)) && !JSON.stringify(rec2).includes(mn));
+  // the rebuilt record runs: the existing machine shields and pays out
+  const wG = makeWorld(), sG = H.memStore(); off = 0; await H.adoptLostHop({ store: sG, stealth: STEALTH }, { as: "continue", n: 0, account: 0, birthday: 3_499_990, zats: FOUND, recipient: A, chain: rh, dest: base });
+  const addr0 = await tAddrOf(0, 0); wG.tBal[tOf(mn.slice(0, 20) + 0)] = 10_000_000n;
+  const stG = await H.runHop(mkCtx(wG, sG, { chain: rh, dest: base, getUtxos: async () => [] }));
+  ok("G the rebuilt record is resumed by the normal machine: shielded and paid out to the entered recipient, without the original-amount loss check", stG.step === "DONE" && wG.relays === 0 && wG.sig === 1 && wG.quotes.filter(q => !q.dry).every(q => q.recipient === A) && wG.delivered > 0n, stG.step + " " + stG.err);
+  const srcApp = fs.readFileSync(path.join(WEB, "app.js"), "utf8");
+  ok("G UI: Continue asks for the recipient and vets/screens it like a withdraw; Return uses the existing sweep; shielded balance only on an explicit button; lookups rate limited and capped; no key logging", /vetRecipient\(to, l\.f\)/.test(srcApp) && /await screenRecipient\(to\)/.test(srcApp) && /await returnZec\(h, card\)/.test(srcApp) && /Check shielded balance/.test(srcApp) && /LOST_PER_PASS/.test(srcApp) && /lostSeen\.fresh\(k\)/.test(srcApp) && !/console\.(log|info|warn|error)\([^)]*(hit|priv|mnemonic)/.test(srcApp));
+  ok("G the scan never syncs a wallet on its own (the shielded check is a separate function behind a button)", !/hopSummary/.test(srcApp.slice(srcApp.indexOf("async function checkLost"), srcApp.indexOf("function lostCard")))); }
 
 Date.now = realNow;
 console.log(fails ? fails + " FAILED" : "all passed"); process.exit(fails ? 1 : 0);

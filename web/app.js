@@ -4,7 +4,7 @@ import { paymentNonce, receiveTypedData, splitSig, payAmounts as calcAmounts, fe
 import { CHAINS, pickChain, chainOfMeta, addChainParams, appFeesOf } from "./chains.js";
 import * as PW from "./private-withdraw.js";
 import { hopCard, hopView, statusLine } from "./hop-card.js";
-import { getBalances, fetchBatch, authorizationUsed, waitFinal, hasTransfer, hasPaid, hasAuthUsed, recentLogs, timeoutSignal, TRANSFER_TOPIC, PAID_TOPIC, AUTH_USED_TOPIC, ETH_TOKEN } from "./chain-read.js";
+import { getBalances, fetchBatch, authorizationUsed, waitFinal, hasTransfer, hasPaid, hasAuthUsed, recentLogs, logSpanSince, timeoutSignal, TRANSFER_TOPIC, PAID_TOPIC, AUTH_USED_TOPIC, ETH_TOKEN } from "./chain-read.js";
 
 const C = pickChain(), TOK = C.token, SYM = TOK.symbol, NAT = C.native.symbol;
 const USDC = TOK.address, STEALTHPAY = C.stealthPay, CHAIN_HEX = C.chainHex, API = C.api || "/stealth-api";
@@ -187,6 +187,7 @@ async function scan() {
   if (keys !== K) return;                                    // the account changed while scanning: nothing of this run is shown
   found = mine; render(); showResume().catch(() => {}); resumeFast().catch(() => {});      // 1101 M-1: the payments are listed BEFORE any balance is read; a failing RPC can no longer hide them
   const unread = await refreshBalances(true);
+  checkLost().catch(() => {});      // 1130 G: in the background; a failure only means no card
   const msg = n + " announcements scanned, " + found.length + " are yours." + (found.some(f => f.legacy) ? " Some are under your legacy keys (withdraw only)." : "") + (unread ? " Balances of " + unread + " could not be read from the chain right now; scan again to retry." : "");
   if (head.lag != null && head.lag > 50) say("pay-hint", msg + " Index is " + head.lag + " blocks behind.", "warn"); else say("pay-hint", msg, unread ? "warn" : "ok");
 }
@@ -216,7 +217,83 @@ function renderHops() {
   for (const [k, h] of hops) box.appendChild(hopCard(h, { onContinue: b => { b.disabled = true; runHop(h.f, h.hit, null).catch(e => say("pay-hint", e.message || String(e), "bad")); },
     onFunds: b => { b.disabled = true; runHop(h.f, h.hit, null).catch(e => say("pay-hint", e.message || String(e), "bad")); }, onDismiss: () => { hops.delete(k); renderHops(); },
     onReturn: (b, card) => { b.disabled = true; returnZec(h, card).catch(e => { b.disabled = false; say("pay-hint", e.message || String(e), "bad"); }); } }));
-  box.hidden = !hops.size;
+  for (const [k, l] of lost) if (!hops.has(k)) box.appendChild(lostCard(k, l));
+  box.hidden = !hops.size && !lost.size;
+}
+// ---- 1130 G: a private transfer whose record this browser lost (cleared storage, another device). The hop seed is a function of the stealth key, so after Scan the hop t-addresses of a payment that now holds nothing
+// (and has no local record) are asked for UTXOs: one cheap call each, no wallet sync, rate limited. A finding becomes a card with Return money / Continue; shielded ZEC needs a wallet sync, so it has its own button.
+const lost = new Map(), lostBusy = { v: false }, LOST_CHECK_KEY = "stealth-lost-checked", LOST_RECHECK_MS = 6 * 3600_000, LOST_PER_PASS = 10;
+const lostSeen = { read() { try { const o = JSON.parse(localStorage.getItem(LOST_CHECK_KEY) || "{}"); return o && typeof o === "object" ? o : {}; } catch { return {}; } },
+  fresh(k) { return Date.now() - (Number(this.read()[k]) || 0) < LOST_RECHECK_MS; }, mark(k) { const o = this.read(); o[k] = Date.now(); const ks = Object.keys(o); if (ks.length > 500) for (const x of ks.slice(0, ks.length - 500)) delete o[x]; try { localStorage.setItem(LOST_CHECK_KEY, JSON.stringify(o)); } catch {} } };
+const lostNone = new Set();      // payments checked on the chain with nothing found: they get the explicit "Check shielded balance" button
+const zecText = z => (Number(z) / 1e8).toFixed(8).replace(/0+$/, "").replace(/\.$/, "");
+async function checkLost() {
+  if (!keys || lostBusy.v || !indexedDB) return; lostBusy.v = true;
+  try {
+    const HM = await hopMod(), store = HM.idbStore(), sleep = ms => new Promise(r => setTimeout(r, ms)); let done = 0;
+    for (const f of found.slice()) {
+      if (done >= LOST_PER_PASS) break;
+      const k = f.stealth.toLowerCase(); if (f.legacy || f.usdc !== 0n || (hops.get(k) || {}).running || lost.has(k) || lostSeen.fresh(k)) continue;
+      const hit = hitOf(f); if (!hit || hit.stealth.toLowerCase() !== k) continue;
+      const ctx = { store, stealth: f.stealth, priv: hit.stealthPriv, words: await HM.loadWords(), getUtxos: HM.makeGetUtxos(), sleep };
+      let cnt = null; try { cnt = await HM.makeCountPriorHops(C, chainRpc)(f.stealth); } catch {}
+      if (cnt === 0) { lostSeen.mark(k); continue; }       // no authorization was ever spent from this address: no hop can exist
+      if (cnt != null) ctx.priorHops = cnt;
+      done++; const res = await HM.findLostFunds(ctx);
+      if (res.error) continue;                              // not marked: the next Scan tries again
+      lostSeen.mark(k);
+      if (res.skipped) continue;
+      if (res.found.length) lost.set(k, { f, hit, n: res.found[0].n, found: res.found, total: res.total, truncated: res.truncated }); else lostNone.add(k);
+      renderHops(); render();
+    }
+  } finally { lostBusy.v = false; }
+}
+function lostCard(k, l) {
+  const card = el("div", "hop warn"), line = el("div", "hop-line"), acts = el("div", "row hop-act");
+  card.appendChild(el("div", "hop-t", "Unfinished private transfer found: " + zecText(l.total) + " ZEC" + (l.shielded ? " (shielded)" : "")));
+  card.appendChild(el("div", "hop-line", "This browser has no record of it (storage was cleared, or it ran on another device), but the ZEC is still on the transfer's temporary wallet, rebuilt from your key. " + (l.shielded ? "Continue sends it on to a recipient you enter now." : "Return it to your wallet, or continue the transfer to a recipient you enter now.") + (l.truncated ? " More outputs exist than could be read at once; Return money handles them in rounds." : "")));
+  card.appendChild(line);
+  const btn = (txt, cls, fn) => { const b = el("button", "btn " + cls, txt); b.type = "button"; b.addEventListener("click", () => fn(b)); acts.appendChild(b); return b; };
+  const fail = (b, e) => { if (b) b.disabled = false; line.textContent = (e && e.message) || String(e); };
+  if (!l.shielded) btn("Return money", "", b => { b.disabled = true; lostReturn(k, l, card, line).catch(e => fail(b, e)); });
+  const canContinue = self.crossOriginIsolated && (l.shielded || l.found.every(x => x.index === 0));
+  if (canContinue) btn("Continue", "ghost", b => { const f = el("div", "row"); const inp = el("input"); inp.placeholder = "Recipient address 0x…"; inp.setAttribute("aria-label", "Recipient address"); inp.autocomplete = "off"; inp.spellcheck = false;
+    const go = el("button", "btn", "Continue transfer"); go.type = "button"; go.addEventListener("click", () => { go.disabled = true; lostContinue(k, l, inp.value.trim(), line).catch(e => { go.disabled = false; line.textContent = (e && e.message) || String(e); }); });
+    f.appendChild(inp); f.appendChild(go); card.insertBefore(f, acts); b.disabled = true; line.textContent = "Enter the recipient again: it cannot be read from the chain. It is checked like a normal withdraw."; });
+  if (!l.shielded) btn("Check shielded balance", "ghost", b => { b.disabled = true; lostShielded(k, l.f, l.hit, line).catch(e => fail(b, e)).finally(() => { b.disabled = false; }); });
+  card.appendChild(acts); return card;
+}
+const blockTimeSec = async n => { const b = await rpcOne("eth_getBlockByNumber", ["0x" + Number(n).toString(16), false]); const t = b && Number(BigInt(b.timestamp)); if (!Number.isFinite(t)) throw new Error("could not read the payment's block time"); return t; };
+// shielded ZEC needs a wallet sync (minutes), so it only runs on this button
+async function lostShielded(k, f, hit, line) {
+  if (!self.crossOriginIsolated) throw new Error("This page cannot run the Zcash wallet here (it is not cross-origin isolated).");
+  const HM = await hopMod(), base = await hopCtx(HM, f, hit, {}); let cnt = 1; try { cnt = await base.countPriorHops(f.stealth); } catch {}
+  if (cnt === 0) { line.textContent = "No private transfer was ever started from this address."; return; }
+  const bt = await blockTimeSec(f.block); let best = null;
+  for (let n = 0; n < Math.min(HM.LOST_N, Math.max(1, cnt)); n++) {
+    line.textContent = "Syncing the Zcash wallet to look for shielded ZEC (hop wallet " + (n + 1) + ")… this takes a few minutes. Keep this tab open.";
+    const rows = await HM.hopSummary({ ...base, n, blockTimeSec: bt, nAccts: HM.scanAccts(null) }, null), row = rows.filter(x => x.orchard >= HM.HOLD_DUST).sort((a, b) => (b.orchard > a.orchard ? 1 : -1))[0];
+    if (row) { best = { n, row, rows }; break; }
+  }
+  if (!best) { line.textContent = "No shielded ZEC found on this address's transfer wallets."; lostNone.delete(k); render(); return; }
+  const prev = lost.get(k) || {}; lost.set(k, { ...prev, f, hit, n: best.n, found: prev.found && prev.n === best.n ? prev.found : [], total: best.row.orchard, shielded: { account: best.row.account, blockTimeSec: bt } }); lostNone.delete(k); renderHops(); render();
+}
+async function lostReturn(k, l, card, line) {
+  const HM = await hopMod(), ctx = { store: HM.idbStore(), stealth: l.f.stealth }, r = await HM.adoptLostHop(ctx, { as: "return", n: l.n, zats: l.total, chain: C, dest: C });
+  const rec = await HM.findHop(ctx.store, l.f.stealth); if (!rec) throw new Error("could not save the recovered transfer");
+  lost.delete(k); const h = { f: l.f, hit: l.hit, running: false, msg: "", st: rec.rec.st }; hops.set(k, h);
+  await returnZec(h, card);
+}
+async function lostContinue(k, l, to, line) {
+  if (!self.crossOriginIsolated) throw new Error("This page cannot run the Zcash wallet here (it is not cross-origin isolated).");
+  if (!vetRecipient(to, l.f)) { line.textContent = "Cancelled."; return; }
+  line.textContent = "Checking the recipient…"; await screenRecipient(to);
+  const HM = await hopMod(), { zcash: ZC } = await import("./chains.js"), ZR = await import("./zec-return.js"), ctx = { store: HM.idbStore(), stealth: l.f.stealth };
+  let birthday, account, zats = l.total;
+  if (l.shielded) { birthday = HM.birthdayFromTime(l.shielded.blockTimeSec, await ZR.getTip(ZC.lightwalletd)); account = l.shielded.account; }
+  else { const top = l.found.slice().sort((a, b) => (b.value > a.value ? 1 : -1))[0]; account = top.account; zats = top.value; const hs = l.found.map(x => x.height).filter(x => x > 0); birthday = (hs.length ? Math.min(...hs) : (await ZR.getTip(ZC.lightwalletd)) - 5000) - 10; }
+  await HM.adoptLostHop(ctx, { as: "continue", n: l.n, account, birthday, zats, recipient: to, chain: C, dest: C });
+  lost.delete(k); renderHops(); render(); await runHop(l.f, l.hit, null);
 }
 // 1105 L-4: every writer of a hop record outside the machine takes the machine's own Web Lock (non-blocking). If the hop is running (or another writer is) the write is skipped, never interleaved.
 const underHopLock = (stealth, fn) => navigator.locks ? navigator.locks.request("zec-hop:" + stealth.toLowerCase(), { ifAvailable: true }, l => l ? fn() : undefined) : fn();
@@ -227,7 +304,7 @@ async function returnZec(h, card) {
   const line = el("div", "hop-line", "Looking for the ZEC…"); card.appendChild(line); const step = t => { line.textContent = t; };
   const seed = await HM.mnemonicSeed(await HM.mnemonicFor(h.hit.stealthPriv, await HM.loadWords(), h.st.n || 0));
   let key = null, utxos = [], unspendable = false;
-  for (let a = 0; a < 4 && !utxos.length; a++) for (let i = 0; i < 3 && !utxos.length; i++) {
+  for (let a = 0; a < HM.scanAccts(h.st) && !utxos.length; a++) for (let i = 0; i < HM.SCAN_INDEXES && !utxos.length; i++) {      // 1129 F-1: ONE rule for the range (max mode uses accounts 0-4)
     key = ZR.deriveT(seed, ZR.tPath(a, i)); const raw = await ZR.getUtxos(ZC.lightwalletd, key.addr); utxos = ZR.sweepSet(raw);
     if (!utxos.length && (raw.length || raw.truncated)) unspendable = true;      // 1103 M-1: dust only, or a list too long to read to the end: that is NOT "empty"
   }
@@ -243,7 +320,7 @@ async function returnZec(h, card) {
     }
     step("Checking the shielded balance…");
     const r = await HM.findHop(HM.idbStore(), h.f.stealth), left = await HM.hopSummary(await hopCtx(HM, h.f, h.hit, null), r && r.rec);
-    if (left.some(x => x.transparent + x.orchard > 0n)) throw new Error("ZEC is still in the shielded pool. Press Continue transfer.");
+    if (HM.holdsZec(left)) throw new Error("ZEC is still in the shielded pool. Press Continue transfer.");
     const v = await noteEmptyFor(HM, h, true);
     if (v.hide) { await hideHop(HM, h); step("Nothing left here, confirmed by repeated checks. Removed."); return; }
     step("The server says there is nothing here (" + ((v.obs && v.obs.count) || 1) + "/" + ZR.EMPTY_N + " checks, spread over at least 30 minutes). Not removed: rechecking. Press Return money again later."); return;
@@ -279,7 +356,7 @@ async function finishSweep(HM, h, step, sw) {
   step(fin.status === "SUCCESS" ? "Done: ≈ " + (Number(sw.amountOut) / 1e6).toFixed(2) + " " + SYM + " sent to your wallet." : "Swap ended as " + fin.status + ". The ZEC is back on the hop address; press Return money again.");
   if (fin.status === "SUCCESS") {      // 1122 L-3: the transparent return worked, but the card goes away only when the hop wallet holds nothing at all (shielded ZEC included); a failed check keeps the card
     let left = null; try { const r = await HM.findHop(HM.idbStore(), h.f.stealth); left = await HM.hopSummary(await hopCtx(HM, h.f, h.hit, null), r && r.rec); } catch {}
-    if (left && !left.some(x => x.transparent + x.orchard > 0n)) await hideHop(HM, h); else step("Done: the payout was sent. The hop wallet may still hold some ZEC, so the card stays: press Return money again.");
+    if (left && !HM.holdsZec(left)) await hideHop(HM, h); else step("Done: the payout was sent. The hop wallet may still hold some ZEC, so the card stays: press Return money again.");
   }
   else await underHopLock(h.f.stealth, async () => { const r = await HM.findHop(HM.idbStore(), h.f.stealth); if (r && r.rec.st.sweep && r.rec.st.sweep.txid === sw.txid) { r.rec.st = { ...r.rec.st, sweep: { ...r.rec.st.sweep, ended: fin.status, endedAt: Date.now() } }; await HM.idbStore().put(r.key, r.rec); } }).catch(() => {});      // 1110 L-1: the intent is settled (no endless resume), but kept so "empty" is not counted while the refund is still on its way
 }
@@ -291,7 +368,7 @@ async function staleV1(HM, r, hit) {
     const ZR = await import("./zec-return.js"), { zcash: ZC } = await import("./chains.js");
     const seed = await HM.mnemonicSeed(await HM.mnemonicFor(hit.stealthPriv, await HM.loadWords(), r.rec.st.n || 0));
     let empty = true;
-    for (let a = 0; a < 4 && empty; a++) for (let i = 0; i < 3 && empty; i++) if ((await ZR.getUtxos(ZC.lightwalletd, ZR.deriveT(seed, ZR.tPath(a, i)).addr)).length) empty = false;
+    for (let a = 0; a < HM.scanAccts(r.rec.st) && empty; a++) for (let i = 0; i < HM.SCAN_INDEXES && empty; i++) if ((await ZR.getUtxos(ZC.lightwalletd, ZR.deriveT(seed, ZR.tPath(a, i)).addr)).length) empty = false;
     // 1100 M-1: one "empty" answer proves nothing (lagging, restarting or lying server); only repeated answers over 30+ minutes hide the card
     const v = ZR.noteEmpty(r.rec.st.emptyObs, empty); r.rec.st = { ...r.rec.st, emptyObs: v.obs }; await underHopLock(r.rec.st.stealth, async () => { const cur = await HM.findHop(HM.idbStore(), r.rec.st.stealth); if (cur) { cur.rec.st = { ...cur.rec.st, emptyObs: v.obs }; await HM.idbStore().put(cur.key, cur.rec); } });
     return v;
@@ -324,6 +401,8 @@ function render() {
     const hp = activeHop(f);
     const small = el("small", null, "block " + f.block + " · " + (hp ? fmtTok(BigInt(hp.st.amount)) + " " + SYM + " · in private transfer" : (f.usdc === undefined ? "reading balance…" : f.usdc === null ? "balance not read (scan again)" : "now holds " + fmtTok(f.usdc) + " " + SYM) + (f.eth ? " + " + (Number(f.eth) / NUNIT).toFixed(5) + " " + NAT : "")) + " · ");
     const a = el("a", null, "tx"); a.href = C.explorer + "/tx/" + f.tx; a.target = "_blank"; a.rel = "noopener noreferrer"; small.appendChild(a); row.appendChild(small);
+    const kk = f.stealth.toLowerCase();
+    if (!hp && f.usdc === 0n && lostNone.has(kk) && self.crossOriginIsolated && !lost.has(kk)) { const d = el("div"), ln = el("div", "note"); d.style.marginTop = "8px"; const b = el("button", "btn ghost", "Check shielded balance"); b.type = "button"; b.addEventListener("click", () => { b.disabled = true; lostShielded(kk, f, hitOf(f), ln).catch(e => { ln.textContent = (e && e.message) || String(e); }).finally(() => { b.disabled = false; }); }); d.appendChild(b); d.appendChild(ln); row.appendChild(d); }
     if (!hp && f.usdc > 0n) { const d = el("div"); d.style.marginTop = "8px"; const b = el("button", "btn ghost", "Withdraw " + SYM); b.type = "button"; b.addEventListener("click", () => openWithdraw(i)); d.appendChild(b); row.appendChild(d); }
     list.appendChild(row);
   });
@@ -350,7 +429,7 @@ function openWithdraw(i) {
 const ROUTE_NOTE = {
   std: "Gasless, straight from the stealth address to the recipient. Anyone can see that link on-chain.",
   fast: "No Zcash: NEAR Intents swaps the money in 1–2 parts at random times. The link is broken by the swap, not by cryptography: someone who sees both sides and matches amounts and times can still connect them.",
-  max: "Through the Zcash shielded pool and back, paid out in 2 parts at random times. Keep this tab open; it can be resumed if you close it.",
+  max: "Through the Zcash shielded pool and back, paid out in 2 parts, one after the other (the second follows as soon as the first has been sent, so the gap between them is not random). Keep this tab open; it can be resumed if you close it.",
 };
 function setRoutes(HM) {
   const sel = $("wd-route"), prev = sel.value, priv = !$("wd-priv-wrap").hidden; sel.textContent = "";
@@ -413,7 +492,7 @@ async function runHop(f, hit, o) {
   } else if (TERMINAL.includes(st.step)) autoTries.delete(k);
   if (st.relayed && st.inQuote && !h.sp) { const amtIn = BigInt(st.inQuote.amountIn); spent.set(k, { left: f.usdc > amtIn ? f.usdc - amtIn : 0n, until: Date.now() + 120_000 }); }
   if (st.step === "FAILED_IN") spent.delete(k);
-  if (st.step === "FAILED") try { const rec = (await HM.findHop(ctx.store, f.stealth)).rec; h.extra = (await HM.hopSummary(ctx, rec)).filter(x => x.transparent + x.orchard > 0n).map(x => "Hop wallet account " + x.account + ": " + (Number(x.transparent) / 1e8) + " ZEC transparent, " + (Number(x.orchard) / 1e8) + " ZEC shielded").join("\n"); } catch (e) { h.extra = "Could not read the hop wallet: " + e.message; }
+  if (st.step === "FAILED") try { const rec = (await HM.findHop(ctx.store, f.stealth)).rec; h.extra = (await HM.hopSummary(ctx, rec)).filter(x => x.transparent + x.orchard >= HM.HOLD_DUST).map(x => "Hop wallet account " + x.account + ": " + (Number(x.transparent) / 1e8) + " ZEC transparent, " + (Number(x.orchard) / 1e8) + " ZEC shielded").join("\n"); } catch (e) { h.extra = "Could not read the hop wallet: " + e.message; }
   renderHops(); render(); await refreshBalances().catch(() => {});
 }
 /** Quote preview: when the service fee is on (chains.js privateFee), say how much of the shown Fee is ours. Nothing is added while it is off. */
@@ -428,7 +507,7 @@ async function privateWithdraw(to, value, hit) {
     say("pay-hint", "Asking NEAR Intents for a quote…");
     const q1 = await PW.requestQuote({ base: PW.ONECLICK, req: HM.reqIn({ chain: C, amount: value, tAddr: HM.DRY_T, stealth: wd.stealth, dry: true }) }), zec = BigInt(q1.quote.amountOut);
     if (!HM.okSize(zec)) throw new Error("Too small for the private route. Try a larger amount.");
-    const q2 = await PW.requestQuote({ base: PW.ONECLICK, req: HM.reqOut({ dest, amount: HM.outAmount(zec - HM.SHIELD_FEE), recipient: to, refundT: HM.DRY_T, dry: true }) });
+    const q2 = await PW.requestQuote({ base: PW.ONECLICK, req: HM.reqOut({ dest, amount: HM.previewOut(zec, mode), recipient: to, refundT: HM.DRY_T, dry: true }) });
     const out = BigInt(q2.quote.amountOut), fee = value - out, box = $("wd-quote"); box.textContent = "";
     const pct = (Number(fee) / Number(value) * 100).toFixed(1), qt = el("div", "qt"), c1 = el("div"), c2 = el("div");
     c1.appendChild(el("span", "note", "Recipient gets")); c1.appendChild(el("span", "big", "≈ " + (Number(out) / 10 ** dest.token.decimals).toFixed(2) + " " + dest.token.symbol));
@@ -444,16 +523,35 @@ async function privateWithdraw(to, value, hit) {
 
 // ---- route "private, fast": NEAR Intents only (web/private-withdraw.js runFast). The record (no recipient in it) is kept in localStorage while a part is open, so a closed tab can still follow the swaps.
 const FAST_KEY = "stealth-fast-wd";
-const fastRecs = { read() { try { return JSON.parse(localStorage.getItem(FAST_KEY) || "{}") || {}; } catch { return {}; } }, write(m) { try { Object.keys(m).length ? localStorage.setItem(FAST_KEY, JSON.stringify(m)) : localStorage.removeItem(FAST_KEY); } catch {} },
-  put(rec) { const m = this.read(); m[rec.stealth] = rec; this.write(m); }, del(k) { const m = this.read(); delete m[k]; this.write(m); } };
+// 1130 L-1: ONE storage key per stealth address ("stealth-fast-wd:<addr>"), so two tabs working on different addresses never overwrite each other's record (the old single map lost updates).
+// The old single-map key is migrated on read. put() THROWS when the record cannot be stored (full / blocked storage): the caller must not start a withdraw it could not follow after a reload.
+const fastRecs = { read() { const m = {}; try {
+    const old = JSON.parse(localStorage.getItem(FAST_KEY) || "null");
+    if (old && typeof old === "object") { let all = true; for (const a of Object.keys(old)) { m[a] = old[a]; try { if (localStorage.getItem(FAST_KEY + ":" + a) == null) localStorage.setItem(FAST_KEY + ":" + a, JSON.stringify(old[a])); } catch { all = false; } } if (all) localStorage.removeItem(FAST_KEY); }
+    for (let i = 0; i < localStorage.length; i++) { const key = localStorage.key(i); if (key && key.startsWith(FAST_KEY + ":")) { try { const r = JSON.parse(localStorage.getItem(key)); if (r && typeof r === "object") m[key.slice(FAST_KEY.length + 1)] = r; } catch {} } }
+  } catch {} return m; },
+  put(rec) { try { localStorage.setItem(FAST_KEY + ":" + rec.stealth, JSON.stringify(rec)); } catch (e) { throw new Error("Could not save the withdraw record in this browser (storage is full or blocked): " + ((e && e.message) || e)); } },
+  del(k) { try { localStorage.removeItem(FAST_KEY + ":" + k); } catch {} } };
 // 1125 F-1: ONE record per withdraw. A new withdraw from an address that still has an open record (a part in flight, not yet followed to its end) is refused, never written over it.
-function fastClaim(rec) { if (PW.fastOpenRec(fastRecs.read()[rec.stealth])) throw new Error("An earlier private withdraw from this address is still open (a part is with NEAR Intents or not finished). Reload this page to follow it, then try again."); fastRecs.put(rec); }
-// 1125 F-2: what the user needs to find a deposit address later (UNKNOWN / FAILED part) is kept until dismissed, not shown once and lost with the record.
-const FAST_NOTES_KEY = "stealth-fast-notes";
-const fastNotes = { read() { try { const a = JSON.parse(localStorage.getItem(FAST_NOTES_KEY) || "[]"); return Array.isArray(a) ? a.filter(x => typeof x === "string") : []; } catch { return []; } },
-  add(t) { const a = this.read(); if (!a.includes(t)) a.push(t); try { localStorage.setItem(FAST_NOTES_KEY, JSON.stringify(a.slice(-20))); } catch {} }, clear() { try { localStorage.removeItem(FAST_NOTES_KEY); } catch {} } };
-const fastNeedsNote = rec => rec.parts.some(p => p.depositAddress && (p.state === "UNKNOWN" || p.state === "FAILED"));
-function showFastBox(extra = []) { const box = $("fast-resume"), n = fastNotes.read(), txt = n.concat(extra).join("\n\n"); box.textContent = txt; box.hidden = !txt; $("btn-fast-dismiss").hidden = !n.length; }
+// 1130 L-1: and it is refused when the record cannot be persisted (written, then read back), because an unrecorded withdraw cannot be followed after a reload and would not block the next one.
+function fastClaim(rec) {
+  if (PW.fastOpenRec(fastRecs.read()[rec.stealth])) throw new Error("An earlier private withdraw from this address is still open (a part is with NEAR Intents or not finished). Reload this page to follow it, or abandon that record below, then try again.");
+  fastRecs.put(rec); const back = fastRecs.read()[rec.stealth];
+  if (!back || back.startedAt !== rec.startedAt) throw new Error("Could not save the withdraw record in this browser (storage is full or blocked); nothing was sent.");
+}
+// 1125 F-2: what the user needs to find a deposit address later (UNKNOWN / FAILED / STUCK part) is kept until dismissed, not shown once and lost with the record.
+// 1130 L-3: notes are kept per wallet account (acct), the cap is 200 (not 20), and "Dismiss" removes only the notes that were on screen.
+const FAST_NOTES_KEY = "stealth-fast-notes", NOTES_MAX = 200;
+const noteId = t => { let h = 5381; for (let i = 0; i < t.length; i++) h = ((h * 33) ^ t.charCodeAt(i)) >>> 0; return h.toString(16); };
+const fastNotes = { all() { try { const o = JSON.parse(localStorage.getItem(FAST_NOTES_KEY) || "{}"); if (Array.isArray(o)) return { "": o.filter(x => typeof x === "string").map(t => ({ id: noteId(t), t })) }; return o && typeof o === "object" ? o : {}; } catch { return {}; } },
+  save(o) { try { localStorage.setItem(FAST_NOTES_KEY, JSON.stringify(o)); } catch {} },
+  read(acct) { const o = this.all(), l = String(acct || "").toLowerCase(); return (o[""] || []).concat(l ? o[l] || [] : []).filter(x => x && typeof x.t === "string"); },      // "" = notes from before they were per account: shown to every account until dismissed
+  add(t, acct) { const o = this.all(), l = String(acct || "").toLowerCase(), a = o[l] || []; if (!a.some(x => x.t === t)) a.push({ id: noteId(t), t }); o[l] = a.slice(-NOTES_MAX); this.save(o); },
+  drop(ids, acct) { const o = this.all(), l = String(acct || "").toLowerCase(), set = new Set(ids); for (const k of ["", l]) if (o[k]) { o[k] = o[k].filter(x => !set.has(x.id)); if (!o[k].length) delete o[k]; } if (Object.keys(o).length) this.save(o); else { try { localStorage.removeItem(FAST_NOTES_KEY); } catch {} } } };
+const fastNeedsNote = rec => rec.parts.some(p => p.depositAddress && (p.state === "UNKNOWN" || p.state === "FAILED" || p.state === "STUCK"));
+let shownNotes = [];
+const fastOpenIdle = () => { const m = fastRecs.read(); return Object.keys(m).filter(k => !fastBusy.has(k) && PW.fastOpenRec(m[k])); };
+function showFastBox(extra = []) { const box = $("fast-resume"), n = fastNotes.read(acct), txt = n.map(x => x.t).concat(extra).join("\n\n"); shownNotes = n.map(x => x.id); box.textContent = txt; box.hidden = !txt; $("btn-fast-dismiss").hidden = !n.length; $("btn-fast-abandon").hidden = !fastOpenIdle().length; }
 async function fastWithdraw(to, value, hit) {
   const dest = CHAINS[$("wd-dest").value]; if (!dest || !dest.oneClick) throw new Error("pick a destination chain");
   const key = [to.toLowerCase(), value, dest.key, "fast"].join("|");
@@ -474,13 +572,13 @@ async function fastWithdraw(to, value, hit) {
   const rec = { v: 1, stealth: k, chain: C.key, dest: dest.key, startedAt: Date.now(), parts: plan };
   $("btn-wd").disabled = true; $("withdraw").hidden = true; fastBusy.add(k);
   const lock = await holdScreen(), fmt = v => fmtTok(v);
-  const save = r => fastRecs.put(r);
+  const save = r => { try { fastRecs.put(r); } catch (e) { say("pay-hint", e.message + " The withdraw continues, but if this tab is closed it cannot be followed.", "warn"); } };      // 1130 L-1: surfaced, never silent (the START is refused in fastClaim)
   let cur = null, claimed = false;      // claimed: this run owns the stored record (a refused second start must not touch the guard or notes of the live one)
-  const noteIfNeeded = () => { if (claimed && fastNeedsNote(rec)) { fastNotes.add("Private withdraw of " + fmtTok(value) + " " + SYM + " (" + C.name + "), started " + new Date(rec.startedAt).toLocaleString() + ":\n" + PW.fastSummary(rec, fmt, SYM).join("\n")); showFastBox(); } };
+  const noteIfNeeded = () => { if (claimed && fastNeedsNote(rec)) { fastNotes.add("Private withdraw of " + fmtTok(value) + " " + SYM + " (" + C.name + "), started " + new Date(rec.startedAt).toLocaleString() + ":\n" + PW.fastSummary(rec, fmt, SYM).join("\n"), acct); showFastBox(); } };
   const settleGuard = () => { if (claimed && !rec.parts.some(p => p.state === "SIGNED" || p.state === "UNKNOWN")) pendingWd.delete(k); };
   const ctx = { from: C, to: dest, priv: hit.stealthPriv, stealth: w.stealth, recipient: to, api: API, base: PW.ONECLICK, fetchFn: fetch, minRatio: ratio * 0.98, randomNonce: randomBytes32,
     authUsed: (a, n) => authorizationUsed(rpcOne, USDC, a, n), onProgress: m => say("pay-hint", m, "ok"),
-    findTx: a => txOfLogs({ address: USDC, topics: [AUTH_USED_TOPIC, "0x" + padAddr(w.stealth), a.nonce] }, () => true), onRefused: () => pendingWd.delete(k),
+    findTx: a => txOfLogs({ address: USDC, topics: [AUTH_USED_TOPIC, "0x" + padAddr(w.stealth), a.nonce], span: logSpanSince(a.validBefore) }, () => true), onRefused: () => pendingWd.delete(k),
     onSigned: info => { cur = info; pendingWd.set(k, (info.validBefore + 60) * 1000); },       // armed before the request leaves; cleared only when the deposit is confirmed
     waitReceipt: h => waitReceipt(h, x => hasTransfer(x, { token: USDC, from: w.stealth, to: cur.depositAddress, value: cur.amount }) && hasAuthUsed(x, { token: USDC, authorizer: w.stealth, nonce: cur.auth.nonce }), true),
     onDeposited: info => { if (info.index === rec.parts.length - 1) pendingWd.delete(k); spent.set(k, { left: (spent.get(k) || { left: w.usdc }).left - BigInt(rec.parts[info.index].amount), until: Date.now() + 120_000 }); render(); } };
@@ -500,16 +598,27 @@ async function resumeFast() {
   for (const k of Object.keys(m)) {
     const rec = m[k]; if (!rec || !Array.isArray(rec.parts) || fastBusy.has(k)) continue;
     let ran = false;
-    const go = async () => { ran = true; fastBusy.add(k); try { await PW.runFast({ base: PW.ONECLICK, fetchFn: fetch, onProgress: t => { box.hidden = false; box.textContent = "Earlier private withdraw: " + t; } }, rec, r => fastRecs.put(r), { resume: true }); } finally { fastBusy.delete(k); } };
+    const go = async () => { ran = true; fastBusy.add(k); try { await PW.runFast({ base: PW.ONECLICK, fetchFn: fetch, onProgress: t => { box.hidden = false; box.textContent = "Earlier private withdraw: " + t; } }, rec, r => { try { fastRecs.put(r); } catch {} }, { resume: true }); } finally { fastBusy.delete(k); } };
     try { if (navigator.locks) await navigator.locks.request("fast-wd:" + k, { ifAvailable: true }, l => l ? go() : undefined); else await go(); } catch (e) { extra.push("Earlier private withdraw: " + (e.message || e)); continue; }
     if (!ran) continue;                                      // 1125 F-6: another tab holds the lock, so this record is a LIVE withdraw there, not an earlier one
     const chain = CHAINS[rec.chain] || C, sums = PW.fastSummary(rec, v => (Number(v) / 10 ** chain.token.decimals).toFixed(2), chain.token.symbol), text = "Earlier private withdraw (" + chain.name + "):\n" + sums.join("\n");
-    if (fastNeedsNote(rec)) fastNotes.add(text); else extra.push(text);      // 1125 F-2: all summaries are listed (not only the last), and the ones with a deposit address to look up stay
+    if (fastNeedsNote(rec)) fastNotes.add(text, acct); else extra.push(text);      // 1125 F-2: all summaries are listed (not only the last), and the ones with a deposit address to look up stay
     if (PW.fastDone(rec)) { fastRecs.del(k); if (!rec.parts.some(p => p.state === "UNKNOWN")) pendingWd.delete(k); }   // UNKNOWN: the signed transfer may still land, the guard stays until its authorization expires
   }
   showFastBox(extra);
 }
-$("btn-fast-dismiss").addEventListener("click", () => { fastNotes.clear(); showFastBox(); });
+$("btn-fast-dismiss").addEventListener("click", () => { fastNotes.drop(shownNotes, acct); showFastBox(); });
+// 1130 M-2: the explicit way out of a record that cannot be closed (a part that never got a final 1Click status, a tab that died): every open part is parked in the state that tells the truth, the deposit address goes into a note.
+$("btn-fast-abandon").addEventListener("click", once(async () => {
+  const ks = fastOpenIdle(); if (!ks.length || !confirm("Abandon the unfinished private withdraw record" + (ks.length > 1 ? "s" : "") + "? Parts already handed to NEAR Intents stay with NEAR Intents (their deposit addresses are kept in a note); this page stops following them.")) return;
+  for (const k of ks) {
+    const go = () => { const rec = fastRecs.read()[k]; if (!rec || !PW.fastOpenRec(rec)) return; const chain = CHAINS[rec.chain] || C; PW.abandonRec(rec);
+      fastNotes.add("Abandoned private withdraw (" + chain.name + "), started " + new Date(rec.startedAt).toLocaleString() + ":\n" + PW.fastSummary(rec, v => (Number(v) / 10 ** chain.token.decimals).toFixed(2), chain.token.symbol).join("\n"), acct);
+      fastRecs.del(k); };
+    if (navigator.locks) await navigator.locks.request("fast-wd:" + k, { ifAvailable: true }, l => { if (l) go(); }); else go();      // a record another tab is running is not abandoned from here
+  }
+  showFastBox();
+}));
 // ---- unfinished hops of the payments found: banner with Resume (needs the keys, so it appears after Scan)
 async function showResume() {
   if (!self.crossOriginIsolated || !keys || !((await (indexedDB.databases ? indexedDB.databases() : [])) || []).some(d => d.name === "stealth-zec-hop")) return;
@@ -529,14 +638,27 @@ $("btn-wd-cancel").addEventListener("click", () => { $("withdraw").hidden = true
 const TYPEHASH = keccak(new TextEncoder().encode("TransferWithAuthorization(address from,address to,uint256 value,uint256 validAfter,uint256 validBefore,bytes32 nonce)"));
 const DOMAIN_TYPEHASH = keccak(new TextEncoder().encode("EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)"));
 const domainSeparator = () => keccak(unhex(hex(DOMAIN_TYPEHASH) + hex(keccak(new TextEncoder().encode(TOK.domainName))).slice(2) + hex(keccak(new TextEncoder().encode(TOK.domainVersion))).slice(2) + pad(BigInt(C.chainId)) + padAddr(USDC)));
+// the same checks for every recipient the user types (a normal withdraw and "Continue" of a recovered transfer)
+function vetRecipient(to, w) {
+  if (!isAddr(to)) throw new Error("enter a destination address");
+  if (acct && to.toLowerCase() === acct) throw new Error("Refused: that is the wallet your keys came from. Sending there would tie this payment to your public address.");
+  if (w && w.payer && to.toLowerCase() === w.payer.toLowerCase()) throw new Error("Refused: that is the wallet that paid you. Sending it back links the two.");
+  if (found.some(f => f.stealth.toLowerCase() === to.toLowerCase()) && !confirm("That is another of your stealth addresses. Pooling payments links them to each other. Continue?")) return false;
+  return true;
+}
+async function screenRecipient(to) {
+  // audit 1087 M-3: the relayer only sees the 1Click deposit address, so the real recipient is screened here, before anything is signed (fail closed if the check cannot run)
+  // the whole list is fetched and checked here, so the recipient never reaches our server; /relay/screen only while a relayer without the list endpoint is live
+  const sl = await api("/relay/sanctions-list").catch(() => null), local = sl && Array.isArray(sl.addresses) && sl.addresses.length === sl.count && sl.count > 0;
+  if (!local) say("pay-hint", "The sanctions list could not be loaded here, so this recipient address is checked by the relayer instead (it will see it).", "warn");     // 1101 I-1
+  const sc = local ? { listed: sl.addresses.includes(to.toLowerCase()) } : await api("/relay/screen?addr=" + to).catch(() => null);
+  if (!sc || sc.listed !== false) throw new Error(sc && sc.listed ? "That recipient address is on a sanctions list; refusing." : "Could not check the recipient against the sanctions list; nothing was sent. Try again.");
+}
 $("btn-wd").addEventListener("click", once(async () => {
   try {
     if (!wd || !keys) return;
     const to = $("wd-to").value.trim();
-    if (!isAddr(to)) throw new Error("enter a destination address");
-    if (acct && to.toLowerCase() === acct) throw new Error("Refused: that is the wallet your keys came from. Sending there would tie this payment to your public address.");
-    if (wd.payer && to.toLowerCase() === wd.payer.toLowerCase()) throw new Error("Refused: that is the wallet that paid you. Sending it back links the two.");
-    if (found.some(f => f.stealth.toLowerCase() === to.toLowerCase()) && !confirm("That is another of your stealth addresses. Pooling payments links them to each other. Continue?")) return;
+    if (!vetRecipient(to, wd)) return;
     const all = wd.usdc; const amtIn = $("wd-amt").value.trim();
     const exact = amtIn ? calcAmounts({ src: "amount", text: amtIn, decimals: TOK.decimals, fee: 0n }) : null;      // exact decimals, no floats (1098 I-1)
     if (amtIn && !exact) throw new Error("enter the amount as a plain number");
@@ -549,12 +671,7 @@ $("btn-wd").addEventListener("click", once(async () => {
     const dsep = await chainRpc(C.rpc, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "eth_call", params: [{ to: USDC, data: "0x3644e515" }, "latest"] }) }, true).then(r => r.json()).then(j => j.result).catch(() => null);
     if (String(dsep).toLowerCase() !== hex(domainSeparator()).toLowerCase()) throw new Error(SYM + " domain mismatch (or could not be read from the chain); refusing to sign");
     if (route() !== "std" && !$("wd-priv-wrap").hidden) {
-      // audit 1087 M-3: the relayer only sees the 1Click deposit address, so the real recipient is screened here, before anything is signed (fail closed if the check cannot run)
-      // the whole list is fetched and checked here, so the recipient never reaches our server; /relay/screen only while a relayer without the list endpoint is live
-      const sl = await api("/relay/sanctions-list").catch(() => null), local = sl && Array.isArray(sl.addresses) && sl.addresses.length === sl.count && sl.count > 0;
-      if (!local) say("pay-hint", "The sanctions list could not be loaded here, so this recipient address is checked by the relayer instead (it will see it).", "warn");     // 1101 I-1
-      const sc = local ? { listed: sl.addresses.includes(to.toLowerCase()) } : await api("/relay/screen?addr=" + to).catch(() => null);
-      if (!sc || sc.listed !== false) throw new Error(sc && sc.listed ? "That recipient address is on a sanctions list; refusing." : "Could not check the recipient against the sanctions list; nothing was sent. Try again.");
+      await screenRecipient(to);
       return route() === "fast" ? await fastWithdraw(to, value, hit) : await privateWithdraw(to, value, hit);
     }
     const now = Math.floor(Date.now() / 1000); const validBefore = BigInt(now + 3600); const nonce = randomBytes32();
@@ -568,7 +685,7 @@ $("btn-wd").addEventListener("click", once(async () => {
     // 1121 L-2: the guard is cleared only by a DEFINITE refusal (400/403/429 JSON, not "already used"). "authorization already used" means an earlier attempt of this same request went through (lost answer, then the retry): follow it like d.used.
     const ans = PW.relayOutcome(r, d);      // 1125 F-3: the same reading of the answer as the fast route
     if (ans.kind === "error") { if (ans.definite) pendingWd.delete(w.stealth.toLowerCase()); throw new Error(ans.message); }
-    if (ans.kind === "used") d.hash = await txOfLogs({ address: USDC, topics: [AUTH_USED_TOPIC, "0x" + padAddr(w.stealth), nonce] }, () => true);      // 1101 L-1: found by THIS request's nonce, not by "an identical transfer"
+    if (ans.kind === "used") d.hash = await txOfLogs({ address: USDC, topics: [AUTH_USED_TOPIC, "0x" + padAddr(w.stealth), nonce], span: logSpanSince(validBefore) }, () => true);      // 1101 L-1: found by THIS request's nonce, not by "an identical transfer"
     if (!isHash(d.hash)) throw new Error("the relayer answered without a valid transaction hash; check the explorer before sending again");
     $("withdraw").hidden = true;
     say("pay-hint", "Submitted: " + fmtTok(value) + " " + SYM + " → " + to.slice(0, 8) + "… waiting for the block…");

@@ -211,10 +211,13 @@ let lastAlert = 0, lastLockAlert = 0;
 const alertOnce = (...a) => { if (Date.now() - lastAlert > 60000) { lastAlert = Date.now(); log("ALERT", ...a); } };
 const HEX32 = /^0x[0-9a-fA-F]{64}$/;
 
+// audit 1130 M-1: `definite: true` in a 400 is a PROMISE that this request was refused by offline validation, before any state was read or anything could be broadcast, and that
+// every repeat of the same bytes is refused the same way. Everything else (STILL, "in progress", limits, balance, expiry, upstream) may follow an earlier attempt that did broadcast: no flag.
+const early = m => Object.assign(new Error(m), { definite: true });
 function parseAuth(o, what) {
-  if (!o || !HEX32.test(o.nonce) || !HEX32.test(o.r) || !HEX32.test(o.s)) throw new Error("bad signature fields" + what);
-  const v = Number(o.v); if (![27, 28].includes(v)) throw new Error("bad v" + what);
-  if (!isLowS(o.s)) throw new Error("bad signature (high s)" + what);          // audit 1102 L-3: offline, before any RPC
+  if (!o || !HEX32.test(o.nonce) || !HEX32.test(o.r) || !HEX32.test(o.s)) throw early("bad signature fields" + what);
+  const v = Number(o.v); if (![27, 28].includes(v)) throw early("bad v" + what);
+  if (!isLowS(o.s)) throw early("bad signature (high s)" + what);          // audit 1102 L-3: offline, before any RPC
   return { value: BigInt(o.value), validAfter: BigInt(o.validAfter || 0), validBefore: BigInt(o.validBefore), nonce: lc(o.nonce), v, r: o.r, s: o.s };   // audit 1113 L-1: nonce in one case
 }
 
@@ -490,26 +493,26 @@ async function sendAndTrack(call, gasLimit, reserve, from, tag, onGone = () => {
 
 export async function relay(b, ip, ctx = {}) {
   ip = safeIp(ipKey(ip));                                              // audit 1087 M-1: IPv6 -> its /64; audit 1099 M-1: only an address-like token reaches the log
-  if (!b || typeof b !== "object" || !isAddress(b.from || "") || !isAddress(b.to || "")) throw new Error("bad request");   // cheap shape checks first (audit 1099 M-2)
-  if (b.endRecipient && !isAddress(b.endRecipient)) throw new Error("bad request");
+  if (!b || typeof b !== "object" || !isAddress(b.from || "") || !isAddress(b.to || "")) throw early("bad request");   // cheap shape checks first (audit 1099 M-2)
+  if (b.endRecipient && !isAddress(b.endRecipient)) throw early("bad request");
   const from = getAddress(b.from), to = getAddress(b.to);
   // audit 1087 M-3: `to` is a 1Click deposit address for a private withdraw. A client that names the real end recipient (endRecipient) gets it screened too;
   // the web app screens it itself via /relay/screen before signing (sending it here would tell this server who receives the money).
   screen.check({ from, to, feeRecipient: account.address, ...(b.endRecipient ? { endRecipient: getAddress(b.endRecipient) } : {}) }, ip);      // before any RPC / counters / gas
   const main = parseAuth(b, ""); const value = main.value;
-  if (value < MIN_VALUE) throw new Error("below the minimum of $0.10");
+  if (value < MIN_VALUE) throw early("below the minimum of $0.10");
   let fee = null;
   if (b.feeAuth) {
-    if (FEE_MIN === 0n) throw new Error("fees are not enabled");
+    if (FEE_MIN === 0n) throw early("fees are not enabled");
     fee = parseAuth(b.feeAuth, " (fee)");
-    if (fee.value < FEE_MIN) throw new Error("fee below the minimum");
-    if (fee.nonce === main.nonce) throw new Error("the fee and the transfer need different nonces");   // audit 1128 L-4: one nonce would share one unsure / feePaid key
-  } else if (FEE_MIN > 0n) throw new Error("fee authorization required");
+    if (fee.value < FEE_MIN) throw early("fee below the minimum");
+    if (fee.nonce === main.nonce) throw early("the fee and the transfer need different nonces");   // audit 1128 L-4: one nonce would share one unsure / feePaid key
+  } else if (FEE_MIN > 0n) throw early("fee authorization required");
   // audit 1099 M-2/I-6: everything that can be decided without the network is decided now: the EIP-712 signature (so a stranger cannot take the address lock, and junk costs no RPC)
   for (const [a, dst] of fee ? [[main, to], [fee, account.address]] : [[main, to]]) {
     const signer = await recoverTypedDataAddress({ domain: { name: CC.domain.name, version: CC.domain.version, chainId: CC.id, verifyingContract: TOKEN }, types: TRANSFER_TYPES, primaryType: "TransferWithAuthorization",
       message: { from, to: dst, value: a.value, validAfter: a.validAfter, validBefore: a.validBefore, nonce: a.nonce }, signature: { r: a.r, s: a.s, v: BigInt(a.v) } }).catch(() => null);
-    if (signer !== from) throw new Error("signature does not match the address");
+    if (signer !== from) throw early("signature does not match the address");
   }
   // audit 1120 M-1: the signature is valid, but the request is charged to the SIGNER only once it is proven FRESH (authorization still unused). Public signatures of a victim (on chain, in the mempool) can
   // be replayed by anyone: every refusal before that proof (dedupe is free, known-used, expired, used on chain) is charged to the NETWORK key (ctx.signer stays unset).
@@ -726,7 +729,7 @@ function serve() {
         const t = refusedLines.take();   // audit 1099 M-2: at most 20 refusal lines a minute, the rest is summarised
         if (t.summary) log("refused lines suppressed", t.summary);
         if (t.log) { log("refused", ipk, JSON.stringify(msg)); if (e.unknown) log("unclassified error", ipk, JSON.stringify(e.detail)); }   // audit 1113 I-5: ONE log token per refusal   // audit 1099 M-1: msg is data (later argument): neutralised; JSON.stringify: audit 1087 L-1, one line per refusal
-        send(400, { error: msg });
+        send(400, e && e.definite === true ? { error: msg, definite: true } : { error: msg });
       } finally { release(); }
     });
   }).listen(Number(E.STEALTH_RELAY_PORT || 3874), "127.0.0.1", async () => {

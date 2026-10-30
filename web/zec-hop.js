@@ -11,20 +11,34 @@ import { zcash as ZC, privateFee, appFeesOf } from "./chains.js";
 
 export const STEPS = ["QUOTE_IN", "DEPOSIT_IN", "WAIT_T", "SHIELD", "DELAY", "QUOTE_OUT", "SEND_OUT"];
 export const DONE_STEPS = new Set(["DONE", "FAILED_IN", "FAILED"]);
-export const HOP_TAG = "stealth-zec-hop/v1", MAX_OUT = 3, PART_TRIES = 2, PENDING = "PENDING_DEPOSIT", ETA_MIN = 35, T_CONFS = 3;   // T_CONFS: confirmations of the hop wallet's own t-deposit before we try to shield. The wallet policy (constructor args, 1/1 below) already allows 1; 3 blocks (~4 min) keep a shallow reorg from hitting the shield. A too-early shield only raises InsufficientFunds, which SHIELD retries every 10 s
-export const STEP_MIN = { QUOTE_IN: 0.5, DEPOSIT_IN: 4, WAIT_T: 4, SHIELD: 3, DELAY: 6, QUOTE_OUT: 0.5, SEND_OUT: 8 };   // typical minutes per step (sum 26.5)
+export const HOP_TAG = "stealth-zec-hop/v1", MAX_OUT = 3, PART_TRIES = 2, PENDING = "PENDING_DEPOSIT", T_CONFS = 3;   // T_CONFS: confirmations of the hop wallet's own t-deposit before we try to shield. The wallet policy (constructor args, 1/1 below) already allows 1; 3 blocks (~4 min) keep a shallow reorg from hitting the shield. A too-early shield only raises InsufficientFunds, which SHIELD retries (10 s pause, but every round starts with a wallet sync that takes minutes)
+/** 1129 F-3: a REPEAT wallet sync (WebZjs, a wallet that already scanned) takes 145-340 s with 1-4 accounts and more with 5 (syncW's own estimate for 5 accounts is ~6.7 min). The shield step does one such sync while it waits for the
+ *  shielded balance, and every payout part does one before its quote, so the typical times below include them. */
+export const SYNC_MIN = 6;
+export const STEP_MIN = { QUOTE_IN: 0.5, DEPOSIT_IN: 4, WAIT_T: 4, SHIELD: 3 + SYNC_MIN, DELAY: 6, QUOTE_OUT: 0.5 + SYNC_MIN, SEND_OUT: 8 };   // typical minutes per step (sum 38)
+export const ETA_MIN = Math.round(Object.values(STEP_MIN).reduce((a, b) => a + b, 0));          // for a saved state without a mode
 /** Payout modes (audit H-1): the shielded balance is paid out in k parts of random size, each with its own random delay, quote and deposit.
  *  Limit (1105 L-7): the split defeats a match on ONE amount only. The parts sum to the in-leg amount minus known fees, all go to the same recipient, and the pipeline latency is
  *  near-constant, so an observer who can see both legs can still match on sum and time window, especially with few concurrent users.
- *  max = 2 parts spread over 5..12 min (owner 30.10: full privacy within 30-40 min; the first part is sent within firstMax min so the second never waits long behind it).
+ *  max = 2 parts planned at 5..12 min after the shield (owner 30.10). 1129 F-2: the parts run strictly one after the other (a send takes ~8 min plus the wallet sync before its quote), so in practice the second payout
+ *  follows the first as soon as that one has ended: the planned time of part 2 only matters when it is later than that. The screen says so (ROUTE_NOTE); the gap between the payouts is not randomised by the plan.
  *  fast / private are the OLD modes (up to 47 / 60 min): no longer offered, kept so that a saved hop of those modes resumes with its own plan. totalMin/totalMax: minutes from "shielded" to the LAST part's send time. */
 export const MODES = { max: { kMin: 2, kMax: 2, totalMin: 5, totalMax: 12, firstMax: 6 }, fast: { kMin: 1, kMax: 2, totalMin: 3, totalMax: 10 }, private: { kMin: 2, kMax: 3, totalMin: 8, totalMax: 15 } };
 export const DEFAULT_MODE = "max";
 export const modeOf = m => MODES[m] || MODES[DEFAULT_MODE];
 export const accountsFor = mode => 1 + modeOf(mode).kMax * PART_TRIES;            // account 0 holds the shielded funds, every part attempt gets a fresh refund account
+/** 1129 F-1: the ONE rule for how many accounts (0..n-1) of a hop wallet can hold ZEC: Return, the hidden-record pre-scan and the lost-record finder all use it. A saved state knows its own nAccts; otherwise its mode;
+ *  otherwise (a lost record) the default mode. A v1 state (no mode, 4 accounts) is covered by the default's 5. */
+export const scanAccts = st => (st && Number.isInteger(st.nAccts) && st.nAccts > 0 ? st.nAccts : accountsFor(st && st.mode || DEFAULT_MODE));
+export const SCAN_INDEXES = 3;                                                     // transparent address indexes per account looked at (same as the Return sweep)
+/** 1129 I-2: less than this (0.0001 ZEC) cannot pay its own fee, so it does not keep a card alive. */
+export const HOLD_DUST = 10_000n;
+export const holdsZec = rows => rows.some(x => x.transparent + x.orchard >= HOLD_DUST);
 const MIN = 60_000, BASE_MIN = Object.values(STEP_MIN).reduce((a, b) => a + b, 0) - STEP_MIN.DELAY - STEP_MIN.QUOTE_OUT - STEP_MIN.SEND_OUT;
 /** Minutes from "shielded" until the last of k parts is paid, parts sent one after the other: part i is sent at its time (spread evenly over `total`, the first capped by firstMax) or when the previous one ended. */
 const payoutMin = (m, k, total) => { const send = STEP_MIN.QUOTE_OUT + STEP_MIN.SEND_OUT; let end = 0; for (let i = 0; i < k; i++) { let t = total * (i + 1) / k; if (i === 0 && m.firstMax) t = Math.min(t, m.firstMax); end = Math.max(t, end) + send; } return end; };
+/** 1129 I-3: what the preview asks the out-leg quote about: the shielded ZEC minus the shield fee and one fee reserve PER payout part (max mode pays kMax parts, each keeps its own reserve). */
+export const previewOut = (zec, mode = DEFAULT_MODE) => outAmount(zec - SHIELD_FEE - RESERVE * BigInt(modeOf(mode).kMax - 1));
 /** [low, high] minutes for the whole private transfer of a mode (steps before the delay + payout of kMin parts over totalMin / of kMax parts over totalMax). */
 export const etaRangeMin = mode => { const m = modeOf(mode); return [Math.round(BASE_MIN + payoutMin(m, m.kMin, m.totalMin)), Math.round(BASE_MIN + payoutMin(m, m.kMax, m.totalMax))]; };
 export const etaLabel = mode => { const [a, b] = etaRangeMin(mode), h = x => (x / 60).toFixed(1).replace(/\.0$/, ""); return b < 120 ? a + "–" + b + " min" : a < 120 ? a + " min–" + h(b) + " h" : h(a) + "–" + h(b) + " h"; };
@@ -244,13 +258,13 @@ export async function findHop(store, stealth) {
   const p = stealth.toLowerCase() + "#", ks = (await store.keys()).filter(k => k.startsWith(p)).sort((a, b) => Number(a.slice(p.length)) - Number(b.slice(p.length)));
   return ks.length ? { key: ks[ks.length - 1], rec: await store.get(ks[ks.length - 1]) } : null;
 }
-/** Is there spendable ZEC on the transparent addresses of hop wallet n (the same 4 x 3 addresses the Return flow sweeps)? Anything unreadable counts as "yes" through the thrown error. */
+/** Is there spendable ZEC on the transparent addresses of hop wallet n (the same scanAccts x SCAN_INDEXES addresses the Return flow sweeps)? Anything unreadable counts as "yes" through the thrown error. */
 async function hopHoldsZec(ctx, n, rec = null) {
   const ZR = await import("./zec-return.js"), seed = await withTimeout(mnemonicSeed(await mnemonicFor(ctx.priv, ctx.words, n)), 30000, "Seed derivation");      // 1122 I-2
-  for (let a = 0; a < 4; a++) for (let i = 0; i < 3; i++) { const raw = await ctx.getUtxos(ZR.deriveT(seed, ZR.tPath(a, i)).addr); if (ZR.sweepSet(raw).length || raw.truncated) return true; }
+  for (let a = 0; a < scanAccts(rec && rec.st); a++) for (let i = 0; i < SCAN_INDEXES; i++) { const raw = await ctx.getUtxos(ZR.deriveT(seed, ZR.tPath(a, i)).addr); if (ZR.sweepSet(raw).length || raw.truncated) return true; }
   // 1122 L-3: shielded ZEC counts too (the hop wallet is restored from its saved bytes and synced; any failure throws = "could not check", so nothing is started)
   if (rec && rec.db && (ctx.Zjs || ctx.loadZjs)) {      // no saved wallet = none was ever set up, so nothing could have been shielded
-    const left = await hopSummary(ctx, rec); if (left.some(x => x.transparent + x.orchard > 0n)) return true; }
+    const left = await hopSummary(ctx, rec); if (holdsZec(left)) return true; }
   return false;
 }
 export async function startHop(ctx) {
@@ -422,7 +436,7 @@ export async function runHop(ctx) {
       const fin = await poll(q.depositAddress, "Swap to ZEC", 40 * 60_000, fIn); await go(afterIn(fin.status).step, afterIn(fin.status));
     },
     async WAIT_T() {
-      const need = st.attempt ? MIN_SHIELD : BigInt(st.inQuote.minOut) * 9n / 10n, ta = ctx.getUtxos ? await taddr(st.attempt) : null;
+      const need = st.attempt || st.rebuilt || !st.inQuote ? MIN_SHIELD : BigInt(st.inQuote.minOut) * 9n / 10n, ta = ctx.getUtxos ? await taddr(st.attempt) : null;
       let last = null, utxo = null, k = 0;
       // 1) arrival: the cheap lightwalletd UTXO query decides (1 s) and gives the exact block; the slow wallet sync is only a second opinion (first pass, then every 6th)
       await until("ZEC to arrive", 45 * 60_000, async () => {
@@ -432,8 +446,13 @@ export async function runHop(ctx) {
       });
       if (!(last && last.o >= ZC.minIn && last.t < MIN_SHIELD)) {   // coins on the t-address: they become spendable only after T_CONFS confirmations
         if (st.tSeenHeight == null) { st.tSeenHeight = utxo && utxo.height ? utxo.height - 1 : await tip(); st.tSeenAt = Date.now(); await save(); }   // the block of the deposit when known (it counts as confirmation 1), else the tip when first seen
-        const t0 = Date.now();
+        const t0 = Date.now(); let miss = 0, listed = !!(utxo && utxo.sum >= need);      // listed: the UTXO list itself showed the deposit, so only then can its later absence mean a reorg (a list that never showed it proves nothing)
         for (;;) {
+          // 1129 F-4: the deposit is looked at again on every beat. If it moved to a later block (a reorg) the confirmations count from there; if it is gone (three empty answers in a row: one answer proves nothing) the hop goes
+          // back to waiting for the ZEC to arrive instead of shielding on stale numbers.
+          if (ta) { const u = await utxoOf(ta);
+            if (u && u.sum >= need) { miss = 0; listed = true; if (u.height && u.height - 1 > st.tSeenHeight) { st.tSeenHeight = u.height - 1; st.tSeenAt = Date.now(); await save(); } }
+            else if (u && listed && ++miss >= 3) { st.tSeenHeight = null; st.tSeenAt = null; await save(); say("The ZEC deposit is no longer on the Zcash chain (a reorg?); waiting for it to arrive again…"); return go("WAIT_T"); } }
           const n = Math.max(0, Math.min(T_CONFS, (await tip()) - st.tSeenHeight)); if (n >= T_CONFS) break;
           if (Date.now() - t0 > 45 * 60_000) throw new Halt("Zcash confirmations are taking too long");
           say("Waiting for Zcash confirmations (" + n + "/" + T_CONFS + ") · ~" + Math.max(1, Math.round((T_CONFS - n) * 1.25)) + " min");
@@ -457,7 +476,7 @@ export async function runHop(ctx) {
           say("Shielding: sending to the Zcash network…");
           st.shieldTry = Date.now(); st.shieldAcct = i; await save();      // 1122 L-2: "may have gone out" is recorded BEFORE the broadcast, so a failing wallet save afterwards or any non-definite error leaves it armed
           try { await wc(() => w.pczt_send(pr), 120000, "Shield broadcast"); } catch (e2) { if (/InsufficientFunds/.test(String((e2 && e2.message) || e2))) { st.shieldTry = null; st.shieldAcct = null; await save(); } throw e2; }      // a definite "not spendable yet" refusal sent nothing
-          await saveWallet(); st.shieldTry = null; st.shieldAcct = null; await save(); break;
+          await saveWallet(); st.shieldTry = null; st.shieldAcct = null; st.shieldDone = true; await save(); break;
         } catch (e) {
           if (!/InsufficientFunds/.test(String((e && e.message) || e))) throw e;          // coins not spendable yet (confirmations): wait and try again
           if (Date.now() - t0 > 30 * 60_000) throw new Halt("The ZEC has arrived but is not spendable yet. Press Continue in a few minutes.");
@@ -465,13 +484,18 @@ export async function runHop(ctx) {
         }
       }
       const tShield = ctx.getUtxos ? await taddr(i) : null;
-      await until("the shielded balance (1 confirmation)", 40 * 60_000, async () => {
-        if (tShield) { const u = await utxoOf(tShield); if (u && u.sum >= MIN_SHIELD) return false; }           // the shield is not mined yet (the t-coins are still there): no need for a slow wallet sync
-        const x = await bal(i); await saveWallet(); return x.o >= ZC.minIn && x.p === 0n && x.t < MIN_SHIELD;
+      let lastB = null, nothing = 0, back = false;
+      await until("the shielded balance (1 confirmation; if the deposit never arrived or was reorged away, press Continue to look again, or Return money)", 40 * 60_000, async () => {
+        if (tShield) { const u = await utxoOf(tShield); if (u && u.sum >= MIN_SHIELD) { nothing = 0; return false; } }           // the shield is not mined yet (the t-coins are still there): no need for a slow wallet sync
+        const x = await bal(i); await saveWallet(); lastB = x;
+        // 1129 F-4: neither transparent nor shielded ZEC (and no shield of ours may be in flight): the deposit was reorged away. Two such reads in a row send the hop back to WAIT_T.
+        if (!st.shieldDone && !st.shieldTry && x.t < MIN_SHIELD && x.o < ZC.minIn && x.p === 0n) { if (++nothing >= 2) { back = true; return true; } } else nothing = 0;
+        return x.o >= ZC.minIn && x.p === 0n && x.t < MIN_SHIELD;
       }, 10000);
+      if (back) return go("WAIT_T", { tSeenHeight: null, tSeenAt: null });
       if (partsOn()) { const p = P(); p.acct = i; p.refundAcct = null; p.at = Date.now() + delayMs(ctx.rand); await go("DELAY", { delayUntil: p.at }); }      // a refunded part is shielded again: short own delay, then sent from this account
       else if (st.mode) {                                        // H-1: split the shielded balance into random parts, each with its own random time
-        const parts = planParts({ orchard: (await bal(i)).o, reserve: BigInt(st.reserve), mode: st.mode, rand: ctx.rand, now: Date.now(), acct: i });
+        const parts = planParts({ orchard: (lastB || await bal(i)).o, reserve: BigInt(st.reserve), mode: st.mode, rand: ctx.rand, now: Date.now(), acct: i });
         await go("DELAY", { parts, partIdx: 0, delayUntil: parts[0].at });
       } else await go("DELAY", { delayUntil: Date.now() + delayMs(ctx.rand) });         // state of the old code: one out-leg
     },
@@ -486,16 +510,17 @@ export async function runHop(ctx) {
       if (p.quote && (p.raw || Date.now() < p.quote.deadlineMs - 120_000)) return go("SEND_OUT");
       if (st.waitExpiry) { await until("the earlier unsent Zcash transaction to expire", 70 * 60_000, async () => (await tip()) > st.waitExpiry); st.waitExpiry = null; await save(); }
       const reserve = BigInt(p.reserve || st.reserve);
-      if (partsOn()) await until("the shielded change to confirm", 40 * 60_000, async () => { const x = await bal(p.acct); return x.p === 0n && x.o >= (p.tries ? ZC.minIn : BigInt(p.amount)) + reserve; }, 10000);
-      const b = await bal(p.acct), amount = partsOn() && !p.tries ? BigInt(p.amount) : outAmount(b.o, reserve);
+      let lastB = null;      // 1129 F-3: the balance the wait just read is used for the quote; a second full wallet sync (minutes) would add nothing
+      if (partsOn()) await until("the shielded change to confirm", 40 * 60_000, async () => { const x = await bal(p.acct); lastB = x; return x.p === 0n && x.o >= (p.tries ? ZC.minIn : BigInt(p.amount)) + reserve; }, 10000);
+      const b = lastB || await bal(p.acct), amount = partsOn() && !p.tries ? BigInt(p.amount) : outAmount(b.o, reserve);
       if (!amount || amount < ZC.minIn) throw new Halt("only " + b.o + " zatoshi are shielded, below the 1Click minimum; they stay in the hop wallet");
       if (partsOn() && p.refundAcct == null) { p.refundAcct = await allocAcct(); await save(); }            // a fresh hop t-address per part and attempt: the refund address is never reused
       const refundT = await taddr(partsOn() ? p.refundAcct : st.attempt + 1), req = reqOut({ dest: ctx.dest, amount, recipient: st.recipient, refundT, rand: ctx.rand });
       const info = quoteInfoOf(await PW.requestQuote({ base, fetchFn: fOut, okDeposit: isT, req }), req);
       const paid = (partsOn() ? st.parts : []).filter(x => x.status === "SUCCESS").reduce((a, x) => a + Number(x.quote.amountOut), 0);
       const left = (partsOn() ? st.parts.filter((x, i) => i > (st.partIdx || 0)).reduce((a, x) => a + BigInt(x.amount), 0n) : 0n) + amount;
-      const loss = projectedLoss({ amountIn: st.amount, inDec: ctx.chain.token.decimals, outDec: ctx.dest.token.decimals, paidOut: paid, rate: Number(info.amountOut) / Number(amount), zatsLeft: left }), cap = ctx.maxLoss == null ? MAX_LOSS : ctx.maxLoss;
-      if (loss > cap) throw new Halt("the quote would lose " + (loss * 100).toFixed(1) + "% of the amount in total, above the " + (cap * 100).toFixed(1) + "% limit; nothing was sent, the ZEC stays shielded. Resume later or raise the limit");
+      const loss = st.rebuilt ? 0 : projectedLoss({ amountIn: st.amount, inDec: ctx.chain.token.decimals, outDec: ctx.dest.token.decimals, paidOut: paid, rate: Number(info.amountOut) / Number(amount), zatsLeft: left }), cap = ctx.maxLoss == null ? MAX_LOSS : ctx.maxLoss;
+      if (!st.rebuilt && loss > cap) throw new Halt("the quote would lose " + (loss * 100).toFixed(1) + "% of the amount in total, above the " + (cap * 100).toFixed(1) + "% limit; nothing was sent, the ZEC stays shielded. Resume later or raise the limit");
       p.quote = info; p.tx = null; p.raw = null; p.expiry = null; await go("SEND_OUT");
     },
     async SEND_OUT() {
@@ -564,11 +589,48 @@ export async function scrubFinished(store, stealth) {
   return true;
 }
 
+// ---------------------------------------------------------------- recovery from the chain when the browser lost its hop record (1130 G)
+// The hop seed is a pure function of the stealth key (entropyFor), so the transparent addresses of hop wallet n can be rebuilt from the keys alone and asked for UTXOs (one cheap lightwalletd call each, no wallet sync).
+/** Looks for ZEC on the hop t-addresses of hop wallets n = 0..LOST_N-1, accounts 0..scanAccts()-1, SCAN_INDEXES indexes each. ctx = { store, stealth, priv, words, getUtxos(addr), sleep?, gapMs?, accts? }.
+ *  A payment that has ANY local hop record is left alone ({ skipped: "record" }): the record knows its own wallet. Queries are spaced by gapMs (default 150 ms) so a page of payments does not hammer the proxy.
+ *  -> { skipped } | { found: [{ n, account, index, addr, value, height }], total, truncated } for the wallet n with the most ZEC | { error }. Keys and mnemonics are never logged or returned. */
+export const LOST_N = 4;
+export async function findLostFunds(ctx) {
+  if (await findHop(ctx.store, ctx.stealth)) return { skipped: "record" };
+  const ZR = await import("./zec-return.js"), sleep = ctx.sleep || sleepMs, gap = ctx.gapMs ?? 150, accts = ctx.accts || scanAccts(null);
+  let best = null, truncated = false;
+  try {
+    for (let n = 0; n < (Number.isInteger(ctx.priorHops) ? Math.min(LOST_N, ctx.priorHops) : LOST_N); n++) {      // priorHops (AuthorizationUsed count of the address) bounds n when known: no authorization, no hop
+      const seed = await withTimeout(mnemonicSeed(await mnemonicFor(ctx.priv, ctx.words, n)), 30000, "Seed derivation"), found = [];
+      for (let a = 0; a < accts; a++) for (let i = 0; i < SCAN_INDEXES; i++) {
+        const key = ZR.deriveT(seed, ZR.tPath(a, i)), raw = await ctx.getUtxos(key.addr); if (raw.truncated) truncated = true;
+        const set = ZR.sweepSet(raw); if (set.length) found.push({ n, account: a, index: i, addr: key.addr, value: set.reduce((s, u) => s + BigInt(u.value), 0n), height: (hs => hs.length ? Math.min(...hs) : 0)(set.map(u => u.height).filter(h => h > 0)) });
+        if (gap > 0) await sleep(gap);
+      }
+      const total = found.reduce((s, x) => s + x.value, 0n); if (found.length && (!best || total > best.total)) best = { found, total };
+    }
+  } catch (e) { return { error: oneLineErr(e) }; }
+  return best ? { found: best.found, total: best.total, truncated } : { found: [], total: 0n, truncated };
+}
+/** Writes the record that makes a lost transfer visible again, unless one already exists for this address (never two records, never an overwrite). The wallet is created later, by the machine, at `birthday`.
+ *  as: "return" -> a stopped (FAILED, earlierFunds) card whose Return money sweeps the t-addresses; "continue" -> a hop at SHIELD that goes on with the ZEC found in `account` (recipient required, a valid address).
+ *  -> { key, created } */
+export async function adoptLostHop(ctx, { as, n, account = 0, birthday = null, zats = 0n, recipient = null, chain, dest, now = Date.now() }) {
+  if (as !== "return" && as !== "continue") throw new Error("bad adopt mode");
+  if (as === "continue" && !isAddr(recipient)) throw new Error("enter a valid recipient address");
+  const have = await findHop(ctx.store, ctx.stealth); if (have) return { key: have.key, created: false };
+  const key = ctx.stealth.toLowerCase() + "#" + n, st = newState({ stealth: ctx.stealth, chain, dest, recipient: recipient || "0x" + "00".repeat(20), amount: 0n, n, mode: DEFAULT_MODE, now });
+  Object.assign(st, { rebuilt: true, zecFound: zats.toString(), stepAt: now, relayed: true });
+  if (as === "return") Object.assign(st, { step: "FAILED", result: "RECOVERED", earlierFunds: true, recipient: null });
+  else { if (Number.isInteger(birthday)) st.birthday = Math.max(ZC.orchardActivation, birthday); Object.assign(st, { step: "SHIELD", attempt: account, tSeenHeight: null }); }
+  await ctx.store.put(key, { st, db: null }); return { key, created: true };
+}
+
 /** Funds left in the hop wallet: per account t-address and balances. Works from the saved wallet, or from the keys alone (fallback birthday from the payment's block time). */
 export async function hopSummary(ctx, rec = null) {
   const Zj = ctx.Zjs || await ctx.loadZjs(), mn = await mnemonicFor(ctx.priv, ctx.words, rec ? rec.st.n || 0 : ctx.n || 0), w = new Zj.WebWallet(ZC.network, ZC.lightwalletd, 1, 1, rec && rec.db || null);
   let ids = rec && rec.st.accts;
-  if (!ids) { const bd = rec && rec.st.birthday != null ? rec.st.birthday : Number.isFinite(ctx.blockTimeSec) ? birthdayFromTime(ctx.blockTimeSec, Number(await withTimeout(w.get_latest_block(), 20000, "Zcash tip query"))) : ZC.orchardActivation; ids = []; for (let i = 0; i < (rec && rec.st.nAccts || MAX_OUT + 1); i++) ids.push(await withTimeout(w.create_account("hop" + i, mn, i, bd), 60000, "Zcash account setup")); }
+  if (!ids) { const bd = rec && rec.st.birthday != null ? rec.st.birthday : Number.isFinite(ctx.blockTimeSec) ? birthdayFromTime(ctx.blockTimeSec, Number(await withTimeout(w.get_latest_block(), 20000, "Zcash tip query"))) : ZC.orchardActivation; ids = []; for (let i = 0; i < (rec ? rec.st.nAccts || MAX_OUT + 1 : ctx.nAccts || MAX_OUT + 1); i++) ids.push(await withTimeout(w.create_account("hop" + i, mn, i, bd), 60000, "Zcash account setup")); }
   await withTimeout(w.sync(), 15 * 60_000, "Zcash wallet sync"); const s = await withTimeout(w.get_wallet_summary(), 30000, "wallet summary");
   return Promise.all(ids.map(async (id, i) => { const e = (s.account_balances.find(x => x[0] === id) || [0, {}])[1]; return { account: i, t: await withTimeout(w.get_current_address_transparent(id), 20000, "Zcash address query"), transparent: BigInt(e.unshielded_balance || 0), orchard: BigInt(e.orchard_balance || 0) + BigInt(e.ironwood_balance || 0) }; }));
 }
