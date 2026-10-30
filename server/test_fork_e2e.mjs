@@ -7,12 +7,12 @@
 import { spawn, spawnSync } from "child_process"; import fs from "fs"; import os from "os"; import path from "path"; import net from "net"; import httpServer from "http"; import { fileURLToPath } from "url";
 import { createPublicClient, createWalletClient, http, parseAbi, parseEventLogs, keccak256, encodeAbiParameters, toHex, getAddress } from "viem";
 import { generatePrivateKey, privateKeyToAccount } from "viem/accounts";
-import { paymentNonce as jsPaymentNonce, payAmounts, splitSig } from "../web/pay-auth.js";
+import { paymentNonce as jsPaymentNonce, payAmounts, splitSig, payFeeFor as webPayFeeFor } from "../web/pay-auth.js";
 import { deriveForPayment, metaAddress, parseMeta, checkAnnouncement, decodeMetadata, keysFromSignature, signKeyRequestWith, keyRequestDigest, addressOf, addressFromPriv, secpUtils, unhex, hex } from "../web/stealth-crypto.js";
 import { CHAINS } from "../web/chains.js";
 import { postRelay } from "../web/relay-post.js";
 import { keccak } from "../web/stealth-crypto.js";
-import { makeFailBudget, makeTokenBucket, makeCounters, parseAllow, classifyError, failWeight, isLowS, SECP_N, ipKey, Refusal, Upstream } from "./relay-util.mjs";
+import { makeFailBudget, makeTokenBucket, makeCounters, parseAllow, classifyError, failWeight, isLowS, SECP_N, ipKey, payFeeFor, Refusal, Upstream } from "./relay-util.mjs";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const FORK_URL = "https://rpc.mainnet.chain.robinhood.com", FORK_BLOCK = 101173445;     // fixed block: anvil caches the state it fetches
@@ -887,6 +887,25 @@ try {
       await sleep(1800); const j = stOf(R);
       ok("B14 1128 L-5 unconfirmed send (503 'could not be confirmed'): the gas reservation stays in the day's counter (state gas > 0) and the unsure record is kept", w.status === 503 && j && BigInt(j.gas) > 0n && j.unsure.length === 1, JSON.stringify([w, j && j.gas, j && j.unsure.length]));
       await rpc("evm_setAutomine", [true]); await mine(1); }
+
+    // ---- configurable pay fee (STEALTH_RELAY_PAY_FEE_BPS): OFF by default, the fixed fee keeps working
+    { const stR1 = await (await fetch(RELAY + "/relay/stats")).json();
+      ok("B14 fees: default relayer (no BPS variable): /relay/stats pay_fee 0.05, pay_fee_min 0.05, pay_fee_bps 0", stR1.pay_fee === String(FEE) && stR1.pay_fee_min === String(FEE) && stR1.pay_fee_bps === 0, JSON.stringify(stR1).slice(0, 200));
+      await rpc("evm_setAutomine", [true]);
+      const Rb = await withDir("feebps", { STEALTH_RELAY_PAY_FEE_BPS: "100" }), stB = await (await fetch(Rb.url + "/relay/stats")).json();
+      ok("B14 fees: with STEALTH_RELAY_PAY_FEE_BPS=100 the stats expose pay_fee_bps 100 next to the unchanged flat fee / minimum", stB.pay_fee_bps === 100 && stB.pay_fee === String(FEE) && stB.pay_fee_min === String(FEE), JSON.stringify(stB).slice(0, 200));
+      const payAt = async (R, amt, fee) => { const P = await newPayer(), dd = newDest(), au = await payAuth(P, dd, amt, fee, R.addr), b = payBody(P, dd, amt, fee, R.addr, au), w = await post(R.url, "/relay/pay", b, nip()); return { w, dd }; };
+      const lowFee = await payAt(Rb, 10n * U, FEE);
+      ok("B14 fees: 1% of $10 is 0.10: the flat 0.05 fee is now refused ('fee out of range')", lowFee.w.status === 400 && /fee out of range/.test(lowFee.w.error), JSON.stringify(lowFee.w));
+      const c0 = await bal(Rb.addr), okFee = await payAt(Rb, 10n * U, payFeeFor(10n * U, FEE, 100));
+      const rcB = okFee.w.hash && await pub.waitForTransactionReceipt({ hash: okFee.w.hash, timeout: 20000 }).catch(() => null);
+      ok("B14 fees: fee = ceil(1% of $10) = 0.10 is accepted: receiver gets 9.90, the relayer collects 0.10", okFee.w.status === 200 && rcB && rcB.status === "success" && (await bal(okFee.dd.stealth)) === 9_900_000n && (await bal(Rb.addr)) - c0 === 100_000n, JSON.stringify(okFee.w));
+      const small = await payAt(Rb, 2n * U, FEE);
+      ok("B14 fees: on $2 the 1% is 0.02, below the 0.05 minimum: the flat fee is accepted exactly as before", small.w.status === 200 && !!small.w.hash, JSON.stringify(small.w));
+      const odd = await payAt(Rb, 1_234_567n, payFeeFor(1_234_567n, FEE, 100));
+      ok("B14 fees: rounding is UP and agrees between server and page (payFeeFor == web payFeeFor on 2000 amounts, bps 0/10/100)", [0, 10, 100].every(b => Array.from({ length: 2000 }, (_, i) => BigInt(i * 7919 + 1)).every(a => payFeeFor(a, FEE, b) === webPayFeeFor(a, FEE, b))) && payFeeFor(1_234_567n, FEE, 100) === 50000n && odd.w.status === 200, JSON.stringify(odd.w));
+      const bad = spawnSync("node", [path.join(HERE, "relayer.mjs")], { encoding: "utf8", timeout: 20000, env: { ...process.env, STEALTH_ENV_ONLY: "1", STEALTH_CHAIN: "rh", STEALTH_RPC: RPC, STEALTHPAY: SP, RELAYER_KEY: generatePrivateKey(), STEALTH_RELAY_PAY_FEE_BPS: "abc", STEALTH_RELAY_STATE: path.join(tmp, "badbps.json"), STEALTH_RELAY_LOG: path.join(tmp, "badbps.log") } });
+      ok("B14 fees: a malformed STEALTH_RELAY_PAY_FEE_BPS stops the relayer at start (exit 1, clear message), it never runs with a guessed rate", bad.status === 1 && /PAY_FEE_BPS must be/.test(bad.stderr), bad.status + " " + bad.stderr.slice(0, 120)); }
 
     // I-5: a state file that cannot be loaded -> the relayer refuses to start, ALERT line the watchdog matches
     { const bad = [["corrupt", "{not json"], ["dir", null]], res = [];

@@ -92,6 +92,9 @@ export class Refusal extends Error {
 }
 /** Infrastructure trouble (RPC / indexer down or slow) after the offline checks. Answered 503; consumes no failure budget. */
 export class Upstream extends Error { constructor(msg) { super(msg); this.name = "Upstream"; } }
+/** The pay fee (token units) required for a payment of `amount`: the flat fee/minimum, or `bps` basis points of the amount (rounded UP) when that is more. bps 0 = the flat fee only.
+ *  Same formula as payFeeFor in web/pay-auth.js (a test keeps the two equal). */
+export const payFeeFor = (amount, flat, bps = 0) => { const p = (BigInt(amount) * BigInt(bps) + 9999n) / 10000n; return p > BigInt(flat) ? p : BigInt(flat); };
 export const failWeight = e => (e instanceof Refusal && e.honest ? 0.2 : 1);
 
 /** Audit 1108 M-3: classify an error by CAUSE (viem error names along the .cause chain, never the caller's text). Demonstrable transport trouble -> Upstream (503, nothing charged);

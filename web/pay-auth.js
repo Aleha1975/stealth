@@ -43,13 +43,19 @@ export function splitSig(sig) {
 /** The two linked amount fields ("you pay" / "receiver gets"). `src` is the field the user typed in ("amount" = you pay, "amount-get" = receiver gets).
  *  Exact decimal parsing (no floats). Typing in "you pay" means exactly that much leaves the wallet: send = typed, get = typed - fee (the fee is
  *  taken OUT of it by StealthPay.payWithAuthorization). Typing in "receiver gets" means send = typed + fee. Returns {send,get,fee} in token units, or null. */
-export function payAmounts({ src, text, decimals, fee }) {
+export function payAmounts({ src, text, decimals, fee, bps = 0 }) {
   const m = /^(\d*)(?:\.(\d*))?$/.exec(String(text || "").trim().replace(",", "."));
   if (!m || (!m[1] && !m[2])) return null;
   const raw = BigInt((m[1] || "0") + (m[2] || "").slice(0, decimals).padEnd(decimals, "0"));
   if (raw <= 0n) return null;
-  return src === "amount-get" ? { send: raw + fee, get: raw, fee } : { send: raw, get: raw - fee, fee };
+  if (!bps) return src === "amount-get" ? { send: raw + fee, get: raw, fee } : { send: raw, get: raw - fee, fee };   // fixed fee (the relayer's default): exactly as before
+  if (src !== "amount-get") { const f = payFeeFor(raw, fee, bps); return { send: raw, get: raw - f, fee: f }; }
+  let send = raw + fee; for (let i = 0; i < 40; i++) { const next = raw + payFeeFor(send, fee, bps); if (next === send) break; send = next; }   // fee depends on what leaves the wallet: fixed point (monotone, converges at once)
+  return { send, get: raw, fee: send - raw };
 }
+/** The relayer's pay fee for a payment of `amount` token units: the flat fee it offers (/relay/stats pay_fee, also its minimum) or `bps` basis points of the amount (rounded UP), whichever is larger.
+ *  Same formula as payFeeFor in server/relay-util.mjs (a test keeps the two equal). bps 0 = the flat fee only. */
+export const payFeeFor = (amount, flat, bps = 0) => { const p = (BigInt(amount) * BigInt(bps) + 9999n) / 10000n; return p > BigInt(flat) ? p : BigInt(flat); };
 /** Client-side cap on the relayer's fee (audit 1086 L-1): the fee and its recipient come from our relayer API, so a compromised API must not be able to take (almost) the whole
  *  payment. Refused when the fee is above `maxAbs` token units (default 1.00 with 6 decimals) or above half of what leaves the wallet. */
-export const feeWithinCap = (fee, raw, maxAbs = 1_000_000n) => fee >= 0n && fee <= maxAbs && fee * 2n <= raw;
+export const feeWithinCap = (fee, raw, maxAbs = 1_000_000n, pctCapBps = 0) => fee >= 0n && (fee <= maxAbs || fee * 10000n <= raw * BigInt(pctCapBps)) && fee * 2n <= raw;   // pctCapBps: a percentage fee announced by the relayer may exceed maxAbs, but never this share of the payment (0 = no such allowance)

@@ -20,7 +20,7 @@
    API 127.0.0.1:3874: POST /stealth-api/relay {from,to,value,validAfter,validBefore,nonce,v,r,s[,feeAuth:{value,validAfter,validBefore,nonce,v,r,s}]}
    -> {hash[,feeHash]}; GET /stealth-api/relay/stats */
 import { makeScreen } from "./sanctions/screen.mjs";
-import { cleanLog, neutral, safeIp, capMap, makeFailBudget, makeTokenBucket, makeLineLimiter, makeCounters, parseAllow, ipKey, parseEnvLine, isLowS, failWeight, classifyError, Refusal, Upstream } from "./relay-util.mjs";
+import { cleanLog, neutral, safeIp, capMap, makeFailBudget, makeTokenBucket, makeLineLimiter, makeCounters, parseAllow, ipKey, parseEnvLine, isLowS, failWeight, classifyError, payFeeFor, Refusal, Upstream } from "./relay-util.mjs";
 import http from "http"; import fs from "fs"; import path from "path"; import { fileURLToPath, pathToFileURL } from "url";
 import { createPublicClient, createWalletClient, http as vhttp, fallback, parseAbi, formatEther, getAddress, defineChain, encodeAbiParameters, encodeFunctionData, keccak256, toHex, recoverTypedDataAddress, isAddress } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
@@ -52,6 +52,8 @@ const payAbi = parseAbi([
 ]);
 const STEALTHPAY = /^0x[0-9a-fA-F]{40}$/.test((E.STEALTHPAY || "").trim()) ? getAddress(E.STEALTHPAY.trim()) : null;   // StealthPay этой цепи; нет -> /relay/pay выключен
 const PAY_FEE_MIN = BigInt(E.STEALTH_RELAY_PAY_FEE_MIN || "0");                                  // минимальная комиссия за газ в платеже
+const PAY_FEE_BPS = Number(E.STEALTH_RELAY_PAY_FEE_BPS || 0);                                      // 0 = off (the fixed fee only); else fee >= this share of the payment, in basis points (rounded up), never below the minimum
+if (!Number.isInteger(PAY_FEE_BPS) || PAY_FEE_BPS < 0 || PAY_FEE_BPS > 100) { console.error("STEALTH_RELAY_PAY_FEE_BPS must be an integer 0..100"); process.exit(1); }
 const PAY_FEE = BigInt(E.STEALTH_RELAY_PAY_FEE || PAY_FEE_MIN.toString());                       // комиссия, которую предлагает веб (в /relay/stats)
 const MAX_PER_PAYER_PER_DAY = Number(E.STEALTH_RELAY_PAY_PER_PAYER || 20);
 const GAS_BUDGET_WEI_PER_DAY = BigInt(E.STEALTH_RELAY_GAS_BUDGET_WEI || "200000000000000");   // 0.0002 ETH/day
@@ -602,6 +604,7 @@ export async function relayPay(b, ip, ctx = {}) {
   const auth = { from, validAfter: BigInt(b.auth.validAfter || 0), validBefore: BigInt(b.auth.validBefore), v: Number(b.auth.v), r: b.auth.r, s: b.auth.s };
   if (amount < MIN_VALUE) throw new Error("below the minimum of $0.10");
   if (fee < PAY_FEE_MIN || fee >= amount) throw new Error("fee out of range");
+  if (PAY_FEE_BPS && fee < payFeeFor(amount, PAY_FEE_MIN, PAY_FEE_BPS)) throw new Error("fee out of range");   // percentage fee (off by default)
   if (fee > 0n ? feeTo !== account.address : feeTo !== "0x0000000000000000000000000000000000000000") throw new Error("fee recipient must be the relayer");
   if (stealth === STEALTHPAY || stealth === TOKEN || stealth === account.address || stealth === from) throw new Error("bad destination");
   roll();
@@ -675,7 +678,7 @@ export async function statusOf(h) {
   statusCache.set(cur, { t: Date.now(), v }); capMap(statusCache, 2000);
   return v;
 }
-export const stats = () => { roll(); return { chain: CHAIN, relayer: account.address, gas_spent_today_eth: formatEther(st.gas), gas_budget_eth: formatEther(GAS_BUDGET_WEI_PER_DAY), fee_min: FEE_MIN.toString(), pay_enabled: !!STEALTHPAY, stealthpay: STEALTHPAY, pay_fee: PAY_FEE.toString(), pay_fee_min: PAY_FEE_MIN.toString(), sends: tmStats.n, avg_lock_wait_ms: tmStats.n ? Math.round(tmStats.wait / tmStats.n) : 0, max_lock_wait_ms: tmStats.maxWait, avg_send_ms: tmStats.n ? Math.round(tmStats.send / tmStats.n) : 0 }; };
+export const stats = () => { roll(); return { chain: CHAIN, relayer: account.address, gas_spent_today_eth: formatEther(st.gas), gas_budget_eth: formatEther(GAS_BUDGET_WEI_PER_DAY), fee_min: FEE_MIN.toString(), pay_enabled: !!STEALTHPAY, stealthpay: STEALTHPAY, pay_fee: PAY_FEE.toString(), pay_fee_min: PAY_FEE_MIN.toString(), pay_fee_bps: PAY_FEE_BPS, sends: tmStats.n, avg_lock_wait_ms: tmStats.n ? Math.round(tmStats.wait / tmStats.n) : 0, max_lock_wait_ms: tmStats.maxWait, avg_send_ms: tmStats.n ? Math.round(tmStats.send / tmStats.n) : 0 }; };
 
 const refusedLines = makeLineLimiter(Number(E.STEALTH_RELAY_REFUSED_LOG_PER_MIN || 20)); let active = 0;
 function serve() {

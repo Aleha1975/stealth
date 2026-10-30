@@ -7,6 +7,7 @@
 import { keccak, signDigest, unhex, hex } from "./stealth-crypto.js";
 import { postRelay } from "./relay-post.js";
 import { timeoutSignal } from "./chain-read.js";
+import { privateFee, appFeesOf } from "./chains.js";
 
 export const ONECLICK = "https://1click.chaindefuser.com";
 export const NEAR_RPCS = ["https://rpc.mainnet.near.org", "https://free.rpc.fastnear.com"];   // read-only: current_salt of intents.near
@@ -88,13 +89,15 @@ export async function sessionSignIn({ base = ONECLICK, priv, address, fetchFn = 
 
 // ---------------------------------------------------------------- 1Click quote / deposit / status
 /** Quote request. originAsset = the chain's own token, refundTo = the stealth address (never the user's main wallet). */
-export function buildQuoteRequest({ from, to, amount, recipient, refundTo, dry, confidentiality = "public", now = Date.now(), deadlineMs = 3600_000 }) {
+export function buildQuoteRequest({ from, to, amount, recipient, refundTo, dry, confidentiality = "public", now = Date.now(), deadlineMs = 3600_000, fees = privateFee }) {
   if (!from.oneClick || !to.oneClick) throw new Error("private withdraw is not available on " + (from.oneClick ? to.name : from.name));
   if (!isAddr(recipient) || !isAddr(refundTo)) throw new Error("bad address");
   if (!(amount > 0n)) throw new Error("bad amount");
-  return { dry: !!dry, swapType: "EXACT_INPUT", slippageTolerance: 100, originAsset: from.oneClick.assetId, depositType: "ORIGIN_CHAIN",
+  const r = { dry: !!dry, swapType: "EXACT_INPUT", slippageTolerance: 100, originAsset: from.oneClick.assetId, depositType: "ORIGIN_CHAIN",
     destinationAsset: to.oneClick.assetId, amount: amount.toString(), refundTo, refundType: "ORIGIN_CHAIN", recipient, recipientType: "DESTINATION_CHAIN",
-    deadline: new Date(now + deadlineMs).toISOString(), confidentiality };
+    deadline: new Date(now + deadlineMs).toISOString(), confidentiality }, af = appFeesOf(fees);
+  if (af) r.appFees = af;      // service fee (chains.js privateFee, off by default); this one quote is the whole route, i.e. its first leg
+  return r;
 }
 async function call(fetchFn, url, init) {
   const r = await fetchFn(url, { ...init, signal: init.signal || timeoutSignal(30000) }); const j = await r.json().catch(() => ({}));

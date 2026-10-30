@@ -1,7 +1,7 @@
 import { keysFromSignature, keyRequestTypedData, metaAddress, parseMeta, deriveForPayment, checkAnnouncement, decodeMetadata, hex, unhex, keccak, signDigest, randomBytes32 } from "./stealth-crypto.js";
 import { postRelay } from "./relay-post.js";
-import { paymentNonce, receiveTypedData, splitSig, payAmounts as calcAmounts, feeWithinCap } from "./pay-auth.js";
-import { CHAINS, pickChain, chainOfMeta, addChainParams } from "./chains.js";
+import { paymentNonce, receiveTypedData, splitSig, payAmounts as calcAmounts, feeWithinCap, payFeeFor } from "./pay-auth.js";
+import { CHAINS, pickChain, chainOfMeta, addChainParams, appFeesOf } from "./chains.js";
 import * as PW from "./private-withdraw.js";
 import { hopCard, hopView, statusLine } from "./hop-card.js";
 import { getBalances, fetchBatch, authorizationUsed, waitFinal, hasTransfer, hasPaid, hasAuthUsed, recentLogs, timeoutSignal, TRANSFER_TOPIC, PAID_TOPIC, AUTH_USED_TOPIC, ETH_TOKEN } from "./chain-read.js";
@@ -416,6 +416,11 @@ async function runHop(f, hit, o) {
   if (st.step === "FAILED") try { const rec = (await HM.findHop(ctx.store, f.stealth)).rec; h.extra = (await HM.hopSummary(ctx, rec)).filter(x => x.transparent + x.orchard > 0n).map(x => "Hop wallet account " + x.account + ": " + (Number(x.transparent) / 1e8) + " ZEC transparent, " + (Number(x.orchard) / 1e8) + " ZEC shielded").join("\n"); } catch (e) { h.extra = "Could not read the hop wallet: " + e.message; }
   renderHops(); render(); await refreshBalances().catch(() => {});
 }
+/** Quote preview: when the service fee is on (chains.js privateFee), say how much of the shown Fee is ours. Nothing is added while it is off. */
+function feeNote(box, value) {
+  const af = appFeesOf(); if (!af) return;
+  box.appendChild(el("div", "note", "Includes our service fee " + (af[0].fee / 100) + "% (≈ " + fmtTok(value * BigInt(af[0].fee) / 10000n) + " " + SYM + "), charged on the first step."));
+}
 async function privateWithdraw(to, value, hit) {
   const dest = CHAINS[$("wd-dest").value]; if (!dest || !dest.oneClick) throw new Error("pick a destination chain");
   const HM = await hopMod(), mode = HM.DEFAULT_MODE, key = [to.toLowerCase(), value, dest.key, mode, "max"].join("|");
@@ -429,7 +434,7 @@ async function privateWithdraw(to, value, hit) {
     c1.appendChild(el("span", "note", "Recipient gets")); c1.appendChild(el("span", "big", "≈ " + (Number(out) / 10 ** dest.token.decimals).toFixed(2) + " " + dest.token.symbol));
     c2.appendChild(el("span", "note", "Fee")); c2.appendChild(el("span", "big", "≈ " + (Number(fee) / TUNIT).toFixed(2) + " (" + pct + "%)"));
     const c3 = el("div"); c3.appendChild(el("span", "note", "Takes about")); c3.appendChild(el("span", "big", HM.etaLabel(mode)));
-    qt.appendChild(c1); qt.appendChild(c2); qt.appendChild(c3); box.appendChild(qt); box.appendChild(el("div", "note", "Takes about " + HM.etaLabel(mode) + " · keep this tab open (it can be resumed if you close it)"));
+    qt.appendChild(c1); qt.appendChild(c2); qt.appendChild(c3); box.appendChild(qt); feeNote(box, value); box.appendChild(el("div", "note", "Takes about " + HM.etaLabel(mode) + " · keep this tab open (it can be resumed if you close it)"));
     box.hidden = false; pv = { key }; $("btn-wd").textContent = "Confirm private transfer";
     say("pay-hint", "Check the quote, then confirm.", "warn"); return;
   }
@@ -460,7 +465,7 @@ async function fastWithdraw(to, value, hit) {
     c1.appendChild(el("span", "note", "Recipient gets")); c1.appendChild(el("span", "big", "≈ " + sm.outText + " " + dest.token.symbol));
     c2.appendChild(el("span", "note", "Fee")); c2.appendChild(el("span", "big", "≈ " + sm.feeText + " (" + sm.feePct + "%)"));
     c3.appendChild(el("span", "note", "Takes about")); c3.appendChild(el("span", "big", PW.fastEtaLabel()));
-    qt.appendChild(c1); qt.appendChild(c2); qt.appendChild(c3); box.appendChild(qt);
+    qt.appendChild(c1); qt.appendChild(c2); qt.appendChild(c3); box.appendChild(qt); feeNote(box, value);
     box.appendChild(el("div", "note", "Sent in 1–2 parts at random times, up to " + PW.FAST.delayMaxMin + " min apart · keep this tab open. The link is broken by the swap, not by cryptography."));
     box.hidden = false; pv = { key, ratio: Number(sm.amountOut) / Number(sm.amountIn) }; $("btn-wd").textContent = "Confirm private withdraw";
     say("pay-hint", "Check the quote, then confirm.", "warn"); return;
@@ -623,9 +628,9 @@ async function payGasless({ amount, raw: rawIn = null, d, ephLen, ephData, tagWo
   const stats = await api("/relay/stats").catch(() => { throw new Error("The relayer is not reachable."); });
   if (!stats.pay_enabled || !isAddr(stats.relayer) || stats.pay_fee == null) throw new Error("Gasless payments are not available on " + C.name + " right now.");
   if (String(stats.stealthpay || "").toLowerCase() !== STEALTHPAY.toLowerCase()) throw new Error("The relayer serves a different StealthPay contract; refusing.");
-  const raw = rawIn ?? BigInt(Math.round(amount * TUNIT)), fee = BigInt(stats.pay_fee), feeTo = stats.relayer;   // "you pay" = raw = what leaves the wallet; the fee comes out of it
+  const bps = payBps(stats), raw = rawIn ?? BigInt(Math.round(amount * TUNIT)), fee = payFeeFor(raw, BigInt(stats.pay_fee), bps), feeTo = stats.relayer;   // "you pay" = raw = what leaves the wallet; the fee comes out of it (flat fee, or bps of it when the relayer announces one)
   if (fee < 0n || fee >= raw) throw new Error("The amount is below the relayer fee (" + fmtTok(fee) + " " + SYM + ").");
-  if (!feeWithinCap(fee, raw, BigInt(TUNIT))) throw new Error("The relayer asks " + fmtTok(fee) + " " + SYM + " in fees for a " + fmtTok(raw) + " " + SYM + " payment, which is more than this page accepts (max 1.00 and half of the payment). Refusing.");   // audit 1086 L-1
+  if (!feeWithinCap(fee, raw, BigInt(TUNIT), bps ? PAY_BPS_CAP : 0)) throw new Error("The relayer asks " + fmtTok(fee) + " " + SYM + " in fees for a " + fmtTok(raw) + " " + SYM + " payment, which is more than this page accepts (max " + (bps ? "1.00 or " + PAY_BPS_CAP / 100 + "%" : "1.00") + " and half of the payment). Refusing.");   // audit 1086 L-1
   const bal = BigInt(await wallet("eth_call", [{ to: USDC, data: "0x70a08231" + padAddr(acct) }, "latest"]));
   if (bal < raw) throw new Error("Your wallet holds less than " + amount + " " + SYM + ".");
   const args = { chainId: C.chainId, stealthPay: STEALTHPAY, token: USDC, stealth: d.stealth, eph: d.ephPub, viewTag: d.viewTag, fee, feeRecipient: feeTo };
@@ -650,18 +655,20 @@ async function payGasless({ amount, raw: rawIn = null, d, ephLen, ephData, tagWo
   return j.hash;
 }
 // ---- amount: two linked fields, "you pay" and "receiver gets"; editing one fills the other using the relayer's gasless fee
-let payFee = null, amtSrc = "amount";
-api("/relay/stats").then(s => { if (s.pay_enabled && s.pay_fee != null) payFee = BigInt(s.pay_fee); calc(); }).catch(() => {});
+let payFee = null, payBpsNow = 0, amtSrc = "amount";
+const PAY_BPS_CAP = 100;       // this page never accepts a percentage fee above 1% of the payment, whatever the relayer announces
+const payBps = s => { const b = Number(s.pay_fee_bps || 0); if (!Number.isInteger(b) || b < 0 || b > PAY_BPS_CAP) throw new Error("The relayer announces an unusual fee rate; refusing."); return b; };
+api("/relay/stats").then(s => { if (s.pay_enabled && s.pay_fee != null) { payFee = BigInt(s.pay_fee); payBpsNow = payBps(s); } calc(); }).catch(() => {});
 const curFee = () => $("token").value === "TOKEN" ? (payFee ?? 0n) : 0n, unit = () => $("token").value === "TOKEN" ? TUNIT : NUNIT;
 /** Returns { send, get, fee } in token units from the field the user last edited, or null. */
 function payAmounts() {
-  return calcAmounts({ src: amtSrc, text: $(amtSrc).value, decimals: Math.round(Math.log10(unit())), fee: curFee() });   // exact decimals, see pay-auth.js
+  return calcAmounts({ src: amtSrc, text: $(amtSrc).value, decimals: Math.round(Math.log10(unit())), fee: curFee(), bps: $("token").value === "TOKEN" ? payBpsNow : 0 });   // exact decimals, see pay-auth.js
 }
 function calc() {
   const out = $("pay-calc"), a = payAmounts(), other = amtSrc === "amount" ? "amount-get" : "amount", u = unit();
   $(other).value = a ? String(Number(amtSrc === "amount" ? a.get : a.send) / u) : "";
   if (a && a.get <= 0n) { $(other).value = ""; out.textContent = "Minimum is above the " + fmtTok(a.fee) + " " + SYM + " network fee."; return; }
-  out.textContent = $("token").value !== "TOKEN" ? "Gas is paid from your wallet." : payFee != null ? "Network fee " + fmtTok(payFee) + " " + SYM + " included" : "";
+  out.textContent = $("token").value !== "TOKEN" ? "Gas is paid from your wallet." : payFee != null ? (payBpsNow ? "Fee " + (payBpsNow / 100) + "% (minimum " + fmtTok(payFee) + " " + SYM + ")" + (a ? " = " + fmtTok(a.fee) + " " + SYM : "") + " included" : "Network fee " + fmtTok(payFee) + " " + SYM + " included") : "";
 }
 ["amount", "amount-get"].forEach(id => $(id).addEventListener("input", () => { amtSrc = id; calc(); }));
 $("token").addEventListener("change", calc);

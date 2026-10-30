@@ -7,7 +7,7 @@ import { keccak, unhex, hex } from "./stealth-crypto.js";
 import * as PW from "./private-withdraw.js";
 import { postRelay } from "./relay-post.js";
 import { hasTransfer, hasAuthUsed, timeoutSignal } from "./chain-read.js";
-import { zcash as ZC } from "./chains.js";
+import { zcash as ZC, privateFee, appFeesOf } from "./chains.js";
 
 export const STEPS = ["QUOTE_IN", "DEPOSIT_IN", "WAIT_T", "SHIELD", "DELAY", "QUOTE_OUT", "SEND_OUT"];
 export const DONE_STEPS = new Set(["DONE", "FAILED_IN", "FAILED"]);
@@ -73,7 +73,7 @@ export async function loadWords(fetchFn = fetch, url = new URL("./vendor/bip39-e
   if (hex(await sha256(enc(t))).slice(2) !== WORDLIST_SHA256) throw new Error("the BIP39 word list does not match its pinned hash");
   return t.trim().split("\n");
 }
-/** M-5: nothing is shared between the two legs but protocol constants. No referral / appFees / user id fields exist here; refundTo and recipient differ per leg and per part;
+/** M-5: nothing is shared between the two legs but protocol constants. No referral / user id fields exist here, and appFees (off by default, chains.js privateFee) appears on the FIRST leg only; refundTo and recipient differ per leg and per part;
  *  the quote deadline is 1 h +- 10 min of random jitter so it is no fingerprint either. The remaining links are listed in audit/zec-hop-scope.md. */
 const reqOf = ({ originAsset, destAsset, amount, recipient, refundTo, dry, now = Date.now(), rand = Math.random }) => {
   if (!(amount > 0n)) throw new Error("bad amount");
@@ -84,9 +84,11 @@ const reqOf = ({ originAsset, destAsset, amount, recipient, refundTo, dry, now =
 export const sharedFields = (a, b) => Object.keys(a).filter(k => k in b && JSON.stringify(a[k]) === JSON.stringify(b[k])).map(k => k + "=" + JSON.stringify(a[k]));
 export const CONSTANT_FIELDS = new Set(["dry", "swapType", "slippageTolerance", "depositType", "refundType", "recipientType", "confidentiality"]);
 /** In-leg: chain stablecoin -> ZEC paid to the hop's t-address; refund goes back to the stealth address. */
-export function reqIn({ chain, amount, tAddr, stealth, dry, now, rand }) {
+export function reqIn({ chain, amount, tAddr, stealth, dry, now, rand, fees = privateFee }) {
   if (!chain.oneClick || !isT(tAddr) || !isAddr(stealth)) throw new Error("bad address");
-  return reqOf({ originAsset: chain.oneClick.assetId, destAsset: ZC.assetId, amount, recipient: tAddr, refundTo: stealth, dry, now, rand });
+  const r = reqOf({ originAsset: chain.oneClick.assetId, destAsset: ZC.assetId, amount, recipient: tAddr, refundTo: stealth, dry, now, rand }), af = appFeesOf(fees);
+  if (af) r.appFees = af;      // the service fee (config in chains.js, off by default): FIRST leg only, so the legs still share nothing but protocol constants
+  return r;
 }
 /** Out-leg: ZEC -> stablecoin on `dest` to the final recipient; a ZEC-origin refund must be a Zcash t-address (a fresh one of the hop wallet). */
 export function reqOut({ dest, amount, recipient, refundT, dry, now, rand }) {
