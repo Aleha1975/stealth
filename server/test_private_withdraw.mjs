@@ -238,7 +238,7 @@ async function fastUnit() {
     w.fetchFn = async (url, init = {}) => { const u = String(url), j = x => ({ ok: true, status: 200, json: async () => x });
       if (u.endsWith("/v0/quote")) { const q = JSON.parse(init.body); w.quotes.push(q); if (o.quoteFailAt === w.quotes.length) return { ok: false, status: 500, json: async () => ({ message: "quote service down" }) };
         const dep = "0x" + (0xd0 + ++w.deps).toString(16).padStart(2, "0").repeat(20); return j({ quote: { amountIn: q.amount, amountOut: String(BigInt(q.amount) - 3000n), depositAddress: dep, timeEstimate: 30 }, quoteRequest: q }); }
-      if (u.endsWith("/relay")) { const b = JSON.parse(init.body); w.relays.push(b); return j({ hash: "0x" + String(w.relays.length).padStart(64, "0") }); }
+      if (u.endsWith("/relay")) { const b = JSON.parse(init.body); w.relays.push(b); if (o.relay) return o.relay(b); return j({ hash: "0x" + String(w.relays.length).padStart(64, "0") }); }
       if (u.endsWith("/v0/deposit/submit")) { w.submits.push(JSON.parse(init.body)); return j({}); }
       if (u.includes("/v0/status")) { const a = new URL(u).searchParams.get("depositAddress"); w.polls[a] = (w.polls[a] || 0) + 1; return j({ status: w.polls[a] >= 2 ? "SUCCESS" : "PROCESSING" }); }
       throw new Error("unexpected url " + u); };
@@ -262,6 +262,21 @@ async function fastUnit() {
   { const w = world(), r = rec(1); r.parts[0].state = "DEPOSITED"; r.parts[0].depositAddress = "0x" + "e1".repeat(20); const x = world(); x.fetchFn = async u => ({ ok: true, status: 200, json: async () => ({ status: "REFUNDED" }) });
     await PW.runFast(mk(x), r, () => {}, { resume: true });
     ok("a REFUNDED part is reported as refunded to the stealth address", r.parts[0].state === "REFUNDED" && PW.fastSummary(r)[0].includes("refunded") && PW.fastDone(r)); }
+  // 1125 F-3: the fast route reads the relayer's answer like the standard route (PW.relayOutcome)
+  { const w = world({ relay: () => ({ ok: false, status: 400, json: async () => ({ error: "bad signature" }) }) }), r = rec(2); let err = null, refused = 0; try { await PW.runFast(mk(w, { onRefused: () => refused++ }), r, () => {}); } catch (e) { err = e; }
+    ok("1125 F-3: a definite relayer refusal (400 JSON) -> part NOT_SENT (not 'signed'), guard hook onRefused called, nothing after it started", err && err.message === "bad signature" && refused === 1 && r.parts.map(p => p.state).join() === "NOT_SENT,NOT_SENT" && w.relays.length === 1 && PW.fastDone(r)); }
+  { const w = world({ relay: () => ({ ok: false, status: 500, json: async () => ({ error: "boom" }) }) }), r = rec(1); let refused = 0; try { await PW.runFast(mk(w, { onRefused: () => refused++ }), r, () => {}); } catch {}
+    ok("1125 F-3: a 500 is NOT a definite refusal: part stays SIGNED, guard not cleared", refused === 0 && r.parts[0].state === "SIGNED"); }
+  { const w = world({ relay: () => ({ ok: false, status: 400, json: async () => ({ error: "Authorization already used" }) }) }), r = rec(2), found = [];
+    await PW.runFast(mk(w, { findTx: async a => { found.push(a.nonce); return "0x" + "ab".repeat(32); } }), r, () => {});
+    ok("1125 F-3: 'authorization already used' is followed to its transaction (findTx by the nonce), then submit + poll, both parts SUCCESS", found.length === 2 && r.parts.every(p => p.state === "SUCCESS" && p.txHash === "0x" + "ab".repeat(32)) && w.submits.length === 2); }
+  { const w = world({ relay: () => ({ ok: false, status: 400, json: async () => ({ error: "authorization already used" }) }) }), r = rec(1); let err = null; try { await PW.runFast(mk(w), r, () => {}); } catch (e) { err = e.message; }
+    ok("1125 F-3: 'already used' with no findable transaction -> SIGNED kept, message carries the deposit address", /hash could not be found/.test(err) && err.includes(r.parts[0].depositAddress) && r.parts[0].state === "SIGNED"); }
+  // 1125 F-5: mined but without the expected transfer is not called a revert
+  { const w = world(), r = rec(1); let err = null; try { await PW.runFast(mk(w, { waitReceipt: async h => ({ ok: false, unexpected: true, hash: h }) }), r, () => {}); } catch (e) { err = e.message; }
+    ok("1125 F-5: rc.unexpected -> 'does not contain the expected transfer', not 'reverted'; part stays SIGNED", /does not contain the expected transfer/.test(err) && !/reverted/.test(err) && r.parts[0].state === "SIGNED"); }
+  // 1125 F-1 record gate
+  ok("1125 F-1: fastOpenRec is true for PLANNED/SIGNED/DEPOSITED parts, false for finished or missing records", PW.fastOpenRec({ parts: [{ state: "SUCCESS" }, { state: "DEPOSITED" }] }) && PW.fastOpenRec({ parts: [{ state: "PLANNED" }] }) && !PW.fastOpenRec({ parts: [{ state: "UNKNOWN" }, { state: "NOT_SENT" }] }) && !PW.fastOpenRec(undefined) && !PW.fastOpenRec({}));
 }
 
 // ================= PART 1 (network): REAL dry quotes =================

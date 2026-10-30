@@ -1,6 +1,7 @@
 /* Unit tests of the audit hardening that need neither anvil nor forge. Run: node test_web_units.mjs */
 import { unhex, hex, checkAnnouncement, decodeMetadata, keysFromSignature, signKeyRequestWith, addressFromPriv, metaAddress } from "../web/stealth-crypto.js";
 import { paymentNonce, feeWithinCap } from "../web/pay-auth.js";
+import * as PWm from "../web/private-withdraw.js";
 import { requestQuote, buildQuoteRequest } from "../web/private-withdraw.js";
 import { CHAINS } from "../web/chains.js";
 import { cleanLog, ipKey, parseEnvLine } from "./relay-util.mjs";
@@ -178,7 +179,7 @@ const PRIV = new Uint8Array(32).fill(9), ACC = addressFromPriv(PRIV), A2 = "0x" 
   // 1109 L-1: the guard is armed BEFORE the request leaves, persisted, and cleared only by a confirmed outcome
   const wdSrc = src.slice(src.indexOf('$("btn-wd").addEventListener("click"'), src.indexOf("async function waitReceipt"));
   t("1109 L-1: pendingWd is set (until the authorization expires) before postRelay, and persisted", wdSrc.indexOf("pendingWd.set(") > 0 && wdSrc.indexOf("pendingWd.set(") < wdSrc.indexOf("await postRelay(") && /\(now \+ 3600 \+ 60\) \* 1000/.test(wdSrc) && /localStorage\.setItem\(PW_KEY/.test(src));
-  t("1109 L-1: it is cleared only on the relayer's own JSON refusal, a revert or success (not on an unknown outcome)", /if \(d\.error && \[400, 403, 429\]\.includes\(r\.status\)\) pendingWd\.delete/.test(wdSrc) && (wdSrc.match(/pendingWd\.delete/g) || []).length === 3 && !/Date\.now\(\) \+ 600_000/.test(src));
+  t("1109 L-1: it is cleared only on the relayer's own JSON refusal, a revert or success (not on an unknown outcome)", /if \(ans\.definite\) pendingWd\.delete/.test(wdSrc) && /\[400, 403, 429\]\.includes\(r\.status\)/.test(fs.readFileSync(new URL("..\/web\/private-withdraw.js", import.meta.url), "utf8")) && (wdSrc.match(/pendingWd\.delete/g) || []).length === 3 && !/Date\.now\(\) \+ 600_000/.test(src));
   // 1109 L-3, I-1, I-2, I-5, I-6
   t("1109 L-3: a failed log read inside txOfLogs is retried; the final message says the withdrawal is already on chain", /try \{ l = \(await recentLogs\(rpcOne, filter\)\)/.test(src) && /already on chain \(its authorization is used\)/.test(src));
   t("1109 I-1/I-2: the left-over uses the captured amount; a non-bigint balance is refused", /left: all - value/.test(src) && /typeof all !== "bigint" \|\| !\(value > 0n\)/.test(src) && !/left: w\.usdc - value/.test(src));
@@ -207,9 +208,40 @@ const PRIV = new Uint8Array(32).fill(9), ACC = addressFromPriv(PRIV), A2 = "0x" 
   t("1121 L-1: storage that throws everywhere falls back to memory", p4.get("0xcc") === until);
   const wdSrc = src.slice(src.indexOf('$("btn-wd").addEventListener("click"'), src.indexOf("async function waitReceipt"));
   t("1121 L-2: 'authorization already used' is followed on chain (txOfLogs) and never clears the guard; only a 400/403/429 JSON refusal clears it",
-    /usedErr = !!d\.error && \/authorization already used\/i/.test(wdSrc) && /if \(!usedErr && \(!r\.ok \|\| d\.error\)\)/.test(wdSrc) && /if \(d\.used \|\| usedErr\) d\.hash = await txOfLogs/.test(wdSrc) && !/if \(d\.error\) pendingWd\.delete/.test(wdSrc));
+    /PW\.relayOutcome\(r, d\)/.test(wdSrc) && /if \(ans\.kind === "error"\) \{ if \(ans\.definite\) pendingWd\.delete/.test(wdSrc) && /if \(ans\.kind === "used"\) d\.hash = await txOfLogs/.test(wdSrc) && !/if \(d\.error\) pendingWd\.delete/.test(wdSrc) && /authorization already used/i.test(fs.readFileSync(new URL("../web/private-withdraw.js", import.meta.url), "utf8")));
   const rp = fs.readFileSync(new URL("../web/relay-post.js", import.meta.url), "utf8");
   t("1121 I-2: a busy/503 final message no longer says 'Nothing was sent'", !/Nothing was sent/.test(rp) && /may be out/.test(rp));
   t("1122 L-3: a SUCCESS return hides the card only after a hopSummary shows nothing left (shielded included)", /left && !left\.some\(x => x\.transparent \+ x\.orchard > 0n\)\) await hideHop/.test(src)); }
   t("fast route: an UNKNOWN part keeps the pendingWd guard after a reload", /if \(!rec\.parts\.some\(p => p\.state === "UNKNOWN"\)\) pendingWd\.delete\(k\)/.test(fs.readFileSync(new URL("../web/app.js", import.meta.url), "utf8")));
+// ---- audit 1125 (round 6)
+{ const src = fs.readFileSync(new URL("../web/app.js", import.meta.url), "utf8");
+  const a = src.indexOf("const FAST_KEY"), b = src.indexOf("async function fastWithdraw"), code = src.slice(a, b);
+  const mkStore = () => { const st = {}; return { getItem: k => st[k] ?? null, setItem: (k, v) => { st[k] = v; }, removeItem: k => { delete st[k]; } }; };
+  const mk = ls => new Function("localStorage", "PW", "$", code + "; return { fastRecs, fastClaim, fastNotes, fastNeedsNote };")(ls, PWm, () => ({}));
+  const ls = mkStore(), A = mk(ls), S = "0x" + "ab".repeat(20);
+  const recOf = (st, extra = {}) => ({ v: 1, stealth: S, startedAt: 1, parts: [{ amount: "3000000", state: st, depositAddress: "0x" + "e1".repeat(20), txHash: null }], ...extra });
+  A.fastClaim(recOf("PLANNED")); const A2 = mk(ls);         // a second tab sees the same storage
+  let err = null; try { A2.fastClaim(recOf("PLANNED", { startedAt: 2 })); } catch (e) { err = e.message; }
+  t("1125 F-1: a second withdraw from an address with an open record is refused and the stored record is untouched", /still open/.test(err || "") && A.fastRecs.read()[S].startedAt === 1);
+  const r1 = A.fastRecs.read()[S]; r1.parts[0].state = "DEPOSITED"; A.fastRecs.put(r1);
+  err = null; try { A2.fastClaim(recOf("PLANNED", { startedAt: 3 })); } catch (e) { err = e.message; }
+  t("1125 F-1: ... also when the open part is DEPOSITED (poll timed out), its deposit address stays", /still open/.test(err || "") && A.fastRecs.read()[S].parts[0].depositAddress === "0x" + "e1".repeat(20));
+  r1.parts[0].state = "SUCCESS"; A.fastRecs.put(r1); A2.fastClaim(recOf("PLANNED", { startedAt: 4 }));
+  t("1125 F-1: once the record is finished a new withdraw can start (one record per withdraw, no queue)", A.fastRecs.read()[S].startedAt === 4);
+  const src2 = src.slice(src.indexOf("async function fastWithdraw"), src.indexOf("async function resumeFast"));
+  t("1125 F-1: the record is claimed INSIDE the lock (a refused tab writes nothing) and the unclaimed run never touches guard or notes", /const run = \(\) => \{ fastClaim\(rec\); claimed = true;/.test(src2) && !/save\(rec\); const run/.test(src2) && /const settleGuard = \(\) => \{ if \(claimed/.test(src2));
+  // F-2
+  const N1 = mkStore(), M1 = mk(N1).fastNotes; M1.add("addr 0xe1"); M1.add("addr 0xe1"); M1.add("other");
+  t("1125 F-2: notes with a deposit address persist across a reload, are not duplicated, and are listed together", mk(N1).fastNotes.read().join("|") === "addr 0xe1|other");
+  M1.clear(); t("1125 F-2: ... until dismissed", mk(N1).fastNotes.read().length === 0);
+  t("1125 F-2: only UNKNOWN/FAILED parts with a deposit address need a note", A.fastNeedsNote(recOf("UNKNOWN")) && A.fastNeedsNote(recOf("FAILED")) && !A.fastNeedsNote(recOf("SUCCESS")) && !A.fastNeedsNote(recOf("NOT_SENT")));
+  const rsrc = src.slice(src.indexOf("async function resumeFast"), src.indexOf("// ---- unfinished hops"));
+  t("1125 F-2: resumeFast lists every summary (no overwrite of box.textContent per record), keeps address notes, dismiss button exists", /if \(fastNeedsNote\(rec\)\) fastNotes\.add\(text\); else extra\.push\(text\)/.test(rsrc) && !/box\.textContent = "Earlier private withdraw \("/.test(rsrc) && /showFastBox\(extra\)/.test(rsrc) && /id="btn-fast-dismiss"/.test(fs.readFileSync(new URL("../web/app.html", import.meta.url), "utf8")));
+  // F-3
+  const ro = PWm.relayOutcome;
+  t("1125 F-3: relayOutcome: 400/403/429 JSON = definite refusal; 500, no-JSON, 'already used', d.used are not; ok passes", ro({ ok: false, status: 400 }, { error: "x" }).definite === true && ro({ ok: false, status: 429 }, { error: "x" }).definite === true
+    && ro({ ok: false, status: 500 }, { error: "x" }).definite === false && ro({ ok: false, status: 400 }, { error: "Authorization already used" }).kind === "used" && ro({ ok: true, status: 202 }, { used: true }).kind === "used" && ro({ ok: true, status: 200 }, { hash: "0x1" }).kind === "ok" && ro({ ok: false, status: 400 }, {}).definite === false);
+  // F-4 / F-6
+  t("1125 F-4: the per-address guard stays armed between parts (cleared on the last part, on a definite refusal, or when nothing is left signed)", /onDeposited: info => \{ if \(info\.index === rec\.parts\.length - 1\) pendingWd\.delete\(k\)/.test(src2) && /onRefused: \(\) => pendingWd\.delete\(k\)/.test(src2));
+  t("1125 F-6: a record whose lock another tab holds is not reported as 'earlier'", /let ran = false;/.test(rsrc) && /if \(!ran\) continue;/.test(rsrc)); }
 console.log(fail ? "FAILED " + fail : "all passed"); process.exit(fail ? 1 : 0);

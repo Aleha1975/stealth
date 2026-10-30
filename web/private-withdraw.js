@@ -14,7 +14,7 @@ export const INTENTS_CONTRACT = "intents.near";
 export const SESSION_SIGNIN = false;          // the app only calls authenticate() when this is true (nothing is sent to /v0/auth/* today)
 export const MIN_PART = 1_000_000n;           // smallest split part (1 token, 6 decimals); 1Click refuses tiny swaps ("at least 150000")
 export const TERMINAL = new Set(["SUCCESS", "REFUNDED", "FAILED"]);
-const isAddr = a => /^0x[0-9a-fA-F]{40}$/.test(a || "");
+const isAddr = a => /^0x[0-9a-fA-F]{40}$/.test(a || ""), isHash = h => /^0x[0-9a-fA-F]{64}$/.test(h || "");
 
 // ---------------------------------------------------------------- base58 + ERC-191 session sign-in
 const B58 = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
@@ -166,6 +166,16 @@ export function signTransferAuth({ chain, priv, from, to, value, validBefore, no
   return { from, to, value: value.toString(), validAfter: "0", validBefore: String(validBefore), nonce, v: sig.v, r: sig.r, s: sig.s };
 }
 
+/** The relayer's answer, read the same way by the standard route (app.js) and the fast route (1121 L-2, 1125 F-3).
+ *  -> { kind: "used" }  the authorization is already used on chain (lost answer, then the retry): follow the transaction, do not give up;
+ *     { kind: "error", message, definite }  definite = a JSON 400/403/429 refusal: the relayer did NOT take it, so the double-send guard may be cleared;
+ *     { kind: "ok" }. */
+export function relayOutcome(r, d) {
+  const usedErr = !!d.error && /authorization already used/i.test(String(d.error));
+  if (d.used || usedErr) return { kind: "used" };
+  if (!r.ok || d.error) return { kind: "error", message: d.error || "relayer error", definite: !!d.error && [400, 403, 429].includes(r.status) };
+  return { kind: "ok" };
+}
 /** One part: optional delay -> real quote -> stealth key signs the transfer to the deposit address -> relayer -> receipt -> submit -> poll.
  *  ctx: { from(chain), to(chain), priv, stealth, recipient, api, token, base, fetchFn, sleep, waitReceipt(hash)->{ok}, onProgress(msg), randomNonce(), maxWorse(0..1), refAmountOut }
  *  Returns { status, depositAddress, txHash, quote, final }. Throws before anything is signed if the quote is worse than the preview. */
@@ -189,10 +199,15 @@ export async function runPart(ctx, amount, delayMs) {
   say("Sending through the relayer (no gas for you)…");
   if (ctx.onSigned) ctx.onSigned({ auth, depositAddress: q.depositAddress, amount, validBefore });      // from here on the outcome of this transfer may be unknown to us: the caller arms its double-send guard
   const { r, d } = await postRelay(fetchFn, ctx.api + "/relay", auth, { onBusy: m => say(m), check: ctx.authUsed ? () => ctx.authUsed(ctx.stealth, auth.nonce) : null });
-  if (d.used) throw new Error("The relayer received the deposit transfer (its authorization is used on chain) but its transaction hash was lost. Check the explorer; deposit address " + q.depositAddress + ".");
-  if (!r.ok || d.error) throw new Error(d.error || "relayer error");
+  const o = relayOutcome(r, d);
+  if (o.kind === "error") { const e = new Error(o.message); if (o.definite) { e.refused = true; if (ctx.onRefused) ctx.onRefused(); } throw e; }      // refused: nothing left the stealth address
+  if (o.kind === "used") {      // an earlier attempt of this same request went through: find its transaction by the authorization nonce, like the standard route
+    d.hash = ctx.findTx ? await ctx.findTx(auth).catch(() => null) : null;
+    if (!isHash(d.hash)) throw new Error("The relayer received the deposit transfer (its authorization is used on chain) but its transaction hash could not be found. Check the explorer; deposit address " + q.depositAddress + ".");
+  }
+  if (!isHash(d.hash)) throw new Error("the relayer answered without a valid transaction hash; check the explorer; deposit address " + q.depositAddress);
   say("Deposit sent (tx " + d.hash.slice(0, 12) + "…), waiting for the block…");
-  const rc = await ctx.waitReceipt(d.hash); if (!rc.ok) throw new Error("the deposit transfer reverted (tx " + d.hash.slice(0, 12) + "…)");
+  const rc = await ctx.waitReceipt(d.hash); if (!rc.ok) throw new Error(rc.unexpected ? "the deposit transaction is mined but does not contain the expected transfer (tx " + d.hash.slice(0, 12) + "…). Check the explorer; deposit address " + q.depositAddress + "." : "the deposit transfer reverted (tx " + d.hash.slice(0, 12) + "…)");
   if (ctx.onDeposited) ctx.onDeposited({ depositAddress: q.depositAddress, txHash: rc.hash || d.hash });
   await submitDeposit({ base: ctx.base, txHash: d.hash, depositAddress: q.depositAddress, fetchFn }).catch(e => say("Could not notify NEAR Intents (" + e.message + "); it will still detect the deposit."));
   say("NEAR Intents is swapping (deposit address " + q.depositAddress + ")…");
@@ -237,7 +252,7 @@ export async function runFast(ctx, rec, save = () => {}, { resume = false } = {}
       onSigned: info => { p.state = "SIGNED"; p.depositAddress = info.depositAddress; save(rec); if (ctx.onSigned) ctx.onSigned({ ...info, index: i }); },
       onDeposited: info => { p.state = "DEPOSITED"; p.depositAddress = info.depositAddress; p.txHash = info.txHash; save(rec); if (ctx.onDeposited) ctx.onDeposited({ ...info, index: i }); } };
     try { const r = await runPart(c, BigInt(p.amount), p.delayMs); p.state = r.status; p.final = r.status; save(rec); }
-    catch (e) { if (p.state === "PLANNED") p.state = "NOT_SENT"; for (const q of rec.parts) if (q.state === "PLANNED") q.state = "NOT_SENT"; save(rec); throw e; }      // the parts after a failed one are not started
+    catch (e) { if (p.state === "PLANNED" || (p.state === "SIGNED" && e.refused)) p.state = "NOT_SENT"; for (const q of rec.parts) if (q.state === "PLANNED") q.state = "NOT_SENT"; save(rec); throw e; }      // the parts after a failed one are not started
   }
   return rec;
 }
@@ -252,4 +267,6 @@ export function fastSummary(rec, amountFmt = v => v.toString(), sym = "") {
   });
   return out;
 }
+/** 1125 F-1: a stored record that still has an open part (a new withdraw from the same address must not replace it) */
+export const fastOpenRec = rec => !!rec && Array.isArray(rec.parts) && rec.parts.some(p => FAST_OPEN.has(p.state));
 export const fastDone = rec => rec.parts.every(p => !FAST_OPEN.has(p.state));

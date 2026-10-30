@@ -441,6 +441,14 @@ async function privateWithdraw(to, value, hit) {
 const FAST_KEY = "stealth-fast-wd";
 const fastRecs = { read() { try { return JSON.parse(localStorage.getItem(FAST_KEY) || "{}") || {}; } catch { return {}; } }, write(m) { try { Object.keys(m).length ? localStorage.setItem(FAST_KEY, JSON.stringify(m)) : localStorage.removeItem(FAST_KEY); } catch {} },
   put(rec) { const m = this.read(); m[rec.stealth] = rec; this.write(m); }, del(k) { const m = this.read(); delete m[k]; this.write(m); } };
+// 1125 F-1: ONE record per withdraw. A new withdraw from an address that still has an open record (a part in flight, not yet followed to its end) is refused, never written over it.
+function fastClaim(rec) { if (PW.fastOpenRec(fastRecs.read()[rec.stealth])) throw new Error("An earlier private withdraw from this address is still open (a part is with NEAR Intents or not finished). Reload this page to follow it, then try again."); fastRecs.put(rec); }
+// 1125 F-2: what the user needs to find a deposit address later (UNKNOWN / FAILED part) is kept until dismissed, not shown once and lost with the record.
+const FAST_NOTES_KEY = "stealth-fast-notes";
+const fastNotes = { read() { try { const a = JSON.parse(localStorage.getItem(FAST_NOTES_KEY) || "[]"); return Array.isArray(a) ? a.filter(x => typeof x === "string") : []; } catch { return []; } },
+  add(t) { const a = this.read(); if (!a.includes(t)) a.push(t); try { localStorage.setItem(FAST_NOTES_KEY, JSON.stringify(a.slice(-20))); } catch {} }, clear() { try { localStorage.removeItem(FAST_NOTES_KEY); } catch {} } };
+const fastNeedsNote = rec => rec.parts.some(p => p.depositAddress && (p.state === "UNKNOWN" || p.state === "FAILED"));
+function showFastBox(extra = []) { const box = $("fast-resume"), n = fastNotes.read(), txt = n.concat(extra).join("\n\n"); box.textContent = txt; box.hidden = !txt; $("btn-fast-dismiss").hidden = !n.length; }
 async function fastWithdraw(to, value, hit) {
   const dest = CHAINS[$("wd-dest").value]; if (!dest || !dest.oneClick) throw new Error("pick a destination chain");
   const key = [to.toLowerCase(), value, dest.key, "fast"].join("|");
@@ -462,33 +470,41 @@ async function fastWithdraw(to, value, hit) {
   $("btn-wd").disabled = true; $("withdraw").hidden = true; fastBusy.add(k);
   const lock = await holdScreen(), fmt = v => fmtTok(v);
   const save = r => fastRecs.put(r);
-  let cur = null;
+  let cur = null, claimed = false;      // claimed: this run owns the stored record (a refused second start must not touch the guard or notes of the live one)
+  const noteIfNeeded = () => { if (claimed && fastNeedsNote(rec)) { fastNotes.add("Private withdraw of " + fmtTok(value) + " " + SYM + " (" + C.name + "), started " + new Date(rec.startedAt).toLocaleString() + ":\n" + PW.fastSummary(rec, fmt, SYM).join("\n")); showFastBox(); } };
+  const settleGuard = () => { if (claimed && !rec.parts.some(p => p.state === "SIGNED" || p.state === "UNKNOWN")) pendingWd.delete(k); };
   const ctx = { from: C, to: dest, priv: hit.stealthPriv, stealth: w.stealth, recipient: to, api: API, base: PW.ONECLICK, fetchFn: fetch, minRatio: ratio * 0.98, randomNonce: randomBytes32,
     authUsed: (a, n) => authorizationUsed(rpcOne, USDC, a, n), onProgress: m => say("pay-hint", m, "ok"),
+    findTx: a => txOfLogs({ address: USDC, topics: [AUTH_USED_TOPIC, "0x" + padAddr(w.stealth), a.nonce] }, () => true), onRefused: () => pendingWd.delete(k),
     onSigned: info => { cur = info; pendingWd.set(k, (info.validBefore + 60) * 1000); },       // armed before the request leaves; cleared only when the deposit is confirmed
     waitReceipt: h => waitReceipt(h, x => hasTransfer(x, { token: USDC, from: w.stealth, to: cur.depositAddress, value: cur.amount }) && hasAuthUsed(x, { token: USDC, authorizer: w.stealth, nonce: cur.auth.nonce }), true),
-    onDeposited: info => { pendingWd.delete(k); spent.set(k, { left: (spent.get(k) || { left: w.usdc }).left - BigInt(rec.parts[info.index].amount), until: Date.now() + 120_000 }); render(); } };
+    onDeposited: info => { if (info.index === rec.parts.length - 1) pendingWd.delete(k); spent.set(k, { left: (spent.get(k) || { left: w.usdc }).left - BigInt(rec.parts[info.index].amount), until: Date.now() + 120_000 }); render(); } };
   try {
-    save(rec); const run = () => PW.runFast(ctx, rec, save);
+    const run = () => { fastClaim(rec); claimed = true; return PW.runFast(ctx, rec, save); };      // claimed inside the lock: a second tab is refused before it can write
     if (navigator.locks) await navigator.locks.request("fast-wd:" + k, { ifAvailable: true }, l => l ? run() : Promise.reject(new Error("A withdraw from this address is already running in another tab."))); else await run();
     const sums = PW.fastSummary(rec, fmt, SYM), ok = rec.parts.every(p => p.state === "SUCCESS");
     if (PW.fastDone(rec)) fastRecs.del(k);
+    noteIfNeeded(); settleGuard();
     say("pay-hint", (ok ? "Done privately: " + fmtTok(value) + " " + SYM + " sent through NEAR Intents to " + to.slice(0, 8) + "… on " + dest.name + "." : "Finished with problems:") + (ok && rec.parts.length < 2 ? "" : "\n" + sums.join("\n")), ok ? "ok" : "warn");
-  } catch (e) { say("pay-hint", (e.message || String(e)) + "\n" + PW.fastSummary(rec, fmt, SYM).join("\n"), "bad"); if (PW.fastDone(rec)) fastRecs.del(k); }
+  } catch (e) { say("pay-hint", (e.message || String(e)) + "\n" + PW.fastSummary(rec, fmt, SYM).join("\n"), "bad"); if (PW.fastDone(rec) && fastRecs.read()[k] && fastRecs.read()[k].startedAt === rec.startedAt) fastRecs.del(k); noteIfNeeded(); settleGuard(); }
   finally { fastBusy.delete(k); if (lock) lock.release().catch(() => {}); $("btn-wd").disabled = false; pvReset(); await refreshBalances().catch(() => {}); render(); }
 }
 // after a reload: follow parts that were handed to NEAR Intents, mark the rest (never signed -> still on the stealth address; signed but unconfirmed -> check the explorer)
 async function resumeFast() {
-  const m = fastRecs.read(), box = $("fast-resume");
+  const m = fastRecs.read(), box = $("fast-resume"), extra = [];
   for (const k of Object.keys(m)) {
     const rec = m[k]; if (!rec || !Array.isArray(rec.parts) || fastBusy.has(k)) continue;
-    const go = async () => { fastBusy.add(k); try { await PW.runFast({ base: PW.ONECLICK, fetchFn: fetch, onProgress: t => { box.hidden = false; box.textContent = "Earlier private withdraw: " + t; } }, rec, r => fastRecs.put(r), { resume: true }); } finally { fastBusy.delete(k); } };
-    try { if (navigator.locks) await navigator.locks.request("fast-wd:" + k, { ifAvailable: true }, l => l ? go() : undefined); else await go(); } catch (e) { box.hidden = false; box.textContent = "Earlier private withdraw: " + (e.message || e); continue; }
-    const chain = CHAINS[rec.chain] || C, sums = PW.fastSummary(rec, v => (Number(v) / 10 ** chain.token.decimals).toFixed(2), chain.token.symbol);
-    box.hidden = false; box.textContent = "Earlier private withdraw (" + chain.name + "):\n" + sums.join("\n");
+    let ran = false;
+    const go = async () => { ran = true; fastBusy.add(k); try { await PW.runFast({ base: PW.ONECLICK, fetchFn: fetch, onProgress: t => { box.hidden = false; box.textContent = "Earlier private withdraw: " + t; } }, rec, r => fastRecs.put(r), { resume: true }); } finally { fastBusy.delete(k); } };
+    try { if (navigator.locks) await navigator.locks.request("fast-wd:" + k, { ifAvailable: true }, l => l ? go() : undefined); else await go(); } catch (e) { extra.push("Earlier private withdraw: " + (e.message || e)); continue; }
+    if (!ran) continue;                                      // 1125 F-6: another tab holds the lock, so this record is a LIVE withdraw there, not an earlier one
+    const chain = CHAINS[rec.chain] || C, sums = PW.fastSummary(rec, v => (Number(v) / 10 ** chain.token.decimals).toFixed(2), chain.token.symbol), text = "Earlier private withdraw (" + chain.name + "):\n" + sums.join("\n");
+    if (fastNeedsNote(rec)) fastNotes.add(text); else extra.push(text);      // 1125 F-2: all summaries are listed (not only the last), and the ones with a deposit address to look up stay
     if (PW.fastDone(rec)) { fastRecs.del(k); if (!rec.parts.some(p => p.state === "UNKNOWN")) pendingWd.delete(k); }   // UNKNOWN: the signed transfer may still land, the guard stays until its authorization expires
   }
+  showFastBox(extra);
 }
+$("btn-fast-dismiss").addEventListener("click", () => { fastNotes.clear(); showFastBox(); });
 // ---- unfinished hops of the payments found: banner with Resume (needs the keys, so it appears after Scan)
 async function showResume() {
   if (!self.crossOriginIsolated || !keys || !((await (indexedDB.databases ? indexedDB.databases() : [])) || []).some(d => d.name === "stealth-zec-hop")) return;
@@ -545,9 +561,9 @@ $("btn-wd").addEventListener("click", once(async () => {
     const { r, d } = await postRelay(fetch, API + "/relay", { from: w.stealth, to, value: value.toString(), validAfter: "0", validBefore: validBefore.toString(), nonce, v: sig.v, r: sig.r, s: sig.s },
       { onBusy: m => say("pay-hint", m, "warn"), check: () => authorizationUsed(rpcOne, USDC, w.stealth, nonce) });
     // 1121 L-2: the guard is cleared only by a DEFINITE refusal (400/403/429 JSON, not "already used"). "authorization already used" means an earlier attempt of this same request went through (lost answer, then the retry): follow it like d.used.
-    const usedErr = !!d.error && /authorization already used/i.test(String(d.error));
-    if (!usedErr && (!r.ok || d.error)) { if (d.error && [400, 403, 429].includes(r.status)) pendingWd.delete(w.stealth.toLowerCase()); throw new Error(d.error || "relayer error"); }
-    if (d.used || usedErr) d.hash = await txOfLogs({ address: USDC, topics: [AUTH_USED_TOPIC, "0x" + padAddr(w.stealth), nonce] }, () => true);      // 1101 L-1: found by THIS request's nonce, not by "an identical transfer"
+    const ans = PW.relayOutcome(r, d);      // 1125 F-3: the same reading of the answer as the fast route
+    if (ans.kind === "error") { if (ans.definite) pendingWd.delete(w.stealth.toLowerCase()); throw new Error(ans.message); }
+    if (ans.kind === "used") d.hash = await txOfLogs({ address: USDC, topics: [AUTH_USED_TOPIC, "0x" + padAddr(w.stealth), nonce] }, () => true);      // 1101 L-1: found by THIS request's nonce, not by "an identical transfer"
     if (!isHash(d.hash)) throw new Error("the relayer answered without a valid transaction hash; check the explorer before sending again");
     $("withdraw").hidden = true;
     say("pay-hint", "Submitted: " + fmtTok(value) + " " + SYM + " → " + to.slice(0, 8) + "… waiting for the block…");
