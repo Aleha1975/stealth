@@ -101,13 +101,15 @@ export const failWeight = e => (e instanceof Refusal && e.honest ? 0.2 : 1);
  *  a simulation revert -> Refusal (charged to the key); anything else -> Refusal{unknown} (charged at weight 1, never refunded). */
 const TRANSPORT = /^(TimeoutError|WebSocketRequestError|SocketClosedError)$/;
 const REVERT = /^(ContractFunctionRevertedError|ExecutionRevertedError)$/;
+/** A plain HTTP 429 anywhere in the cause chain (the provider rate-limiting us). */
+export const rateLimited = e => { for (let x = e, i = 0; x && i < 8; i++, x = x.cause) if (x.status === 429) return true; return false; };
 export function classifyError(e) {
   if (e instanceof Refusal || e instanceof Upstream) return e;
   let transport = false, revert = false;
   for (let x = e, i = 0; x && i < 8; i++, x = x.cause) {
     const n = String(x.name || "");
-    // audit 1113 L-3: an HTTP error counts as infrastructure trouble only without a status (connection level) or with a 5xx status; 4xx (429, 403, 413) is not
-    if (TRANSPORT.test(n) || (n === "HttpRequestError" && !(x.status < 500)) || (typeof x.status === "number" && x.status >= 500) || (n === "TypeError" && /fetch failed/i.test(String(x.message)))) transport = true;
+    // audit 1113 L-3: an HTTP error counts as infrastructure trouble only without a status (connection level) or with a 5xx status; 4xx (403, 413) is not. 1135 L-1: 429 is the provider's rate limit on US, not the signer's doing: Upstream, never charged
+    if (TRANSPORT.test(n) || (n === "HttpRequestError" && !(x.status < 500)) || (typeof x.status === "number" && x.status >= 500) || x.status === 429 || (n === "TypeError" && /fetch failed/i.test(String(x.message)))) transport = true;
     if (REVERT.test(n) || /execution reverted/i.test(String(x.details || x.shortMessage || ""))) revert = true;
   }
   if (transport) return new Upstream(String(e && (e.shortMessage || e.message) || e).slice(0, 100));

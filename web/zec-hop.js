@@ -184,7 +184,7 @@ export function planParts({ orchard, reserve = RESERVE, mode = DEFAULT_MODE, ran
 }
 
 // ---------------------------------------------------------------- quote validation (M-6)
-export const MAX_LOSS = 0.03, SLIP_CAP_BPS = 300, QUOTE_MIN_LEFT_MS = 5 * MIN, QUOTE_MAX_LEFT_MS = 2 * 3600_000, TX_EXPIRY_DELTA = 40;   // TX_EXPIRY_DELTA: blocks a Zcash wallet transaction stays valid (ZIP-203 default)
+export const MAX_LOSS = 0.03, SLIP_CAP_BPS = 300, QUOTE_MIN_LEFT_MS = 5 * MIN, QUOTE_MAX_LEFT_MS = 2 * 3600_000, TX_EXPIRY_DELTA = 40, QUOTE_TOL = 0.02;   // TX_EXPIRY_DELTA: blocks a Zcash wallet transaction stays valid (ZIP-203 default); QUOTE_TOL: a re-quote of a rebuilt hop may be this much worse than the rate the user approved (2x the 1% slippage every quote already allows) before the user is asked again
 /** Checks a 1Click quote against the request and economic sanity; returns the fields we keep. Throws Halt (never retried) with nothing sent. */
 export function quoteInfoOf(j, req, { now = Date.now(), minLeft = QUOTE_MIN_LEFT_MS, maxLeft = QUOTE_MAX_LEFT_MS, slipBps = SLIP_CAP_BPS } = {}) {
   const q = j && j.quote; if (!q) throw new Halt("NEAR Intents returned no quote");
@@ -521,10 +521,11 @@ export async function runHop(ctx) {
       const left = (partsOn() ? st.parts.filter((x, i) => i > (st.partIdx || 0)).reduce((a, x) => a + BigInt(x.amount), 0n) : 0n) + amount;
       const loss = st.rebuilt ? 0 : projectedLoss({ amountIn: st.amount, inDec: ctx.chain.token.decimals, outDec: ctx.dest.token.decimals, paidOut: paid, rate: Number(info.amountOut) / Number(amount), zatsLeft: left }), cap = ctx.maxLoss == null ? MAX_LOSS : ctx.maxLoss;
       if (!st.rebuilt && loss > cap) throw new Halt("the quote would lose " + (loss * 100).toFixed(1) + "% of the amount in total, above the " + (cap * 100).toFixed(1) + "% limit; nothing was sent, the ZEC stays shielded. Resume later or raise the limit");
-      if (st.rebuilt && !st.quoteOk) {      // 1133 L-5: nothing bounds a bad quote of a rebuilt record (the original amount is unknown), so the user sees it against what was found and confirms before any payout. Asked once; no price cap invented
+      const rate = Number(info.amountOut) / Number(amount);
+      if (st.rebuilt && !(st.quoteRate > 0 && rate >= st.quoteRate * (1 - QUOTE_TOL))) {      // 1133 L-5: nothing bounds a bad quote of a rebuilt record (the original amount is unknown), so the user sees it against what was found and confirms before any payout. 1136 F-3b: the approval is a RATE; a later quote (after an expiry or refund) that is worse by more than QUOTE_TOL asks again
         if (typeof ctx.confirmQuote !== "function") throw new Halt("this rebuilt transfer needs your confirmation of the quote, and this page cannot ask for it; nothing was sent, the ZEC stays shielded");
         if (!(await ctx.confirmQuote({ zecFound: BigInt(st.zecFound || 0), amount, zatsLeft: left, amountOut: BigInt(info.amountOut), recipient: st.recipient }))) throw new Halt("the quote was not confirmed; nothing was sent, the ZEC stays shielded. Resume to see a new quote");
-        st.quoteOk = true; await save();
+        st.quoteRate = rate; await save();
       }
       p.quote = info; p.tx = null; p.raw = null; p.expiry = null; await go("SEND_OUT");
     },
@@ -599,17 +600,20 @@ export async function scrubFinished(store, stealth) {
 /** Looks for ZEC on the hop t-addresses of hop wallets n < the chain's prior hop count (ctx.priorHops; unknown -> n < LOST_N), at most the newest LOST_MAX_N of them, accounts 0..scanAccts()-1, SCAN_INDEXES indexes each.
  *  ctx = { store, stealth, priv, words, getUtxos(addr), sleep?, gapMs?, accts?, priorHops? }. Only a wallet n that has a LOCAL hop record is left alone (the record knows its own wallet); when every n is
  *  covered by a record -> { skipped: "record" }. Queries are spaced by gapMs (default 150 ms) so a page of payments does not hammer the proxy.
- *  -> { skipped } | { found: [{ n, account, index, addr, value, height, latest, pending }], total, truncated, maxLocal } for the wallet n with the most ZEC | { error }.
+ *  -> { skipped } | { found: [{ n, account, index, addr, value, height, latest, pending }], total, truncated (a UTXO list was cut), capped + lo + top (wallets lo..top-1 were looked at; older exist when capped; ctx.before scans below a given n), maxLocal } for the wallet n with the most ZEC | { error }.
  *  height = oldest confirmed output, latest = newest (0 when any output is unconfirmed), pending = some output is in the mempool; maxLocal = highest local record n (-1 none): a find below it cannot be adopted (findHop takes the highest key).
  *  Keys and mnemonics are never logged or returned. */
 export const LOST_N = 4, LOST_MAX_N = 8, LOST_MIN_AGE = 100;      // LOST_MIN_AGE: blocks (~2 h at 75 s) a hop's t-address output must be old before a lost-record card may act on it: a hop running on another device finishes well inside that
 export const localNs = async (store, stealth) => { const p = stealth.toLowerCase() + "#"; return (await store.keys()).filter(k => k.startsWith(p) && /^[0-9]+$/.test(k.slice(p.length))).map(k => Number(k.slice(p.length))); };
-/** The hop wallets n to look at: below the prior hop count (LOST_N when unknown), the newest LOST_MAX_N of them, without the ones that have a local record. -> { ns, capped, maxLocal } */
-export const lostRange = (priorHops, local) => {
-  const top = Number.isInteger(priorHops) && priorHops >= 0 ? priorHops : LOST_N, all = []; for (let n = Math.max(0, top - LOST_MAX_N); n < top; n++) all.push(n);
-  return { ns: all.filter(n => !local.includes(n)), capped: top > LOST_MAX_N, maxLocal: local.length ? Math.max(...local) : -1 };
+/** The hop wallets n to look at: the newest LOST_MAX_N below `before` (default: the prior hop count, LOST_N when unknown), without the ones that have a local record. 1136 F-2: lo..top-1 is the range
+ *  looked at and capped (lo > 0) says older wallets exist below it; asking again with before = lo reaches them. -> { ns, lo, top, capped, maxLocal } */
+export const lostRange = (priorHops, local, before = null) => {
+  const ok = x => Number.isInteger(x) && x >= 0, top = ok(before) ? before : ok(priorHops) ? priorHops : LOST_N, lo = Math.max(0, top - LOST_MAX_N), all = []; for (let n = lo; n < top; n++) all.push(n);
+  return { ns: all.filter(n => !local.includes(n)), lo, top, capped: lo > 0, maxLocal: local.length ? Math.max(...local) : -1 };
 };
 /** M-1 (1133): is any output of the finding too young to be sure no hop on another device is still working on it? An unconfirmed output, an unknown tip or an unknown height all count as young. */
+/** The age facts of one set of outputs (heights from the proxy): oldest confirmed, newest (0 when any is unconfirmed), any in the mempool. */
+export const outputAge = set => { const hs = set.map(u => u.height), conf = hs.filter(h => h > 0); return { height: conf.length ? Math.min(...conf) : 0, latest: conf.length === hs.length ? Math.max(...conf) : 0, pending: conf.length < hs.length }; };
 export const lostYoung = (found, tip) => !Number.isFinite(tip) || found.some(x => x.pending || !(x.latest > 0) || !(tip - x.latest >= LOST_MIN_AGE));
 /** L-4 (1133): Continue shields ONE account, so it is only offered when all the ZEC is on that account (index 0); otherwise Return money, which sweeps every account in rounds. -> account | null */
 export const lostContinueAcct = found => found.length && found.every(x => x.account === found[0].account && x.index === 0) ? found[0].account : null;
@@ -617,36 +621,34 @@ export const lostContinueAcct = found => found.length && found.every(x => x.acco
 export const firstBlock = (rows, stealth) => { const bs = rows.filter(r => r.stealth.toLowerCase() === stealth.toLowerCase() && r.block > 0).map(r => r.block); return bs.length ? Math.min(...bs) : null; };
 export async function findLostFunds(ctx) {
   const ZR = await import("./zec-return.js"), sleep = ctx.sleep || sleepMs, gap = ctx.gapMs ?? 150, accts = ctx.accts || scanAccts(null);
-  const { ns, capped, maxLocal } = lostRange(ctx.priorHops, await localNs(ctx.store, ctx.stealth));      // priorHops (AuthorizationUsed count of the address) bounds n when known: no authorization, no hop
-  if (!ns.length && maxLocal >= 0) return { skipped: "record" };
-  let best = null, truncated = capped;
+  const { ns, lo, top, capped, maxLocal } = lostRange(ctx.priorHops, await localNs(ctx.store, ctx.stealth), ctx.before);      // priorHops (AuthorizationUsed count of the address) bounds n when known: no authorization, no hop
+  if (!ns.length && maxLocal >= 0) return { skipped: "record", lo, top, capped, maxLocal };
+  let best = null, truncated = false;
   try {
     for (const n of ns) {
       const seed = await withTimeout(mnemonicSeed(await mnemonicFor(ctx.priv, ctx.words, n)), 30000, "Seed derivation"), found = [];
       for (let a = 0; a < accts; a++) for (let i = 0; i < SCAN_INDEXES; i++) {
         const key = ZR.deriveT(seed, ZR.tPath(a, i)), raw = await ctx.getUtxos(key.addr); if (raw.truncated) truncated = true;
-        const set = ZR.sweepSet(raw), hs = set.map(u => u.height), conf = hs.filter(h => h > 0);
-        if (set.length) found.push({ n, account: a, index: i, addr: key.addr, value: set.reduce((s, u) => s + BigInt(u.value), 0n), height: conf.length ? Math.min(...conf) : 0, latest: conf.length === hs.length ? Math.max(...conf) : 0, pending: conf.length < hs.length });
+        const set = ZR.sweepSet(raw);
+        if (set.length) found.push({ n, account: a, index: i, addr: key.addr, value: set.reduce((s, u) => s + BigInt(u.value), 0n), ...outputAge(set) });
         if (gap > 0) await sleep(gap);
       }
       const total = found.reduce((s, x) => s + x.value, 0n); if (found.length && (!best || total > best.total)) best = { found, total };
     }
   } catch (e) { return { error: oneLineErr(e) }; }
-  return best ? { found: best.found, total: best.total, truncated, maxLocal } : { found: [], total: 0n, truncated, maxLocal };
+  const r = { truncated, capped, lo, top, maxLocal }; return best ? { found: best.found, total: best.total, ...r } : { found: [], total: 0n, ...r };
 }
-/** Writes the record that makes a lost transfer visible again, unless one already exists for this address (never two records, never an overwrite). The wallet is created later, by the machine, at `birthday`.
- *  as: "return" -> a stopped (FAILED, earlierFunds) card whose Return money sweeps the t-addresses; "continue" -> a hop at SHIELD that goes on with the ZEC found in `account` (recipient required, a valid address).
+/** Writes the record that lets Continue run a lost transfer again, unless one already exists for this address (never two records, never an overwrite). The wallet is created later, by the machine, at `birthday`.
+ *  A hop at SHIELD that goes on with the ZEC found in `account` (recipient required, a valid address). Return needs no record at all: it works from the keys (1136 F-4).
  *  1133 M-2: the check and the write are one step: under ctx.lock(fn) when given (the app's hop lock; it returns undefined when another tab holds it), and the write is store.add (fails on an existing key).
- *  -> { key, created, reason? } (created false: a record exists, or n is below the newest record: findHop would hide it) */
-export async function adoptLostHop(ctx, { as, n, account = 0, birthday = null, zats = 0n, recipient = null, chain, dest, now = Date.now() }) {
-  if (as !== "return" && as !== "continue") throw new Error("bad adopt mode");
-  if (as === "continue" && !isAddr(recipient)) throw new Error("enter a valid recipient address");
-  const key = ctx.stealth.toLowerCase() + "#" + n, st = newState({ stealth: ctx.stealth, chain, dest, recipient: recipient || "0x" + "00".repeat(20), amount: 0n, n, mode: DEFAULT_MODE, now });
+ *  -> { key, created, reason? } (created false: a record exists for this n, or a NEWER one does and findHop would hide this one; a record below n is harmless: findHop takes the new, higher key) */
+export async function adoptLostHop(ctx, { n, account = 0, birthday = null, zats = 0n, recipient = null, chain, dest, now = Date.now() }) {
+  if (!isAddr(recipient)) throw new Error("enter a valid recipient address");
+  const key = ctx.stealth.toLowerCase() + "#" + n, st = newState({ stealth: ctx.stealth, chain, dest, recipient, amount: 0n, n, mode: DEFAULT_MODE, now });
   Object.assign(st, { rebuilt: true, zecFound: zats.toString(), stepAt: now, relayed: true });
-  if (as === "return") Object.assign(st, { step: "FAILED", result: "RECOVERED", earlierFunds: true, recipient: null });
-  else { if (Number.isInteger(birthday)) st.birthday = Math.max(ZC.orchardActivation, birthday); Object.assign(st, { step: "SHIELD", attempt: account, tSeenHeight: null }); }
+  if (Number.isInteger(birthday)) st.birthday = Math.max(ZC.orchardActivation, birthday); Object.assign(st, { step: "SHIELD", attempt: account, tSeenHeight: null });
   const step = async () => {
-    const have = await findHop(ctx.store, ctx.stealth); if (have) return { key: have.key, created: false, reason: Number(have.key.split("#")[1]) === n ? "exists" : "newer" };
+    const have = await findHop(ctx.store, ctx.stealth), hn = have && Number(have.key.split("#")[1]); if (have && hn >= n) return { key: have.key, created: false, reason: hn === n ? "exists" : "newer" };      // 1136 F-1: only a record at n or above blocks
     if (typeof ctx.store.add === "function") { try { await ctx.store.add(key, { st, db: null }); } catch (e) { if (e && e.code === "EXISTS") return { key, created: false, reason: "exists" }; throw e; } }
     else await ctx.store.put(key, { st, db: null });
     return { key, created: true };

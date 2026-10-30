@@ -957,8 +957,8 @@ try {
       un instanceof Refusal && un.unknown && failWeight(un) === 1 && !/secret/.test(un.message) && /secret/.test(un.detail) && cls(pass) === pass && cls(named("HttpRequestError", null, { details: "execution reverted" })) instanceof Upstream);
     const srcU = fs.readFileSync(path.join(HERE, "relay-util.mjs"), "utf8"), srcR = fs.readFileSync(path.join(HERE, "relayer.mjs"), "utf8");
     ok("1108 the old ceiling is gone: no hardMin / recentGood / good-map / ok() / isCostly / FAIL_PER_MIN / winN anywhere", !/hardMin|recentGood|isCostly|FAIL_PER_MIN|winN|fails\.ok|goodMs/.test(srcU + srcR) && !/\bok\(k\)/.test(srcU));
-    ok("1113 L-3 HTTP 4xx (429/403/413) is NOT transport trouble: charged to the key; 5xx and status-less connection errors are Upstream; a 403 whose body says 'execution reverted' is a revert",
-      [429, 403, 413].every(c => !(cls(named("HttpRequestError", null, { status: c })) instanceof Upstream)) && cls(named("HttpRequestError", null, { status: 429 })).unknown === true
+    ok("1113 L-3 / 1135 L-1 HTTP 403/413 are NOT transport trouble (charged to the key); 429 is the provider rate-limiting US (Upstream, not charged, also nested); 5xx and status-less connection errors are Upstream; a 403 whose body says 'execution reverted' is a revert",
+      [403, 413].every(c => !(cls(named("HttpRequestError", null, { status: c })) instanceof Upstream)) && cls(named("HttpRequestError", null, { status: 403 })).unknown === true && cls(named("HttpRequestError", null, { status: 429 })) instanceof Upstream && cls(named("ContractFunctionExecutionError", named("HttpRequestError", null, { status: 429 }))) instanceof Upstream
       && [500, 502, 503, 504].every(c => cls(named("HttpRequestError", null, { status: c })) instanceof Upstream) && cls(named("HttpRequestError", named("TypeError", null, { message: "fetch failed" }))) instanceof Upstream
       && cls(named("HttpRequestError", null, { status: 403, details: "execution reverted" })).message === "the transaction would fail on chain");
     { const ac = parseAllow("2001:db8:77:77::1, 2001:db8::/64, 2001:DB8:0:0:5::7/128, 7.9.9.9, ::ffff:1.2.3.4"), key = ipKey("2001:db8::5");

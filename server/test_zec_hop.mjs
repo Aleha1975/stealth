@@ -631,10 +631,10 @@ const tAddrOf = async (n, a, i = 0) => ZRm.deriveT(await H.mnemonicSeed(await H.
   const skip = await H.findLostFunds({ ...base0, store: sB, priorHops: 1, getUtxos: gu({ [a40]: [{ txid: "11".repeat(32), n: 0, value: FOUND, height: 3_500_100 }] }) });
   ok("G a payment that has a local hop record is left alone (no lookups, nothing offered)", skip.skipped === "record" && calls === 0);
   // adopt
-  const sC = H.memStore(); const r1 = await H.adoptLostHop({ store: sC, stealth: STEALTH }, { as: "return", n: 0, zats: FOUND, chain: rh, dest: rh }); const rec1 = await H.findHop(sC, STEALTH);
-  ok("G Return: a stopped card (FAILED, earlierFunds, no recipient) is written so the existing sweep path can work on it", r1.created && rec1.rec.st.step === "FAILED" && rec1.rec.st.earlierFunds === true && rec1.rec.st.rebuilt === true && rec1.rec.st.recipient == null && rec1.rec.st.n === 0);
+  const sC = H.memStore(); const r1 = await H.adoptLostHop({ store: sC, stealth: STEALTH }, { n: 0, zats: FOUND, recipient: A, chain: rh, dest: rh }); const rec1 = await H.findHop(sC, STEALTH);
+  ok("G Continue: a hop at SHIELD, rebuilt, with the entered recipient is written (1136 F-4: Return writes no record at all, so adoptLostHop has no return mode)", r1.created && rec1.rec.st.step === "SHIELD" && rec1.rec.st.rebuilt === true && rec1.rec.st.recipient === A && rec1.rec.st.n === 0 && !/as === "return"|RECOVERED/.test(fs.readFileSync(path.join(WEB, "zec-hop.js"), "utf8")));
   const r1b = await H.adoptLostHop({ store: sC, stealth: STEALTH }, { as: "continue", n: 0, recipient: A, chain: rh, dest: rh });
-  ok("G no double record: adopting again never overwrites or adds a record", !r1b.created && (await sC.keys()).length === 1 && (await H.findHop(sC, STEALTH)).rec.st.step === "FAILED");
+  ok("G no double record: adopting again never overwrites or adds a record", !r1b.created && r1b.reason === "exists" && (await sC.keys()).length === 1 && (await H.findHop(sC, STEALTH)).rec.st.step === "SHIELD");
   const sD = H.memStore(); const bad1 = await H.adoptLostHop({ store: sD, stealth: STEALTH }, { as: "continue", n: 0, recipient: "0x12", chain: rh, dest: rh }).then(() => null, e => e.message);
   ok("G Continue needs a valid recipient address (nothing is written without one)", /valid recipient/.test(bad1 || "") && (await sD.keys()).length === 0);
   await H.adoptLostHop({ store: sD, stealth: STEALTH }, { as: "continue", n: 0, account: 2, birthday: 3_499_990, zats: FOUND, recipient: A, chain: rh, dest: rh }); const rec2 = (await H.findHop(sD, STEALTH)).rec;
@@ -645,7 +645,7 @@ const tAddrOf = async (n, a, i = 0) => ZRm.deriveT(await H.mnemonicSeed(await H.
   let asked = null; const stG = await H.runHop(mkCtx(wG, sG, { chain: rh, dest: base, getUtxos: async () => [], confirmQuote: async q => { asked = q; return true; } }));
   ok("G the rebuilt record is resumed by the normal machine: shielded and paid out to the entered recipient, without the original-amount loss check", stG.step === "DONE" && wG.relays === 0 && wG.sig === 1 && wG.quotes.filter(q => !q.dry).every(q => q.recipient === A) && wG.delivered > 0n, stG.step + " " + stG.err);
   const srcApp = fs.readFileSync(path.join(WEB, "app.js"), "utf8");
-  ok("G UI: Continue asks for the recipient and vets/screens it like a withdraw; Return uses the existing sweep; shielded balance only on an explicit button; lookups rate limited and capped; no key logging", /vetRecipient\(to, l\.f\)/.test(srcApp) && /await screenRecipient\(to\)/.test(srcApp) && /await returnZec\(h, card\)/.test(srcApp) && /Check shielded balance/.test(srcApp) && /LOST_PER_PASS/.test(srcApp) && /lostSeen\.fresh\(k\)/.test(srcApp) && !/console\.(log|info|warn|error)\([^)]*(hit|priv|mnemonic)/.test(srcApp));
+  ok("G UI: Continue asks for the recipient and vets/screens it like a withdraw; Return uses the existing sweep; shielded balance only on an explicit button; lookups rate limited and capped; no key logging", /vetRecipient\(to, l\.f\)/.test(srcApp) && /await screenRecipient\(to\)/.test(srcApp) && /returnZec\(\{ f: l\.f/.test(srcApp) && /Check shielded balance/.test(srcApp) && /LOST_PER_PASS/.test(srcApp) && /lostSeen\.fresh\(k\)/.test(srcApp) && !/console\.(log|info|warn|error)\([^)]*(hit|priv|mnemonic)/.test(srcApp));
   ok("G the scan never syncs a wallet on its own (the shielded check is a separate function behind a button)", !/hopSummary/.test(srcApp.slice(srcApp.indexOf("async function checkLost"), srcApp.indexOf("function lostCard"))));
 
   // ---- 1133 (round 6) regressions
@@ -660,14 +660,14 @@ const tAddrOf = async (n, a, i = 0) => ZRm.deriveT(await H.mnemonicSeed(await H.
     const fz = await H.findLostFunds({ ...base0, store: H.memStore(), priorHops: 1, getUtxos: gu({ [a40]: [...hu(3_500_100), ...hu(3_500_300)] }) });
     ok("1133 M-1 confirmed outputs: latest = the newest height, not pending", fz.found[0].latest === 3_500_300 && fz.found[0].height === 3_500_100 && !fz.found[0].pending);
     const srcApp2 = fs.readFileSync(path.join(WEB, "app.js"), "utf8"), card = srcApp2.slice(srcApp2.indexOf("function lostCard"), srcApp2.indexOf("const blockTimeSec"));
-    ok("1133 M-1 UI: a young card has no Return / Continue, says it may be running elsewhere, and both actions re-check with a fresh tip", /if \(l\.young\) btn\("Check again"/.test(card) && /else if \(!older\)/.test(card) && /may still be running on another device/.test(card) && (srcApp2.match(/await lostGuard\(l\)/g) || []).length === 2 && /lostYoung\(l\.found, tip\)/.test(srcApp2));
+    ok("1133 M-1 UI: a young card has no Return / Continue, says it may be running elsewhere, and both actions re-check with a fresh tip", /if \(l\.young\) btn\("Check again"/.test(card) && /may still be running on another device/.test(card) && /await lostGuard\(l\)/.test(srcApp2.slice(srcApp2.indexOf("async function lostContinue"))) && /lostYoung\(l\.found, tip\)/.test(srcApp2));
   }
   { // M-2: find + write is one step
     const slow = () => { const m = H.memStore(); return { get: async k => { await new Promise(r => setTimeout(r, 5)); return m.get(k); }, put: async (k, v) => { await new Promise(r => setTimeout(r, 5)); return m.put(k, v); }, add: m.add, keys: async () => { await new Promise(r => setTimeout(r, 5)); return m.keys(); } }; };
     const sR = slow(), a1 = { store: sR, stealth: STEALTH }, args = (r, as = "continue") => ({ as, n: 0, recipient: r, chain: rh, dest: rh, birthday: 3_499_990 });
-    const rs = await Promise.all([H.adoptLostHop(a1, args(A)), H.adoptLostHop(a1, args("0x" + "22".repeat(20))), H.adoptLostHop(a1, args(null, "return"))]);
+    const rs = await Promise.all([H.adoptLostHop(a1, args(A)), H.adoptLostHop(a1, args("0x" + "22".repeat(20))), H.adoptLostHop(a1, args("0x" + "33".repeat(20)))]);
     ok("1133 M-2 three parallel adopts (no lock, store.add): exactly one record is written, the others report created:false", rs.filter(r => r.created).length === 1 && (await sR.keys()).length === 1 && rs.every(r => r.key === STEALTH.toLowerCase() + "#0"), JSON.stringify(rs));
-    const winner = (await H.findHop(sR, STEALTH)).rec.st; ok("1133 M-2 ...and the stored record is the winner's, not overwritten", [A, "0x" + "22".repeat(20), null].includes(winner.recipient));
+    const winner = (await H.findHop(sR, STEALTH)).rec.st; ok("1133 M-2 ...and the stored record is the winner's, not overwritten", [A, "0x" + "22".repeat(20), "0x" + "33".repeat(20)].includes(winner.recipient));
     const putOnly = (() => { const m = H.memStore(); return { get: m.get, put: m.put, keys: async () => { await new Promise(r => setTimeout(r, 5)); return m.keys(); } }; })(); let q = Promise.resolve();
     const lk = fn => { const r = q.then(fn); q = r.catch(() => {}); return r; };
     const rp = await Promise.all([1, 2, 3].map(() => H.adoptLostHop({ store: putOnly, stealth: STEALTH, lock: lk }, args(A))));
@@ -677,7 +677,7 @@ const tAddrOf = async (n, a, i = 0) => ZRm.deriveT(await H.mnemonicSeed(await H.
     const sE = H.memStore(); await sE.add("k", { a: 1 }); const dup = await sE.add("k", { a: 2 }).then(() => null, e => e.code);
     ok("1133 M-2 store.add fails on an existing key and keeps the old value", dup === "EXISTS" && (await sE.get("k")).a === 1);
     const srcHop = fs.readFileSync(path.join(WEB, "zec-hop.js"), "utf8"); ok("1133 M-2 the IndexedDB store's add is a readwrite add() that maps ConstraintError to EXISTS", /add: \(k, v\) => open\(\)/.test(srcHop) && /\.add\(v, k\)/.test(srcHop) && /ConstraintError/.test(srcHop));
-    const srcA = fs.readFileSync(path.join(WEB, "app.js"), "utf8"); ok("1133 M-2 UI: both adopt calls carry the app's hop lock", (srcA.match(/lock: lostLock\(l\.f\.stealth\)/g) || []).length === 2);
+    const srcA = fs.readFileSync(path.join(WEB, "app.js"), "utf8"); ok("1133 M-2 UI: the adopt call carries the app's hop lock", (srcA.match(/lock: lostLock\(l\.f\.stealth\)/g) || []).length === 1);
     const sN = H.memStore(); await sN.put(STEALTH.toLowerCase() + "#3", { st: { v: 2, n: 3, step: "DONE" }, db: null });
     const low = await H.adoptLostHop({ store: sN, stealth: STEALTH }, args(A));
     ok("1133 M-2 a record below the newest one is not adopted (findHop would hide it): created:false, reason newer", !low.created && low.reason === "newer" && (await sN.keys()).length === 1);
@@ -685,7 +685,7 @@ const tAddrOf = async (n, a, i = 0) => ZRm.deriveT(await H.mnemonicSeed(await H.
   { // L-1
     const srcA = fs.readFileSync(path.join(WEB, "app.js"), "utf8"), lc = srcA.slice(srcA.indexOf("async function lostContinue"), srcA.indexOf("// 1105 L-4"));
     ok("1133 L-1 lostContinue aborts when no record was created, before running the machine", /if \(!r\.created\) throw NOT_ADOPTED\(r\)/.test(lc) && lc.indexOf("NOT_ADOPTED(r)") < lc.indexOf("await runHop(") && /already exists/.test(srcA) && /const r = await HM\.adoptLostHop/.test(lc));
-    ok("1133 L-1 ...and so does Return (it would otherwise sweep the wallet of another record)", /if \(!r\.created\) throw NOT_ADOPTED\(r\)/.test(srcA.slice(srcA.indexOf("async function lostReturn"), srcA.indexOf("async function lostContinue"))));
+    ok("1136 F-4 ...and Return adopts nothing (it works from the keys), so it can never sweep or hide the wallet of another record", !/adoptLostHop/.test(srcA.slice(srcA.indexOf("const lostReturn"), srcA.indexOf("async function lostContinue"))));
   }
   { // L-2
     let c = 0; const g2 = async () => { c++; return []; }, mkS = async ns => { const s = H.memStore(); for (const n of ns) await s.put(STEALTH.toLowerCase() + "#" + n, { st: { v: 2, n }, db: null }); return s; };
@@ -698,7 +698,7 @@ const tAddrOf = async (n, a, i = 0) => ZRm.deriveT(await H.mnemonicSeed(await H.
     c = 0; const rb = await H.findLostFunds({ ...base0, store: await mkS([0, 1]), priorHops: 2, getUtxos: g2 });
     ok("1133 L-2 every n below the count has a record -> skipped, no lookups", rb.skipped === "record" && c === 0);
     calls = 0; const rh2 = await H.findLostFunds({ ...base0, store: H.memStore(), priorHops: 1_000_000_000, getUtxos: gu({}) });
-    ok("1133 L-2 bounded: a huge count scans only the newest LOST_MAX_N wallets and says it is truncated", calls === H.LOST_MAX_N * 15 && rh2.truncated === true && H.LOST_MAX_N === 8, "calls " + calls);
+    ok("1133 L-2 bounded: a huge count scans only the newest LOST_MAX_N wallets and says it is truncated", calls === H.LOST_MAX_N * 15 && rh2.capped === true && rh2.truncated === false && rh2.lo === 1_000_000_000 - 8 && rh2.top === 1_000_000_000 && H.LOST_MAX_N === 8, "calls " + calls);
     const rg = H.lostRange(3, [1]); ok("1133 L-2 lostRange: unknown count -> LOST_N, local records excluded, negative / fractional counts are not trusted", JSON.stringify(H.lostRange(null, []).ns) === "[0,1,2,3]" && JSON.stringify(rg.ns) === "[0,2]" && rg.maxLocal === 1 && H.lostRange(-5, []).ns.length === 4 && H.lostRange(2.5, []).ns.length === 4);
   }
   { // L-3
@@ -717,10 +717,10 @@ const tAddrOf = async (n, a, i = 0) => ZRm.deriveT(await H.mnemonicSeed(await H.
     const mkW = () => { const w = makeWorld(); off = 0; w.tBal[tOf(mn.slice(0, 20) + 0)] = 10_000_000n; return w; };
     const adopt = async () => { const s = H.memStore(); await H.adoptLostHop({ store: s, stealth: STEALTH }, { as: "continue", n: 0, account: 0, birthday: 3_499_990, zats: FOUND, recipient: A, chain: rh, dest: base }); return s; };
     const w0 = mkW(), s0 = await adopt(), st0 = await H.runHop(mkCtx(w0, s0, { chain: rh, dest: base, getUtxos: async () => [] }));
-    ok("1133 L-5 no way to ask -> the rebuilt hop halts before any payout (fails closed)", st0.step !== "DONE" && st0.halted === true && /confirmation/.test(st0.err) && !w0.delivered && !(await latest(s0)).st.quoteOk && !(await latest(s0)).st.parts.some(p => p.raw), st0.step + " " + st0.err);
+    ok("1133 L-5 no way to ask -> the rebuilt hop halts before any payout (fails closed)", st0.step !== "DONE" && st0.halted === true && /confirmation/.test(st0.err) && !w0.delivered && !(await latest(s0)).st.quoteRate && !(await latest(s0)).st.parts.some(p => p.raw), st0.step + " " + st0.err);
     const w1 = mkW(), s1 = await adopt(), st1 = await H.runHop(mkCtx(w1, s1, { chain: rh, dest: base, getUtxos: async () => [], confirmQuote: async () => false }));
-    ok("1133 L-5 the user declines -> Halt, nothing signed or sent, not remembered as confirmed", st1.halted === true && /not confirmed/.test(st1.err) && !w1.delivered && !(await latest(s1)).st.quoteOk, st1.step + " " + st1.err);
-    ok("1133 L-5 the confirmation gets st.zecFound, the amount to send, what comes out and the recipient; asked once for the whole transfer", asked && asked.zecFound === FOUND && asked.amount > 0n && asked.amountOut > 0n && asked.recipient === A && asked.zatsLeft >= asked.amount && stG.quoteOk === true);
+    ok("1133 L-5 the user declines -> Halt, nothing signed or sent, not remembered as confirmed", st1.halted === true && /not confirmed/.test(st1.err) && !w1.delivered && !(await latest(s1)).st.quoteRate, st1.step + " " + st1.err);
+    ok("1133 L-5 the confirmation gets st.zecFound, the amount to send, what comes out and the recipient; asked once for the whole transfer", asked && asked.zecFound === FOUND && asked.amount > 0n && asked.amountOut > 0n && asked.recipient === A && asked.zatsLeft >= asked.amount && stG.quoteRate > 0);
     let n2 = 0; const w2 = mkW(), s2 = await adopt(), st2 = await H.runHop(mkCtx(w2, s2, { chain: rh, dest: base, getUtxos: async () => [], confirmQuote: async () => { n2++; return true; } }));
     ok("1133 L-5 confirmed -> pays out; one question even with several payout parts", st2.step === "DONE" && n2 === 1 && (st2.parts || []).length >= 1, st2.step + " " + st2.err + " asked " + n2);
     const srcA = fs.readFileSync(path.join(WEB, "app.js"), "utf8"); ok("1133 L-5 UI: hopCtx passes confirmQuote, which shows the found amount and the quote and asks", /confirmQuote: q => confirmRebuiltQuote\(q\)/.test(srcA) && /Pay out at this quote\?/.test(srcA) && /zecText\(q\.zecFound\)/.test(srcA));
@@ -732,6 +732,49 @@ const tAddrOf = async (n, a, i = 0) => ZRm.deriveT(await H.mnemonicSeed(await H.
     const srcA = fs.readFileSync(path.join(WEB, "app.js"), "utf8"); ok("1133 I-4 lostShielded derives the birthday from firstBlock, not from whichever payment row came first", /blockTimeSec\(HM\.firstBlock\(found, f\.stealth\) \|\| f\.block\)/.test(srcA));
     const late = H.birthdayFromTime(1_000_000, 3_500_000, 1_000_000 + 6000), early = H.birthdayFromTime(1_000_000 - 3600, 3_500_000, 1_000_000 + 6000);
     ok("1133 I-4 an earlier anchor gives an earlier birthday (so the earliest payment is the safe one)", early < late);
+  }
+  { // 1136 (round 7)
+    const key = n => STEALTH.toLowerCase() + "#" + n, srcA = fs.readFileSync(path.join(WEB, "app.js"), "utf8"), srcH = fs.readFileSync(path.join(WEB, "zec-hop.js"), "utf8");
+    const mkRec = n => ({ st: { v: 2, n, step: "DONE" }, db: null }), ad = (s, n) => H.adoptLostHop({ store: s, stealth: STEALTH }, { n, recipient: A, chain: rh, dest: rh, birthday: 3_499_990 });
+    { // F-1
+      const sF = H.memStore(); await sF.put(key(0), mkRec(0)); const up = await ad(sF, 1);
+      ok("1136 F-1 a record BELOW the requested n does not block the adoption; findHop then takes the new, higher key", up.created && (await H.findHop(sF, STEALTH)).key === key(1) && (await sF.keys()).length === 2);
+      const same = await ad(sF, 1), low = await ad(sF, 0);
+      ok("1136 F-1 a record AT n is 'exists', one ABOVE n is 'newer' (nothing written either way)", !same.created && same.reason === "exists" && !low.created && low.reason === "newer" && (await sF.keys()).length === 2);
+    }
+    { // F-2
+      let c = 0; const gc = map => async addr => { c++; return map[addr] || []; }, at = async n => { const ZRm = await import("../web/zec-return.js"); return ZRm.deriveT(await H.mnemonicSeed(await H.mnemonicFor(PRIV, words, n)), ZRm.tPath(0, 0)).addr; };
+      const e20 = await H.findLostFunds({ ...base0, store: H.memStore(), priorHops: 20, getUtxos: gc({}) });
+      ok("1136 F-2 an EMPTY result still carries the range looked at (12..19) and that older wallets were not read; truncated (one cut UTXO list) is a different thing", e20.found.length === 0 && e20.capped === true && e20.lo === 12 && e20.top === 20 && e20.truncated === false);
+      const o1 = await H.findLostFunds({ ...base0, store: H.memStore(), priorHops: 20, before: 12, getUtxos: gc({}) }), o2 = await H.findLostFunds({ ...base0, store: H.memStore(), priorHops: 20, before: o1.lo, getUtxos: gc({ [await at(3)]: hu(3_500_100) }) });
+      ok("1136 F-2 'scan older' (before = lo) walks down the wallets 4..11, then 0..3, and finds an old wallet; the last chunk is not capped", o1.lo === 4 && o1.top === 12 && o1.capped && o2.lo === 0 && o2.top === 4 && !o2.capped && o2.found.length === 1 && o2.found[0].n === 3);
+      const g = H.lostRange(20, [2], 12); ok("1136 F-2 lostRange(before) bounds the top and still skips local records; a bad 'before' falls back to the count", g.top === 12 && g.lo === 4 && JSON.stringify(g.ns) === "[4,5,6,7,8,9,10,11]" && H.lostRange(20, [5], 12).ns.length === 7 && H.lostRange(20, [], -3).top === 20);
+      const ck = srcA.slice(srcA.indexOf("async function checkLost"), srcA.indexOf("async function lostOlder")), card = srcA.slice(srcA.indexOf("function lostCard"), srcA.indexOf("const blockTimeSec"));
+      ok("1136 F-2 UI: a capped result is not marked checked for 6 h, the empty result keeps its range (lostNone is a Map of results), found and empty both say what was looked at, and 'Scan older wallets' exists on the card and on the empty row", /if \(!res\.capped\) lostSeen\.mark\(k\)/.test(ck) && /lostNone\.set\(k, res\)/.test(srcA) && /scanText\(l\)/.test(card) && /Scan older wallets/.test(card) && /Looked at transfer wallet/.test(srcA) && /nr\.capped/.test(srcA) && /Scan older wallets/.test(srcA.slice(srcA.indexOf("const nr = lostNone.get(kk)"))) && !/if \(res\.capped\) lostSeen/.test(ck));
+      ok("1136 F-2 'Return money handles them in rounds' is said only for a cut UTXO list (truncated), never for the wallet cap", /l\.truncated \? " More outputs exist than could be read at once; Return money handles them in rounds\."/.test(card) && !/capped[^;]*in rounds/.test(card));
+    }
+    { // F-3a
+      const age = H.outputAge([{ height: 3_500_100 }, { height: 3_500_300 }]), pend = H.outputAge([{ height: 3_500_100 }, { height: 0 }]);
+      ok("1136 F-3a outputAge: oldest / newest of confirmed outputs; any unconfirmed output -> latest 0 and pending", age.height === 3_500_100 && age.latest === 3_500_300 && !age.pending && pend.latest === 0 && pend.pending && pend.height === 3_500_100);
+      const rz = srcA.slice(srcA.indexOf("async function returnZec"), srcA.indexOf("async function finishSweep")), i1 = rz.indexOf("HM.lostYoung([HM.outputAge(utxos)], tip)");
+      ok("1136 F-3a returnZec applies the age rule to the freshly queried set it is about to sweep (only for a record-less lost wallet), failing closed on an unknown tip, before the quote and the intent", i1 > 0 && /if \(h\.lost\)/.test(rz.slice(i1 - 330, i1)) && i1 < rz.indexOf("Getting a quote") && i1 < rz.indexOf("sweepIntents.set(h, intent)") && /let tip = null; try \{ tip = await ZR\.getTip/.test(rz.slice(i1 - 330, i1)));
+    }
+    { // F-3b
+      const mkW = () => { const w = makeWorld(); off = 0; w.tBal[tOf(mn.slice(0, 20) + 0)] = 10_000_000n; return w; };
+      const run = async mult => { const s = H.memStore(); await ad(s, 0); if (mult) { const r = await s.get(key(0)); await s.put(key(0), { ...r, st: { ...r.st, quoteRate: asked0Rate * mult } }); } let n = 0, got = null; const w = mkW();
+        const st = await H.runHop(mkCtx(w, s, { chain: rh, dest: base, getUtxos: async () => [], confirmQuote: async q => { n++; got = q; return true; } })); return { n, st, got, rec: (await latest(s)).st }; };
+      const first = await run(0), asked0Rate = Number(first.got.amountOut) / Number(first.got.amount);
+      const same = await run(1.0), within = await run(1.0 + H.QUOTE_TOL / 2), worse = await run(1.0 + H.QUOTE_TOL * 3), better = await run(0.8);
+      ok("1136 F-3b the approved RATE is stored (quoteRate), not a flag", first.n === 1 && Math.abs(first.rec.quoteRate - asked0Rate) < 1e-9 && first.rec.quoteOk === undefined && H.QUOTE_TOL === 0.02);
+      ok("1136 F-3b a re-quote at the same rate, within QUOTE_TOL worse, or better is paid without asking again", same.n === 0 && within.n === 0 && better.n === 0 && same.st.step === "DONE" && within.st.step === "DONE" && better.st.step === "DONE", [same.n, within.n, better.n].join());
+      ok("1136 F-3b a re-quote worse than the approved rate by more than QUOTE_TOL asks again (and a refusal halts with nothing sent)", worse.n === 1 && worse.st.step === "DONE");
+    }
+    { // F-4
+      const rz = srcA.slice(srcA.indexOf("async function returnZec"), srcA.indexOf("async function finishSweep")), card = srcA.slice(srcA.indexOf("function lostCard"), srcA.indexOf("const blockTimeSec"));
+      ok("1136 F-4 Return on a lost wallet needs no record and no 'cannot be recovered' state: the Return button is not tied to `older`, only Continue / shielded are", /if \(l\.found\.length\) btn\("Return money"/.test(card) && /const canContinue = !older &&/.test(card) && /Return money still works/.test(srcA) && !/cannot be recovered from here/.test(srcA));
+      ok("1136 F-4 the sweep intent is kept per hop wallet (stealth#n) outside hop records, written before the broadcast, and an older build's record intent is still read", /sweepIntents = \{ key: h => h\.f\.stealth\.toLowerCase\(\) \+ "#" \+ \(h\.st\.n \|\| 0\)/.test(srcA) && /sweepIntents\.get\(h\) \|\| await HM\.findHop/.test(rz) && !/rr\.rec\.st = \{ \.\.\.rr\.rec\.st, sweep/.test(srcA));
+      ok("1136 F-4 after a lost wallet is returned (or found empty) it is forgotten and looked for again, so the next wallet of the address gets its own card; no record is hidden", /lostForget\(h\.lost\); checkLost\(\)/.test(srcA) && /lostForget\(h\.lost\); step\("Nothing is listed/.test(rz) && !/hideHop\(HM, h\)[^\n]*h\.lost/.test(srcA));
+    }
   }
 }
 Date.now = realNow;

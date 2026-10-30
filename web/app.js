@@ -45,7 +45,7 @@ function setAcct(a) {
   acct = a ? a.toLowerCase() : null;
   $("wbtn").textContent = acct ? acct.slice(0, 6) + "…" + acct.slice(-4) : "Connect wallet"; $("wbtn").classList.toggle("on", !!acct);
   if (changed) { keys = null; found = []; $("recv-out").hidden = true; $("pay-list").textContent = ""; $("withdraw").hidden = true; say("recv-hint", "Account changed: derive the keys again for this account.", "warn"); }
-  try { if (typeof showFastBox === "function" && $("fast-resume")) showFastBox(); } catch {}      // 1132 M-1: this account's recovery notes
+  try { if ($("fast-resume")) { showFastBox(); if (acct && fastDeferred) { fastDeferred = false; resumeFast().catch(() => {}); } } } catch {}      // 1132 M-1: this account's recovery notes (a try/catch, not a typeof check: showFastBox is hoisted, the bindings it reads are not). 1135 L-4: records that waited for an account are followed now
 }
 async function connect() {
   if (!window.ethereum) { say("recv-hint", "No wallet found. Open this page inside MetaMask.", "bad"); return null; }
@@ -226,15 +226,23 @@ function renderHops() {
 const lost = new Map(), lostBusy = { v: false }, LOST_CHECK_KEY = "stealth-lost-checked", LOST_RECHECK_MS = 6 * 3600_000, LOST_PER_PASS = 10;
 const lostSeen = { read() { try { const o = JSON.parse(localStorage.getItem(LOST_CHECK_KEY) || "{}"); return o && typeof o === "object" ? o : {}; } catch { return {}; } },
   fresh(k) { return Date.now() - (Number(this.read()[k]) || 0) < LOST_RECHECK_MS; }, unmark(k) { const o = this.read(); delete o[k]; try { localStorage.setItem(LOST_CHECK_KEY, JSON.stringify(o)); } catch {} }, mark(k) { const o = this.read(); o[k] = Date.now(); const ks = Object.keys(o); if (ks.length > 500) for (const x of ks.slice(0, ks.length - 500)) delete o[x]; try { localStorage.setItem(LOST_CHECK_KEY, JSON.stringify(o)); } catch {} } };
-const lostNone = new Set();      // payments checked on the chain with nothing found: they get the explicit "Check shielded balance" button
+const lostNone = new Map();      // payments checked on the chain with nothing found -> the range looked at; they get the explicit "Check shielded balance" button
+const lostForget = k => { lost.delete(k); lostNone.delete(k); lostSeen.unmark(k); };
 const zecText = z => (Number(z) / 1e8).toFixed(8).replace(/0+$/, "").replace(/\.$/, "");
+// 1136 F-2: the range of hop wallets looked at is always said (1-based), with what was NOT looked at when the cap cut it
+const scanText = r => r && r.top > r.lo ? "Looked at transfer wallet" + (r.top - r.lo > 1 ? "s " + (r.lo + 1) + "–" + r.top : " " + r.top) + (r.capped ? "; " + r.lo + " older wallet" + (r.lo > 1 ? "s were" : " was") + " not looked at." : ".") : "";
+async function setLost(HM, k, f, hit, res) {      // res: a findLostFunds result (or one merged with an older scan)
+  if (!res.found.length) { lostNone.set(k, res); return; }
+  let tip = null; try { tip = await (await import("./zec-return.js")).getTip((await import("./chains.js")).zcash.lightwalletd); } catch {}      // 1133 M-1: no tip = young (fail closed)
+  lost.set(k, { f, hit, ...res, n: res.found[0].n, young: HM.lostYoung(res.found, tip), contAcct: HM.lostContinueAcct(res.found) });
+}
 async function checkLost() {
   if (!keys || lostBusy.v || !indexedDB) return; lostBusy.v = true;
   try {
     const HM = await hopMod(), store = HM.idbStore(), sleep = ms => new Promise(r => setTimeout(r, ms)); let done = 0;
     for (const f of found.slice()) {
       if (done >= LOST_PER_PASS) break;
-      const k = f.stealth.toLowerCase(); if (f.legacy || f.usdc !== 0n || (hops.get(k) || {}).running || lost.has(k) || lostSeen.fresh(k)) continue;
+      const k = f.stealth.toLowerCase(); if (f.legacy || f.usdc !== 0n || (hops.get(k) || {}).running || lost.has(k) || lostNone.has(k) || lostSeen.fresh(k)) continue;
       const hit = hitOf(f); if (!hit || hit.stealth.toLowerCase() !== k) continue;
       const ctx = { store, stealth: f.stealth, priv: hit.stealthPriv, words: await HM.loadWords(), getUtxos: HM.makeGetUtxos(), sleep };
       let cnt = null; try { cnt = await HM.makeCountPriorHops(C, chainRpc)(f.stealth); } catch {}
@@ -242,31 +250,40 @@ async function checkLost() {
       if (cnt != null) ctx.priorHops = cnt;
       done++; const res = await HM.findLostFunds(ctx);
       if (res.error) continue;                              // not marked: the next Scan tries again
-      lostSeen.mark(k);
+      if (!res.capped) lostSeen.mark(k);                    // 1136 F-2: a result that left older wallets unread is not "checked" for 6 h (this page still asks once: lostNone / lost)
       if (res.skipped) continue;
-      if (res.found.length) { let tip = null; try { tip = await (await import("./zec-return.js")).getTip((await import("./chains.js")).zcash.lightwalletd); } catch {}      // 1133 M-1: no tip = young (fail closed)
-        lost.set(k, { f, hit, n: res.found[0].n, found: res.found, total: res.total, truncated: res.truncated, maxLocal: res.maxLocal, young: HM.lostYoung(res.found, tip), contAcct: HM.lostContinueAcct(res.found) }); } else lostNone.add(k);
+      await setLost(HM, k, f, hit, res);
       renderHops(); render();
     }
   } finally { lostBusy.v = false; }
+}
+// 1136 F-2: the explicit way to read the wallets below the range already looked at; the richer find is shown, the range widens
+async function lostOlder(k, f, hit, line) {
+  const HM = await hopMod(), prev = lost.get(k) || lostNone.get(k); if (!prev || !prev.capped) return;
+  line.textContent = "Looking at older transfer wallets…";
+  const res = { found: [], total: 0n, ...(await HM.findLostFunds({ store: HM.idbStore(), stealth: f.stealth, priv: hit.stealthPriv, words: await HM.loadWords(), getUtxos: HM.makeGetUtxos(), sleep: ms => new Promise(r => setTimeout(r, ms)), before: prev.lo })) };
+  if (res.error) throw new Error(res.error);
+  const keepPrev = prev.found && prev.found.length && (prev.total >= (res.total || 0n) || !res.found.length), range = { lo: res.lo, top: prev.top, capped: res.capped };
+  lostNone.delete(k); await setLost(HM, k, f, hit, keepPrev ? { ...prev, ...range } : { ...res, ...range }); renderHops(); render();
 }
 function lostCard(k, l) {
   const card = el("div", "hop warn"), line = el("div", "hop-line"), acts = el("div", "row hop-act"), older = l.maxLocal != null && l.n < l.maxLocal;
   card.appendChild(el("div", "hop-t", "Unfinished private transfer found: " + zecText(l.total) + " ZEC" + (l.shielded ? " (shielded)" : "")));
   const why = l.young ? "The ZEC arrived recently, so this transfer may still be running on another device. It is available here later (about 2 hours after it arrived); nothing can be sent or returned from this card yet."      // 1133 M-1
-    : older ? "This is an earlier transfer wallet of this address, and a newer transfer record exists in this browser, so it cannot be recovered from here."
-    : "This browser has no record of it (storage was cleared, or it ran on another device), but the ZEC is still on the transfer's temporary wallet, rebuilt from your key. " + (l.shielded && !l.found.length ? "Continue sends it on to a recipient you enter now." : l.shielded || l.found.length ? "Return it to your wallet" + (l.shielded || l.contAcct == null ? " first (it sweeps every account, in rounds)." : ", or continue the transfer to a recipient you enter now.") : "") + (l.truncated ? " More outputs exist than could be read at once; Return money handles them in rounds." : "");
-  card.appendChild(el("div", "hop-line", why)); card.appendChild(line);
+    : older ? "This is an earlier transfer wallet of this address, and a newer transfer record exists in this browser, so it cannot be continued from here." + (l.found.length ? " Return money still works." : "")
+    : "This browser has no record of it (storage was cleared, or it ran on another device), but the ZEC is still on the transfer's temporary wallet, rebuilt from your key. " + (l.shielded && !l.found.length ? "Continue sends it on to a recipient you enter now." : l.shielded || l.found.length ? "Return it to your wallet" + (l.shielded || l.contAcct == null ? " first (it sweeps every account, in rounds)." : ", or continue the transfer to a recipient you enter now.") : "") + (l.truncated ? " More outputs exist than could be read at once; Return money handles them in rounds." : "");      // truncated = one address's list was cut; the wallet cap is capped (scanText)
+  card.appendChild(el("div", "hop-line", why)); if (!l.young && scanText(l)) card.appendChild(el("div", "note", scanText(l))); card.appendChild(line);
   const btn = (txt, cls, fn) => { const b = el("button", "btn " + cls, txt); b.type = "button"; b.addEventListener("click", () => fn(b)); acts.appendChild(b); return b; };
   const fail = (b, e) => { if (b) b.disabled = false; line.textContent = (e && e.message) || String(e); };
-  if (l.young) btn("Check again", "ghost", b => { lost.delete(k); lostSeen.unmark(k); renderHops(); checkLost().catch(() => {}); });
-  else if (!older) {
-    if (l.found.length) btn("Return money", "", b => { b.disabled = true; lostReturn(k, l, card, line).catch(e => fail(b, e)); });
-    const canContinue = self.crossOriginIsolated && (l.shielded ? !l.found.length : l.contAcct != null);      // 1133 L-4: one account only; ZEC on several accounts goes back first
+  if (l.young) btn("Check again", "ghost", b => { lostForget(k); renderHops(); checkLost().catch(() => {}); });
+  else {
+    if (l.found.length) btn("Return money", "", b => { b.disabled = true; lostReturn(k, l, card).catch(e => fail(b, e)).finally(() => { b.disabled = false; }); });      // 1136 F-4: from the keys alone, any wallet, no record
+    const canContinue = !older && self.crossOriginIsolated && (l.shielded ? !l.found.length : l.contAcct != null);      // 1133 L-4: one account only; ZEC on several accounts goes back first. Continue needs a record, so not on an earlier wallet
     if (canContinue) btn("Continue", "ghost", b => { const f = el("div", "row"); const inp = el("input"); inp.placeholder = "Recipient address 0x…"; inp.setAttribute("aria-label", "Recipient address"); inp.autocomplete = "off"; inp.spellcheck = false;
       const go = el("button", "btn", "Continue transfer"); go.type = "button"; go.addEventListener("click", () => { go.disabled = true; lostContinue(k, l, inp.value.trim(), line).catch(e => { go.disabled = false; line.textContent = (e && e.message) || String(e); }); });
       f.appendChild(inp); f.appendChild(go); card.insertBefore(f, acts); b.disabled = true; line.textContent = "Enter the recipient again: it cannot be read from the chain. It is checked like a normal withdraw."; });
-    if (!l.shielded) btn("Check shielded balance", "ghost", b => { b.disabled = true; lostShielded(k, l.f, l.hit, line).catch(e => fail(b, e)).finally(() => { b.disabled = false; }); });
+    if (!l.shielded && !older) btn("Check shielded balance", "ghost", b => { b.disabled = true; lostShielded(k, l.f, l.hit, line).catch(e => fail(b, e)).finally(() => { b.disabled = false; }); });
+    if (l.capped) btn("Scan older wallets", "ghost", b => { b.disabled = true; lostOlder(k, l.f, l.hit, line).catch(e => fail(b, e)); });
   }
   card.appendChild(acts); return card;
 }
@@ -276,33 +293,27 @@ async function lostShielded(k, f, hit, line) {
   if (!self.crossOriginIsolated) throw new Error("This page cannot run the Zcash wallet here (it is not cross-origin isolated).");
   const HM = await hopMod(), base = await hopCtx(HM, f, hit, {}); let cnt = null; try { cnt = await base.countPriorHops(f.stealth); } catch {}
   if (cnt === 0) { line.textContent = "No private transfer was ever started from this address."; return; }
-  const bt = await blockTimeSec(HM.firstBlock(found, f.stealth) || f.block), rg = HM.lostRange(cnt, await HM.localNs(base.store, f.stealth)), prev = lost.get(k) || {}; let best = null;      // 1133 I-4: the note cannot predate the FIRST payment to this address
+  const bt = await blockTimeSec(HM.firstBlock(found, f.stealth) || f.block), prev = lost.get(k) || {}, rg = HM.lostRange(cnt, await HM.localNs(base.store, f.stealth), (prev.top != null ? prev : lostNone.get(k) || {}).top); let best = null;      // 1133 I-4: the note cannot predate the FIRST payment to this address
   for (const n of rg.ns) {      // 1133 L-4: every wallet is looked at (bounded by LOST_MAX_N) and the richest wins; transparent ZEC already found counts for its own wallet
     line.textContent = "Syncing the Zcash wallet to look for shielded ZEC (hop wallet " + (n + 1) + ")… this takes a few minutes. Keep this tab open.";
     const rows = await HM.hopSummary({ ...base, n, blockTimeSec: bt, nAccts: HM.scanAccts(null) }, null), row = rows.filter(x => x.orchard >= HM.HOLD_DUST).sort((a, b) => (b.orchard > a.orchard ? 1 : -1))[0];
     if (row) { const sum = row.orchard + (prev.found && prev.found.length && prev.n === n ? prev.total : 0n); if (!best || sum > best.sum) best = { n, row, rows, sum }; }
   }
-  if (!best) { line.textContent = "No shielded ZEC found on this address's transfer wallets."; lostNone.delete(k); render(); return; }
+  if (!best) { line.textContent = "No shielded ZEC found. " + scanText(rg); if (lostNone.has(k)) lostNone.set(k, { ...lostNone.get(k), lo: rg.lo, top: rg.top, capped: rg.capped }); return; }
   const keep = prev.found && prev.n === best.n;      // transparent findings of another wallet are not mixed in; a note says they exist
   const other = prev.found && prev.found.length && !keep ? " Transparent ZEC (" + zecText(prev.total) + ") also sits on another transfer wallet of this address; recover this one first, then check again." : "";
-  lost.set(k, { ...prev, f, hit, n: best.n, found: keep ? prev.found : [], total: best.row.orchard + (keep ? prev.total : 0n), young: keep ? prev.young : false, contAcct: keep ? prev.contAcct : null, maxLocal: rg.maxLocal, truncated: !!(rg.capped || (keep && prev.truncated)), shielded: { account: best.row.account, blockTimeSec: bt } });
+  lost.set(k, { ...prev, f, hit, n: best.n, found: keep ? prev.found : [], total: best.row.orchard + (keep ? prev.total : 0n), young: keep ? prev.young : false, contAcct: keep ? prev.contAcct : null, maxLocal: rg.maxLocal, lo: rg.lo, top: rg.top, capped: rg.capped, truncated: !!(keep && prev.truncated), shielded: { account: best.row.account, blockTimeSec: bt } });
   line.textContent = other.trim(); lostNone.delete(k); renderHops(); render();
 }
 const lostLock = stealth => fn => underHopLock(stealth, fn);      // 1133 M-2: the app's own hop lock around find + write (undefined = another tab holds it)
-const NOT_ADOPTED = r => new Error(r.reason === "newer" ? "A newer transfer record exists in this browser, so this earlier transfer wallet cannot be recovered from here." : "A transfer record for this payment already exists in this browser (another tab or an earlier press). Nothing was changed; reload and use its card.");
-// 1133 M-1: re-checked at the moment of the click with a fresh tip, not only when the card was drawn
+const NOT_ADOPTED = r => new Error(r.reason === "newer" ? "A newer transfer record exists in this browser, so this earlier transfer wallet cannot be continued from here. Return money still works." : "A transfer record for this payment already exists in this browser (another tab or an earlier press). Nothing was changed; reload and use its card.");
+// 1133 M-1: re-checked at the moment of the click with a fresh tip, not only when the card was drawn (Continue; Return re-checks the very outputs it sweeps, in returnZec)
 async function lostGuard(l) {
   const ZR = await import("./zec-return.js"), { zcash: ZC } = await import("./chains.js"), HM = await hopMod(); let tip = null; try { tip = await ZR.getTip(ZC.lightwalletd); } catch {}
   if (l.found.length && HM.lostYoung(l.found, tip)) { l.young = true; renderHops(); throw new Error("This may still be running on another device: its ZEC is too recent to touch. Try again in about 2 hours."); }
 }
-async function lostReturn(k, l, card, line) {
-  await lostGuard(l);
-  const HM = await hopMod(), ctx = { store: HM.idbStore(), stealth: l.f.stealth, lock: lostLock(l.f.stealth) }, r = await HM.adoptLostHop(ctx, { as: "return", n: l.n, zats: l.total, chain: C, dest: C });
-  if (!r.created) throw NOT_ADOPTED(r);
-  const rec = await HM.findHop(ctx.store, l.f.stealth); if (!rec) throw new Error("could not save the recovered transfer");
-  lost.delete(k); const h = { f: l.f, hit: l.hit, running: false, msg: "", st: rec.rec.st }; hops.set(k, h);
-  await returnZec(h, card);
-}
+// 1136 F-4: Return needs only the keys: no record is adopted, so every recoverable wallet keeps its Return button (h.lost marks the card the result comes back to)
+const lostReturn = (k, l, card) => returnZec({ f: l.f, hit: l.hit, running: false, msg: "", st: { n: l.n }, lost: k }, card);
 async function lostContinue(k, l, to, line) {
   if (!self.crossOriginIsolated) throw new Error("This page cannot run the Zcash wallet here (it is not cross-origin isolated).");
   if (!vetRecipient(to, l.f)) { line.textContent = "Cancelled."; return; }
@@ -312,12 +323,15 @@ async function lostContinue(k, l, to, line) {
   let birthday, account, zats = l.total;
   if (l.shielded) { if (l.found.length) throw new Error("ZEC also sits on the transparent addresses: press Return money first."); birthday = HM.birthdayFromTime(l.shielded.blockTimeSec, await ZR.getTip(ZC.lightwalletd)); account = l.shielded.account; }
   else { account = HM.lostContinueAcct(l.found); if (account == null) throw new Error("The ZEC is on several accounts: press Return money first, it sweeps all of them."); zats = l.found.reduce((s, x) => s + x.value, 0n); const hs = l.found.map(x => x.height).filter(x => x > 0); birthday = (hs.length ? Math.min(...hs) : (await ZR.getTip(ZC.lightwalletd)) - 5000) - 10; }
-  const r = await HM.adoptLostHop(ctx, { as: "continue", n: l.n, account, birthday, zats, recipient: to, chain: C, dest: C });
+  const r = await HM.adoptLostHop(ctx, { n: l.n, account, birthday, zats, recipient: to, chain: C, dest: C });
   if (!r.created) throw NOT_ADOPTED(r);      // 1133 L-1: never run on another record's recipient
   lost.delete(k); renderHops(); render(); await runHop(l.f, l.hit, null);
 }
 // 1105 L-4: every writer of a hop record outside the machine takes the machine's own Web Lock (non-blocking). If the hop is running (or another writer is) the write is skipped, never interleaved.
 const underHopLock = (stealth, fn) => navigator.locks ? navigator.locks.request("zec-hop:" + stealth.toLowerCase(), { ifAvailable: true }, l => l ? fn() : undefined) : fn();
+// 1136 F-4: the sweep intent (recorded before the broadcast; it is what stops a second sweep and lets a reload follow the swap) is kept per hop wallet (stealth#n), not in a hop record: Return works on a wallet that has none
+const SWEEP_KEY = "stealth-sweep-intents", sweepIntents = { key: h => h.f.stealth.toLowerCase() + "#" + (h.st.n || 0), all() { try { const o = JSON.parse(localStorage.getItem(SWEEP_KEY) || "{}"); return o && typeof o === "object" ? o : {}; } catch { return {}; } },
+  get(h) { return this.all()[this.key(h)] || null; }, set(h, v) { const o = this.all(); o[this.key(h)] = v; const ks = Object.keys(o); if (ks.length > 200) for (const x of ks.slice(0, ks.length - 200)) delete o[x]; try { localStorage.setItem(SWEEP_KEY, JSON.stringify(o)); return localStorage.getItem(SWEEP_KEY) === JSON.stringify(o); } catch { return false; } } };
 // ZEC stuck on the hop t-address (shielding is refused since NU6.3): sign a plain transparent tx here and swap it back to the connected wallet
 async function returnZec(h, card) {
   const [HM, ZR] = await Promise.all([hopMod(), import("./zec-return.js")]), { zcash: ZC } = await import("./chains.js");
@@ -330,7 +344,7 @@ async function returnZec(h, card) {
     if (!utxos.length && (raw.length || raw.truncated)) unspendable = true;      // 1103 M-1: dust only, or a list too long to read to the end: that is NOT "empty"
   }
   if (!utxos.length && unspendable) { step("This address holds only tiny outputs (below the network fee) or more outputs than can be read at once. Nothing was removed and nothing can be swept from them yet. Try again later."); return; }
-  const prevOf = () => HM.findHop(HM.idbStore(), h.f.stealth).then(r => r && r.rec.st.sweep).catch(() => null);
+  const prevOf = async () => sweepIntents.get(h) || await HM.findHop(HM.idbStore(), h.f.stealth).then(r => r && (r.rec.st.n || 0) === (h.st.n || 0) ? r.rec.st.sweep : null).catch(() => null);      // 1136 F-4: the intent lives beside the keys, not in a hop record (an older build's record is still read)
   const prevOk = p => p && /^[0-9a-f]{64}$/i.test(p.txid || "") && /^t1[1-9A-HJ-NP-Za-km-z]{33}$/.test(p.deposit || "");
   if (!utxos.length) {                                   // the server lists nothing: that is an ANSWER of an untrusted server, not proof (1100 M-1). Never hide on one answer.
     // 1110 L-1: an unresolved sweep intent means the inputs are gone because the sweep went out: follow its swap (never count "empty" observations, never hide) until NEAR ends it
@@ -339,6 +353,7 @@ async function returnZec(h, card) {
       if (!sp.ended) return await finishSweep(HM, h, step, { txid: sp.txid, deposit: sp.deposit, amountOut: sp.amountOut });
       if (Date.now() - (sp.endedAt || 0) < 3600_000) { step("The swap ended as " + sp.ended + ". The refund is on its way back to the hop address: press Return money again in a few minutes."); return; }
     }
+    if (h.lost) { lostForget(h.lost); step("Nothing is listed on the transparent addresses now (moved already, or the server is behind). Scan checks again; the shielded balance has its own button."); return; }      // no record to count empty observations in: the card just goes, and is found again if the ZEC is still there
     step("Checking the shielded balance…");
     const r = await HM.findHop(HM.idbStore(), h.f.stealth), left = await HM.hopSummary(await hopCtx(HM, h.f, h.hit, null), r && r.rec);
     if (HM.holdsZec(left)) throw new Error("ZEC is still in the shielded pool. Press Continue transfer.");
@@ -346,7 +361,7 @@ async function returnZec(h, card) {
     if (v.hide) { await hideHop(HM, h); step("Nothing left here, confirmed by repeated checks. Removed."); return; }
     step("The server says there is nothing here (" + ((v.obs && v.obs.count) || 1) + "/" + ZR.EMPTY_N + " checks, spread over at least 30 minutes). Not removed: rechecking. Press Return money again later."); return;
   }
-  noteEmptyFor(HM, h, false).catch(() => {});
+  if (!h.lost) noteEmptyFor(HM, h, false).catch(() => {});
   const total = utxos.reduce((s, u) => s + u.value, 0n), amount = total - ZR.sweepFee(utxos.length);
   { // 1103 L-1: an earlier press recorded its sweep BEFORE broadcasting. If that transaction is on the network, carry on with it instead of building a conflicting second one.
     const prev = await prevOf();
@@ -359,6 +374,10 @@ async function returnZec(h, card) {
       if (until === null ? Date.now() - (prev.at || 0) < 3600_000 : tipNow <= until) throw new Error("Your earlier return transaction (" + prev.txid.slice(0, 12) + "…) is not on the network yet but may still be mined (it stays valid for about 50 minutes). Not sending another yet: press Return money again later.");
     }
   }
+  if (h.lost) {      // 1136 F-3a: the age rule applies to the very outputs about to be swept (fresh query), not to the card's snapshot
+    let tip = null; try { tip = await ZR.getTip(ZC.lightwalletd); } catch {}
+    if (HM.lostYoung([HM.outputAge(utxos)], tip)) { step("This may still be running on another device: its ZEC is too recent to touch. Try again in about 2 hours."); return; }
+  }
   step("Getting a quote…");
   const j = await PW.requestQuote({ req: HM.reqOut({ dest: C, amount, recipient: acct, refundT: key.addr }), okDeposit: a => /^t1[1-9A-HJ-NP-Za-km-z]{33}$/.test(a || "") });
   step("Sending " + (Number(amount) / 1e8) + " ZEC…");
@@ -367,7 +386,7 @@ async function returnZec(h, card) {
   const intent = { txid: sw.txid, deposit: j.quote.depositAddress, amountOut: j.quote.amountOut, at: Date.now(), expiry: sw.expiry };
   // 1133 L-3: the hop lock is held from recording the intent through the broadcast, so a resume (Halt / auto-retry) cannot shield the same outputs meanwhile. Nothing inside takes the lock again; the broadcast is bounded by its own request timeouts plus 5 min
   const saved = await underHopLock(h.f.stealth, async () => {
-    try { const rr = await HM.findHop(HM.idbStore(), h.f.stealth); if (!rr) return false; rr.rec.st = { ...rr.rec.st, sweep: intent }; await HM.idbStore().put(rr.key, rr.rec); } catch { return false; }      // recorded BEFORE broadcasting
+    if (!sweepIntents.set(h, intent)) return false;      // recorded BEFORE broadcasting
     await HM.withTimeout(ZR.sendAndConfirm(ZC.lightwalletd, sw.raw, undefined, sw.txid), 5 * 60_000, "Zcash broadcast"); return true; });        // 1100 L-2: the node must hand our exact bytes back before this counts as sent
   if (!saved) throw new Error("Could not record the return before sending it (the transfer may be running in another tab). Nothing was sent; try again in a minute.");
   await finishSweep(HM, h, step, intent);
@@ -377,11 +396,12 @@ async function finishSweep(HM, h, step, sw) {
   if (note) step("Sent" + note);
   const fin = await PW.pollStatus({ depositAddress: sw.deposit, timeoutMs: 60 * 60_000, intervalMs: 10_000, onUpdate: s => step("Returning · " + s.status.toLowerCase().replace(/_/g, " ") + " · usually 10–20 min" + note) });
   step(fin.status === "SUCCESS" ? "Done: ≈ " + (Number(sw.amountOut) / 1e6).toFixed(2) + " " + SYM + " sent to your wallet." : "Swap ended as " + fin.status + ". The ZEC is back on the hop address; press Return money again.");
-  if (fin.status === "SUCCESS") {      // 1122 L-3: the transparent return worked, but the card goes away only when the hop wallet holds nothing at all (shielded ZEC included); a failed check keeps the card
+  if (fin.status === "SUCCESS" && h.lost) { lostForget(h.lost); checkLost().catch(() => {}); }      // a lost wallet has no card to keep: it is looked for again, and any other wallet of this address shows up with its own Return
+  else if (fin.status === "SUCCESS") {      // 1122 L-3: the transparent return worked, but the card goes away only when the hop wallet holds nothing at all (shielded ZEC included); a failed check keeps the card
     let left = null; try { const r = await HM.findHop(HM.idbStore(), h.f.stealth); left = await HM.hopSummary(await hopCtx(HM, h.f, h.hit, null), r && r.rec); } catch {}
     if (left && !HM.holdsZec(left)) await hideHop(HM, h); else step("Done: the payout was sent. The hop wallet may still hold some ZEC, so the card stays: press Return money again.");
   }
-  else await underHopLock(h.f.stealth, async () => { const r = await HM.findHop(HM.idbStore(), h.f.stealth); if (r && r.rec.st.sweep && r.rec.st.sweep.txid === sw.txid) { r.rec.st = { ...r.rec.st, sweep: { ...r.rec.st.sweep, ended: fin.status, endedAt: Date.now() } }; await HM.idbStore().put(r.key, r.rec); } }).catch(() => {});      // 1110 L-1: the intent is settled (no endless resume), but kept so "empty" is not counted while the refund is still on its way
+  else await underHopLock(h.f.stealth, async () => { const cur = sweepIntents.get(h); if (!cur || cur.txid === sw.txid) sweepIntents.set(h, { ...sw, ended: fin.status, endedAt: Date.now() }); }).catch(() => {});      // 1110 L-1: the intent is settled (no endless resume), but kept so "empty" is not counted while the refund is still on its way
 }
 // A transfer from the first version (before Ironwood) could never shield, so its ZEC only ever sat on the hop t-addresses:
 // once those are empty (returned) the record is history and shows nothing. Later versions are never hidden this way.
@@ -425,7 +445,9 @@ function render() {
     const small = el("small", null, "block " + f.block + " · " + (hp ? fmtTok(BigInt(hp.st.amount)) + " " + SYM + " · in private transfer" : (f.usdc === undefined ? "reading balance…" : f.usdc === null ? "balance not read (scan again)" : "now holds " + fmtTok(f.usdc) + " " + SYM) + (f.eth ? " + " + (Number(f.eth) / NUNIT).toFixed(5) + " " + NAT : "")) + " · ");
     const a = el("a", null, "tx"); a.href = C.explorer + "/tx/" + f.tx; a.target = "_blank"; a.rel = "noopener noreferrer"; small.appendChild(a); row.appendChild(small);
     const kk = f.stealth.toLowerCase();
-    if (!hp && f.usdc === 0n && lostNone.has(kk) && self.crossOriginIsolated && !lost.has(kk)) { const d = el("div"), ln = el("div", "note"); d.style.marginTop = "8px"; const b = el("button", "btn ghost", "Check shielded balance"); b.type = "button"; b.addEventListener("click", () => { b.disabled = true; lostShielded(kk, f, hitOf(f), ln).catch(e => { ln.textContent = (e && e.message) || String(e); }).finally(() => { b.disabled = false; }); }); d.appendChild(b); d.appendChild(ln); row.appendChild(d); }
+    if (!hp && f.usdc === 0n && lostNone.has(kk) && !lost.has(kk) && (self.crossOriginIsolated || lostNone.get(kk).capped)) { const nr = lostNone.get(kk), d = el("div"), ln = el("div", "note", scanText(nr)), bar = el("div", "row"); d.style.marginTop = "8px"; d.appendChild(ln); d.appendChild(bar);      // 1136 F-2: an empty result says what it looked at
+      const mk = (txt, fn) => { const b = el("button", "btn ghost", txt); b.type = "button"; b.addEventListener("click", () => { b.disabled = true; fn(kk, f, hitOf(f), ln).catch(e => { ln.textContent = (e && e.message) || String(e); }).finally(() => { b.disabled = false; }); }); bar.appendChild(b); };
+      if (self.crossOriginIsolated) mk("Check shielded balance", lostShielded); if (nr.capped) mk("Scan older wallets", lostOlder); row.appendChild(d); }
     if (!hp && f.usdc > 0n) { const d = el("div"); d.style.marginTop = "8px"; const b = el("button", "btn ghost", "Withdraw " + SYM); b.type = "button"; b.addEventListener("click", () => openWithdraw(i)); d.appendChild(b); row.appendChild(d); }
     list.appendChild(row);
   });
@@ -571,12 +593,13 @@ const noteId = t => { let h = 5381; for (let i = 0; i < t.length; i++) h = ((h *
 const fastNotes = { all() { try { const o = JSON.parse(localStorage.getItem(FAST_NOTES_KEY) || "{}"); if (Array.isArray(o)) return { "": o.filter(x => typeof x === "string").map(t => ({ id: noteId(t), t })) }; return o && typeof o === "object" ? o : {}; } catch { return {}; } },
   save(o) { try { localStorage.setItem(FAST_NOTES_KEY, JSON.stringify(o)); } catch {} },
   read(acct) { const o = this.all(), l = String(acct || "").toLowerCase(); return (o[""] || []).concat(l ? o[l] || [] : []).filter(x => x && typeof x.t === "string"); },      // "" = notes from before they were per account: shown to every account until dismissed
-  add(t, acct) { const o = this.all(), l = String(acct || "").toLowerCase(), a = o[l] || []; if (!a.some(x => x.t === t)) a.push({ id: noteId(t), t }); o[l] = a.slice(-NOTES_MAX); this.save(o); },
+  // 1135 L-4: no owner, no note (the "" bucket is only what older builds left behind)
+  add(t, acct) { const l = String(acct || "").toLowerCase(); if (!l) return false; const o = this.all(), a = o[l] || []; if (!a.some(x => x.t === t)) a.push({ id: noteId(t), t }); o[l] = a.slice(-NOTES_MAX); this.save(o); return true; },
   drop(ids, acct) { const o = this.all(), l = String(acct || "").toLowerCase(), set = new Set(ids); for (const k of ["", l]) if (o[k]) { o[k] = o[k].filter(x => !set.has(x.id)); if (!o[k].length) delete o[k]; } if (Object.keys(o).length) this.save(o); else { try { localStorage.removeItem(FAST_NOTES_KEY); } catch {} } } };
 const fastNeedsNote = rec => rec.parts.some(p => p.depositAddress && (p.state === "UNKNOWN" || p.state === "FAILED" || p.state === "STUCK"));
-let shownNotes = [];
+let shownNotes = [], fastExtra = [], fastLive = "", fastDeferred = false;      // 1135 L-3: transient lines and the text of a running resume are kept here, so every showFastBox() (e.g. from setAcct) draws them again
 const fastOpenIdle = () => { const m = fastRecs.read(); return Object.keys(m).filter(k => !fastBusy.has(k) && PW.fastOpenRec(m[k])); };
-function showFastBox(extra = []) { const box = $("fast-resume"), n = fastNotes.read(acct), txt = n.map(x => x.t).concat(extra).join("\n\n"); shownNotes = n.map(x => x.id); box.textContent = txt; box.hidden = !txt; $("btn-fast-dismiss").hidden = !n.length; $("btn-fast-abandon").hidden = !fastOpenIdle().length; }
+function showFastBox(extra = []) { for (const x of extra) if (!fastExtra.includes(x)) fastExtra.push(x); const box = $("fast-resume"), n = fastNotes.read(acct), txt = (fastLive ? [fastLive] : []).concat(n.map(x => x.t), fastExtra).join("\n\n"); shownNotes = n.map(x => x.id); box.textContent = txt; box.hidden = !txt; $("btn-fast-dismiss").hidden = !n.length && !fastExtra.length; $("btn-fast-abandon").hidden = !fastOpenIdle().length; }
 async function fastWithdraw(to, value, hit) {
   const dest = CHAINS[$("wd-dest").value]; if (!dest || !dest.oneClick) throw new Error("pick a destination chain");
   const key = [to.toLowerCase(), value, dest.key, "fast"].join("|");
@@ -598,8 +621,9 @@ async function fastWithdraw(to, value, hit) {
   $("btn-wd").disabled = true; $("withdraw").hidden = true; fastBusy.add(k);
   const lock = await holdScreen(), fmt = v => fmtTok(v);
   const save = r => { try { fastRecs.put(r); } catch (e) { say("pay-hint", e.message + " The withdraw continues, but if this tab is closed it cannot be followed.", "warn"); } };      // 1130 L-1: surfaced, never silent (the START is refused in fastClaim)
+  const owner = acct;      // 1135 L-4: the account that started this withdraw owns its notes, whatever is connected when it ends
   let cur = null, claimed = false;      // claimed: this run owns the stored record (a refused second start must not touch the guard or notes of the live one)
-  const noteIfNeeded = () => { if (claimed && fastNeedsNote(rec)) { fastNotes.add("Private withdraw of " + fmtTok(value) + " " + SYM + " (" + C.name + "), started " + new Date(rec.startedAt).toLocaleString() + ":\n" + PW.fastSummary(rec, fmt, SYM).join("\n"), acct); showFastBox(); } };
+  const noteIfNeeded = () => { if (claimed && fastNeedsNote(rec)) { fastNotes.add("Private withdraw of " + fmtTok(value) + " " + SYM + " (" + C.name + "), started " + new Date(rec.startedAt).toLocaleString() + ":\n" + PW.fastSummary(rec, fmt, SYM).join("\n"), owner); showFastBox(); } };
   const settleGuard = () => { if (claimed && !rec.parts.some(p => p.state === "SIGNED" || p.state === "UNKNOWN")) pendingWd.delete(k); };
   const ctx = { from: C, to: dest, priv: hit.stealthPriv, stealth: w.stealth, recipient: to, api: API, base: PW.ONECLICK, fetchFn: fetch, minRatio: ratio * 0.98, randomNonce: randomBytes32,
     authUsed: (a, n) => authorizationUsed(rpcOne, USDC, a, n), onProgress: m => say("pay-hint", m, "ok"),
@@ -614,27 +638,29 @@ async function fastWithdraw(to, value, hit) {
     if (PW.fastDone(rec)) fastRecs.del(k);
     noteIfNeeded(); settleGuard();
     say("pay-hint", (ok ? "Done privately: " + fmtTok(value) + " " + SYM + " sent through NEAR Intents to " + to.slice(0, 8) + "… on " + dest.name + "." : "Finished with problems:") + (ok && rec.parts.length < 2 ? "" : "\n" + sums.join("\n")), ok ? "ok" : "warn");
-  } catch (e) { say("pay-hint", (e.message || String(e)) + "\n" + PW.fastSummary(rec, fmt, SYM).join("\n"), "bad"); if (PW.fastDone(rec) && fastRecs.read()[k] && fastRecs.read()[k].startedAt === rec.startedAt) fastRecs.del(k); noteIfNeeded(); settleGuard(); }
-  finally { fastBusy.delete(k); if (lock) lock.release().catch(() => {}); $("btn-wd").disabled = false; pvReset(); await refreshBalances().catch(() => {}); render(); }
+  } catch (e) { say("pay-hint", (e.message || String(e)) + (e.config ? PW.CONFIG_NOTE + " Use Abandon below to clear this record." : "\n" + PW.fastSummary(rec, fmt, SYM).join("\n")), "bad");      // 1135 L-2: the true reason, the guard stays, Abandon is the way out
+    if (PW.fastDone(rec) && fastRecs.read()[k] && fastRecs.read()[k].startedAt === rec.startedAt) fastRecs.del(k); noteIfNeeded(); settleGuard(); }
+  finally { fastBusy.delete(k); showFastBox(); if (lock) lock.release().catch(() => {}); $("btn-wd").disabled = false; pvReset(); await refreshBalances().catch(() => {}); render(); }
 }
 // after a reload: follow parts that were handed to NEAR Intents, mark the rest (never signed -> still on the stealth address; signed but unconfirmed -> check the explorer)
 async function resumeFast() {
-  const m = fastRecs.read(), box = $("fast-resume"), extra = [];
+  const m = fastRecs.read(), extra = [];
   for (const k of Object.keys(m)) {
     const rec = m[k]; if (!rec || !Array.isArray(rec.parts) || fastBusy.has(k)) continue;
     let ran = false;
-    const go = async () => { ran = true; fastBusy.add(k); try { await PW.runFast({ base: PW.ONECLICK, fetchFn: fetch, onProgress: t => { box.hidden = false; box.textContent = "Earlier private withdraw: " + t; } }, rec, r => { try { fastRecs.put(r); } catch {} }, { resume: true }); } finally { fastBusy.delete(k); } };
+    const go = async () => { ran = true; fastBusy.add(k); try { await PW.runFast({ base: PW.ONECLICK, fetchFn: fetch, onProgress: t => { fastLive = "Earlier private withdraw: " + t; showFastBox(); } }, rec, r => { try { fastRecs.put(r); } catch {} }, { resume: true }); } finally { fastBusy.delete(k); fastLive = ""; } };
     try { if (navigator.locks) await navigator.locks.request("fast-wd:" + k, { ifAvailable: true }, l => l ? go() : undefined); else await go(); } catch (e) { extra.push("Earlier private withdraw: " + (e.message || e)); continue; }
     if (!ran) continue;                                      // 1125 F-6: another tab holds the lock, so this record is a LIVE withdraw there, not an earlier one
     const chain = CHAINS[rec.chain] || C, sums = PW.fastSummary(rec, v => (Number(v) / 10 ** chain.token.decimals).toFixed(2), chain.token.symbol), text = "Earlier private withdraw (" + chain.name + "):\n" + sums.join("\n");
-    if (fastNeedsNote(rec)) fastNotes.add(text, acct); else extra.push(text);      // 1125 F-2: all summaries are listed (not only the last), and the ones with a deposit address to look up stay
+    if (fastNeedsNote(rec)) { if (!acct) { extra.push(text); fastDeferred = true; continue; } fastNotes.add(text, acct); } else extra.push(text);      // 1135 L-4: no account yet -> shown now, the record is kept and followed again when one connects      // 1125 F-2: all summaries are listed (not only the last), and the ones with a deposit address to look up stay
     if (PW.fastDone(rec)) { fastRecs.del(k); if (!rec.parts.some(p => p.state === "UNKNOWN")) pendingWd.delete(k); }   // UNKNOWN: the signed transfer may still land, the guard stays until its authorization expires
   }
   showFastBox(extra);
 }
-$("btn-fast-dismiss").addEventListener("click", () => { fastNotes.drop(shownNotes, acct); showFastBox(); });
+$("btn-fast-dismiss").addEventListener("click", () => { fastNotes.drop(shownNotes, acct); fastExtra = []; showFastBox(); });
 // 1130 M-2: the explicit way out of a record that cannot be closed (a part that never got a final 1Click status, a tab that died): every open part is parked in the state that tells the truth, the deposit address goes into a note.
 $("btn-fast-abandon").addEventListener("click", once(async () => {
+  if (!acct) { say("pay-hint", "Connect your wallet first: the note with the deposit address is saved for your account.", "warn"); return; }
   const ks = fastOpenIdle(); if (!ks.length || !confirm("Abandon the unfinished private withdraw record" + (ks.length > 1 ? "s" : "") + "? Parts already handed to NEAR Intents stay with NEAR Intents (their deposit addresses are kept in a note); this page stops following them.")) return;
   for (const k of ks) {
     const go = () => { const rec = fastRecs.read()[k]; if (!rec || !PW.fastOpenRec(rec)) return; const chain = CHAINS[rec.chain] || C; PW.abandonRec(rec);
@@ -709,7 +735,7 @@ $("btn-wd").addEventListener("click", once(async () => {
       { onBusy: m => say("pay-hint", m, "warn"), check: () => authorizationUsed(rpcOne, USDC, w.stealth, nonce) });
     // 1121 L-2: the guard is cleared only by a DEFINITE refusal (400/403/429 JSON, not "already used"). "authorization already used" means an earlier attempt of this same request went through (lost answer, then the retry): follow it like d.used.
     const ans = PW.relayOutcome(r, d);      // 1125 F-3: the same reading of the answer as the fast route
-    if (ans.kind === "error") { if (ans.definite) pendingWd.delete(w.stealth.toLowerCase()); throw new Error(ans.message); }
+    if (ans.kind === "error") { if (ans.definite) pendingWd.delete(w.stealth.toLowerCase()); throw new Error(ans.message + (ans.config ? PW.CONFIG_NOTE : "")); }      // 1135 L-2: the true reason; the guard stays
     if (ans.kind === "used") d.hash = await txOfLogs({ address: USDC, topics: [AUTH_USED_TOPIC, "0x" + padAddr(w.stealth), nonce], span: logSpanSince(validBefore) }, () => true);      // 1101 L-1: found by THIS request's nonce, not by "an identical transfer"
     if (!isHash(d.hash)) throw new Error("the relayer answered without a valid transaction hash; check the explorer before sending again");
     $("withdraw").hidden = true;

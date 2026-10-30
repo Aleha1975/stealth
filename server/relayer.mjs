@@ -20,7 +20,7 @@
    API 127.0.0.1:3874: POST /stealth-api/relay {from,to,value,validAfter,validBefore,nonce,v,r,s[,feeAuth:{value,validAfter,validBefore,nonce,v,r,s}]}
    -> {hash[,feeHash]}; GET /stealth-api/relay/stats */
 import { makeScreen } from "./sanctions/screen.mjs";
-import { cleanLog, neutral, safeIp, capMap, makeFailBudget, makeTokenBucket, makeLineLimiter, makeCounters, parseAllow, ipKey, parseEnvLine, isLowS, failWeight, classifyError, payFeeFor, Refusal, Upstream } from "./relay-util.mjs";
+import { cleanLog, neutral, safeIp, capMap, makeFailBudget, makeTokenBucket, makeLineLimiter, makeCounters, parseAllow, ipKey, parseEnvLine, isLowS, failWeight, classifyError, rateLimited, payFeeFor, Refusal, Upstream } from "./relay-util.mjs";
 import http from "http"; import fs from "fs"; import path from "path"; import { fileURLToPath, pathToFileURL } from "url";
 import { createPublicClient, createWalletClient, http as vhttp, fallback, parseAbi, formatEther, getAddress, defineChain, encodeAbiParameters, encodeFunctionData, keccak256, toHex, recoverTypedDataAddress, isAddress } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
@@ -91,7 +91,7 @@ let sticky = 0; export const stickyIndex = () => sticky;
 // "missing trie node" family. Deterministic rejections of OUR transaction (nonce too low, already known, underpriced, reverts) are not in this list: they must be answered, never retried elsewhere.
 const BAD_ENDPOINT = /limit exceeded|rate limit|quota|unauthori[sz]ed|forbidden|invalid api key|header not found|missing trie node|historical state/i;
 const isBadEndpoint = e => { for (let x = e, i = 0; x && i < 8; i++, x = x.cause) { if ([401, 402, 403, 408].includes(x.status) || x.code === -32005 || (x.code !== undefined && BAD_ENDPOINT.test(String(x.details || x.shortMessage || x.message || "")))) return true; } return false; };
-const isTransport = e => { if (classifyError(e) instanceof Upstream) return true; for (let x = e, i = 0; x && i < 8; i++, x = x.cause) if (x.status === 429) return true; return isBadEndpoint(e); };
+const isTransport = e => classifyError(e) instanceof Upstream || isBadEndpoint(e);      // 1135 L-1: a plain HTTP 429 is Upstream in classifyError itself, for every caller
 export const nodeCall = async (fn) => {
   let last;
   for (let i = 0; i < pubs.length; i++) {
@@ -99,7 +99,7 @@ export const nodeCall = async (fn) => {
     try { const r = await fn(pubs[k]); if (k !== sticky) { log("rpc endpoint switched", sticky, "->", k); sticky = k; } return r; }
     catch (e) { if (!isTransport(e)) throw e; last = e; }
   }
-  if (classifyError(last) instanceof Upstream || !isTransport(last)) throw last;       // 1131 L-1: transport includes a plain HTTP 429 from every endpoint
+  if (classifyError(last) instanceof Upstream && !rateLimited(last)) throw last;       // `last` is always a transport error here (the loop only continues on one). A raw transport error keeps its text; a 429 and a bad-endpoint answer (auth / quota) become a plain Upstream below, as before 1135
   throw new Upstream("rpc endpoints unavailable");     // audit 1128 L-1: every endpoint refused us (auth / quota): infrastructure trouble, an honest signer is not charged for it
 };
 const node = {

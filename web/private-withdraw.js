@@ -171,13 +171,15 @@ export function signTransferAuth({ chain, priv, from, to, value, validBefore, no
 
 /** The relayer's answer, read the same way by the standard route (app.js) and the fast route (1121 L-2, 1125 F-3).
  *  -> { kind: "used" }  the authorization is already used on chain (lost answer, then the retry): follow the transaction, do not give up;
- *     { kind: "error", message, definite }  definite = a JSON 400 that carries the relayer's explicit `definite: true` (refused by offline validation, before any broadcast; 1130 M-1): only then may the
+ *     { kind: "error", message, definite, config }  config = a 400 that names a setting of the relayer (shown as it is, with CONFIG_NOTE; the guard stays);  definite = a JSON 400 that carries the relayer's explicit `definite: true` (refused by offline validation, before any broadcast; 1130 M-1): only then may the
  *       double-send guard be cleared. Every other error (a 400 "still being confirmed" / "in progress", 403, 429, 5xx) may follow an earlier broadcast of the same authorization and counts as in progress;
  *     { kind: "ok" }. */
+const CONFIG_REFUSAL = /below the minimum|fees are not enabled|fee below the minimum|fee authorization required/i;      // 1135 L-2: the relayer's own settings refused the request (server/relayer.mjs early(..., false)); matched by its words, no new flag
+export const CONFIG_NOTE = " This is a setting of the relayer, not a problem with your request, and nothing is known to have been sent. The safety lock stays on until this authorization expires (up to about an hour).";
 export function relayOutcome(r, d) {
   const usedErr = !!d.error && /authorization already used/i.test(String(d.error));
   if (d.used || usedErr) return { kind: "used" };
-  if (!r.ok || d.error) return { kind: "error", message: d.error || "relayer error", definite: !!d.error && r.status === 400 && d.definite === true };
+  if (!r.ok || d.error) return { kind: "error", message: d.error || "relayer error", definite: !!d.error && r.status === 400 && d.definite === true, config: !!d.error && r.status === 400 && d.definite !== true && CONFIG_REFUSAL.test(String(d.error)) };
   return { kind: "ok" };
 }
 /** One part: optional delay -> real quote -> stealth key signs the transfer to the deposit address -> relayer -> receipt -> submit -> poll.
@@ -204,7 +206,7 @@ export async function runPart(ctx, amount, delayMs) {
   if (ctx.onSigned) ctx.onSigned({ auth, depositAddress: q.depositAddress, amount, validBefore });      // from here on the outcome of this transfer may be unknown to us: the caller arms its double-send guard
   const { r, d } = await postRelay(fetchFn, ctx.api + "/relay", auth, { onBusy: m => say(m), check: ctx.authUsed ? () => ctx.authUsed(ctx.stealth, auth.nonce) : null });
   const o = relayOutcome(r, d);
-  if (o.kind === "error") { const e = new Error(o.message); if (o.definite) { e.refused = true; if (ctx.onRefused) ctx.onRefused(); } throw e; }      // refused: nothing left the stealth address
+  if (o.kind === "error") { const e = new Error(o.message); if (o.definite) { e.refused = true; if (ctx.onRefused) ctx.onRefused(); } if (o.config) e.config = true; throw e; }      // refused: nothing left the stealth address
   if (o.kind === "used") {      // an earlier attempt of this same request went through: find its transaction by the authorization nonce, like the standard route
     d.hash = ctx.findTx ? await ctx.findTx(auth).catch(() => null) : null;
     if (!isHash(d.hash)) throw new Error("The relayer received the deposit transfer (its authorization is used on chain) but its transaction hash could not be found. Check the explorer; deposit address " + q.depositAddress + ".");
