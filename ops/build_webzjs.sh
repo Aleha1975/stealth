@@ -20,7 +20,8 @@ WORK="${WORK:-$HOME/.cache/webzjs-build}"
 sha() { if command -v sha256sum >/dev/null; then sha256sum "$@"; else shasum -a 256 "$@"; fi; }
 if [ -z "${PKG_DIR:-}" ]; then
   unset RUSTFLAGS CARGO_ENCODED_RUSTFLAGS CARGO_BUILD_RUSTFLAGS   # a caller's RUSTFLAGS would REPLACE the patch's .cargo/config.toml flags (+atomics, getrandom backend)
-  mkdir -p "$WORK"; export RUSTUP_HOME="$WORK/rustup" CARGO_HOME="$WORK/cargo"; export PATH="$WORK/llvm/bin:$CARGO_HOME/bin:$PATH"
+  mkdir -p "$WORK"; WORK_RAW="$WORK"; WORK="$(cd "$WORK" && pwd -P)"   # canonical path (macOS: /var -> /private/var): cargo hands rustc canonical paths, so the remap must match those
+  export RUSTUP_HOME="$WORK/rustup" CARGO_HOME="$WORK/cargo"; export PATH="$WORK/llvm/bin:$CARGO_HOME/bin:$PATH"
   if [ -s "$PATCH" ]; then [ "$PATCH_SHA256" = "$(sha "$PATCH" | cut -d' ' -f1)" ] || { echo "patch hash mismatch (only the audited patch can be built; edit PATCH_SHA256 in this script after reviewing $PATCH)"; exit 1; }
   else echo "missing patch $PATCH"; exit 1; fi
   if [ ! -x "$WORK/llvm/bin/clang" ]; then       # clang 18 (the system clang has no usable wasm32 backend for the C deps: secp256k1, blake2 ...)
@@ -56,10 +57,12 @@ if [ -z "${PKG_DIR:-}" ]; then
   # flags, so they are repeated here and checked to be identical to the patch's; the remap is the only addition.
   FLAGS='-C target-feature=+atomics,+bulk-memory,+mutable-globals --cfg getrandom_backend="wasm_js"'
   grep -qF 'rustflags = ["-C", "target-feature=+atomics,+bulk-memory,+mutable-globals", "--cfg", "getrandom_backend=\"wasm_js\""]' "$SRC/.cargo/config.toml" || { echo "patch .cargo/config.toml rustflags differ from FLAGS in this script"; exit 1; }
-  export RUSTFLAGS="$FLAGS --remap-path-prefix=$WORK=/build"; export CFLAGS_wasm32_unknown_unknown="-ffile-prefix-map=$WORK=/build"
+  RM="--remap-path-prefix=$WORK=/build"; CM="-ffile-prefix-map=$WORK=/build"
+  if [ "$WORK_RAW" != "$WORK" ]; then RM="$RM --remap-path-prefix=$WORK_RAW=/build"; CM="$CM -ffile-prefix-map=$WORK_RAW=/build"; fi   # also the non-canonical spelling
+  export RUSTFLAGS="$FLAGS $RM"; export CFLAGS_wasm32_unknown_unknown="$CM"
   ( cd "$SRC" && CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-4}" nice just build-wallet )   # wasm-pack build -t web --release --features "wasm wasm-parallel" -Z build-std, then add-worker-module.sh
   PKG_DIR="$SRC/packages/webzjs-wallet"; PROV="verified build: this run checked the patch sha256 $PATCH_SHA256 and the toolchain pins (rustc, clang, just, wasm-pack, wasm-bindgen-cli), applied to WebZjs $COMMIT
-$RUSTC_PIN | wasm-pack $WASMPACK | wasm-bindgen $WBG | just $JUST | clang $CLANG | host $(uname -sm)
+$RUSTC_PIN | wasm-pack $WASMPACK | wasm-bindgen $WBG | just $JUST | clang $CLANG
 not pinned: the wasm-opt that wasm-pack downloads at build time. built $(date -u +%FT%TZ) (paths remapped to /build)"
 else
   UNVERIFIED=1; PROV="UNVERIFIED BUILD: PKG_DIR=$PKG_DIR was used as is; the patch hash, WebZjs commit and toolchain were NOT checked by this script
