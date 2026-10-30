@@ -35,7 +35,7 @@ export function capMap(m, max) { while (m.size > max) m.delete(m.keys().next().v
 
 /** Audit 1099 M-2: failure budgets, independent of nginx. Per network key (ipKey): at most `perKey` failures per hour; globally at most `perMin` failures per minute --
  *  while the global rate is exceeded, networks that have already failed in this hour are refused before any RPC; clean networks still pass. Memory bounded by `maxKeys`. */
-export function makeFailBudget({ perKey = 30, perMin = 120, maxKeys = 10000, now = () => Date.now() } = {}) {
+export function makeFailBudget({ perKey = 30, perMin = 120, hardMin = perMin * 2, maxKeys = 10000, now = () => Date.now() } = {}) {
   const per = new Map(); let winStart = 0, winN = 0;
   const cur = k => { const e = per.get(k); if (!e) return 0; if (now() - e.t > 3600_000) { per.delete(k); return 0; } return e.n; };
   return {
@@ -43,12 +43,15 @@ export function makeFailBudget({ perKey = 30, perMin = 120, maxKeys = 10000, now
     check(k) {
       const n = cur(k);
       if (n >= perKey) return "too many failed requests from this network, try again later";
-      if (n > 0 && now() - winStart < 60_000 && winN >= perMin) return "the relayer is busy with failing requests, try again later";
+      const hot = now() - winStart < 60_000;
+      if (hot && n > 0 && winN >= perMin) return "the relayer is busy with failing requests, try again later";
+      if (hot && winN >= hardMin) return "the relayer is busy with failing requests, try again later";   // audit 1102 M-1: shared ceiling for ALL keys, also ones without an earlier failure (a /48 has 65k fresh keys)
       return null;
     },
-    fail(k) {
+    /** w = weight: honest state refusals (audit 1102 L-1) count a fraction toward the per-key hour budget; the global minute window always counts 1 */
+    fail(k, w = 1) {
       const t = now(); if (t - winStart >= 60_000) { winStart = t; winN = 0; } winN++;
-      const e = per.get(k); if (e && t - e.t <= 3600_000) e.n++; else { per.delete(k); per.set(k, { n: 1, t }); }
+      const e = per.get(k); if (e && t - e.t <= 3600_000) e.n += w; else { per.delete(k); per.set(k, { n: w, t }); }
       capMap(per, maxKeys);
     },
     size: () => per.size,
@@ -61,3 +64,12 @@ export function makeLineLimiter(max = 20, now = () => Date.now()) {
   let start = 0, n = 0, dropped = 0;
   return { take() { const t = now(); let summary = 0; if (t - start >= 60_000) { summary = dropped; start = t; n = 0; dropped = 0; } n++; if (n > max) { dropped++; return { log: false, summary }; } return { log: true, summary }; } };
 }
+
+/** Audit 1102 L-3: FiatToken-style contracts reject high-s signatures (s > n/2); reject them offline, before any RPC. */
+export const SECP_N = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141n;
+export const isLowS = s => { try { const x = BigInt(s); return x > 0n && x <= SECP_N / 2n; } catch { return false; } };
+
+/** Audit 1102 L-1: refusals that depend on the caller's own state (not on malformed / forged input) are weighed low against the shared per-network budget,
+ *  so one abuser behind a shared IPv4 (VPN, CGNAT, Tor exit) cannot lock the honest users out with ordinary errors. */
+export const HONEST_REFUSAL = /already in progress|expires too soon|not valid yet|holds less|reached its withdrawal limit|too many (requests|payments)|gas budget|out of gas funds|authorization already used|below the minimum|fee below/;
+export const failWeight = msg => (HONEST_REFUSAL.test(String(msg)) ? 0.2 : 1);

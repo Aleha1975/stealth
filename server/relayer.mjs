@@ -17,7 +17,7 @@
    API 127.0.0.1:3874: POST /stealth-api/relay {from,to,value,validAfter,validBefore,nonce,v,r,s[,feeAuth:{value,validAfter,validBefore,nonce,v,r,s}]}
    -> {hash[,feeHash]}; GET /stealth-api/relay/stats */
 import { makeScreen } from "./sanctions/screen.mjs";
-import { cleanLog, neutral, safeIp, capMap, makeFailBudget, makeLineLimiter, ipKey, parseEnvLine } from "./relay-util.mjs";
+import { cleanLog, neutral, safeIp, capMap, makeFailBudget, makeLineLimiter, ipKey, parseEnvLine, isLowS, failWeight } from "./relay-util.mjs";
 import http from "http"; import fs from "fs"; import path from "path"; import { fileURLToPath, pathToFileURL } from "url";
 import { createPublicClient, createWalletClient, http as vhttp, fallback, parseAbi, formatEther, getAddress, defineChain, encodeAbiParameters, encodeFunctionData, keccak256, toHex, recoverTypedDataAddress, isAddress } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
@@ -118,6 +118,7 @@ const HEX32 = /^0x[0-9a-fA-F]{64}$/;
 function parseAuth(o, what) {
   if (!o || !HEX32.test(o.nonce) || !HEX32.test(o.r) || !HEX32.test(o.s)) throw new Error("bad signature fields" + what);
   const v = Number(o.v); if (![27, 28].includes(v)) throw new Error("bad v" + what);
+  if (!isLowS(o.s)) throw new Error("bad signature (high s)" + what);          // audit 1102 L-3: offline, before any RPC
   return { value: BigInt(o.value), validAfter: BigInt(o.validAfter || 0), validBefore: BigInt(o.validBefore), nonce: o.nonce, v, r: o.r, s: o.s };
 }
 
@@ -152,6 +153,9 @@ async function submit(call, gasLimit, used, retried = false, prevHash = null) {
     localNonce = null; feeCache.t = 0;
     const msg = String(e && (e.details || e.shortMessage || e.message) || e);
     if (h && /already known/i.test(msg)) { capMap(nonceOfHash, 500); nonceOfHash.set(h, nonce); return h; }
+    // audit 1102 L-2: any other send error may be a lost ANSWER (timeout, dropped connection, 5xx) of a transaction the node did accept: look for our own hash before giving up,
+    // otherwise the user's retry of the same authorization would sign a second transaction that reverts on our gas
+    if (h && !/nonce too low|nonce.*(lower|too low)/i.test(msg) && await seenTx(h)) { capMap(nonceOfHash, 500); nonceOfHash.set(h, nonce); log("send answer lost, transaction found", h); return h; }
     // локальный nonce устарел (ключ релеера использовал кто-то ещё, рестарт узла): один повтор с nonce, взятым заново с узла, вместо отказа клиенту
     if (!retried && /nonce too low|nonce.*(lower|too low)/i.test(msg)) {
       for (const c of [h, prevHash]) if (c && await seenTx(c)) return c;
@@ -314,6 +318,7 @@ export async function relayPay(b, ip) {
   if (!b || !b.auth || !isAddress(b.token || "") || !isAddress(b.stealth || "") || !isAddress(b.auth.from || "") || !isAddress(b.feeRecipient || "")) throw new Error("bad request");
   if (!EPH.test(b.eph || "") || !HEX1.test(b.viewTag || "")) throw new Error("bad ephemeral key or view tag");
   if (!HEX32.test(b.auth.r) || !HEX32.test(b.auth.s) || ![27, 28].includes(Number(b.auth.v))) throw new Error("bad signature fields");
+  if (!isLowS(b.auth.s)) throw new Error("bad signature (high s)");           // audit 1102 L-3
   ip = safeIp(ipKey(ip));                                              // audit 1087 M-1: IPv6 -> its /64
   const token = getAddress(b.token), stealth = getAddress(b.stealth), feeTo = getAddress(b.feeRecipient), from = getAddress(b.auth.from);
   screen.check({ payer: from, stealth, feeRecipient: feeTo }, ip);   // before any RPC / counters / gas
@@ -346,15 +351,16 @@ export async function relayPay(b, ip) {
   let reserve = 0n, sent = false;
   try {
     // независимые чтения -- одним залпом (раньше ~6 последовательных RPC на заявку); проверки применяются в прежнем порядке
-    const [onchain, code, bal, used, bw] = await Promise.all([
+    // audit 1102 M-1: ONE cheap read first -- a self-signed junk request from an empty wallet costs one RPC instead of five
+    const bal = await pub.readContract({ address: TOKEN, abi, functionName: "balanceOf", args: [from] });
+    if (bal < amount) throw new Error("the wallet holds less than the amount");
+    const [onchain, code, used, bw] = await Promise.all([
       pub.readContract({ address: STEALTHPAY, abi: payAbi, functionName: "paymentNonce", args: [token, stealth, eph, tag, fee, feeTo] }),
       pub.getCode({ address: stealth }),
-      pub.readContract({ address: TOKEN, abi, functionName: "balanceOf", args: [from] }),
       pub.readContract({ address: TOKEN, abi, functionName: "authorizationState", args: [from, nonce] }),
       pub.getBalance({ address: account.address })]);
     if (onchain.toLowerCase() !== nonce.toLowerCase()) throw new Error("payment nonce mismatch");
     if (code) throw new Error("destination is a contract");
-    if (bal < amount) throw new Error("the wallet holds less than the amount");
     if (used) throw new Error("authorization already used");
     if (bw < MIN_BALANCE_WEI) { alertOnce("relayer balance low:", formatEther(bw), "ETH < threshold", formatEther(MIN_BALANCE_WEI)); throw new Error("relayer is out of gas funds, try again later"); }
     const call = { address: STEALTHPAY, abi: payAbi, functionName: "payWithAuthorization", args: [token, amount, stealth, eph, tag, fee, feeTo, auth] };
@@ -416,7 +422,7 @@ function serve() {
     req.on("end", async () => {
       try { send(200, await (isPay ? relayPay : relay)(JSON.parse(body), ip)); }
       catch (e) {
-        const msg = String(e && (e.shortMessage || e.message) || e).slice(0, 160); fails.fail(ipk);
+        const msg = String(e && (e.shortMessage || e.message) || e).slice(0, 160); fails.fail(ipk, failWeight(msg));
         const t = refusedLines.take();   // audit 1099 M-2: at most 20 refusal lines a minute, the rest is summarised
         if (t.summary) log("refused lines suppressed", t.summary);
         if (t.log) log("refused", ipk, JSON.stringify(msg));   // audit 1099 M-1: msg is data (later argument): neutralised; JSON.stringify: audit 1087 L-1, one line per refusal

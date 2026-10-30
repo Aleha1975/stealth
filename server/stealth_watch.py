@@ -120,10 +120,15 @@ def check_chain(c, st):
     if c["log"] and os.path.exists(c["log"]):
         try:
             size = os.path.getsize(c["log"]); pos = st["log_pos"].get(c["log"])
-            if pos is None or pos > size: pos = size           # first run / rotated: start from now
+            if pos is None: pos = size                       # first run: start from now
+            elif pos > size: pos = 0                          # audit 1102 I-4: rotated: read the new file from its start
             with open(c["log"], "rb") as f:
-                f.seek(pos); chunk = f.read(256 * 1024).decode("utf8", "replace")
-                st["log_pos"][c["log"]] = f.tell()
+                f.seek(pos); raw = f.read(256 * 1024)
+                nl = raw.rfind(b"\n")                              # audit 1102 I-4: only whole lines; a partial last line is read next run
+                if nl >= 0: raw = raw[:nl + 1]
+                elif len(raw) < 256 * 1024: raw = b""
+                chunk = raw.decode("utf8", "replace")
+                st["log_pos"][c["log"]] = pos + len(raw)
             # audit 1099 M-1: only the relayer's FIXED line templates count ("<ISO time> ALERT <template> ..." / "<ISO time> reverted ..."); user-influenced text
             # is logged only as later arguments, never at the template position, and the relayer breaks up the words ALERT/reverted inside it
             bad = {}

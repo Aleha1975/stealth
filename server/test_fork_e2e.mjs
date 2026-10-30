@@ -12,6 +12,7 @@ import { deriveForPayment, metaAddress, parseMeta, checkAnnouncement, decodeMeta
 import { CHAINS } from "../web/chains.js";
 import { postRelay } from "../web/relay-post.js";
 import { keccak } from "../web/stealth-crypto.js";
+import { makeFailBudget, failWeight, isLowS, SECP_N, ipKey } from "./relay-util.mjs";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const FORK_URL = "https://rpc.mainnet.chain.robinhood.com", FORK_BLOCK = 101173445;     // fixed block: anvil caches the state it fetches
@@ -157,7 +158,7 @@ try {
   eq("A2 payer debited exactly 5.000000", usd(a1 - await bal(A.address)), "5.000000");
   eq("A2 stealth got the full 5.000000 (fee 0)", usd(await bal(d2.stealth)), "5.000000");
   // extra stealth payments (own gas, cheap) that the negative tests will withdraw from
-  const W = {}; for (const k of ["rep", "dom", "dom2", "exp", "amt", "feelow", "nofee", "sanc", "par", "stuck", "drop", "nonce", "after", "dup", "dup2", "alk", "ntl", "rd"]) { W[k] = newDest(); await payOwnGas(A, W[k], 3n * U); }
+  const W = {}; for (const k of ["rep", "dom", "dom2", "exp", "amt", "feelow", "nofee", "sanc", "par", "stuck", "drop", "nonce", "after", "dup", "dup2", "alk", "ntl", "rd", "lst"]) { W[k] = newDest(); await payOwnGas(A, W[k], 3n * U); }
   await mine(3);
   // B scans announcements through the indexer
   let annRows = []; for (let i = 0; i < 90; i++) { try { annRows = (await (await fetch(IDX + "/announcements?since=0&limit=2000")).json()).rows; } catch {} if (annRows.length >= 2 + Object.keys(W).length) break; await sleep(500); }
@@ -432,14 +433,24 @@ try {
     const fpPort = await freePort(); await new Promise(r => fproxy.listen(fpPort, "127.0.0.1", r)); procs.push({ kill: () => fproxy.close() });
     const p4 = await freePort(), R4 = await startRelayer("r4", p4, { STEALTH_RPC: "http://127.0.0.1:" + fpPort, STEALTH_RELAY_STUCK_S: "3", STEALTH_RELAY_GONE_GAP_MS: "1000" }), RELAY4 = "http://127.0.0.1:" + p4 + "/stealth-api";
     await rpc("evm_setAutomine", [true]); await mine(1);
-    for (const k of ["alk", "ntl", "rd"]) await knownWait(W[k].stealth);
+    for (const k of ["alk", "ntl", "rd", "lst"]) await knownWait(W[k].stealth);
     // cheap validation: bad signature / expired authorization are refused with ZERO RPC calls (and no address lock taken)
     { const c0 = fault.calls, bad = await post(RELAY4, "/relay", await wbody(W.alk.stealth, C, 2n * U, null, { domain: { chainId: 1 } }), nip());
       const P = await newPayer(), dd = newDest(), au = await payAuth(P, dd, 2n * U, FEE, R4.addr, { domain: { chainId: 1 } }), badPay = await post(RELAY4, "/relay/pay", payBody(P, dd, 2n * U, FEE, R4.addr, au), nip());
       const exp = await post(RELAY4, "/relay", await wbody(W.alk.stealth, C, 2n * U, null, { validBefore: now() + 5 }), nip());
       ok("B12 M-2 forged signature / expired authorization: refused with no RPC call at all (withdraw and pay)", bad.status === 400 && /signature does not match/.test(bad.error) && badPay.status === 400 && /signature does not match/.test(badPay.error) && exp.status === 400 && /expires too soon/.test(exp.error) && fault.calls === c0, fault.calls - c0 + " calls; " + bad.error + " | " + badPay.error + " | " + exp.error); }
+    // audit 1102 L-3: a high-s signature (valid for ecrecover, rejected by the token) is refused offline, with ZERO RPC calls (withdraw main, withdraw fee, pay)
+    { const flip = x => ({ ...x, s: "0x" + (SECP_N - BigInt(x.s)).toString(16).padStart(64, "0"), v: x.v === 27 ? 28 : 27 });
+      const c0 = fault.calls, w0 = await wbody(W.alk.stealth, C, 2n * U, null), w1 = await wbody(W.alk.stealth, C, 2n * U, 100000n);
+      const hs = await post(RELAY4, "/relay", { ...w0, ...flip(w0) }, nip()), hf = await post(RELAY, "/relay", { ...w1, feeAuth: { ...w1.feeAuth, ...flip(w1.feeAuth) } }, nip());
+      const P = await newPayer(), dd = newDest(), au = await payAuth(P, dd, 2n * U, FEE, R4.addr), hp = await post(RELAY4, "/relay/pay", payBody(P, dd, 2n * U, FEE, R4.addr, { ...au, sig: flip(au.sig) }), nip());
+      ok("B12 1102 L-3 high-s signature (main, fee via the fee-enabled relayer, pay): refused offline; the R4 calls make no RPC", [hs, hf, hp].every(x => x.status === 400 && /high s/.test(x.error)) && fault.calls === c0, fault.calls - c0 + " calls; " + hs.error + " | " + hf.error + " | " + hp.error);
+      ok("B12 1102 L-3 isLowS unit: n/2 ok, n/2+1 and 0 rejected", isLowS("0x" + (SECP_N / 2n).toString(16)) && !isLowS("0x" + (SECP_N / 2n + 1n).toString(16)) && !isLowS("0x" + "0".repeat(64)));
+      // M-1: a self-signed payment from an EMPTY wallet costs ONE cheap read (balanceOf), not five
+      const E0 = await newPayer(0n), de = newDest(), ae = await payAuth(E0, de, 2n * U, FEE, R4.addr), c1 = fault.calls, pe = await post(RELAY4, "/relay/pay", payBody(E0, de, 2n * U, FEE, R4.addr, ae), nip());
+      ok("B12 1102 M-1 pay from an empty wallet: refused after exactly one RPC read", pe.status === 400 && /holds less/.test(pe.error) && fault.calls - c1 === 1, fault.calls - c1 + " calls; " + pe.error); }
     // L-2: the node accepted our transaction but the answer was an error ("already known" / "nonce too low"): no second send, the ORIGINAL hash is returned
-    for (const [k, err] of [["alk", "already known"], ["ntl", "nonce too low"]]) {
+    for (const [k, err] of [["alk", "already known"], ["ntl", "nonce too low"], ["lst", "upstream request timeout"]]) {
       const c0 = await bal(C), n0 = await nonceOf(R4.addr); fault.dupErr = err;
       const w = await post(RELAY4, "/relay", await wbody(W[k].stealth, C, 2n * U, null), nip()); fault.dupErr = null;
       let rc = null; if (w.hash) rc = await pub.waitForTransactionReceipt({ hash: w.hash, timeout: 15000 }).catch(() => null);
@@ -456,6 +467,30 @@ try {
       const rc = await pub.waitForTransactionReceipt({ hash: w.hash, timeout: 15000 }).catch(() => null); await sleep(800);
       ok("B12 L-3 ...and it still executes exactly once", rc && rc.status === "success" && (await bal(C)) - c0 === 2n * U, usd((await bal(C)) - c0)); }
   }
+
+  // ===================================================================================== B13) audit 1102 units
+  sect("B13) 1102 M-1 / L-1 units: shared ceiling, honest-refusal weight, nginx map");
+  { let t = 0; const fb = makeFailBudget({ perKey: 30, perMin: 10, now: () => t });
+    for (let i = 0; i < 20; i++) fb.fail("k" + i);                                       // 20 distinct networks fail in one minute (hardMin = 2 x perMin)
+    ok("1102 M-1 shared ceiling: a network with NO earlier failure is refused too once the global minute rate hit the ceiling", fb.check("fresh") !== null && /busy/.test(fb.check("fresh")) && fb.check("k0") !== null);
+    const fb2 = makeFailBudget({ perKey: 30, perMin: 10, now: () => t });
+    for (let i = 0; i < 12; i++) fb2.fail("k" + i);
+    ok("1102 M-1 below the ceiling a clean network still passes while a failed one is refused", fb2.check("fresh") === null && fb2.check("k0") !== null);
+    t += 61_000; ok("1102 M-1 the window resets after a minute", fb.check("fresh") === null);
+    const fb3 = makeFailBudget({ perKey: 30, now: () => t });
+    for (let i = 0; i < 100; i++) fb3.fail("shared", failWeight("a withdrawal from this address is already in progress"));
+    ok("1102 L-1 100 honest-state refusals (in progress) do not lock a shared network (weight 0.2 -> 20 < 30)", fb3.check("shared") === null);
+    for (let i = 0; i < 30; i++) fb3.fail("shared", failWeight("signature does not match the address"));
+    ok("1102 L-1 ...but forged-input refusals still do", fb3.check("shared") !== null && failWeight("signature does not match the address") === 1 && failWeight("authorization expires too soon") < 1 && failWeight("the address holds less than the requested amount") < 1); }
+  { // the nginx map in deploy/stealth-rh.conf, evaluated in JS (same regex dialect for these constructs): every spelling of one /64 must give one key, and agree with the relayer's ipKey()
+    const conf = fs.readFileSync(path.join(HERE, "deploy/stealth-rh.conf"), "utf8");
+    const rules = [...conf.matchAll(/^#\s+~(\S+)\s+(\S+);\s*$/gm)].map(m => [new RegExp(m[1]), m[2]]);
+    const key = a => { for (const [re, v] of rules) { const m = a.match(re); if (m) return v.replace(/\$(\w+)/g, (_, n) => m.groups?.[n] ?? "$" + n); } return a; };
+    const same = [["2001:db8:abcd:1::5", "2001:db8:abcd:1:0:0:0:9"], ["2001:db8:abcd::5", "2001:db8:abcd:0:1::7", "2001:db8:abcd::9999"], ["2001:db8::5", "2001:db8:0:0:3::1"], ["2001::5", "2001:0:0:0:8:8:8:8"], ["::5", "0:0:0:0:1:2:3:4"]];
+    ok("1102 M-1 nginx map has its rules", rules.length >= 6, String(rules.length));
+    ok("1102 M-1 nginx map: all spellings of one /64 share a key, also with '::' in the first four groups", same.every(g => new Set(g.map(key)).size === 1), same.map(g => g.map(key).join("=")).join(" ; "));
+    ok("1102 M-1 nginx map: different /64s differ; IPv4 and IPv4-mapped IPv6 are the IPv4 address; same bucketing as ipKey()", key("2001:db8:abcd::5") !== key("2001:db8:abce::5") && key("::ffff:1.2.3.4") === "1.2.3.4" && key("1.2.3.4") === "1.2.3.4"
+      && same.every(g => new Set(g.map(ipKey)).size === 1)); }
 
   // ===================================================================================== C) UI pay amount
   sect("C) UI pay amount: 'you pay 10' = 10 leaves the wallet");
