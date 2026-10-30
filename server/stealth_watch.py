@@ -23,7 +23,8 @@ STATE_FILE = E.get("STEALTH_WATCH_STATE", "/opt/stealth/data-watch/watch_state.j
 REPEAT_S = int(E.get("STEALTH_WATCH_REPEAT_S", str(6 * 3600)))
 MAX_AGE = int(E.get("STEALTH_WATCH_MAX_AGE_S", "120"))
 ALERT_TEMPLATES = ("relayer balance low", "state save failed", "nonce gap fill failed", "sanctions list is older than", "sanctions list reload failed", "sanctions list missing",
-                   "receipt wait failed", "fee sent but main failed", "nonce lock deadline exceeded")
+                   "receipt wait failed", "fee sent but main failed", "nonce lock deadline exceeded",
+                   "state load failed", "unsure table full", "send in flight at lock deadline")
 LOG_TEMPLATE = re.compile(r"^\d{4}-\d\d-\d\dT[\d:.]+Z (?:ALERT (" + "|".join(re.escape(t) for t in ALERT_TEMPLATES) + r")|reverted (?:main|fee|pay) 0x[0-9a-fA-F]{64}$)")
 DEFAULT_CHAINS = ("base=http://127.0.0.1:3873|http://127.0.0.1:3874|/opt/stealth/relayer.base.log|0.0003;"
                   "rh=http://127.0.0.1:3883|http://127.0.0.1:3884|/opt/stealth/data-rh/relayer.rh.log|0.0003")

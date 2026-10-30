@@ -158,7 +158,7 @@ try {
   eq("A2 payer debited exactly 5.000000", usd(a1 - await bal(A.address)), "5.000000");
   eq("A2 stealth got the full 5.000000 (fee 0)", usd(await bal(d2.stealth)), "5.000000");
   // extra stealth payments (own gas, cheap) that the negative tests will withdraw from
-  const W = {}; for (const k of ["rep", "dom", "dom2", "exp", "amt", "feelow", "nofee", "sanc", "par", "stuck", "drop", "nonce", "after", "dup", "dup2", "alk", "ntl", "rd", "lst", "pl1", "pl2", "rs", "gf"]) { W[k] = newDest(); await payOwnGas(A, W[k], 3n * U); }
+  const W = {}; for (const k of ["rep", "dom", "dom2", "exp", "amt", "feelow", "nofee", "sanc", "par", "stuck", "drop", "nonce", "after", "dup", "dup2", "alk", "ntl", "rd", "lst", "pl1", "pl2", "rs", "gf", "l5"]) { W[k] = newDest(); await payOwnGas(A, W[k], 3n * U); }
   await mine(3);
   // B scans announcements through the indexer
   let annRows = []; for (let i = 0; i < 90; i++) { try { annRows = (await (await fetch(IDX + "/announcements?since=0&limit=2000")).json()).rows; } catch {} if (annRows.length >= 2 + Object.keys(W).length) break; await sleep(500); }
@@ -336,7 +336,7 @@ try {
   { const stealthFor = () => newDest(); const payers = [await newPayer(), await newPayer(), await newPayer(), await newPayer(), await newPayer()];
     const one = async (payer, ip) => { const dd = stealthFor(), au = await payAuth(payer, dd, 2n * U, FEE, R2.addr); return post(RELAY2, "/relay/pay", payBody(payer, dd, 2n * U, FEE, R2.addr, au), ip); };
     const res = []; for (let i = 0; i < 5; i++) res.push(await one(payers[i], "7.7.7.7"));
-    ok("B10 per-IP cap (3/day): first 3 accepted, 4th and 5th refused", res.slice(0, 3).every(r => r.status === 200) && res.slice(3).every(r => r.status === 400 && /too many requests/.test(r.error)), JSON.stringify(res.map(r => r.status)));
+    ok("B10 1116 M-2 no per-network daily cap any more: 5 different wallets behind ONE network all accepted (limits are per signer)", res.every(r => r.status === 200), JSON.stringify(res.map(r => r.status)));
     const other = await one(payers[4], "7.7.7.8"); ok("B10 a different IP is not affected", other.status === 200, JSON.stringify(other));
     const q = [await one(payers[0], "8.8.8.1"), await one(payers[0], "8.8.8.2")];       // payers[0] already paid once through 7.7.7.7
     ok("B10 per-payer cap (2/day): the third payment of one wallet is refused", q[0].status === 200 && q[1].status === 400 && /too many payments/.test(q[1].error), JSON.stringify(q.map(r => r.error || r.status)));
@@ -376,7 +376,7 @@ try {
     // IPv6: addresses of one /64 count as one network (R2 allows 3 per network)
     const v6 = async i => { const payer = await newPayer(), dd = newDest(), au = await payAuth(payer, dd, 2n * U, FEE, R2.addr); return post(RELAY2, "/relay/pay", payBody(payer, dd, 2n * U, FEE, R2.addr, au), "2001:db8:aaaa:bbbb:" + (i + 1) + "::" + (i + 7)); };
     const v6r = []; for (let i = 0; i < 4; i++) v6r.push(await v6(i));
-    ok("B11c IPv6: 4 addresses in one /64 share the per-network cap (3 ok, 4th refused)", v6r.slice(0, 3).every(r => r.status === 200) && v6r[3].status === 400 && /too many requests/.test(v6r[3].error), JSON.stringify(v6r.map(r => r.status)));
+    ok("B11c 1116 M-2 IPv6: 4 different wallets in one /64 are all accepted (no per-network cap)", v6r.every(r => r.status === 200), JSON.stringify(v6r.map(r => r.status)));
     // log injection: a forged ALERT line must not become a line of its own
     await post(RELAY, "/relay/pay", { token: TOKEN, amount: "x\n2099-01-01T00:00:00.000Z ALERT forged line", stealth: C, eph: "0x02" + "11".repeat(32), viewTag: "0x11", fee: "0", feeRecipient: ZERO, auth: { from: C, r: "0x" + "11".repeat(32), s: "0x" + "11".repeat(32), v: 27, validBefore: "9999999999" } }, nip());
     const lg = R1.log().split("\n");
@@ -483,10 +483,10 @@ try {
       const dd = newDest(), au = await payAuth(P, dd, 2n * U, FEE, R4.addr), after = await post(RELAY4, "/relay/pay", payBody(P, dd, 2n * U, FEE, R4.addr, au), ip);
       ok("B12 1107 M-1 RPC outage: 35 requests from one network all 503 'network busy' (no 429), and the same network is served as soon as the RPC is back", codes.every(c => c === "503") && after.status === 200 && !!after.hash, codes.slice(0, 5).join() + " ... " + JSON.stringify(after)); }
     // 1107 L-2: ambiguous send error + our transaction not visible on the first poll: polled again ~1 s later, found, the ORIGINAL hash returned, exactly one transaction
-    { const c0 = await bal(C), n0 = await nonceOf(R4.addr); fault.dupErr = "upstream request timeout"; fault.hide = 2; const t0 = Date.now();
+    { const c0 = await bal(C), n0 = await nonceOf(R4.addr); fault.dupErr = "upstream request timeout"; fault.hide = 5; const t0 = Date.now();
       const w = await post(RELAY4, "/relay", await wbody(W.pl1.stealth, C, 2n * U, null), nip()); const dt = Date.now() - t0; fault.dupErr = null; fault.hide = 0;
       let rc = null; if (w.hash) rc = await pub.waitForTransactionReceipt({ hash: w.hash, timeout: 15000 }).catch(() => null); await sleep(800);
-      ok("B12 1107 L-2 timeout + transaction invisible on poll 1: found on a later poll (>= ~1 s), success, one transaction, money moved once", w.status === 200 && dt >= 900 && dt < 7000 && rc && rc.status === "success" && (await nonceOf(R4.addr)) - n0 === 1 && (await bal(C)) - c0 === 2n * U, dt + " ms " + JSON.stringify(w)); }
+      ok("B12 1107 L-2 timeout + transaction invisible on poll 1: found on a later poll (>= ~1 s; 5 hidden reads, so a background watcher stealing one or two cannot make it flaky), success, one transaction, money moved once", w.status === 200 && dt >= 900 && dt < 7000 && rc && rc.status === "success" && (await nonceOf(R4.addr)) - n0 === 1 && (await bal(C)) - c0 === 2n * U, dt + " ms " + JSON.stringify(w)); }
     // ... still invisible after all 3 polls: bounded (lock not held beyond the deadline), 503; the retry of the SAME authorization never signs a second transaction
     { const c0 = await bal(C), n0 = await nonceOf(R4.addr); await rpc("evm_setAutomine", [false]);
       const body = await wbody(W.pl2.stealth, C, 2n * U, null); fault.dupErr = "upstream request timeout"; fault.hide = 1000; const t0 = Date.now();
@@ -515,22 +515,24 @@ try {
     const p7 = await freePort(), R7 = await startRelayer("r7", p7, { STEALTH_RPC: "http://127.0.0.1:" + fxPort, STEALTH_RELAY_FAIL_PER_IP: "3", STEALTH_RELAY_RPC_BURST: "3", STEALTH_RELAY_RPC_REFILL_MS: "3600000" }), RELAY7 = "http://127.0.0.1:" + p7 + "/stealth-api";
     const mk = async R => { const P = await newPayer(), dd = newDest(), au = await payAuth(P, dd, 2n * U, FEE, R.addr); return { P, dd, au, body: payBody(P, dd, 2n * U, FEE, R.addr, au) }; };
     const payReq = async (ip) => { const q = await mk(R7); return post(RELAY7, "/relay/pay", q.body, ip); };
+    const payReqP = async (P, ip) => { const dd = newDest(), au = await payAuth(P, dd, 2n * U, FEE, R7.addr); return post(RELAY7, "/relay/pay", payBody(P, dd, 2n * U, FEE, R7.addr, au), ip); };   // 1116 M-2: the SAME signer, a fresh payment each time
+    const SP1 = await newPayer(), SP2 = await newPayer(), SP3 = await newPayer();
     const stateOf = async R => { await sleep(2200); try { return JSON.parse(fs.readFileSync(R.state, "utf8")); } catch { return { perPayer: {}, perFrom: {}, unsure: [] }; } };   // no file = nothing durable changed
     // a) Upstream (HTTP 502): 503, nothing charged, bucket token and daily counter refunded: 8 outage requests > burst 3, and the same network is then served 3 times
-    fa.http502 = true; const outage = []; for (let i = 0; i < 8; i++) outage.push(await payReq("7.1.1.1")); fa.http502 = false;
+    fa.http502 = true; const outage = []; for (let i = 0; i < 8; i++) outage.push(await payReqP(SP1, "7.1.1.1")); fa.http502 = false;
     ok("B12b 1108 M-3 transport failure (HTTP 502): 503 'network busy' for all 8 requests although the burst is 3 (token refunded), never charged (no 429)", outage.every(r => r.status === 503 && /network busy/.test(r.error)), outage.map(r => r.status).join());
     const j7 = await stateOf(R7);
     ok("B12b 1108 M-3 ...and nothing was persisted for that network (daily counters count sent transactions only)", !("perIp" in j7) && Object.keys(j7.perPayer).length === 0);
-    const s3 = []; for (let i = 0; i < 3; i++) s3.push(await payReq("7.1.1.1")); const s4 = await payReq("7.1.1.1"), other = await payReq("7.1.1.2");
-    ok("B12b 1108 token bucket: burst 3 per network served, the 4th from the same network is refused ('too many requests from this network'), another network is unaffected",
-      s3.every(r => r.status === 200 && r.hash) && s4.status === 400 && /too many requests from this network/.test(s4.error) && other.status === 200, JSON.stringify([s3.map(r => r.status), s4, other.status]).slice(0, 200));
+    const s3 = []; for (let i = 0; i < 3; i++) s3.push(await payReqP(SP1, "7.1.1.1")); const s4 = await payReqP(SP1, "7.1.1.1"), other = await payReq("7.1.1.1");
+    ok("B12b 1116 M-2 token bucket PER SIGNER: burst 3 served, the 4th of the same signer is refused ('too many requests from this address'), another signer behind the SAME network is unaffected",
+      s3.every(r => r.status === 200 && r.hash) && s4.status === 400 && /too many requests from this address/.test(s4.error) && other.status === 200, JSON.stringify([s3.map(r => r.status), s4, other.status]).slice(0, 200));
     // b) a simulation revert is a costly Refusal charged to the key (weight 1; FAIL_PER_IP 3): 3 x 400, then 429; the per-IP daily counter is NOT refunded
-    fa.revert = true; const rv = []; for (let i = 0; i < 4; i++) rv.push(await payReq("7.2.2.2")); fa.revert = false;
+    fa.revert = true; const rv = []; for (let i = 0; i < 4; i++) rv.push(await payReqP(SP2, "7.2.2.2")); fa.revert = false;
     ok("B12b 1108 M-3 estimateGas revert: 400 'would fail on chain' (not 503), charged to the key: the 4th request is 429", rv.slice(0, 3).every(r => r.status === 400 && /would fail on chain/.test(r.error)) && rv[3].status === 429, JSON.stringify(rv).slice(0, 300) + " methods " + JSON.stringify(fa.m));
     const j7b = await stateOf(R7);
-    ok("B12b 1113 M-1 ...and the unfunded reverts consumed no daily quota (nothing persisted for the payers)", !("perIp" in j7b) && Object.keys(j7b.perPayer).length === 4, JSON.stringify(j7b.perPayer).slice(0, 100));
+    ok("B12b 1113 M-1 ...and the unfunded reverts consumed no daily quota (nothing persisted for the payers)", !("perIp" in j7b) && Object.keys(j7b.perPayer).length === 2, JSON.stringify(j7b.perPayer).slice(0, 100));
     // c) unknown error: charged at weight 1, never refunded, its text is NOT sent to the client, only logged
-    fa.odd = true; const od = []; for (let i = 0; i < 4; i++) od.push(await payReq("7.3.3.3")); fa.odd = false;
+    fa.odd = true; const od = []; for (let i = 0; i < 4; i++) od.push(await payReqP(SP3, "7.3.3.3")); fa.odd = false;
     ok("B12b 1108 M-3 unknown error: 400 generic text without the node's wording, charged at weight 1 (4th is 429), detail only in the log",
       od.slice(0, 3).every(r => r.status === 400 && /could not be processed/.test(r.error) && !/odd-node/.test(JSON.stringify(r))) && od[3].status === 429 && /unclassified error/.test(R7.log()) && /odd-node/.test(R7.log()), od.map(r => r.status).join());
     // d) a dedupe hit changes NO budget: no token, no counter, no gas, no state write; a garbage signature gets no hash (M-2)
@@ -542,7 +544,7 @@ try {
       await sleep(2200); const after = await snap();
       ok("B12b 1108 M-2 20 dedupe hits: all 200 with the ORIGINAL hash, and the budget state (daily gas, per-IP/payer counters, stats) is byte-identical", first.status === 200 && hits.every(r => r.status === 200 && r.hash === first.hash) && before === after, before.slice(0, 80) + " | " + after.slice(0, 80));
       ok("B12b 1108 M-2 a garbage signature for a known authorization gets no hash (400 'signature does not match'): the signature is checked before the dedupe lookup", forged.status === 400 && /signature does not match/.test(forged.error) && !forged.hash, JSON.stringify(forged));
-      const n1 = await payReq(ipd), n2 = await payReq(ipd), n3 = await payReq(ipd);
+      const n1 = await payReqP(q.P, ipd), n2 = await payReqP(q.P, ipd), n3 = await payReqP(q.P, ipd);
       ok("B12b 1108 M-2 ...and the 20 hits took no bucket token: the same network still gets its remaining 2 of the burst (3 - 1 real request), the 3rd new one is refused", n1.status === 200 && n2.status === 200 && n3.status === 400 && /too many requests/.test(n3.error), [n1.status, n2.status, n3.status].join()); }
     // e) L-2: the nonce lock has ONE deadline. A stalled getTransactionCount: 503 within the deadline, ALERT line (watchdog template), NOTHING sent, the next request works
     { const p8 = await freePort(), R8 = await startRelayer("r8", p8, { STEALTH_RPC: "http://127.0.0.1:" + fxPort, STEALTH_RELAY_LOCK_MS: "1500" }), RELAY8 = "http://127.0.0.1:" + p8 + "/stealth-api";
@@ -554,15 +556,15 @@ try {
       ok("B12b 1108 L-2 ...the lock was released: the retry of the same payment is sent once (nonce 0 -> 1) and mined", w2.status === 200 && (await nonceOf(R8.addr)) === 1, JSON.stringify(w2)); }
     // g) STEALTH_RELAY_ALLOW_KEYS: skips buckets, daily counters and the failure counter; validation still applies; one fixed log line per request
     { const p10 = await freePort(), R10 = await startRelayer("r10", p10, { STEALTH_RELAY_ALLOW_KEYS: "7.9.9.9, 2001:db8:77:77::1", STEALTH_RELAY_FAIL_PER_IP: "2", STEALTH_RELAY_RPC_BURST: "1", STEALTH_RELAY_RPC_REFILL_MS: "3600000", STEALTH_RELAY_MAX_PER_IP: "1" }), RELAY10 = "http://127.0.0.1:" + p10 + "/stealth-api";
-      const pq = async ip => { const q = await mk(R10); return post(RELAY10, "/relay/pay", q.body, ip); };
+      const pq = async (ip, P0) => { const q = await mk(R10); if (P0) { const dd = newDest(), au = await payAuth(P0, dd, 2n * U, FEE, R10.addr); return post(RELAY10, "/relay/pay", payBody(P0, dd, 2n * U, FEE, R10.addr, au), ip); } return post(RELAY10, "/relay/pay", q.body, ip); };
       const al = []; for (let i = 0; i < 4; i++) al.push(await pq(i % 2 ? "7.9.9.9" : "2001:db8:77:77:" + i + "::5"));
       const jj = []; for (let i = 0; i < 5; i++) jj.push(await post(RELAY10, "/relay", { garbage: 1 }, "7.9.9.9"));
       const bad = await post(RELAY10, "/relay/pay", { ...(await mk(R10)).body, amount: "500000" }, "7.9.9.9");
-      const n1 = await pq("7.8.8.8"), n2 = await pq("7.8.8.8");
+      const NP = await newPayer(), n1 = await pq("7.8.8.8", NP), n2 = await pq("7.8.8.8", NP);
       const j10 = await stateOf(R10);
       ok("B12b allow-list: 4 payments from allowed keys (IPv4 and IPv6 /64) pass although burst=1 and MAX_PER_IP=1; 5 junk requests are all 400 (no 429); no counter was written for them (only the one funded payer of a non-listed network, n1, is counted)",
         al.every(r => r.status === 200) && jj.every(r => r.status === 400) && Object.keys(j10.perPayer).length === 1, JSON.stringify([al.map(r => r.status), jj.map(r => r.status), j10.perPayer]));
-      ok("B12b allow-list: validation still applies (tampered amount -> signature error), and a non-listed network is still limited (2nd request refused)", bad.status === 400 && /signature/.test(bad.error) && n1.status === 200 && n2.status === 400, JSON.stringify([bad, n1.status, n2]).slice(0, 200));
+      ok("B12b allow-list: validation still applies (tampered amount -> signature error), and a non-listed signer is still limited (its 2nd request is refused by the bucket)", bad.status === 400 && /signature/.test(bad.error) && n1.status === 200 && n2.status === 400, JSON.stringify([bad, n1.status, n2]).slice(0, 200));
       ok("B12b allow-list: exactly one fixed 'allow-listed request' log line per allowed request (4 payments + 5 junk + 1 tampered = 10)", R10.log().split("\n").filter(l => / allow-listed request /.test(l)).length === 10); }
     // f) L-1 / I-1: restart between send and confirm. The signed hash is persisted BEFORE the send; the retry after a restart finds THAT transaction (no second one), the withdrawal counts once
     { await rpc("evm_setAutomine", [false]);
@@ -576,10 +578,10 @@ try {
       ok("B12b 1108 L-1 / 1113 L-1 restart + retry of the same authorization with FLIPPED hex case: the SAME hash, exactly one transaction on chain, money moved once", w2.status === 200 && w2.hash === w1.hash && rc && rc.status === "success" && (await nonceOf(R9.addr)) - n0 === 1 && (await bal(C)) - c0 === 2n * U && /earlier unconfirmed send found/.test(R9b.log()), JSON.stringify(w2) + " nonce+" + ((await nonceOf(R9.addr)) - n0));
       ok("B12b 1108 I-1 ...and the recovered send counts ONCE against the address's daily withdrawals (perFrom 1, not 2); the entry is gone once mined", s2.perFrom[body.from] === 1 && s2.unsure.length === 0, JSON.stringify(s2).slice(0, 200)); }
     // 1113 M-1: unfunded / rejected requests never touch the per-network DAILY quota; only sent transactions do
-    { const p11 = await freePort(), R11 = await startRelayer("r11", p11, { STEALTH_RELAY_MAX_PER_IP: "2" }), RELAY11 = "http://127.0.0.1:" + p11 + "/stealth-api", ipq = "11.1.1.1";
+    { const p11 = await freePort(), R11 = await startRelayer("r11", p11, {}), RELAY11 = "http://127.0.0.1:" + p11 + "/stealth-api", ipq = "11.1.1.1";
       const unf = []; for (let i = 0; i < 6; i++) { const P0 = await newPayer(0n), dd = newDest(), au = await payAuth(P0, dd, 2n * U, FEE, R11.addr); unf.push(await post(RELAY11, "/relay/pay", payBody(P0, dd, 2n * U, FEE, R11.addr, au), ipq)); }
       const f = []; for (let i = 0; i < 3; i++) { const P0 = await newPayer(), dd = newDest(), au = await payAuth(P0, dd, 2n * U, FEE, R11.addr); f.push(await post(RELAY11, "/relay/pay", payBody(P0, dd, 2n * U, FEE, R11.addr, au), ipq)); }
-      ok("B12b 1113 M-1 6 unfunded requests from a shared network use no daily quota: the next 2 funded ones are sent, only the 3rd hits the daily cap (2)", unf.every(r => r.status === 400 && /holds less/.test(r.error)) && f[0].status === 200 && f[1].status === 200 && f[2].status === 400 && /today/.test(f[2].error), JSON.stringify([unf.map(r => r.status), f.map(r => r.error || r.status)])); }
+      ok("B12b 1113 M-1 / 1116 M-2 6 unfunded requests from a shared network use no daily quota and block nobody: all 3 funded wallets behind the same network are then sent", unf.every(r => r.status === 400 && /holds less/.test(r.error)) && f.every(r => r.status === 200), JSON.stringify([unf.map(r => r.status), f.map(r => r.error || r.status)])); }
     // 1113 M-2: the concurrency slot is released when the WORK ends, not when the client disconnects (MAX_CONCURRENT=1, a stalled nonce read)
     { const p12 = await freePort(), R12 = await startRelayer("r12", p12, { STEALTH_RPC: "http://127.0.0.1:" + fxPort, STEALTH_RELAY_MAX_CONCURRENT: "1" }), RELAY12 = "http://127.0.0.1:" + p12 + "/stealth-api";
       const q = await mk(R12), ac = new AbortController(); fa.slowNonce = 5000;
@@ -597,6 +599,153 @@ try {
       let al = false; for (let i = 0; i < 40 && !al; i++) { al = /ALERT nonce lock deadline exceeded gap fill/.test(R13.log()); if (!al) await sleep(500); }
       fa.slowNonce = 0; await rpc("evm_setAutomine", [true]); await mine(1);
       ok("B12b 1113 L-2 a stalled gap fill hits the lock deadline (ALERT line with the gap-fill tag) instead of holding the lock for the RPC's full stall", wg.status === 200 && al, R13.log().split("\n").slice(-4).join(" | ").slice(0, 300)); }
+  }
+
+  // ===================================================================================== B14) audit 1116: durable record before every send, fail-closed accounting
+  sect("B14) 1116: no send without a durable record, no resend on a lying 'not found', in-flight send at the lock deadline, full table, fee/main pair, day guard, state load");
+  { const waitFor = async (f, ms = 20000) => { for (let t0 = 0; t0 < ms; t0 += 250) { if (await f()) return true; await sleep(250); } return false; };
+    const stOf = R => { try { return JSON.parse(fs.readFileSync(R.state, "utf8")); } catch { return null; } };
+    const pending = async () => parseInt((await rpc("txpool_status")).pending, 16);
+    const mkp = async (R, P0) => { const P = P0 || await newPayer(), dd = newDest(), au = await payAuth(P, dd, 2n * U, FEE, R.addr); return { P, dd, au, body: payBody(P, dd, 2n * U, FEE, R.addr, au) }; };
+    const knownW = async a => { for (let i = 0; i < 60 && !(await known(a)); i++) await sleep(500); };
+    // fault proxy for this section: lie "not found", delay / fail / answer-with-error the Nth eth_sendRawTransaction
+    const fz = { lieNF: false, sendDelay: 0, errAfterSend: null, failSendNth: 0, sends: 0 };
+    const fzf = async o => {
+      if (o.method === "eth_fillTransaction") return { jsonrpc: "2.0", id: o.id, error: { code: -32601, message: "Method not found" } };   // viem falls back to eth_estimateGas, which is pinned to a mined block below
+      if (fz.lieNF && /^eth_getTransaction(Receipt|ByHash)$/.test(o.method)) return { jsonrpc: "2.0", id: o.id, result: null };
+      if (o.method === "eth_sendRawTransaction") {
+        const my = ++fz.sends;
+        if (fz.failSendNth && my === fz.failSendNth) return { jsonrpc: "2.0", id: o.id, error: { code: -32000, message: "transaction underpriced" } };
+        const dl = fz.sendDelay; if (dl) { fz.sendDelay = 0; await sleep(dl); }
+        const j = await fetch(RPC, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(o) }).then(r => r.json());
+        if (fz.errAfterSend && !j.error) return { jsonrpc: "2.0", id: o.id, error: { code: -32000, message: fz.errAfterSend } };
+        return j;
+      }
+      if (o.method === "eth_estimateGas") { const bn = await fetch(RPC, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "eth_blockNumber", params: [] }) }).then(r => r.json()); o = { ...o, params: [o.params[0], bn.result] }; }   // explicit mined block: anvil answers "latest" with the pool included   // a backend that does not see the pool: the estimate cannot reveal the pending transaction
+      const rr = await fetch(RPC, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(o) }).then(r => r.json()); if (rr.error) fz.estErr = JSON.stringify([o.method, rr.error]).slice(0, 300); return rr; };
+    const fzs = httpServer.createServer((q, r) => { let b = ""; q.on("data", c => b += c); q.on("end", async () => { try { const j = JSON.parse(b); const out = Array.isArray(j) ? await Promise.all(j.map(fzf)) : await fzf(j); r.writeHead(200, { "content-type": "application/json" }); r.end(JSON.stringify(out)); } catch (e) { r.writeHead(502); r.end(String(e)); } }); });
+    const fzPort = await freePort(); await new Promise(r => fzs.listen(fzPort, "127.0.0.1", r)); procs.push({ kill: () => fzs.close() });
+    const FZ = "http://127.0.0.1:" + fzPort;
+    const withDir = async (name, env) => { const dir = path.join(tmp, name + "_d"); fs.mkdirSync(dir); const port = await freePort(), R = await startRelayer(name, port, { STEALTH_RELAY_STATE: path.join(dir, "state.json"), ...env }); R.state = path.join(dir, "state.json"); R.dir = dir; R.url = "http://127.0.0.1:" + port + "/stealth-api"; return R; };
+    await rpc("evm_setAutomine", [true]); await mine(1);
+    for (const k of ["l5"]) await knownW(W[k].stealth);
+
+    // M-1 + I-2: the state directory stops accepting writes: the send is refused (503) and NOTHING is broadcast; no temp file is left behind; after the repair the same signature is sent once
+    { const R = await withDir("m1", {}), x = await mkp(R), n0 = await nonceOf(R.addr), c0 = await bal(x.dd.stealth);
+      fs.chmodSync(R.dir, 0o555);
+      const w = await post(R.url, "/relay/pay", x.body, nip()); const n1 = await nonceOf(R.addr), p1 = await pending();
+      ok("B14 1116 M-1 state write fails: 503 'network busy' (Upstream), no transaction broadcast (nonce and pool unchanged), ALERT state save failed logged", w.status === 503 && /network busy/.test(w.error) && n1 === n0 && /ALERT state save failed/.test(R.log()), JSON.stringify(w) + " nonce " + n0 + "->" + n1 + " pool " + p1);
+      ok("B14 1116 I-2 ...no temp file left behind by the failed write", fs.readdirSync(R.dir).filter(f => /\.tmp$/.test(f)).length === 0, fs.readdirSync(R.dir).join());
+      fs.chmodSync(R.dir, 0o755);
+      const w2 = await post(R.url, "/relay/pay", x.body, nip()); const rc = w2.hash && await pub.waitForTransactionReceipt({ hash: w2.hash, timeout: 15000 }).catch(() => null);
+      ok("B14 1116 M-1 after the repair the SAME signature is relayed, exactly once", w2.status === 200 && rc && rc.status === "success" && (await nonceOf(R.addr)) - n0 === 1 && (await bal(x.dd.stealth)) - c0 === 2n * U - FEE, JSON.stringify(w2));
+      await sleep(1500); const j = stOf(R), leftovers = fs.readdirSync(R.dir);
+      ok("B14 1116 I-2 the state file is valid JSON and the directory holds only it (unique temp names, fsync + rename)", !!j && leftovers.length === 1 && /fsync/.test(fs.readFileSync(path.join(HERE, "relayer.mjs"), "utf8")) && /\.sync\(\)/.test(fs.readFileSync(path.join(HERE, "relayer.mjs"), "utf8")), leftovers.join()); }
+
+    // L-1: the stuck-tx replacement writes its unsure record first (and is not sent when that fails)
+    { await rpc("evm_setAutomine", [false]);
+      const R = await withDir("l1", { STEALTH_RELAY_STUCK_S: "2" }), a = await mkp(R);
+      const w = await post(R.url, "/relay/pay", a.body, nip()); const pe = await pending();
+      fs.chmodSync(R.dir, 0o555);
+      const refused = await waitFor(async () => /replace failed pay .*state not durable/.test(R.log()), 15000); fs.chmodSync(R.dir, 0o755);
+      ok("B14 1116 L-1 replacement with a failing state write: NOT sent (log 'replace failed ... state not durable', no 'replacement' line, still one transaction in the pool)", w.status === 200 && refused && !/ replacement pay /.test(R.log()) && (await pending()) === pe, "pool " + pe + " -> " + (await pending()));
+      await rpc("evm_setAutomine", [true]); await mine(1);
+      await rpc("evm_setAutomine", [false]);
+      const b = await mkp(R), wb = await post(R.url, "/relay/pay", b.body, nip());
+      const rep = await waitFor(async () => R.log().split("\n").some(l => / replacement pay 0x[0-9a-f]{64}$/.test(l)), 15000);
+      const h2 = (R.log().split("\n").filter(l => / replacement pay 0x[0-9a-f]{64}$/.test(l)).pop() || "").split(" ").pop(); const j = stOf(R); const ent = j && j.unsure.find(([, v]) => v.h === h2);
+      ok("B14 1116 L-1 a normal replacement is recorded in the state file BEFORE it is broadcast: the entry holds the replacement hash and the original in alt", wb.status === 200 && rep && !!ent && ent[1].alt.includes(wb.hash), JSON.stringify(j && j.unsure).slice(0, 260));
+      await rpc("evm_setAutomine", [true]); await mine(1); }
+
+    // L-2: the node accepted the send but the answer was an error AND the backend lies "not found": after UNSURE_MS the retry must NOT sign a second transaction
+    { await rpc("evm_setAutomine", [false]);
+      const R = await withDir("l2", { STEALTH_RPC: FZ, STEALTH_RELAY_UNSURE_MS: "2000", STEALTH_RELAY_POLL_GAP_MS: "200", STEALTH_RELAY_GONE_GAP_MS: "300", STEALTH_RELAY_RECOVER_MS: "2000" }), x = await mkp(R);
+      const n0 = await nonceOf(R.addr), s0 = fz.sends; fz.lieNF = true; fz.errAfterSend = "upstream request timeout";
+      const w = await post(R.url, "/relay/pay", x.body, nip()); fz.errAfterSend = null;
+      await sleep(2600);
+      const w2 = await post(R.url, "/relay/pay", x.body, nip()), p2 = await pending();
+      ok("B14 1116 L-2 first answer lost + RPC lies 'not found': 503; after UNSURE_MS the retry is REFUSED ('still being confirmed'), no second transaction was signed or sent", w.status === 503 && w2.status === 400 && /still being confirmed/.test(w2.error) && fz.sends - s0 === 1 && p2 === 1, JSON.stringify([w, w2]) + " sends " + (fz.sends - s0) + " pool " + p2 + " est " + fz.estErr + " LOG " + R.log().split("\n").slice(-5).join(" | "));
+      const w3 = await post(R.url, "/relay/pay", x.body, nip());
+      ok("B14 1116 L-2 ...and keeps being refused while the backend keeps lying (still one send)", w3.status === 400 && fz.sends - s0 === 1);
+      fz.lieNF = false;
+      const w4 = await post(R.url, "/relay/pay", x.body, nip()), ent = stOf(R).unsure[0][1].h; await rpc("evm_setAutomine", [true]); await mine(1);
+      ok("B14 1116 L-2 once the backend tells the truth the retry finds the original transaction (same hash), exactly one transaction on chain, money moved once", w4.status === 200 && w4.hash === ent && (await nonceOf(R.addr)) - n0 === 1 && (await bal(x.dd.stealth)) === 2n * U - FEE && /earlier unconfirmed send found/.test(R.log()), JSON.stringify(w4) + " sends " + (fz.sends - s0)); }
+
+    // L-3: a send already on the wire when the lock deadline passes: 503, the next holder skips its nonce (no collision), the late result is tracked, the retry finds the hash
+    { const R = await withDir("l3", { STEALTH_RPC: FZ, STEALTH_RELAY_LOCK_MS: "1500", STEALTH_RELAY_POLL_GAP_MS: "200", STEALTH_RELAY_GONE_GAP_MS: "300" }), x = await mkp(R), y = await mkp(R);
+      const n0 = await nonceOf(R.addr), cx = await bal(x.dd.stealth), cy = await bal(y.dd.stealth); fz.sendDelay = 3500;
+      const pw = post(R.url, "/relay/pay", x.body, nip()); await sleep(1000); const w2 = await post(R.url, "/relay/pay", y.body, nip()); const w1 = await pw;
+      const alerted = /ALERT send in flight at lock deadline/.test(R.log()), xh = (stOf(R).unsure.find(([, v]) => v.nonce === n0) || [0, {}])[1].h;
+      await waitFor(async () => (await nonceOf(R.addr)) - n0 === 2, 15000);
+      ok("B14 1116 L-3 in-flight send at the deadline: its request gets 503 + an ALERT; the NEXT holder's transaction is not a nonce collision (200); both land (2 transactions), nothing was signed twice", w1.status === 503 && alerted && w2.status === 200 && (await nonceOf(R.addr)) - n0 === 2 && (await bal(x.dd.stealth)) - cx === 2n * U - FEE && (await bal(y.dd.stealth)) - cy === 2n * U - FEE, JSON.stringify([w1, w2]) + " nonce+" + ((await nonceOf(R.addr)) - n0));
+      const w1b = await post(R.url, "/relay/pay", x.body, nip());
+      ok("B14 1116 L-3 ...a retry of the 503 request is NOT sent again (refused: already used on chain), still 2 transactions", w1b.status === 400 && /already used/.test(w1b.error) && (await nonceOf(R.addr)) - n0 === 2, JSON.stringify(w1b));
+      const tracked = await waitFor(async () => R.log().split("\n").some(l => / mined pay /.test(l) && xh && l.includes(xh)), 15000);
+      ok("B14 1116 L-3 ...and the late transaction (hash taken from the unsure record) is tracked to its receipt (log 'mined pay <hash>')", tracked, "xh " + xh + " " + R.log().split("\n").slice(-4).join(" | ").slice(0, 300)); }
+
+    // L-4: the unsure table is bounded WITHOUT eviction (full -> 503, nothing sent) and its entries expire by TTL in memory
+    { await rpc("evm_setAutomine", [false]);
+      const R = await withDir("l4", { STEALTH_RELAY_UNSURE_MAX: "1" }), x = await mkp(R), y = await mkp(R);
+      const w1 = await post(R.url, "/relay/pay", x.body, nip()), p1 = await pending(), w2 = await post(R.url, "/relay/pay", y.body, nip());
+      ok("B14 1116 L-4 table full (max 1): the second send is refused with 503 'network busy', no transaction sent, the first entry is NOT evicted, ALERT unsure table full", w1.status === 200 && w2.status === 503 && (await pending()) === p1 && /ALERT unsure table full/.test(R.log()), JSON.stringify([w1.status, w2]) + " pool " + p1);
+      await sleep(1200); const j1 = stOf(R);
+      await rpc("evm_setAutomine", [true]); await mine(1);
+      const drained = await waitFor(async () => { const j = stOf(R); return j && j.unsure.length === 0; }, 20000), w3 = await post(R.url, "/relay/pay", y.body, nip());
+      ok("B14 1116 L-4 the first entry is still there while unresolved (state file), and once it is mined the table drains and the refused request goes through", j1.unsure.length === 1 && j1.unsure[0][1].h === w1.hash && drained && w3.status === 200, JSON.stringify([j1.unsure.length, drained, w3]));
+      await rpc("evm_setAutomine", [false]);
+      const T = await withDir("l4b", { STEALTH_RELAY_DEDUPE_MS: "3000" }), z = await mkp(T), wz = await post(T.url, "/relay/pay", z.body, nip());
+      await sleep(1200); const sz = stOf(T).unsure.length; const expired = await waitFor(async () => stOf(T).unsure.length === 0, 12000);
+      ok("B14 1116 L-4 TTL in memory: an unconfirmed entry (tx never mined) is swept after DEDUPE_MS and removed from the state file too", wz.status === 200 && sz === 1 && expired, "entries before " + sz);
+      await rpc("evm_setAutomine", [true]); await mine(1); }
+
+    // L-5: fee first; main fails after the fee was collected; the retry with the SAME signatures skips the collected fee and relays the main; the paid fee cannot be reused for another transfer
+    { const R = await withDir("l5", { STEALTH_RPC: FZ, STEALTH_RELAY_FEE_MIN: "100000" }), FEEW = 100000n;
+      const body = await wbody(W.l5.stealth, C, 2n * U, FEEW, { feeTo: R.addr });
+      const c0 = await bal(C), r0 = await bal(R.addr); fz.failSendNth = fz.sends + 2;
+      const w = await post(R.url, "/relay", body, nip()); fz.failSendNth = 0;
+      await sleep(300); const feePaidNow = (await bal(R.addr)) - r0;
+      ok("B14 1116 L-5 main send fails after the fee was collected: request fails, fee on chain (relayer +0.10), C got nothing, ALERT 'fee sent but main failed'", w.status === 400 && feePaidNow === FEEW && (await bal(C)) === c0 && /ALERT fee sent but main failed/.test(R.log()), JSON.stringify(w) + " fee " + feePaidNow);
+      const w2 = await post(R.url, "/relay", body, nip()); const rc = w2.hash && await pub.waitForTransactionReceipt({ hash: w2.hash, timeout: 15000 }).catch(() => null);
+      ok("B14 1116 L-5 retry with the same signatures: 200, the main transfer is relayed (C +2.00), the fee is NOT taken twice (relayer +0.10 in total), the answer carries the first fee hash", w2.status === 200 && rc && rc.status === "success" && (await bal(C)) - c0 === 2n * U && (await bal(R.addr)) - r0 === FEEW && /fee already collected/.test(R.log()) && /^0x[0-9a-f]{64}$/.test(w2.feeHash || ""), JSON.stringify(w2));
+      const other = await wbody(W.l5.stealth, C, 500000n, FEEW, { feeTo: R.addr }), w3 = await post(R.url, "/relay", { ...other, feeAuth: body.feeAuth }, nip());
+      ok("B14 1116 L-5 the paid fee authorization cannot be attached to ANOTHER main transfer (refused 'already used'), nothing moved", w3.status === 400 && /already used/.test(w3.error) && (await bal(C)) - c0 === 2n * U, JSON.stringify(w3)); }
+
+    // L-6: the dropped-tx rollback acts on the day that was charged only (day = 12 s here)
+    { await rpc("evm_setAutomine", [false]);
+      const R = await withDir("l6", { STEALTH_RELAY_DAY_MS: "12000", STEALTH_RELAY_STUCK_S: "5", STEALTH_RELAY_GONE_GAP_MS: "2000", STEALTH_RELAY_PAY_PER_PAYER: "5" }), P = await newPayer(), a = await mkp(R, P), b = await mkp(R, P);
+      await sleep((6500 - (Date.now() % 12000) + 12000) % 12000);
+      const w1 = await post(R.url, "/relay/pay", a.body, nip()); await rpc("anvil_dropTransaction", [w1.hash]).catch(() => {});
+      await sleep((12300 - (Date.now() % 12000) + 12000) % 12000);
+      const w2 = await post(R.url, "/relay/pay", b.body, nip());
+      const dropped = await waitFor(async () => /dropped pay/.test(R.log()), 15000); await sleep(1500); const j = stOf(R);
+      ok("B14 1116 L-6 a tx proven dropped AFTER midnight does not decrement the new day's counter (payer count of the new day stays 1)", w1.status === 200 && w2.status === 200 && dropped && j && j.perPayer[P.address] === 1, JSON.stringify({ w1: w1.status, w2: w2.status, dropped, perPayer: j && j.perPayer }));
+      await rpc("evm_setAutomine", [true]); await mine(3); }
+
+    // M-2 (decision of 1116): accounting by SIGNER. A valid signature is charged to its signer, never to the network; junk is charged to the network and never blocks a signed request
+    { const R = await withDir("m2", { STEALTH_RELAY_FAIL_PER_IP: "3", STEALTH_RELAY_FAIL_PER_SIGNER: "1" }), NAT = "9.9.5.5";
+      const junk = []; for (let i = 0; i < 6; i++) junk.push(await post(R.url, "/relay", { garbage: i }, NAT));
+      const honest = await mkp(R), h1 = await post(R.url, "/relay/pay", honest.body, NAT);
+      ok("B14 1116 M-2 a NAT key flooded with junk (blocked: 400 x3, then 429) still serves an honest request with a valid signature (200 + hash)", junk.slice(0, 3).every(r => r.status === 400) && junk[5].status === 429 && h1.status === 200 && !!h1.hash, JSON.stringify([junk.map(r => r.status), h1]).slice(0, 220));
+      const abuser = await newPayer(0n), bad = []; for (let i = 0; i < 7; i++) { const dd = newDest(), au = await payAuth(abuser, dd, 2n * U, FEE, R.addr); bad.push(await post(R.url, "/relay/pay", payBody(abuser, dd, 2n * U, FEE, R.addr, au), NAT)); }
+      const other = await mkp(R), h2 = await post(R.url, "/relay/pay", other.body, NAT);
+      const dd3 = newDest(), au3 = await payAuth(abuser, dd3, 2n * U, FEE, R.addr), again = await post(R.url, "/relay/pay", payBody(abuser, dd3, 2n * U, FEE, R.addr, au3), "9.9.7.7");
+      ok("B14 1116 M-2 an abusive signer is limited by its OWN budget (400s, then 429 'this address', also from another network); a second signer on the same NAT key is unaffected (200)", bad[0].status === 400 && bad[6].status === 429 && /this address/.test(bad[6].error) && again.status === 429 && h2.status === 200, JSON.stringify([bad.map(r => r.status), again.status, h2.status]));
+      const junk2 = await post(R.url, "/relay", { garbage: 1 }, NAT);
+      ok("B14 1116 M-2 ...and the signer's failures were not charged to the network (the network's junk budget is unchanged: junk still 429 only because of its own earlier junk)", junk2.status === 429, String(junk2.status)); }
+
+    // I-5: a state file that cannot be loaded -> the relayer refuses to start, ALERT line the watchdog matches
+    { const bad = [["corrupt", "{not json"], ["dir", null]], res = [];
+      for (const [nm, content] of bad) { const sf = path.join(tmp, "bad_" + nm + ".json"), lf = path.join(tmp, "bad_" + nm + ".log"); if (content === null) fs.mkdirSync(sf); else fs.writeFileSync(sf, content);
+        const r = spawnSync("node", [path.join(HERE, "relayer.mjs")], { encoding: "utf8", timeout: 20000, env: { ...process.env, STEALTH_ENV_ONLY: "1", STEALTH_CHAIN: "rh", STEALTH_RPC: RPC, STEALTHPAY: SP, RELAYER_KEY: generatePrivateKey(), STEALTH_RELAY_PORT: String(await freePort()), STEALTH_RELAY_STATE: sf, STEALTH_RELAY_LOG: lf } });
+        res.push({ nm, status: r.status, log: fs.existsSync(lf) ? fs.readFileSync(lf, "utf8") : "" }); }
+      const py = spawnSync("python3", ["-B", "-c", "import sys,importlib.util\nspec=importlib.util.spec_from_file_location('w',sys.argv[1]); m=importlib.util.module_from_spec(spec); spec.loader.exec_module(m)\nprint(sum(1 for l in sys.stdin.read().splitlines() if m.LOG_TEMPLATE.match(l)))", path.join(HERE, "stealth_watch.py")], { input: res.map(x => x.log).join(""), encoding: "utf8" });
+      ok("B14 1116 I-5 corrupt / unreadable state file: exit code 1 (fail closed), one 'ALERT state load failed' line each, matched by the watchdog template", res.every(x => x.status === 1 && /ALERT state load failed/.test(x.log) && !/stealth relayer rh/.test(x.log)) && Number(py.stdout) === 2, JSON.stringify(res.map(x => [x.nm, x.status])) + " py " + py.stdout); }
+
+    // I-4: nonceOfHash is not capped by count (700 entries all kept) and is pruned by the confirmed nonce
+    { const sf = path.join(tmp, "i4.json"), code = `import * as R from "file://${path.join(HERE, "relayer.mjs")}"; for (let i = 0; i < 700; i++) R.noteNonce("0x" + i.toString(16).padStart(64, "0"), i); const before = R.nonceOfHash.size; const after = R.pruneNonces(650); console.log(JSON.stringify({ before, after }));`;
+      const r = spawnSync("node", ["--input-type=module", "-e", code], { encoding: "utf8", timeout: 30000, env: { ...process.env, STEALTH_ENV_ONLY: "1", STEALTH_CHAIN: "rh", STEALTH_RPC: RPC, RELAYER_KEY: generatePrivateKey(), STEALTH_RELAY_STATE: sf, STEALTH_RELAY_LOG: path.join(tmp, "i4.log") } });
+      let o = {}; try { o = JSON.parse(r.stdout.trim().split("\n").pop()); } catch {}
+      ok("B14 1116 I-4 700 entries are all kept (no count cap) and pruneNonces(confirmed 650) removes exactly the 650 confirmed ones", o.before === 700 && o.after === 50 && !/capMap\(nonceOfHash/.test(fs.readFileSync(path.join(HERE, "relayer.mjs"), "utf8")), r.stdout + r.stderr.slice(0, 200)); }
   }
 
   // ===================================================================================== B13) audit 1102 units

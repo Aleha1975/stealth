@@ -52,7 +52,6 @@ const STEALTHPAY = /^0x[0-9a-fA-F]{40}$/.test((E.STEALTHPAY || "").trim()) ? get
 const PAY_FEE_MIN = BigInt(E.STEALTH_RELAY_PAY_FEE_MIN || "0");                                  // минимальная комиссия за газ в платеже
 const PAY_FEE = BigInt(E.STEALTH_RELAY_PAY_FEE || PAY_FEE_MIN.toString());                       // комиссия, которую предлагает веб (в /relay/stats)
 const MAX_PER_PAYER_PER_DAY = Number(E.STEALTH_RELAY_PAY_PER_PAYER || 20);
-const MAX_PER_IP_PER_DAY = Number(E.STEALTH_RELAY_MAX_PER_IP || 30);
 const GAS_BUDGET_WEI_PER_DAY = BigInt(E.STEALTH_RELAY_GAS_BUDGET_WEI || "200000000000000");   // 0.0002 ETH/day
 const MIN_VALUE = BigInt(E.STEALTH_RELAY_MIN_USDC || "100000");                                  // $0.10 (токен 6 знаков на обеих цепях)
 const FEE_MIN = BigInt(E.STEALTH_RELAY_FEE_MIN || "0");                                          // 0 = комиссия выключена
@@ -83,44 +82,73 @@ export const pub = createPublicClient({ chain, transport }); const wal = createW
 const log = (head, ...rest) => { const s = new Date().toISOString() + " " + cleanLog(head) + (rest.length ? " " + neutral(rest.join(" ")) : "");
    console.log(s); try { fs.appendFileSync(LOG, s + "\n"); } catch {} };
 const sleep = ms => new Promise(r => setTimeout(r, ms));
-const day = () => Math.floor(Date.now() / 86400000);
+const DAY_MS = Number(E.STEALTH_RELAY_DAY_MS || 86400000);                                        // audit 1116: test hook only (a short "day"); production keeps 24 h
+const day = () => Math.floor(Date.now() / DAY_MS);
 export const screen = makeScreen(undefined, log);                    // OFAC SDN EVM addresses (sanctions/evm.json), reloaded on file change
 
+const feePaid = new Map();                   // audit 1116 L-5: ukey of a FEE authorization we sent -> { h, t }: lets the retry of a pair whose main send failed skip the (already collected) fee; persisted, TTL DEDUPE_MS
 const unsure = new Map();                    // ukey (from:nonce) -> { h, nonce, t, counted }: a transaction sent (or possibly sent) and not yet seen mined; persisted (audit 1108 L-1), TTL DEDUPE_MS
 // ---- счётчики суток: gas = потрачено + зарезервировано под ещё не сверённые транзакции; пишутся в файл атомарно
 const PERSIST_MAX = 10000;                   // audit 1113 M-3: bound of every persisted map
 const lc = s => String(s).toLowerCase();     // audit 1113 L-1: one case for every guard key
 const ukOf = (from, nonce) => lc(from + ":" + nonce);
 export let st = { day: day(), gas: 0n, perFrom: {}, perPayer: {} };   // persisted: only what safety needs (gas, funded sends per address / payer, unsure)
-const ipDay = makeCounters(20000);           // audit 1113 M-1/M-3: per-network SENT transactions today; memory only, LRU, never written to disk
 const bump = (o, k) => { const n = (o[k] || 0) + 1; delete o[k]; o[k] = n; const ks = Object.keys(o); for (let i = 0; i < ks.length - PERSIST_MAX; i++) delete o[ks[i]]; };
 // audit 1113 M-3: the state file is written asynchronously, at most once a second (saveSoon); only the record of an UNSURE send, made just before the send, is written at once (saveNow:
 // restart safety, and bounded by the daily gas budget).
-const snapshot = () => JSON.stringify({ day: st.day, gas: st.gas.toString(), perFrom: st.perFrom, perPayer: st.perPayer, unsure: [...unsure] });
-let writing = null, again = false, lastWrite = 0, saveTimer = null, dirty = false;
+const snapshot = () => JSON.stringify({ day: st.day, gas: st.gas.toString(), perFrom: st.perFrom, perPayer: st.perPayer, unsure: [...unsure], feePaid: [...feePaid] });
+let writing = null, again = false, lastWrite = 0, saveTimer = null, dirty = false, tmpSeq = 0;
+// audit 1116 I-2: every write has its OWN temp file (pid + sequence), the file is fsync'ed before the rename and the directory after it, so a power loss cannot leave an empty state file.
+const writeAtomic = async (data) => {
+  const tmp = STATE_FILE + "." + process.pid + "." + (++tmpSeq) + ".tmp"; let fh = null;
+  try {
+    fh = await fs.promises.open(tmp, "w", 0o600); await fh.writeFile(data); await fh.sync(); await fh.close(); fh = null;
+    await fs.promises.rename(tmp, STATE_FILE);
+    const d = await fs.promises.open(path.dirname(STATE_FILE), "r"); try { await d.sync(); } finally { await d.close(); }
+  } catch (e) { try { if (fh) await fh.close(); } catch {} try { await fs.promises.unlink(tmp); } catch {} throw e; }
+};
+const writeAtomicSync = (data) => {
+  const tmp = STATE_FILE + "." + process.pid + "." + (++tmpSeq) + ".tmp"; let fd = null;
+  try {
+    fd = fs.openSync(tmp, "w", 0o600); fs.writeFileSync(fd, data); fs.fsyncSync(fd); fs.closeSync(fd); fd = null;
+    fs.renameSync(tmp, STATE_FILE);
+    const d = fs.openSync(path.dirname(STATE_FILE), "r"); try { fs.fsyncSync(d); } finally { fs.closeSync(d); }
+  } catch (e) { try { if (fd !== null) fs.closeSync(fd); } catch {} try { fs.unlinkSync(tmp); } catch {} throw e; }
+};
+// audit 1116 M-1: resolves true ONLY if the snapshot taken after this call is durably on disk. A caller that needs durability (the unsure record before a send) must refuse on false.
 const saveNow = () => {
   if (writing) { again = true; return writing; }
   writing = (async () => {
-    try { do { again = false; dirty = false; const tmp = STATE_FILE + ".tmp"; await fs.promises.writeFile(tmp, snapshot()); await fs.promises.rename(tmp, STATE_FILE); } while (again); }
-    catch (e) { log("ALERT state save failed", String(e).slice(0, 80)); }
+    let ok = true;
+    try { do { again = false; dirty = false; await writeAtomic(snapshot()); } while (again); }
+    catch (e) { ok = false; again = false; dirty = true; log("ALERT state save failed", String(e).slice(0, 80)); }
     finally { writing = null; lastWrite = Date.now(); }
+    return ok;
   })();
   return writing;
 };
 const saveSoon = () => { dirty = true; if (!saveTimer) { saveTimer = setTimeout(() => { saveTimer = null; saveNow(); }, Math.max(0, 1000 - (Date.now() - lastWrite))); saveTimer.unref(); } };
-const saveSync = () => { if (!dirty && !saveTimer) return; try { const tmp = STATE_FILE + ".tmp"; fs.writeFileSync(tmp, snapshot()); fs.renameSync(tmp, STATE_FILE); dirty = false; } catch {} };
+const saveSync = () => { if (!dirty && !saveTimer && !writing) return; try { writeAtomicSync(snapshot()); dirty = false; } catch {} };
 for (const sig of ["SIGTERM", "SIGINT"]) process.on(sig, () => { saveSync(); process.exit(0); });
 process.on("exit", saveSync);
 const dec = (o, k) => { if (o[k] > 1) o[k]--; else delete o[k]; };            // audit 1099 M-2: a counter back at zero is removed, so the maps cannot grow
 const migFrom = (o) => { const r = {}; for (const [k, v] of Object.entries(o || {}).slice(-PERSIST_MAX)) { const n = v === true ? 1 : Number(v); if (Number.isFinite(n) && n > 0) r[k] = Math.floor(n); } return r; };   // старый формат: true -> 1
+const HASH_RE = /^0x[0-9a-fA-F]{64}$/;
+// audit 1116 I-5: a missing file is a fresh start; ANY other problem (corrupt JSON, unreadable file, bad field) throws, and the module refuses to start (fail closed, ALERT) instead of silently
+// forgetting the day's gas, the per-address counts and the unsure records.
 export const load = () => {
-  try { const j = JSON.parse(fs.readFileSync(STATE_FILE, "utf8"));
-    for (const [k, v] of Array.isArray(j.unsure) ? j.unsure : []) if (v && /^0x[0-9a-fA-F]{64}$/.test(v.h) && Date.now() - v.t < DEDUPE_MS) unsure.set(lc(k), { h: v.h, nonce: v.nonce, t: v.t, counted: !!v.counted });   // audit 1108 L-1: survives a restart (also across midnight); 1113 L-1: keys lower-cased
-    capMap(unsure, 2000);
-    if (j.day === day()) st = { day: j.day, gas: BigInt(j.gas), perFrom: migFrom(j.perFrom), perPayer: migFrom(j.perPayer) }; } catch {}
+  let raw; try { raw = fs.readFileSync(STATE_FILE, "utf8"); } catch (e) { if (e && e.code === "ENOENT") return; throw e; }
+  const j = JSON.parse(raw); if (!j || typeof j !== "object") throw new Error("state is not an object");
+  for (const [k, v] of Array.isArray(j.unsure) ? j.unsure : []) if (v && HASH_RE.test(v.h) && Date.now() - v.t < DEDUPE_MS) unsure.set(lc(k), { h: v.h, nonce: v.nonce, t: v.t, counted: !!v.counted, alt: (Array.isArray(v.alt) ? v.alt : []).filter(x => HASH_RE.test(x)).slice(0, 4) });   // audit 1108 L-1: survives a restart (also across midnight); 1113 L-1: keys lower-cased
+  for (const [k, v] of Array.isArray(j.feePaid) ? j.feePaid : []) if (v && HASH_RE.test(v.h) && Date.now() - v.t < DEDUPE_MS) feePaid.set(lc(k), { h: v.h, t: v.t, main: typeof v.main === "string" ? lc(v.main) : null });
+  capMap(feePaid, 2000);
+  if (j.day === day()) st = { day: j.day, gas: BigInt(j.gas), perFrom: migFrom(j.perFrom), perPayer: migFrom(j.perPayer) };
 };
-load();
-const roll = () => { if (st.day !== day()) { st = { day: day(), gas: 0n, perFrom: {}, perPayer: {} }; ipDay.clear(); saveSoon(); } };
+try {
+  load();
+  try { for (const f of fs.readdirSync(path.dirname(STATE_FILE))) if (f.startsWith(path.basename(STATE_FILE) + ".") && f.endsWith(".tmp")) fs.unlinkSync(path.join(path.dirname(STATE_FILE), f)); } catch {}   // leftovers of a killed write
+} catch (e) { log("ALERT state load failed", String(e).slice(0, 80), "-- refusing to start"); console.error("state load failed; refusing to start"); process.exit(1); }
+const roll = () => { if (st.day !== day()) { st = { day: day(), gas: 0n, perFrom: {}, perPayer: {} }; saveSoon(); } };
 const inflight = new Set();                 // from-адреса, обрабатываемые прямо сейчас
 // audit 1087 L-4a: поправки к суточному счётчику применяются только к тому дню, в котором сделан резерв (после полуночи новый день не «прощает» чужие траты)
 const adj = (d0, delta) => { if (st.day === d0) { st.gas += delta; if (st.gas < 0n) st.gas = 0n; } };
@@ -132,7 +160,13 @@ const dedupeSet = (k, res) => { k = lc(k); pendingAuth.delete(k); pendingAuth.se
 // audit "stuck tx": исходный хеш -> хеш замены; клиент спрашивает GET /relay/status?hash= и идёт по цепочке
 const issued = new Map();                   // audit 1099 M-2: hashes we sent (and their replacements): /relay/status answers only for these, so it cannot be used as a free RPC proxy
 const replacedBy = new Map(); const remember = (h, h2) => { replacedBy.set(h.toLowerCase(), h2); capMap(replacedBy, 2000); issued.set(h2.toLowerCase(), 1); capMap(issued, 5000); };   // audit 1099 I-2: drop the oldest, not everything
-const rpcBucket = makeTokenBucket({ cap: RPC_BURST, refillMs: RPC_REFILL_MS });
+// audit 1116 M-2 (decision): accounting is split by WHO the request proves to be. A request whose EIP-712 signature recovers to `from` is charged to its SIGNER (key = lower-cased `from`): a per-signer
+// failure budget, a per-signer RPC token bucket and the per-address daily counters. Only requests without a valid signature (offline junk) are charged to the network key (IPv4 / IPv6 /64), and a
+// network key's junk counter NEVER blocks a request that carries a valid signature (users behind one carrier NAT do not share fate). Both maps are LRU-bounded.
+const FAIL_PER_SIGNER = Number(E.STEALTH_RELAY_FAIL_PER_SIGNER || FAIL_PER_IP);
+const sigFails = makeFailBudget({ perKey: FAIL_PER_SIGNER, maxKeys: 20000 });
+const rpcBucket = makeTokenBucket({ cap: RPC_BURST, refillMs: RPC_REFILL_MS, maxKeys: 20000 });
+const signerLimited = () => Object.assign(new Refusal("too many failed requests from this address, try again later", { honest: true }), { http429: true });
 let nonceLock = Promise.resolve();
 let lastAlert = 0, lastLockAlert = 0;
 const alertOnce = (...a) => { if (Date.now() - lastAlert > 60000) { lastAlert = Date.now(); log("ALERT", ...a); } };
@@ -156,7 +190,21 @@ async function cachedFees() {
   feeCache.p = pub.estimateFeesPerGas().then(v => { feeCache = { t: Date.now(), v, p: null }; return v; }, e => { feeCache.p = null; throw e; });
   return feeCache.p;
 }
-const nonceOfHash = new Map();               // hash -> nonce нашей отправки: если транзакцию выбросил узел, закрываем дыру в nonce
+// audit 1116 I-4: hash -> { n, t }: the nonce of OUR send, so a transaction the node dropped can be gap-filled. NOT capped by count (an evicted entry would skip the gap fill): an entry leaves when its
+// transaction is mined / proven gone, when the relayer's CONFIRMED nonce has passed it (pruneNonces, run by the sweep below), or after DEDUPE_MS. Growth is bounded by the daily gas budget.
+export const nonceOfHash = new Map(); export const noteNonce = (h, n) => nonceOfHash.set(h, { n, t: Date.now() });
+export const pruneNonces = (confirmed) => { const now = Date.now(); for (const [h, v] of nonceOfHash) if (v.n < confirmed || now - v.t > DEDUPE_MS) nonceOfHash.delete(h); return nonceOfHash.size; };
+let nonceFloor = 0;                          // audit 1116 L-3: first nonce a new lock holder may use after a holder died with a send in flight (that send may still land)
+const UNSURE_MAX = Number(E.STEALTH_RELAY_UNSURE_MAX || 2000);
+// audit 1116 L-4: entries of `unsure` expire by TTL in memory too; the table is never trimmed by eviction (an entry is an unresolved transaction): when it is full, new sends are refused (503).
+const sweep = async () => {
+  const now = Date.now(); let ch = false;
+  for (const [k, v] of unsure) if (now - v.t > DEDUPE_MS) { unsure.delete(k); ch = true; }
+  for (const [k, v] of feePaid) if (now - v.t > DEDUPE_MS) { feePaid.delete(k); ch = true; }
+  if (ch) saveSoon();
+  try { pruneNonces(Number(await pub.getTransactionCount({ address: account.address, blockTag: "latest" }))); } catch {}
+};
+setInterval(sweep, Math.min(60_000, Math.max(500, DEDUPE_MS / 2))).unref();
 const seenTx = h => pub.getTransactionReceipt({ hash: h }).then(() => true, () => pub.getTransaction({ hash: h }).then(() => true, () => false));
 // audit 1099 L-2: the hash of the signed transaction is known BEFORE it is sent. "already known" = our own transaction is in the pool -> success with that hash.
 // "nonce too low" may be our own transaction already mined (the answer of a first attempt was lost): look for it, and for the authorization already used on chain,
@@ -164,61 +212,91 @@ const seenTx = h => pub.getTransactionReceipt({ hash: h }).then(() => true, () =
 // audit 1107 L-2: an AMBIGUOUS send error (timeout, dropped connection, 5xx) may hide a transaction the node did accept. Poll for our own hash POLLS times POLL_GAP_MS apart, but never
 // longer than RECOVER_MS in total (the nonce lock is held meanwhile). If it is still unknown, remember the hash per authorization: the user's retry first looks for THAT transaction
 // and is refused (not re-sent) while it may still be known, so a second transaction for the same authorization is never signed.
-const POLLS = 3, POLL_GAP_MS = Number(E.STEALTH_RELAY_POLL_GAP_MS || 1000), RECOVER_MS = Number(E.STEALTH_RELAY_RECOVER_MS || 8000), UNSURE_MS = 60_000;
+const POLLS = 3, POLL_GAP_MS = Number(E.STEALTH_RELAY_POLL_GAP_MS || 1000), RECOVER_MS = Number(E.STEALTH_RELAY_RECOVER_MS || 8000), UNSURE_MS = Number(E.STEALTH_RELAY_UNSURE_MS || 60_000);
 const AMBIGUOUS = /timeout|timed out|etimedout|econn|epipe|socket|fetch failed|network|connection|aborted|\b5\d\d\b|bad gateway|unavailable|http request failed|rate limit/i;
 const within = (p, ms) => Promise.race([p.catch(() => false), new Promise(r => setTimeout(() => r(false), Math.max(1, ms)))]);
-async function findTx(h, polls, deadline) {
+async function findTx(h, polls, deadline) {      // h: one hash or a list; returns the first hash seen, or null
+  const hs = [].concat(h);
   for (let i = 0; i < polls; i++) {
-    if (await within(seenTx(h), deadline - Date.now())) return true;
+    for (const x of hs) if (await within(seenTx(x), deadline - Date.now())) return x;
     if (i < polls - 1) { if (Date.now() + POLL_GAP_MS >= deadline) break; await sleep(POLL_GAP_MS); }
   }
-  return false;
+  return null;
 }
 // audit 1108 L-1/L-2: the hash of a signed transaction is written to `unsure` (and the state file) BEFORE it is sent, and removed only when it is mined or proven gone. A retry, also after a
 // restart, looks for THAT transaction first, so a second one is never signed for the same authorization. ctl.dead = the nonce-lock deadline passed: such a holder must not send any more.
+// audit 1116 L-2: a resend of an authorization needs PROOF that the earlier transaction cannot land: every hash it may have (original + replacement) answered "not found" by TWO probes GONE_GAP_MS apart
+// with no RPC error between (a lying / lagging backend or an error is "unknown" and means: keep waiting), authorizationState unused on chain (a failed read counts as unknown), and, unless the node
+// itself already said "nonce too low", the relayer's confirmed nonce has passed the nonce of that transaction (so it can no longer be mined).
+async function provenGone(hs, nonce, used, ctl, needNonce) {
+  if (!used) return false;
+  for (let round = 0; round < 2; round++) {
+    for (const x of hs) if ((await probeTx(x)) !== true) return false;
+    if (round === 0) { await sleep(GONE_GAP_MS); if (ctl.dead) return false; }
+  }
+  try { if (await used()) return false; } catch { return false; }
+  if (needNonce) { const latest = await pub.getTransactionCount({ address: account.address, blockTag: "latest" }).catch(() => null); if (latest === null || Number(latest) <= Number(nonce)) return false; }
+  return !ctl.dead;
+}
+const STILL = () => new Refusal("a previous attempt for this authorization is still being confirmed, try again in a minute", { honest: true });
+// audit 1108 L-1/L-2: the hash of a signed transaction is written to `unsure` (and the state file) BEFORE it is sent, and removed only when it is mined or proven gone. A retry, also after a
+// restart, looks for THAT transaction first, so a second one is never signed for the same authorization. ctl.dead = the nonce-lock deadline passed: such a holder must not send any more.
+// audit 1116 M-1: if the unsure record cannot be made durable, nothing is sent (Upstream 503).
 async function submit(call, gasLimit, used, retried = false, prevHash = null, ukey = null, ctl = { dead: false }, info = {}) {
   let h = null, nonce = null;
   const u = ukey && unsure.get(ukey);
   if (u) {
-    const found = await findTx(u.h, 1, Date.now() + RECOVER_MS);
+    const hs = [u.h, ...(u.alt || [])];
+    const found = await findTx(hs, 1, Date.now() + RECOVER_MS);
     if (ctl.dead) throw new Upstream("relayer busy, try again shortly");
-    if (found) { capMap(nonceOfHash, 500); nonceOfHash.set(u.h, u.nonce); info.counted = !!u.counted; log("earlier unconfirmed send found", u.h); return u.h; }
-    unsure.delete(ukey);
-    if (used && await used().catch(() => false)) throw new Refusal("authorization already used", { honest: true });
-    if (Date.now() - u.t < UNSURE_MS) { unsure.set(ukey, u); throw new Refusal("a previous attempt for this authorization is still being confirmed, try again in a minute", { honest: true }); }
+    if (found) { noteNonce(found, u.nonce); info.counted = !!u.counted; log("earlier unconfirmed send found", found); return found; }
+    let isUsed = null; if (used) { try { isUsed = await used(); } catch { isUsed = null; } }
+    if (isUsed === true) { unsure.delete(ukey); saveSoon(); throw new Refusal("authorization already used", { honest: true }); }
+    if (Date.now() - u.t < UNSURE_MS) throw STILL();
+    if (!(await provenGone(hs, u.nonce, used, ctl, true))) { if (ctl.dead) throw new Upstream("relayer busy, try again shortly"); throw STILL(); }
+    info.counted = !!u.counted; unsure.delete(ukey);
   }
+  if (ukey && !unsure.has(ukey) && unsure.size >= UNSURE_MAX) { alertOnce("unsure table full:", unsure.size); throw new Upstream("relayer is catching up on earlier sends, try again shortly"); }   // audit 1116 L-4
   try {
     const fees = await cachedFees();
-    if (localNonce === null) { const n0 = await pub.getTransactionCount({ address: account.address, blockTag: "pending" }); if (ctl.dead) throw new Upstream("relayer busy, try again shortly"); localNonce = n0; }
+    if (localNonce === null) { const n0 = Number(await pub.getTransactionCount({ address: account.address, blockTag: "pending" })); if (ctl.dead) throw new Upstream("relayer busy, try again shortly"); localNonce = Math.max(n0, nonceFloor); if (n0 >= nonceFloor) nonceFloor = 0; }
     if (localNonce === null) throw new Upstream("relayer busy, try again shortly");     // audit 1113 L-2: never sign with a nonce another holder just reset
     const tx = { chainId: CC.id, nonce: localNonce, gas: gasLimit, to: call.address, value: 0n, data: encodeFunctionData({ abi: call.abi, functionName: call.functionName, args: call.args }),
       ...(fees.maxFeePerGas ? { type: "eip1559", maxFeePerGas: fees.maxFeePerGas, maxPriorityFeePerGas: fees.maxPriorityFeePerGas || 0n } : { type: "legacy", gasPrice: fees.gasPrice }) };
     const ser = await account.signTransaction(tx);
     if (ctl.dead) throw new Upstream("relayer busy, try again shortly");                // audit 1108 L-2: no send after the deadline
     nonce = tx.nonce; h = keccak256(ser);
-    if (ukey) { unsure.set(ukey, { h, nonce, t: Date.now() }); capMap(unsure, 2000); await saveNow(); if (ctl.dead) { unsure.delete(ukey); saveSoon(); throw new Upstream("relayer busy, try again shortly"); } }   // persisted BEFORE the send (restart safety); nothing sent yet if the deadline passed meanwhile
-    const hash = await pub.sendRawTransaction({ serializedTransaction: ser });
+    if (ukey) {
+      unsure.set(ukey, { h, nonce, t: Date.now(), counted: !!info.counted, alt: [] });
+      const ok = await saveNow();                                                       // persisted BEFORE the send (restart safety)
+      if (!ok || ctl.dead) { unsure.delete(ukey); saveSoon(); h = null; throw new Upstream(ok ? "relayer busy, try again shortly" : "relayer state unavailable, try again shortly"); }   // nothing sent: no durable record (1116 M-1) or the deadline passed meanwhile
+    }
+    if (ctl.dead) throw new Upstream("relayer busy, try again shortly");                // audit 1116 L-3: the deadline is checked again right before the send (no await in between)
+    ctl.flight = { nonce: tx.nonce, h };
+    let hash; try { hash = await pub.sendRawTransaction({ serializedTransaction: ser }); } finally { ctl.flight = null; }
     if (ctl.dead) return hash;                                                          // audit 1113 L-2: released meanwhile: the new holder owns localNonce (not touched here); the entry stays in `unsure`, the user's retry finds this hash and reconciles it
-    capMap(nonceOfHash, 500);
-    nonceOfHash.set(hash, tx.nonce); localNonce++; return hash;
+    noteNonce(hash, tx.nonce); localNonce++; return hash;
   } catch (e) {
     if (!ctl.dead) { localNonce = null; feeCache.t = 0; }                                // a timed-out holder never mutates the nonce state of the next one
     const msg = String(e && (e.details || e.shortMessage || e.message) || e);
-    if (h && /already known/i.test(msg)) { capMap(nonceOfHash, 500); nonceOfHash.set(h, nonce); return h; }
+    if (h && /already known/i.test(msg)) { noteNonce(h, nonce); return h; }
     // audit 1102 L-2: any other send error may be a lost ANSWER (timeout, dropped connection, 5xx) of a transaction the node did accept: look for our own hash before giving up,
     // otherwise the user's retry of the same authorization would sign a second transaction that reverts on our gas
-    if (h && !/nonce too low|nonce.*(lower|too low)/i.test(msg)) {
+    if (h && !(e instanceof Upstream) && !/nonce too low|nonce.*(lower|too low)/i.test(msg)) {
       const amb = AMBIGUOUS.test(msg) || /^(HttpRequestError|TimeoutError|WebSocketRequestError)$/.test(String(e && e.name));
-      if (await findTx(h, amb ? POLLS : 1, Date.now() + RECOVER_MS)) { capMap(nonceOfHash, 500); nonceOfHash.set(h, nonce); log("send answer lost, transaction found", h); return h; }
-      if (!amb && ukey) { unsure.delete(ukey); saveSoon(); }                              // the node refused it outright: nothing is out there
+      if (await findTx(h, amb ? POLLS : 1, Date.now() + RECOVER_MS)) { noteNonce(h, nonce); log("send answer lost, transaction found", h); return h; }
+      if (!amb && ukey) { unsure.delete(ukey); saveSoon(); if (ctl.dead && nonceFloor === nonce + 1) nonceFloor = 0; }   // the node refused it outright: nothing is out there
       if (amb) throw new Upstream("the send could not be confirmed, try again in a minute");   // audit 1108 M-3: lost answer of OUR transaction (entry stays in `unsure`): infrastructure trouble, not the caller's
     }
     // локальный nonce устарел (ключ релеера использовал кто-то ещё, рестарт узла): один повтор с nonce, взятым заново с узла, вместо отказа клиенту
     if (!retried && /nonce too low|nonce.*(lower|too low)/i.test(msg)) {
-      for (const c of [h, prevHash]) if (c && await seenTx(c)) { if (ukey && c !== h) unsure.set(ukey, { h: c, nonce: nonce ?? 0, t: Date.now() }); return c; }
-      if (ukey) { unsure.delete(ukey); saveSoon(); }
-      if (used && await used().catch(() => false)) throw new Refusal("authorization already used", { honest: true });
+      for (const c of [h, prevHash]) if (c && await seenTx(c)) { if (ukey && c !== h) unsure.set(ukey, { h: c, nonce: nonce ?? 0, t: Date.now(), counted: !!info.counted, alt: [] }); return c; }
       if (ctl.dead) throw new Upstream("relayer busy, try again shortly");
+      { let isUsed = null; if (used) { try { isUsed = await used(); } catch { isUsed = null; } }
+        if (isUsed === true) { if (ukey) { unsure.delete(ukey); saveSoon(); } throw new Refusal("authorization already used", { honest: true }); } }
+      // audit 1116 L-2: "not found" from one call is not proof: the same two-probe + authorizationState rule before a second transaction is signed (the node's own "nonce too low" already proves the nonce is spent)
+      if (!(await provenGone([h, prevHash].filter(Boolean), nonce, used, ctl, false))) { if (ctl.dead) throw new Upstream("relayer busy, try again shortly"); throw STILL(); }
+      if (ukey) { unsure.delete(ukey); saveSoon(); }
       return submit(call, gasLimit, used, true, h, ukey, ctl, info);
     }
     throw e;
@@ -240,30 +318,39 @@ async function withNonceLock(tag, fn) {
   const ctl = { dead: false, tw: 0 }, tq = Date.now();
   await (nonceLock = nonceLock.then(() => {}, () => {}).then(() => new Promise((res, rej) => {   // the previous holder's failure must not skip THIS one
     ctl.tw = Date.now() - tq;
-    const timer = setTimeout(() => { ctl.dead = true; localNonce = null; feeCache.t = 0; if (Date.now() - lastLockAlert > 60000) { lastLockAlert = Date.now(); log("ALERT nonce lock deadline exceeded", tag, "after", LOCK_MS, "ms"); } rej(new Upstream("relayer busy, try again shortly")); }, LOCK_MS);
+    const timer = setTimeout(() => { ctl.dead = true; localNonce = null; feeCache.t = 0; const fl = ctl.flight; if (fl) nonceFloor = Math.max(nonceFloor, fl.nonce + 1); if (Date.now() - lastLockAlert > 60000) { lastLockAlert = Date.now(); log("ALERT nonce lock deadline exceeded", tag, "after", LOCK_MS, "ms"); } const err = new Upstream("relayer busy, try again shortly"); if (fl) err.flight = true; rej(err); }, LOCK_MS);   // audit 1116 L-3: a send already on the wire cannot be recalled: later holders skip its nonce, and the sender reconciles it (sendAndTrack)
+
     fn(ctl).then(() => { clearTimeout(timer); res(); }, e => { clearTimeout(timer); rej(e); });
   })));
   return ctl;
 }
 async function sendAndTrack(call, gasLimit, reserve, from, tag, onRevert, onGone = () => {}, used, ukey = null, info = {}) {
   const d0 = st.day;
-  let hash;
+  let hash, late = false;
   const tq = Date.now();
-  const ctl = await withNonceLock(tag, c => submit(call, gasLimit, used, false, null, ukey, c, info).then(h => { hash = h; }));
+  const track = h => { hash = h; issued.set(h.toLowerCase(), 1); capMap(issued, 5000); watch().catch(e => log("watch error", String(e).slice(0, 80))); };
+  const lateFail = () => { const x = ukey && unsure.get(ukey); if (!x) { adj(d0, -reserve); nonceFloor = 0; saveSoon(); } };   // refused outright by the node: nothing is out there, the reserve is returned
+  let ctl;
+  try { ctl = await withNonceLock(tag, c => submit(call, gasLimit, used, false, null, ukey, c, info).then(h => { hash = h; if (late) track(h); }, e => { if (late) lateFail(e); throw e; })); }
+  catch (e) {
+    // audit 1116 L-3: the lock deadline passed with our send ON THE WIRE: it may still land. The reserve stays (it may have been spent), the request fails with 503, and when the send settles later it is
+    // tracked like any other (mined / reverted / dropped); the user's retry finds the hash in `unsure`.
+    if (e && e.flight) { late = true; info.keepReserve = true; log("ALERT send in flight at lock deadline", tag); }
+    throw e;
+  }
   const tw = ctl.tw;
   tmStats.n++; tmStats.wait += tw; tmStats.maxWait = Math.max(tmStats.maxWait, tw); tmStats.send += Date.now() - tq - tw;   // lock wait vs send time (see /relay/stats)
   // nonceLock не должен залипать после ошибки одной отправки: ошибка уходит вызывающему через throw ниже
   if (!hash) throw new Error("send failed");
-  issued.set(hash.toLowerCase(), 1); capMap(issued, 5000);
-  const clearUnsure = () => { const x = ukey && unsure.get(ukey); if (x && x.h === hash) unsure.delete(ukey); };   // mined or proven gone: no longer "unconfirmed"
-  const watch = async () => {
+  function clearUnsure() { const x = ukey && unsure.get(ukey); if (x && (x.h === hash || (x.alt || []).includes(hash))) unsure.delete(ukey); nonceOfHash.delete(hash); }   // mined or proven gone: no longer "unconfirmed" (1116 I-4: nor needed for a gap fill)
+  async function watch() {
     let rc;
     try { rc = await pub.waitForTransactionReceipt({ hash, timeout: STUCK_S * 1000 }); }
     catch {
       // audit 1099 L-3: dropped only if two independent probes a few seconds apart both say "not found" with no RPC error in between
       let gone = false; if ((await probeTx(hash)) === true) { await sleep(GONE_GAP_MS); gone = (await probeTx(hash)) === true; }
       if (gone) {                                              // узел выбросил транзакцию (не в пуле, не в блоке): закрыть дыру в nonce, иначе все следующие повиснут за ней
-        const n = nonceOfHash.get(hash);
+        const n = (nonceOfHash.get(hash) || {}).n;
         log("dropped", tag, hash, "nonce", n);
         await withNonceLock("gap fill", async ctl => {        // the gap fill takes the same lock, under the same deadline
           localNonce = null;
@@ -278,7 +365,7 @@ async function sendAndTrack(call, gasLimit, reserve, from, tag, onRevert, onGone
             }
           } catch (e) { log("ALERT nonce gap fill failed", n, String(e).slice(0, 80)); }
         }).catch(() => {});
-        if (onRevert) onRevert(); else if (tag === "main") dec(st.perFrom, from);   // клиент может повторить: подпись не использована
+        if (st.day === d0) { if (onRevert) onRevert(); else if (tag === "main") dec(st.perFrom, from); }   // клиент может повторить: подпись не использована; audit 1116 L-6: only inside the day that was charged (after midnight the new day's counter is not touched)
         adj(d0, -reserve); onGone(); clearUnsure(); saveSoon(); return;                     // audit 1087 L-4c: транзакции нет ни в пуле, ни в блоке -- газа не потрачено, резерв возвращается
       }
       try {                                                    // застряла: та же nonce, комиссия выше -- один раз
@@ -286,7 +373,16 @@ async function sendAndTrack(call, gasLimit, reserve, from, tag, onRevert, onGone
         const up = (x) => x + x * BUMP_PCT / 100n + 1n;
         const fees = tx.maxFeePerGas ? { maxFeePerGas: up(tx.maxFeePerGas), maxPriorityFeePerGas: up(tx.maxPriorityFeePerGas || 0n) } : { gasPrice: up(tx.gasPrice) };
         log("stuck", tag, hash, "nonce", tx.nonce, "-> replacing with +" + BUMP_PCT + "%");
-        const h2 = await wal.writeContract({ ...call, nonce: tx.nonce, gas: tx.gas, ...fees });
+        // audit 1116 L-1: the replacement is a second transaction for the same authorization: signed first, its hash written to `unsure` (durably) BEFORE it is broadcast; if that fails, no replacement is sent
+        const rtx = { chainId: CC.id, nonce: tx.nonce, gas: tx.gas, to: call.address, value: 0n, data: encodeFunctionData({ abi: call.abi, functionName: call.functionName, args: call.args }),
+          ...(fees.maxFeePerGas ? { type: "eip1559", maxFeePerGas: fees.maxFeePerGas, maxPriorityFeePerGas: fees.maxPriorityFeePerGas } : { type: "legacy", gasPrice: fees.gasPrice }) };
+        const rser = await account.signTransaction(rtx), h2 = keccak256(rser);
+        if (ukey) {
+          const x = unsure.get(ukey);
+          unsure.set(ukey, { h: h2, nonce: tx.nonce, t: Date.now(), counted: !!(x && x.counted), alt: [...((x && x.alt) || []), hash].slice(-4) });
+          if (!(await saveNow())) { if (x) unsure.set(ukey, x); else unsure.delete(ukey); throw new Error("state not durable, replacement not sent"); }
+        }
+        await pub.sendRawTransaction({ serializedTransaction: rser });
         log("replacement", tag, h2); remember(hash, h2);
         const extra = reserve * BUMP_PCT / 100n; adj(d0, extra); reserve += extra;   // audit 1087 L-4b: замена дороже на BUMP_PCT -- доплата в резерв, иначе бюджет занижен
       } catch (e) { log("replace failed", tag, hash, String(e).slice(0, 100)); }
@@ -298,12 +394,12 @@ async function sendAndTrack(call, gasLimit, reserve, from, tag, onRevert, onGone
     // audit 1087 M-1: откат НЕ возвращает лимит на адрес/плательщика (раньше возвращал -- можно было гонять откаты бесконечно за наш газ); возвращается только пропажа транзакции (выше)
     if (rc.status !== "success") log("reverted", tag, hash); else log("mined", tag, hash, "gas", formatEther(spent), "ETH");
     saveSoon();
-  };
-  watch().catch(e => log("watch error", String(e).slice(0, 80)));
+  }
+  track(hash);
   return hash;
 }
 
-export async function relay(b, ip) {
+export async function relay(b, ip, ctx = {}) {
   ip = safeIp(ipKey(ip));                                              // audit 1087 M-1: IPv6 -> its /64; audit 1099 M-1: only an address-like token reaches the log
   if (!b || typeof b !== "object" || !isAddress(b.from || "") || !isAddress(b.to || "")) throw new Error("bad request");   // cheap shape checks first (audit 1099 M-2)
   if (b.endRecipient && !isAddress(b.endRecipient)) throw new Error("bad request");
@@ -327,28 +423,35 @@ export async function relay(b, ip) {
   }
   // audit 1099 L-1 / 1108 M-2: a repeat of an authorization we already sent (and whose signature checks out) gets the original hash(es), also after it was mined (kept DEDUPE_MS).
   // No RPC, no counters, no budget of any kind is touched by a hit.
+  ctx.signer = lc(from);                                                  // audit 1116 M-2: from here on the request is charged to its signer, never to the network
   const dupKey = (from + ":" + main.nonce).toLowerCase(), dup = dedupeGet(dupKey);
   if (dup) return dup;
+  if (!ALLOW.has(ip) && sigFails.check(ctx.signer)) throw signerLimited();
   const nowS = BigInt(Math.floor(Date.now() / 1000));
   for (const a of fee ? [main, fee] : [main]) { if (a.validBefore <= nowS + 30n) throw new Refusal("authorization expires too soon", { honest: true }); if (a.validAfter > nowS) throw new Refusal("authorization not valid yet", { honest: true }); }
   roll();
   const d0 = st.day;
   // ---- синхронный блок: проверки суток и замок адреса без await между проверкой и записью
   const allowed = ALLOW.has(ip);
-  if (!allowed && ipDay.get(ip) >= MAX_PER_IP_PER_DAY) throw new Refusal("too many requests from this network today", { honest: true });   // audit 1113 M-1: counts SENT transactions only
   if ((st.perFrom[from] || 0) >= MAX_PER_FROM) throw new Refusal("this address reached its withdrawal limit today; try tomorrow", { honest: true });
   if (inflight.has(from)) throw new Refusal("a withdrawal from this address is already in progress", { honest: true });
   if (st.gas >= GAS_BUDGET_WEI_PER_DAY) throw new Refusal("relayer gas budget for today is spent", { honest: true });
-  if (!allowed && !rpcBucket.take(ip)) throw new Refusal("too many requests from this network, try again shortly", { honest: true });   // audit 1108: per-key admission of RPC-costly work
+  if (!allowed && !rpcBucket.take(ctx.signer)) throw new Refusal("too many requests from this address, try again shortly", { honest: true });   // audit 1108 / 1116 M-2: per-signer admission of RPC-costly work
   inflight.add(from);
-  let reserve = 0n, used = 0n, sent = false;
+  let reserve = 0n, used = 0n, sent = false; const hashes = {};
   try {
     const known = await fetch(INDEXER + "/stealth-api/known?addr=" + from, { signal: AbortSignal.timeout(5000) }).then(r => { if (!r.ok) throw new Error("indexer " + r.status); return r.json(); }).catch(e => { throw new Upstream("indexer unavailable: " + String(e && e.message || e).slice(0, 60)); });   // audit 1107 M-1: an indexer outage is not the caller's failure
     if (!known.known) throw new Refusal("not a stealth address paid through Stealth");
+    // audit 1116 L-5: the fee is collected FIRST (the relayer is paid before it spends on the main transfer). If the pair then fails half way, the retry with the SAME signatures must still work: a fee
+    // authorization that is used on chain AND is recorded in `feePaid` as OUR fee send for THIS main authorization is skipped (already collected) and only the main transfer is relayed. A used fee that
+    // we did not collect for this main (or any other used authorization) is still refused, so a paid fee cannot be reused for another transfer.
+    const feeKey = fee ? ukOf(from, fee.nonce) : null, fp = fee ? feePaid.get(feeKey) : null, feeMaybePaid = !!(fp && fp.main === main.nonce && Date.now() - fp.t < DEDUPE_MS);
     const bal = await pub.readContract({ address: TOKEN, abi, functionName: "balanceOf", args: [from] });
-    if (bal < value + (fee ? fee.value : 0n)) throw new Refusal("the address holds less than the requested amount", { honest: true });
-    const list = [["main", main, to]]; if (fee) list.unshift(["fee", fee, account.address]);
-    for (const [, a] of list) if (await pub.readContract({ address: TOKEN, abi, functionName: "authorizationState", args: [from, a.nonce] })) throw new Refusal("authorization already used", { honest: true });
+    if (bal < value + (fee && !feeMaybePaid ? fee.value : 0n)) throw new Refusal("the address holds less than the requested amount", { honest: true });
+    let list = [["main", main, to]]; if (fee) list.unshift(["fee", fee, account.address]);
+    let feeDone = null;
+    for (const [tag, a] of list) if (await pub.readContract({ address: TOKEN, abi, functionName: "authorizationState", args: [from, a.nonce] })) { if (tag === "fee" && feeMaybePaid) feeDone = fp.h; else throw new Refusal("authorization already used", { honest: true }); }
+    if (feeDone) { list = list.filter(([tag]) => tag !== "fee"); hashes.fee = feeDone; log("fee already collected, main only", from); }
     const bw = await pub.getBalance({ address: account.address });
     if (bw < MIN_BALANCE_WEI) { alertOnce("relayer balance low:", formatEther(bw), "ETH < threshold", formatEther(MIN_BALANCE_WEI)); throw new Refusal("relayer is out of gas funds, try again later", { honest: true }); }
     const calls = list.map(([tag, a, dst]) => [tag, [from, dst, a.value, a.validAfter, a.validBefore, a.nonce, a.v, a.r, a.s]]);
@@ -362,16 +465,16 @@ export async function relay(b, ip) {
     // резерв под бюджет суток СИНХРОННО (после последнего await): параллельные заявки видят уже зарезервированное
     if (st.gas + est > GAS_BUDGET_WEI_PER_DAY) throw new Refusal("relayer gas budget for today is spent", { honest: true });
     st.gas += est; reserve = est; saveSoon();
-    const hashes = {};
     const n = BigInt(calls.length); let left = reserve;
     for (let i = 0; i < calls.length; i++) {                 // комиссия первой; резерв делится поровну между транзакциями
       const [tag, args] = calls[i]; const part = i === calls.length - 1 ? left : reserve / n; left -= part;
       const last = i === calls.length - 1;       // освободить запись о подписи, когда смайнена (или потеряна) последняя транзакция
       const uk = ukOf(from, args[5]), info = {};
       try { hashes[tag] = await sendAndTrack(TRANSFER_CALL(args), lims[i], part, from, tag, undefined, last ? () => pendingAuth.delete(dupKey) : undefined, usedOf(from, args[5]), uk, info); }
-      catch (e) { if (sent) log("ALERT fee sent but main failed", from, String(e).slice(0, 80)); throw e; }
+      catch (e) { if (info.keepReserve) used += part; if (sent) log("ALERT fee sent but main failed", from, String(e).slice(0, 80)); throw e; }
       sent = true; used += part;
-      if (tag === "main") { if (!info.counted) { bump(st.perFrom, from); if (!allowed) ipDay.inc(ip); } const x = unsure.get(uk); if (x) x.counted = true; saveSoon(); }   // audit 1108 I-1: a send recovered from an earlier attempt that was already counted counts once
+      if (tag === "fee") { feePaid.set(uk, { h: hashes.fee, t: Date.now(), main: main.nonce }); capMap(feePaid, 2000); saveSoon(); }
+      if (tag === "main") { if (!info.counted) { bump(st.perFrom, from); } const x = unsure.get(uk); if (x) x.counted = true; saveSoon(); }   // audit 1108 I-1: a send recovered from an earlier attempt that was already counted counts once
     }
     log("relay", from, "->", to, (Number(value) / 1e6).toFixed(6), CC.token_symbol, hashes.main, fee ? "fee " + (Number(fee.value) / 1e6).toFixed(6) + " " + hashes.fee : "", "ip", ip);
     const res = fee ? { hash: hashes.main, feeHash: hashes.fee } : { hash: hashes.main };
@@ -379,7 +482,7 @@ export async function relay(b, ip) {
   } catch (e) {
     const err = classifyError(e);                               // audit 1108 M-3: by cause; only demonstrable transport trouble is Upstream
     adj(d0, -(reserve - used));                                 // неотправленная часть резерва возвращается (в том же дне)
-    if (err instanceof Upstream && !sent && !allowed) rpcBucket.refund(ip);   // audit 1108: ONLY infrastructure trouble is refunded to the key's token bucket
+    if (err instanceof Upstream && !sent && !allowed) rpcBucket.refund(ctx.signer);   // audit 1108: ONLY infrastructure trouble is refunded to the key's token bucket
     if (reserve > 0n || sent) saveSoon();                       // a refusal that changed nothing durable writes nothing
     throw err;
   } finally { inflight.delete(from); }
@@ -392,7 +495,7 @@ const RECEIVE_TYPES = { ReceiveWithAuthorization: [{ name: "from", type: "addres
 export const localPaymentNonce = (token, stealth, eph, tag, fee, feeTo) => keccak256(encodeAbiParameters(
   [{ type: "bytes32" }, { type: "uint256" }, { type: "address" }, { type: "address" }, { type: "address" }, { type: "bytes32" }, { type: "bytes1" }, { type: "uint256" }, { type: "address" }],
   [keccak256(toHex("StealthPay.payWithAuthorization")), BigInt(CC.id), STEALTHPAY, token, stealth, keccak256(eph), tag, fee, feeTo]));
-export async function relayPay(b, ip) {
+export async function relayPay(b, ip, ctx = {}) {
   if (!STEALTHPAY) throw new Error("payments are not enabled on this chain");
   if (!b || !b.auth || !isAddress(b.token || "") || !isAddress(b.stealth || "") || !isAddress(b.auth.from || "") || !isAddress(b.feeRecipient || "")) throw new Error("bad request");
   if (!EPH.test(b.eph || "") || !HEX1.test(b.viewTag || "")) throw new Error("bad ephemeral key or view tag");
@@ -416,6 +519,7 @@ export async function relayPay(b, ip) {
     message: { from, to: STEALTHPAY, value: amount, validAfter: auth.validAfter, validBefore: auth.validBefore, nonce },
     signature: { r: auth.r, s: auth.s, v: BigInt(auth.v) } }).catch(() => null);
   if (!signer || signer !== from) throw new Error("signature does not match the payer");
+  ctx.signer = lc(from);                                                  // audit 1116 M-2: charged to the signer from here on
   const dup = dedupeGet(dupKey);
   if (dup) return dup;                                                  // audit 1087 M-1 / 1099 L-1 / 1108 M-2: the same (signed) payment already sent: the same hash, also after it was mined; touches no budget
   const now = BigInt(Math.floor(Date.now() / 1000));
@@ -423,14 +527,14 @@ export async function relayPay(b, ip) {
   if (auth.validAfter > now) throw new Refusal("authorization not valid yet", { honest: true });
   const d0 = st.day;
   const allowed = ALLOW.has(ip);
-  if (!allowed && ipDay.get(ip) >= MAX_PER_IP_PER_DAY) throw new Refusal("too many requests from this network today", { honest: true });
+  if (!allowed && sigFails.check(ctx.signer)) throw signerLimited();
   if (!allowed && (st.perPayer[from] || 0) >= MAX_PER_PAYER_PER_DAY) throw new Refusal("too many payments from this wallet today", { honest: true });
   const lockKey = "pay:" + from;
   if (inflight.has(lockKey)) throw new Refusal("a payment from this wallet is already in progress", { honest: true });
   if (st.gas >= GAS_BUDGET_WEI_PER_DAY) throw new Refusal("relayer gas budget for today is spent", { honest: true });
-  if (!allowed && !rpcBucket.take(ip)) throw new Refusal("too many requests from this network, try again shortly", { honest: true });   // audit 1108
+  if (!allowed && !rpcBucket.take(ctx.signer)) throw new Refusal("too many requests from this address, try again shortly", { honest: true });   // audit 1108 / 1116 M-2
   inflight.add(lockKey);
-  let reserve = 0n, sent = false;
+  let reserve = 0n, sent = false; const pinfo = {};
   try {
     // независимые чтения -- одним залпом (раньше ~6 последовательных RPC на заявку); проверки применяются в прежнем порядке
     // audit 1102 M-1: ONE cheap read first -- a self-signed junk request from an empty wallet costs one RPC instead of five
@@ -450,13 +554,13 @@ export async function relayPay(b, ip) {
     const est = g * GAS_PAD_PCT / 100n * (fees.maxFeePerGas || fees.gasPrice || 0n);
     if (st.gas + est > GAS_BUDGET_WEI_PER_DAY) throw new Refusal("relayer gas budget for today is spent", { honest: true });
     st.gas += est; reserve = est; saveSoon();
-    const hash = await sendAndTrack(call, g * GAS_PAD_PCT / 100n, reserve, from, "pay", () => dec(st.perPayer, from), () => pendingAuth.delete(dupKey), usedOf(from, nonce), ukOf(from, nonce));   // onRevert = только пропавшая транзакция, не откат (audit 1087 M-1)
-    sent = true; if (!allowed) { bump(st.perPayer, from); ipDay.inc(ip); } saveSoon(); dedupeSet(dupKey, { hash });   // audit 1113 M-1: the daily counters are charged only for a transaction the relayer actually sent
+    const hash = await sendAndTrack(call, g * GAS_PAD_PCT / 100n, reserve, from, "pay", () => dec(st.perPayer, from), () => pendingAuth.delete(dupKey), usedOf(from, nonce), ukOf(from, nonce), pinfo);   // onRevert = только пропавшая транзакция, не откат (audit 1087 M-1)
+    sent = true; if (!allowed) { bump(st.perPayer, from); } saveSoon(); dedupeSet(dupKey, { hash });   // audit 1113 M-1: the daily counters are charged only for a transaction the relayer actually sent
     log("relay-pay", from, "->", stealth, (Number(amount) / 1e6).toFixed(6), CC.token_symbol, "fee", (Number(fee) / 1e6).toFixed(6), hash, "ip", ip);
     return { hash };
   } catch (e) {
     const err = classifyError(e);                                                            // audit 1108 M-3
-    if (!sent) { adj(d0, -reserve); if (err instanceof Upstream && !allowed) rpcBucket.refund(ip); if (reserve > 0n) saveSoon(); }   // 1108: only Upstream is refunded
+    if (!sent) { if (!pinfo.keepReserve) adj(d0, -reserve); if (err instanceof Upstream && !allowed) rpcBucket.refund(ctx.signer); if (reserve > 0n) saveSoon(); }   // 1108: only Upstream is refunded
     throw err;
   } finally { inflight.delete(lockKey); }
 }
@@ -499,7 +603,6 @@ function serve() {
     // audit 1099 M-2: failure budgets and the concurrency cap are checked before the body is even read, independent of nginx
     const allowedNet = ALLOW.has(ipk);
     if (allowedNet) log("allow-listed request", ipk, isPay ? "pay" : "relay");
-    const why = allowedNet ? null : fails.check(ipk); if (why) return send(429, { error: why });
     if (active >= MAX_CONCURRENT) return send(503, { error: "busy, try again shortly" });
     // audit 1113 M-2: the slot is held until the WORK ends (finally below), not until the client disconnects; a request that dies before its body is complete frees it on close
     active++; let released = false, started = false; const release = () => { if (!released) { released = true; active--; } };
@@ -507,14 +610,19 @@ function serve() {
     let body = ""; req.on("data", c => { body += c; if (body.length > 8192) req.destroy(); });
     req.on("end", async () => {
       started = true;
-      try { const r = await (isPay ? relayPay : relay)(JSON.parse(body), ip); send(200, r); }
+      const ctx = {};
+      try { const r = await (isPay ? relayPay : relay)(JSON.parse(body), ip, ctx); send(200, r); }
       catch (e) {
         const msg = String(e && (e.shortMessage || e.message) || e).slice(0, 160);
         if (e instanceof Upstream) {                           // audit 1107 M-1: RPC / indexer trouble: 503, no failure budget consumed (an outage must not lock honest users out)
           const t = refusedLines.take(); if (t.log) log("upstream trouble", ipk, JSON.stringify(msg));
           return send(503, { error: "network busy, try again shortly" });
         }
-        if (!allowedNet) fails.fail(ipk, failWeight(e));                      // audit 1107 L-1: weight by error CLASS, never by message text
+        if (e && e.http429) return send(429, { error: e.message });          // audit 1116 M-2: this SIGNER is over its own failure budget (nothing else is charged)
+        if (!allowedNet) {                                                   // audit 1107 L-1: weight by error CLASS, never by message text
+          if (ctx.signer) sigFails.fail(ctx.signer, failWeight(e));          // valid signature: charged to the signer only
+          else { const why = fails.check(ipk); if (why) return send(429, { error: why }); fails.fail(ipk, failWeight(e)); }   // no valid signature (junk): charged to the network; a blocked network only loses its JUNK
+        }
         const t = refusedLines.take();   // audit 1099 M-2: at most 20 refusal lines a minute, the rest is summarised
         if (t.summary) log("refused lines suppressed", t.summary);
         if (t.log) { log("refused", ipk, JSON.stringify(msg)); if (e.unknown) log("unclassified error", ipk, JSON.stringify(e.detail)); }   // audit 1113 I-5: ONE log token per refusal   // audit 1099 M-1: msg is data (later argument): neutralised; JSON.stringify: audit 1087 L-1, one line per refusal
