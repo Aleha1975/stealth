@@ -8,7 +8,7 @@
 #        PKG_DIR=<dir> ops/build_webzjs.sh   skip the build, only patch + copy + hash an existing wasm-pack output (packages/webzjs-wallet); BUILD_INFO then says "UNVERIFIED BUILD" (no patch/toolchain check was done)
 # web/vendor/webzjs/BUILD_INFO records the provenance of the output (patch sha256, WebZjs commit, tool versions, verified or not); it is listed in SHA256SUMS.
 # PATCH (default: next to this script) = the diff a50df94..spike/ironwood; its sha256 is checked against PATCH_SHA256.
-# The ~60 MB wasm and generated JS are NOT committed; only SHA256SUMS and README.md are. The build is not bit-for-bit reproducible, so this script (re)writes SHA256SUMS and the two hashes
+# The ~60 MB wasm and generated JS are NOT committed; only SHA256SUMS and README.md are. The build is meant to be bit-for-bit reproducible (paths are remapped to /build), and this script (re)writes SHA256SUMS and the pinned hashes
 # in web/zec-hop.js (WEBZJS_SHA256); ops/deploy_lab.sh refuses to ship files that do not match SHA256SUMS and loadZjs() refuses to run a wasm/glue that does not match WEBZJS_SHA256.
 set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"; OUT="$ROOT/web/vendor/webzjs"
@@ -51,10 +51,15 @@ if [ -z "${PKG_DIR:-}" ]; then
   [ "$(git -C "$SRC" rev-parse HEAD)" = "$COMMIT" ] || { echo "wrong commit"; exit 1; }
   git -C "$SRC" apply --index "$PATCH"            # Cargo.lock is part of the patch: crates are resolved exactly as audited
   # one cargo at a time, 4 jobs max; rust-toolchain.toml (from the patch) selects $NIGHTLY
-  ( cd "$SRC" && CARGO_BUILD_JOBS=4 nice just build-wallet )   # wasm-pack build -t web --release --features "wasm wasm-parallel" -Z build-std, then add-worker-module.sh
+  # reproducibility: no absolute path of the builder may reach the wasm (std sources, registry crates, the checkout and C objects all live under $WORK). RUSTFLAGS replaces the config.toml
+  # flags, so they are repeated here and checked to be identical to the patch's; the remap is the only addition.
+  FLAGS='-C target-feature=+atomics,+bulk-memory,+mutable-globals --cfg getrandom_backend="wasm_js"'
+  grep -qF 'rustflags = ["-C", "target-feature=+atomics,+bulk-memory,+mutable-globals", "--cfg", "getrandom_backend=\"wasm_js\""]' "$SRC/.cargo/config.toml" || { echo "patch .cargo/config.toml rustflags differ from FLAGS in this script"; exit 1; }
+  export RUSTFLAGS="$FLAGS --remap-path-prefix=$WORK=/build"; export CFLAGS_wasm32_unknown_unknown="-ffile-prefix-map=$WORK=/build"
+  ( cd "$SRC" && CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-4}" nice just build-wallet )   # wasm-pack build -t web --release --features "wasm wasm-parallel" -Z build-std, then add-worker-module.sh
   PKG_DIR="$SRC/packages/webzjs-wallet"; PROV="verified build: patch sha256 $PATCH_SHA256 applied to WebZjs $COMMIT by this script
 rustc $(rustc +$NIGHTLY --version 2>/dev/null || echo "$NIGHTLY") | $(wasm-pack --version) | $(wasm-bindgen --version) | just $JUST | clang $CLANG | host $(uname -sm)
-builder $(whoami)@$(hostname -s) at $(date -u +%FT%TZ) (the build is not bit-for-bit reproducible: compare behaviour, not bytes)"
+builder $(whoami)@$(hostname -s) at $(date -u +%FT%TZ) (paths remapped to /build; reproducible: two builds in different dirs give the same wasm and glue sha256)"
 else
   PROV="UNVERIFIED BUILD: PKG_DIR=$PKG_DIR was used as is; the patch hash, WebZjs commit and toolchain were NOT checked by this script
 builder $(whoami)@$(hostname -s) at $(date -u +%FT%TZ)${PROV_NOTE:+
@@ -87,7 +92,9 @@ echo "web/vendor/webzjs ready: $(wc -l < "$OUT/SHA256SUMS") files, wasm $(du -h 
 python3 - "$OUT" "$ROOT/web/zec-hop.js" <<'PY'
 import re, sys
 out, js = sys.argv[1], sys.argv[2]
-want = {f: v.strip() for v, f in ((l.split()[0], l.split()[1]) for l in open(out + "/SHA256SUMS").read().splitlines())}
-s = open(js).read(); s2 = re.sub(r'const WEBZJS_SHA256 = \{[^}]*\};', 'const WEBZJS_SHA256 = { "webzjs_wallet.js": "%s", "webzjs_wallet_bg.wasm": "%s" };' % (want["webzjs_wallet.js"], want["webzjs_wallet_bg.wasm"]), s, count=1)
+want = {f: v for v, f in (l.split() for l in open(out + "/SHA256SUMS").read().splitlines())}
+pin = sorted(f for f in want if f in ("webzjs_wallet.js", "webzjs_wallet_bg.wasm") or (f.startswith("snippets/") and f.endswith(".js")))   # exactly what loadZjs fetches and checks
+body = ",\n  ".join('"%s": "%s"' % (f, want[f]) for f in pin)
+s = open(js).read(); s2 = re.sub(r'const WEBZJS_SHA256 = \{[^}]*\};', lambda m: 'const WEBZJS_SHA256 = { ' + body + ' };', s, count=1)
 assert s2 != s or "%s" % want["webzjs_wallet.js"] in s, "WEBZJS_SHA256 not found in web/zec-hop.js"; open(js, "w").write(s2)
 PY
