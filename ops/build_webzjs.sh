@@ -5,23 +5,23 @@
 #       rust nightly-2025-06-20 = rustc 1.89.0-nightly (set by the patch in rust-toolchain.toml; librustzcash 0.25 MSRV is 1.89, nightly-2025-01-07 is too old; NEWER nightlies (tested 2026-10-28) make wasm-bindgen 0.2.100 skip its threads transform -> non-shared memory, DataCloneError)
 #       clang 18.1.8 · wasm-bindgen-cli 0.2.100 (= wasm-bindgen in Cargo.lock) · just/wasm-pack from stable.
 # Usage: ops/build_webzjs.sh                 full build in $WORK (default ~/.cache/webzjs-build); no system changes
-#        PKG_DIR=<dir> ops/build_webzjs.sh   skip the build, only patch + copy + hash an existing wasm-pack output (packages/webzjs-wallet); BUILD_INFO then says "UNVERIFIED BUILD" (no patch/toolchain check was done)
-# web/vendor/webzjs/BUILD_INFO records the provenance of the output (patch sha256, WebZjs commit, tool versions, verified or not); it is listed in SHA256SUMS.
+#        PKG_DIR=<dir> ops/build_webzjs.sh   skip the build, only patch + copy + hash an existing wasm-pack output (packages/webzjs-wallet); BUILD_INFO then says "UNVERIFIED BUILD" and the pins in web/zec-hop.js are NOT rewritten (no patch/toolchain check was done)
+# web/vendor/webzjs/BUILD_INFO records the provenance (patch sha256, commit, tool versions); "verified build" only if this run checked the patch sha256 and the toolchain pins, else "UNVERIFIED BUILD". Reproducibility is measured by ops/check_repro.sh, not claimed. Env: OUT, PIN_JS=0 (do not rewrite web/zec-hop.js).
 # PATCH (default: next to this script) = the diff a50df94..spike/ironwood; its sha256 is checked against PATCH_SHA256.
 # The ~60 MB wasm and generated JS are NOT committed; only SHA256SUMS and README.md are. The build is meant to be bit-for-bit reproducible (paths are remapped to /build), and this script (re)writes SHA256SUMS and the pinned hashes
 # in web/zec-hop.js (WEBZJS_SHA256); ops/deploy_lab.sh refuses to ship files that do not match SHA256SUMS and loadZjs() refuses to run a wasm/glue that does not match WEBZJS_SHA256.
 set -euo pipefail
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"; OUT="$ROOT/web/vendor/webzjs"
-COMMIT=a50df944c32243cb8da9f86e7d52cb65ac926439; CLANG=18.1.8; WBG=0.2.100; NIGHTLY=nightly-2025-06-20; JUST=1.59.0; WASMPACK=0.15.0
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"; OUT="${OUT:-$ROOT/web/vendor/webzjs}"; PIN_JS="${PIN_JS:-1}"   # OUT/PIN_JS=0: build somewhere else without touching web/zec-hop.js (ops/check_repro.sh)
+COMMIT=a50df944c32243cb8da9f86e7d52cb65ac926439; CLANG=18.1.8; WBG=0.2.100; NIGHTLY=nightly-2025-06-20; RUSTC_PIN="rustc 1.89.0-nightly (255aa2208 2025-06-19)"; JUST=1.59.0; WASMPACK=0.15.0
 # sha256 of the downloads; empty = not recorded yet: the script prints the hash it got and refuses until it is filled in (CLANG_SHA256_<platform>, RUSTUP_INIT_SHA256)
 CLANG_SHA256_Darwin_arm64="${CLANG_SHA256_Darwin_arm64:-4573b7f25f46d2a9c8882993f091c52f416c83271db6f5b213c93f0bd0346a10}"; CLANG_SHA256_Linux_x86_64="${CLANG_SHA256_Linux_x86_64:-}"; RUSTUP_INIT_SHA256="${RUSTUP_INIT_SHA256:-9502b514362a21096210d498f143b8cdacda365d3dfcf45e8f5541e089ccafc0}"
-PATCH="${PATCH:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/webzjs-ironwood.patch}"; PATCH_SHA256="${PATCH_SHA256:-7e75b593ce1fda49d241965675b0e4996abbb0572e2ea64e20562c2498edac98}"
+PATCH="${PATCH:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/webzjs-ironwood.patch}"; PATCH_SHA256=af76b20dbcb2e9ee432a6aa08667a4d56b997558d464468961e6b0847952eecc   # fixed: the audited patch (not overridable by the environment)
 WORK="${WORK:-$HOME/.cache/webzjs-build}"
 sha() { if command -v sha256sum >/dev/null; then sha256sum "$@"; else shasum -a 256 "$@"; fi; }
 if [ -z "${PKG_DIR:-}" ]; then
   unset RUSTFLAGS CARGO_ENCODED_RUSTFLAGS CARGO_BUILD_RUSTFLAGS   # a caller's RUSTFLAGS would REPLACE the patch's .cargo/config.toml flags (+atomics, getrandom backend)
   mkdir -p "$WORK"; export RUSTUP_HOME="$WORK/rustup" CARGO_HOME="$WORK/cargo"; export PATH="$WORK/llvm/bin:$CARGO_HOME/bin:$PATH"
-  if [ -s "$PATCH" ]; then [ "$PATCH_SHA256" = "$(sha "$PATCH" | cut -d' ' -f1)" ] || { echo "patch hash mismatch (set PATCH_SHA256 after reviewing $PATCH)"; exit 1; }
+  if [ -s "$PATCH" ]; then [ "$PATCH_SHA256" = "$(sha "$PATCH" | cut -d' ' -f1)" ] || { echo "patch hash mismatch (only the audited patch can be built; edit PATCH_SHA256 in this script after reviewing $PATCH)"; exit 1; }
   else echo "missing patch $PATCH"; exit 1; fi
   if [ ! -x "$WORK/llvm/bin/clang" ]; then       # clang 18 (the system clang has no usable wasm32 backend for the C deps: secp256k1, blake2 ...)
     case "$(uname -s)-$(uname -m)" in
@@ -44,6 +44,7 @@ if [ -z "${PKG_DIR:-}" ]; then
   [ "$(wasm-pack --version 2>/dev/null)" = "wasm-pack $WASMPACK" ] || cargo +stable install --locked wasm-pack --version "$WASMPACK" --force
   [ "$(wasm-bindgen --version 2>/dev/null)" = "wasm-bindgen $WBG" ] || cargo +stable install --locked wasm-bindgen-cli --version "$WBG" --force
   [ "$(clang --version | head -1 | grep -o '[0-9.]*' | head -1)" = "$CLANG" ] || { echo "clang $CLANG not first in PATH"; exit 1; }
+  [ "$(rustc +$NIGHTLY --version | sed 's/^\(rustc [^)]*)\).*/\1/')" = "$RUSTC_PIN" ] || { echo "rustc +$NIGHTLY is not '$RUSTC_PIN'"; exit 1; }   # the only way to reach "verified build" below: patch sha256 + all toolchain pins checked in this run
   export CC_wasm32_unknown_unknown="$WORK/llvm/bin/clang" AR_wasm32_unknown_unknown="$WORK/llvm/bin/llvm-ar"
   SRC="$WORK/WebZjs"
   [ -d "$SRC/.git" ] || git clone https://github.com/ChainSafe/WebZjs "$SRC"
@@ -57,12 +58,12 @@ if [ -z "${PKG_DIR:-}" ]; then
   grep -qF 'rustflags = ["-C", "target-feature=+atomics,+bulk-memory,+mutable-globals", "--cfg", "getrandom_backend=\"wasm_js\""]' "$SRC/.cargo/config.toml" || { echo "patch .cargo/config.toml rustflags differ from FLAGS in this script"; exit 1; }
   export RUSTFLAGS="$FLAGS --remap-path-prefix=$WORK=/build"; export CFLAGS_wasm32_unknown_unknown="-ffile-prefix-map=$WORK=/build"
   ( cd "$SRC" && CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-4}" nice just build-wallet )   # wasm-pack build -t web --release --features "wasm wasm-parallel" -Z build-std, then add-worker-module.sh
-  PKG_DIR="$SRC/packages/webzjs-wallet"; PROV="verified build: patch sha256 $PATCH_SHA256 applied to WebZjs $COMMIT by this script
-rustc $(rustc +$NIGHTLY --version 2>/dev/null || echo "$NIGHTLY") | $(wasm-pack --version) | $(wasm-bindgen --version) | just $JUST | clang $CLANG | host $(uname -sm)
-builder $(whoami)@$(hostname -s) at $(date -u +%FT%TZ) (paths remapped to /build; reproducible: two builds in different dirs give the same wasm and glue sha256)"
+  PKG_DIR="$SRC/packages/webzjs-wallet"; PROV="verified build: this run checked the patch sha256 $PATCH_SHA256 and the toolchain pins (rustc, clang, just, wasm-pack, wasm-bindgen-cli), applied to WebZjs $COMMIT
+$RUSTC_PIN | wasm-pack $WASMPACK | wasm-bindgen $WBG | just $JUST | clang $CLANG | host $(uname -sm)
+not pinned: the wasm-opt that wasm-pack downloads at build time. built $(date -u +%FT%TZ) (paths remapped to /build)"
 else
-  PROV="UNVERIFIED BUILD: PKG_DIR=$PKG_DIR was used as is; the patch hash, WebZjs commit and toolchain were NOT checked by this script
-builder $(whoami)@$(hostname -s) at $(date -u +%FT%TZ)${PROV_NOTE:+
+  UNVERIFIED=1; PROV="UNVERIFIED BUILD: PKG_DIR=$PKG_DIR was used as is; the patch hash, WebZjs commit and toolchain were NOT checked by this script
+built $(date -u +%FT%TZ)${PROV_NOTE:+
 note (from the builder, not checked): $PROV_NOTE}"; echo "WARNING: UNVERIFIED BUILD (PKG_DIR given): the output is hashed as is and marked in BUILD_INFO" >&2
 fi
 [ -f "$PKG_DIR/webzjs_wallet_bg.wasm" ] || { echo "no wasm in $PKG_DIR"; exit 1; }
@@ -71,7 +72,7 @@ rm -rf "$OUT.new"; mkdir -p "$OUT.new"; rsync -a --exclude .gitignore "$PKG_DIR/
 W="$OUT.new/snippets"/wasm-bindgen-rayon-*/src/workerHelpers.js; T="$OUT.new/snippets"/wasm_thread-*/src/wasm32/js/web_worker_module.bundler.js
 sed -i.bak "s#import('../../..')#import('../../../webzjs_wallet.js')#" $W
 sed -i.bak 's#from "../../../../../";#from "../../../../../webzjs_wallet.js";#' $T
-grep -q "webzjs_wallet.js')" $W && grep -q 'webzjs_wallet.js";' $T || { echo "import patches did not apply"; exit 1; }
+[ "$(grep -cF "import('../../../webzjs_wallet.js')" $W)" = 1 ] && grep -q 'webzjs_wallet.js";' $T || { echo "import patches did not apply"; exit 1; }
 # third patch: wasm_thread calls js_sys::eval with exactly two strings: "self" and a script_path() snippet that reads this glue module's URL
 # from a stack trace; answer both without eval (import.meta.url is that URL) so the page keeps a CSP without 'unsafe-eval'
 G="$OUT.new/webzjs_wallet.js"
@@ -89,6 +90,9 @@ for f in README.md SHA256SUMS; do [ -f "$OUT/$f" ] && cp "$OUT/$f" "$OUT.new/$f"
 rm -rf "$OUT"; mv "$OUT.new" "$OUT"
 ( cd "$OUT" && find . -type f ! -name SHA256SUMS ! -name README.md | sed 's#^\./##' | LC_ALL=C sort | xargs -I{} bash -c "$(declare -f sha); sha '{}'" > SHA256SUMS )
 echo "web/vendor/webzjs ready: $(wc -l < "$OUT/SHA256SUMS") files, wasm $(du -h "$OUT/webzjs_wallet_bg.wasm" | cut -f1)"
+if [ "$PIN_JS" != 1 ] || [ -n "${UNVERIFIED:-}" ]; then
+  echo "pins NOT written to web/zec-hop.js (PIN_JS=$PIN_JS${UNVERIFIED:+, unverified build}); WEBZJS_SHA256 would be:"; grep -E ' (webzjs_wallet\.js|webzjs_wallet_bg\.wasm|snippets/.*\.js)$' "$OUT/SHA256SUMS"; exit 0
+fi
 python3 - "$OUT" "$ROOT/web/zec-hop.js" <<'PY'
 import re, sys
 out, js = sys.argv[1], sys.argv[2]

@@ -8212,10 +8212,10 @@ index 0000000..f220285
 +}
 diff --git a/vendor/zcash_client_memory/src/input_source.rs b/vendor/zcash_client_memory/src/input_source.rs
 new file mode 100644
-index 0000000..360a899
+index 0000000..8ec2c43
 --- /dev/null
 +++ b/vendor/zcash_client_memory/src/input_source.rs
-@@ -0,0 +1,566 @@
+@@ -0,0 +1,574 @@
 +use std::num::NonZeroU32;
 +
 +use zcash_client_backend::{
@@ -8483,10 +8483,14 @@ index 0000000..360a899
 +                    lock_filter,
 +                )
 +            })
-+            .filter(|(outpoint, _, _)| {
-+                self.utxo_is_spendable(outpoint, target_height, confirmations_policy)
-+                    .unwrap_or(false)
++            .map(|t| {
++                // an error (e.g. TransactionNotFound) is returned, not turned into "unspendable"
++                self.utxo_is_spendable(t.0, target_height, confirmations_policy)
++                    .map(|ok| ok.then_some(t))
 +            })
++            .collect::<Result<Vec<_>, Error>>()?
++            .into_iter()
++            .flatten()
 +            .filter(|(_, _, tx)| match output_filter {
 +                CoinbaseFilter::AllTransparentOutputs => true,
 +                CoinbaseFilter::NonCoinbaseOnly => {
@@ -8590,7 +8594,10 @@ index 0000000..360a899
 +}
 +
 +impl<P: consensus::Parameters> MemoryWalletDb<P> {
-+    // Select the spendable notes to cover the given target value considering only a single pool
++    // Select the spendable notes to cover the given target value considering only a single pool.
++    // It stops once the target is covered, per pool: select_spendable_notes calls it once per pool in `sources`
++    // with the same target, so with notes in several pools the total can exceed the target (the change output absorbs it).
++    // If the eligible notes do not reach the target they are all returned with Ok: the caller's InsufficientFunds check decides.
 +    // Returns the notes sorted oldest to newest
 +    fn select_spendable_notes_from_pool(
 +        &self,
@@ -8693,7 +8700,7 @@ index 0000000..360a899
 +                    .ok_or(Error::TransactionNotFound(*txid))?;
 +                match spending_tx.status() {
 +                    TransactionStatus::Mined(_height) => true,
-+                    TransactionStatus::TxidNotRecognized => unreachable!(),
++                    TransactionStatus::TxidNotRecognized => return Err(Error::TransactionNotFound(*txid)),
 +                    TransactionStatus::NotInMainChain => {
 +                        // transaction either never expires, or expires in the future.
 +                        spending_tx
@@ -8744,7 +8751,8 @@ index 0000000..360a899
 +                continue;
 +            }
 +            count += 1;
-+            total = (total + note.note.value()).unwrap_or(total);
++            total = (total + note.note.value())
++                .ok_or_else(|| Error::Other("note value overflow in spendable_notes_meta".into()))?;
 +        }
 +
 +        Ok(Some(PoolMeta::new(count, total)))
@@ -11996,10 +12004,10 @@ index 0000000..1cf67c5
 +}
 diff --git a/vendor/zcash_client_memory/src/types/memory_wallet/mod.rs b/vendor/zcash_client_memory/src/types/memory_wallet/mod.rs
 new file mode 100644
-index 0000000..55f4567
+index 0000000..11fa283
 --- /dev/null
 +++ b/vendor/zcash_client_memory/src/types/memory_wallet/mod.rs
-@@ -0,0 +1,1437 @@
+@@ -0,0 +1,1440 @@
 +#![allow(dead_code)]
 +
 +mod serialization;
@@ -12515,7 +12523,7 @@ index 0000000..55f4567
 +                    .ok_or(Error::TransactionNotFound(*txid))?;
 +                match spending_tx.status() {
 +                    TransactionStatus::Mined(_height) => true,
-+                    TransactionStatus::TxidNotRecognized => unreachable!(),
++                    TransactionStatus::TxidNotRecognized => return Err(Error::TransactionNotFound(*txid)),
 +                    TransactionStatus::NotInMainChain => {
 +                        // transaction either never expires, or expires in the future.
 +                        spending_tx
@@ -12534,6 +12542,8 @@ index 0000000..55f4567
 +    /// (`note_is_spendable`) and the wallet summary. The scan-queue ranges are translated to *Sapling*
 +    /// tree positions, so the position test only applies to Sapling notes (Orchard and Ironwood have their
 +    /// own position number spaces); ranges that start above the anchor or end at/below the birthday are ignored.
++    /// For Orchard and Ironwood notes this returns false ALWAYS: those pools have no unscanned-range check here,
++    /// so a note behind an unscanned gap is not excluded; it fails later when its witness is built.
 +    pub(crate) fn note_in_unscanned_range(
 +        &self,
 +        note: &ReceivedNote,
@@ -12587,6 +12597,7 @@ index 0000000..55f4567
 +            .get(&note.txid())
 +            .ok_or_else(|| Error::TransactionNotFound(note.txid()))?;
 +
++        // BlockHeight - u32 saturates at 0 (no underflow)
 +        let anchor_height = target_height - u32::from(confirmations_policy.trusted());
 +        let note_in_unscanned_range =
 +            self.note_in_unscanned_range(note, birthday_height, anchor_height.into());
@@ -16314,10 +16325,10 @@ index 0000000..315fb6c
 +}
 diff --git a/vendor/zcash_client_memory/src/wallet_read.rs b/vendor/zcash_client_memory/src/wallet_read.rs
 new file mode 100644
-index 0000000..3c13c4d
+index 0000000..dc90a17
 --- /dev/null
 +++ b/vendor/zcash_client_memory/src/wallet_read.rs
-@@ -0,0 +1,972 @@
+@@ -0,0 +1,974 @@
 +use std::{
 +    collections::{HashMap, hash_map::Entry},
 +    num::NonZeroU32,
@@ -16561,9 +16572,11 @@ index 0000000..3c13c4d
 +            None => return Ok(None),
 +        };
 +        let target_height = TargetHeight::from(chain_tip_height + 1);
-+        let birthday_height = self
-+            .get_wallet_birthday()?
-+            .expect("If a scan range exists, we know the wallet birthday.");
++        // no birthday = no accounts = nothing to summarize (no panic)
++        let birthday_height = match self.get_wallet_birthday()? {
++            Some(birthday) => birthday,
++            None => return Ok(None),
++        };
 +
 +        let fully_scanned_height = self
 +            .block_fully_scanned()?
