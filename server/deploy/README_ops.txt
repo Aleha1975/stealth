@@ -44,10 +44,23 @@ Charging model and nonce model (audit 1120, round 8; supersedes the M-2 text abo
   Nonce.  The local nonce is reconciled with the node's PENDING count at every lock acquisition. A send on the wire (also one whose holder hit the lock deadline) is tracked in `flights` until it
        settles; later sends stay above it. If it then never reached the node, the next holder finds a gap (local > pending, nothing on the wire, no recent send of ours at the pending nonce:
        STEALTH_RELAY_GAP_GRACE_MS, 15 s) and fills it with a self-transfer (signed locally, deadline checked, broadcast without an await in between), or simply resets. No restart is ever needed.
-  Counters. The daily per-address / per-payer count is incremented and decremented through ONE per-send record (info.counted), also for a send that settles after the lock deadline.
+  Counters. The daily per-address / per-payer count is incremented and decremented through ONE flag, `counted` on the shared `unsure` entry of the authorization (audit 1124 F5: never copied into a per-request object), also for a send that settles after the lock deadline. One watcher per hash (a late orphan and a retry cannot double-charge or double-watch; the second owner returns its own gas reservation).
   I-1 (1120)  rh.env.example sets STEALTH_RELAY_FEE_MIN=0: the withdraw-fee path (and the fee-skip-on-retry logic, audit 1116 L-5) is dormant on RH. feePaid is capped at 2000 entries: if a pair retry came
        after 2000 other fee sends, the retry would be refused "authorization already used" after the fee was collected (bounded by the daily gas budget). Enable fees only after re-running the pair tests.
   I-2 (1120)  FIXED: the dedupe key covers from, nonce, recipient, value and validBefore (pay: nonce, amount, validBefore), so a re-signed different transfer under an old nonce is never answered with
        the old hash (it gets "authorization already used").
   I-3 (1120)  FIXED for the second "nonce too low" attempt (its unsure entry is removed). A record that was written but whose send never happened (directory fsync failure after the rename) is
        rewritten away by the next successful state write (the failed write sets the dirty flag); until then it blocks only that authorization's retry, for at most DEDUPE_MS, and counts toward UNSURE_MAX.
+
+  Audit 1124 (round 9). All findings are non-fund-loss: an EIP-3009 authorization is one-use on chain.
+  F1  FIXED: gas-budget and low-balance refusals are net:true (relayer-wide state, not the signer's doing): charged to the network key, never to the signer.
+  F2/F3/F4 FIXED at the root: nonce truth and every transaction probe (pending/latest count, getTransaction, receipt, authorizationState as a proof, sendRawTransaction) go to ONE sticky RPC
+       (the first STEALTH_RPC entry); it moves to the next entry only on a transport failure (5xx, timeout, connection, 429) and the switch is logged ("rpc endpoint switched"). Balances, gas and fee
+       estimates keep the failover transport. A gap fill needs two pending-count reads STEALTH_RELAY_GONE_GAP_MS apart that agree. Restart: the persisted unsure records (written before every send, with
+       the nonce) refill nonceOfHash and lift the starting local nonce for sends younger than STEALTH_RELAY_GAP_GRACE_MS; nothing new is persisted.
+  F4 residual (documented): provenGone() can still be wrong if a node lies consistently for >= 2 probes. A false "gone" makes the relayer sign a second transaction for the same authorization; because the
+       on-chain authorization is one-use, only one of the two can succeed and the other reverts: the cost is the reverted transaction's gas (bounded by the daily gas budget), NEVER funds.
+  F6  FIXED: sendAndTrack receives the caller's d0 (the day the reservation was credited under) instead of recapturing st.day.
+  I2  FIXED: a variable that is present but empty in the own environment is no longer refilled from the foreign env file.
+  I1  Partly covered: test_fork_e2e.mjs now exercises the sticky endpoint with a dead first RPC and a lagging pending read; a full two-backend divergence harness is not built.
+  I3  ACCEPTED: a malformed numeric field (BigInt SyntaxError) is thrown before any state-dependent step and answered 400 from the generic handler; it is charged to the network key as junk (ctx.signer unset). The message only echoes the caller's own input.

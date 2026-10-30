@@ -621,7 +621,11 @@ try {
         const dl = fz.sendDelay; if (dl) { fz.sendDelay = 0; await sleep(dl); }
         const j = await fetch(RPC, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(o) }).then(r => r.json());
         if (fz.errAfterSend && !j.error) return { jsonrpc: "2.0", id: o.id, error: { code: -32000, message: fz.errAfterSend } };
+        if (fz.respDelay) { const d = fz.respDelay; fz.respDelay = 0; await sleep(d); }   // 1124 F5: the node HAS the transaction, the ANSWER is slow
         return j;
+      }
+      if (fz.stalePending > 0 && o.method === "eth_getTransactionCount" && o.params[1] === "pending") {   // 1124 F2: a lagging backend answers the pending count with the mined one, once per arm
+        fz.stalePending--; fz.staleServed = (fz.staleServed || 0) + 1; o = { ...o, params: [o.params[0], "latest"] };
       }
       if (o.method === "eth_estimateGas") { const bn = await fetch(RPC, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "eth_blockNumber", params: [] }) }).then(r => r.json()); o = { ...o, params: [o.params[0], bn.result] }; }   // explicit mined block: anvil answers "latest" with the pool included   // a backend that does not see the pool: the estimate cannot reveal the pending transaction
       const rr = await fetch(RPC, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(o) }).then(r => r.json()); if (rr.error) fz.estErr = JSON.stringify([o.method, rr.error]).slice(0, 300); return rr; };
@@ -785,6 +789,56 @@ try {
     { const src = fs.readFileSync(path.join(HERE, "relayer.mjs"), "utf8"), i = src.indexOf("async function fillNonce");
       const body = src.slice(i, src.indexOf("async function syncNonce"));
       ok("B14 1120 L-1 fillNonce: signTransaction -> ctl.dead check -> flights.set -> sendRawTransaction (no viem wallet.sendTransaction anywhere, no nonce floor left)", i > 0 && !/wal\.sendTransaction/.test(src) && !/nonceFloor/.test(src) && /signTransaction[\s\S]*if \(ctl\.dead\) return false;\s*flights\.set[\s\S]*sendRawTransaction/.test(body) && /fillNonce\(n, ctl, d0\)/.test(src)); }
+
+    // 1124 F1: relayer-wide refusals (gas budget spent) are net:true: an honest fresh signer is never charged for them, even far past its own failure budget
+    { const R = await withDir("f1", { STEALTH_RPC: FZ, STEALTH_RELAY_GAS_BUDGET_WEI: "1", STEALTH_RELAY_FAIL_PER_SIGNER: "1" }), x = await mkp(R), rs = [];
+      for (let i = 0; i < 8; i++) rs.push(await post(R.url, "/relay/pay", x.body, nip()));
+      ok("B14 1124 F1 gas budget exhausted: 8 requests of one honest signer (own failure budget = 1) all get the 'budget spent' refusal (400), none is turned into a 429 by its own charges", rs.every(r => r.status === 400 && /gas budget/.test(r.error)), JSON.stringify(rs.map(r => r.status))); }
+    { const src = fs.readFileSync(path.join(HERE, "relayer.mjs"), "utf8");
+      ok("B14 1124 F1 all six operational refusals (budget x4, low balance x2) carry net: true", (src.match(/gas budget for today is spent", \{ honest: true, net: true \}/g) || []).length === 4 && (src.match(/out of gas funds, try again later", \{ honest: true, net: true \}/g) || []).length === 2); }
+
+    // 1124 F2: ONE stale pending read (lagging backend) must not make the relayer fill a "gap" over a live send; the second read GONE_GAP_MS later disagrees and the gap fill is skipped
+    { await rpc("evm_setAutomine", [false]);
+      const R = await withDir("f2", { STEALTH_RPC: FZ, STEALTH_RELAY_GAP_GRACE_MS: "0", STEALTH_RELAY_GONE_GAP_MS: "300", STEALTH_RELAY_STUCK_S: "60" }), x = await mkp(R), y = await mkp(R), z = await mkp(R);
+      const n0 = await nonceOf(R.addr), wx = await post(R.url, "/relay/pay", x.body, nip()), wy = await post(R.url, "/relay/pay", y.body, nip());
+      fz.stalePending = 1; fz.staleServed = 0; const wz = await post(R.url, "/relay/pay", z.body, nip()); fz.stalePending = 0;
+      await rpc("evm_setAutomine", [true]); await mine(1); await waitFor(async () => (await nonceOf(R.addr)) - n0 >= 3, 10000);
+      ok("B14 1124 F2 one stale pending read: NO 'nonce gap filled', all three sends land at nonces n, n+1, n+2 (nothing evicted), all three recipients paid", fz.staleServed === 1 && wx.hash && wy.hash && wz.status === 200 && !/nonce gap filled/.test(R.log()) && (await nonceOf(R.addr)) - n0 === 3
+        && (await bal(x.dd.stealth)) === 2n * U - FEE && (await bal(y.dd.stealth)) === 2n * U - FEE && (await bal(z.dd.stealth)) === 2n * U - FEE, JSON.stringify([fz.staleServed, wz]) + " nonce+" + ((await nonceOf(R.addr)) - n0) + " " + R.log().split("\n").slice(-3).join(" | ").slice(0, 200)); }
+
+    // 1124 F5: a late orphan send (lock deadline, answer slow) plus the client's retry: ONE charge, ONE watcher, the gas ends at the real cost (not twice)
+    { await rpc("evm_setAutomine", [false]);
+      const R = await withDir("f5", { STEALTH_RPC: FZ, STEALTH_RELAY_LOCK_MS: "1500", STEALTH_RELAY_POLL_GAP_MS: "200", STEALTH_RELAY_GONE_GAP_MS: "300", STEALTH_RELAY_STUCK_S: "30" }), x = await mkp(R);
+      fz.respDelay = 3500; const pa = post(R.url, "/relay/pay", x.body, nip()); await waitFor(async () => /ALERT send in flight at lock deadline/.test(R.log()), 15000); await sleep(300);
+      const wb = await post(R.url, "/relay/pay", x.body, nip()), wa = await pa; await sleep(2500);
+      await rpc("evm_setAutomine", [true]); await mine(1);
+      const rc = wb.hash && await pub.waitForTransactionReceipt({ hash: wb.hash, timeout: 15000 }).catch(() => null);
+      const spent = rc ? rc.gasUsed * rc.effectiveGasPrice : -1n; let j = null;
+      await waitFor(async () => { j = stOf(R); return j && rc && j.gas === spent.toString() && !/watch error/.test(R.log()); }, 8000); await sleep(1500); j = stOf(R);
+      const minedLines = R.log().split("\n").filter(l => / mined pay /.test(l) && l.includes(wb.hash || "-")).length;
+      ok("B14 1124 F5 late orphan (503) + retry: the retry gets the hash (200), the payer's count is 1 (not 2), exactly one 'mined' watcher line, the day's gas equals the real cost once", wa.status === 503 && wb.status === 200 && rc && rc.status === "success" && j && j.perPayer[x.P.address] === 1 && minedLines === 1 && j.gas === spent.toString(),
+        JSON.stringify([wa, wb]) + " log " + R.log().split("\n").slice(-6).join(" | ").slice(0, 500) + " perPayer " + JSON.stringify(j && j.perPayer) + " mined " + minedLines + " gas " + (j && j.gas) + " spent " + spent); }
+
+    // 1124 F6: the caller's d0 is threaded into sendAndTrack (not recaptured)
+    { const src = fs.readFileSync(path.join(HERE, "relayer.mjs"), "utf8");
+      ok("B14 1124 F6 sendAndTrack takes d0 from its caller; relay() and relayPay() pass theirs; no 'const d0 = st.day' inside sendAndTrack", /async function sendAndTrack\([\s\S]*?info = \{\}, d0 = st\.day\)/.test(src) && /uk, info, d0\)/.test(src) && /pinfo, d0\)/.test(src) && !/info\.counted/.test(src)); }
+
+    // 1124 F3: restart bootstrap. A persisted unsure record younger than the grace window refills nonceOfHash and lifts the starting local nonce above its nonce; an old one does not lift it
+    { const h1 = "0x" + "ab".repeat(32), h2 = "0x" + "cd".repeat(32), res = [];
+      for (const [nm, age] of [["recent", 1000], ["old", 600000]]) {
+        const sf = path.join(tmp, "f3_" + nm + ".json"); fs.writeFileSync(sf, JSON.stringify({ day: Math.floor(Date.now() / 86400000), gas: "0", perFrom: {}, perPayer: {}, feePaid: [], unsure: [["0xaa:0x01", { h: nm === "recent" ? h1 : h2, nonce: 7, t: Date.now() - age, counted: false, alt: [] }]] }));
+        const code = `import * as R from "file://${path.join(HERE, "relayer.mjs")}"; console.log(JSON.stringify({ local: R.peekNonce(), size: R.nonceOfHash.size }));`;
+        const r = spawnSync("node", ["--input-type=module", "-e", code], { encoding: "utf8", timeout: 30000, env: { ...process.env, STEALTH_ENV_ONLY: "1", STEALTH_CHAIN: "rh", STEALTH_RPC: RPC, RELAYER_KEY: generatePrivateKey(), STEALTH_RELAY_STATE: sf, STEALTH_RELAY_LOG: path.join(tmp, "f3.log"), STEALTH_RELAY_GAP_GRACE_MS: "60000" } });
+        let o = {}; try { o = JSON.parse(r.stdout.trim().split("\n").pop()); } catch {} res.push(o); }
+      ok("B14 1124 F3 restart: a recent unsure send (nonce 7) lifts the starting local nonce to 8 and is remembered by hash; an old record is remembered but lifts nothing (null -> pending count decides)", res[0].local === 8 && res[0].size === 1 && res[1].local === null && res[1].size === 1, JSON.stringify(res)); }
+
+    // 1124 F2/F4: one sticky endpoint; it moves only on a transport failure (dead first RPC), the switch is logged, a non-transport error neither switches nor is swallowed
+    { const lf = path.join(tmp, "stk.log"), code = `import * as R from "file://${path.join(HERE, "relayer.mjs")}"; const a = await R.nodeCall(c => c.getChainId()); const i1 = R.stickyIndex(); let e = null; try { await R.nodeCall(async () => { throw new Error("plain"); }); } catch (x) { e = x.message; } console.log(JSON.stringify({ a, i1, i2: R.stickyIndex(), e }));`;
+      const r = spawnSync("node", ["--input-type=module", "-e", code], { encoding: "utf8", timeout: 30000, env: { ...process.env, STEALTH_ENV_ONLY: "1", STEALTH_CHAIN: "rh", STEALTH_RPC: "http://127.0.0.1:1," + RPC, RELAYER_KEY: generatePrivateKey(), STEALTH_RELAY_STATE: path.join(tmp, "stk.json"), STEALTH_RELAY_LOG: lf } });
+      let o = {}; try { o = JSON.parse(r.stdout.trim().split("\n").pop()); } catch {}
+      ok("B14 1124 F2/F4 sticky endpoint: dead first RPC -> the call is answered by the second, the switch is logged once, the index stays there; a plain error does not switch and is rethrown", o.a === 4663 && o.i1 === 1 && o.i2 === 1 && o.e === "plain" && (fs.readFileSync(lf, "utf8").match(/rpc endpoint switched 0 -> 1/g) || []).length === 1, r.stdout + r.stderr.slice(0, 200)); }
+    { const src = fs.readFileSync(path.join(HERE, "relayer.mjs"), "utf8");
+      ok("B14 1124 F2/F4 every nonce / probe / proof / send call goes through the sticky `node` object (no pub.getTransactionCount / getTransaction / getTransactionReceipt / sendRawTransaction / waitForTransactionReceipt left)", !/pub\.(getTransactionCount|getTransaction|getTransactionReceipt|sendRawTransaction|waitForTransactionReceipt)\(/.test(src.replace(/const rc = await pub\.getTransactionReceipt\(\{ hash: cur \}\)/, ""))); }
 
     // I-5: a state file that cannot be loaded -> the relayer refuses to start, ALERT line the watchdog matches
     { const bad = [["corrupt", "{not json"], ["dir", null]], res = [];
