@@ -202,17 +202,17 @@ const patchSend = (w, fn) => { const orig = w.Zjs.WebWallet.prototype.send_autho
   let fastOk = true, privOk = true;
   for (let sd = 1; sd <= 300; sd++) { const r = mulberry(sd), f = H.planParts({ orchard: 50_000_000n, mode: "fast", rand: r, now: 0 }), q = H.planParts({ orchard: 50_000_000n, mode: "private", rand: mulberry(sd + 1000), now: 0 });
     const asc = p => p.every((x, i) => i === 0 || x.at > p[i - 1].at);
-    if (f.length < 1 || f.length > 2 || f[f.length - 1].at < 5 * 60_000 || f[f.length - 1].at > 20 * 60_000 || !asc(f)) fastOk = false;
-    if (q.length < 2 || q.length > 4 || q[q.length - 1].at < 3600_000 || q[q.length - 1].at > 6 * 3600_000 || !asc(q) || q[0].at < 5 * 60_000) privOk = false; }
-  ok("H1 modes: fast = 1..2 parts, last send 5..20 min; private = 2..4 parts, last send 1..6 h, ascending own times", fastOk && privOk);
+    if (f.length < 1 || f.length > 2 || f[f.length - 1].at < 3 * 60_000 || f[f.length - 1].at > 10 * 60_000 || !asc(f)) fastOk = false;
+    if (q.length < 2 || q.length > 3 || q[q.length - 1].at < 8 * 60_000 || q[q.length - 1].at > 15 * 60_000 || !asc(q) || q[0].at < 60_000) privOk = false; }
+  ok("H1 modes: fast = 1..2 parts, last send 3..10 min; private = 2..3 parts, last send 8..15 min, ascending own times", fastOk && privOk);
   ok("H1 plan: parts get distinct fields (own delay, no quote yet)", (p => new Set(p.map(x => x.at)).size === p.length && p.every(x => x.quote === null && x.refundAcct === null))(H.planParts({ orchard: 50_000_000n, mode: "private", rand: mulberry(7), now: 0 }))); }
 { const w = makeWorld(), s = H.memStore(); off = 0; const msgs = [], t0 = Date.now(); const st = await H.startHop(mkCtx(w, s, { mode: "private", rand: mulberry(42), onProgress: (x, m) => msgs.push(m) })); const rec = await latest(s), P = rec.st.parts, o = outQuotes(w);
-  ok("H1 private end-to-end: DONE, k parts, one quote+deposit+send per part", st.step === "DONE" && !st.err && P.length >= 2 && P.length <= 4 && o.length === P.length && w.broadcasts === P.length && P.every(p => p.status === "SUCCESS"), st.err || P.length);
+  ok("H1 private end-to-end: DONE, k parts, one quote+deposit+send per part", st.step === "DONE" && !st.err && P.length >= 2 && P.length <= 3 && o.length === P.length && w.broadcasts === P.length && P.every(p => p.status === "SUCCESS"), st.err || P.length);
   ok("H1 parts: amounts different, irregular, >= floor, sum = shielded - k fee reserves; each quote is for its part", new Set(P.map(p => p.amount)).size === P.length && P.every((p, i) => BigInt(p.amount) % H.ROUND !== 0n && BigInt(p.amount) >= H.PART_FLOOR && BigInt(o[i].amount) === BigInt(p.amount))
     && P.reduce((x, p) => x + BigInt(p.amount), 0n) === 10_000_000n - 15000n - 20000n * BigInt(P.length));
   ok("H1 refund address of every part = a different fresh hop t-address (never the in-leg or another part's)", new Set([...o.map(q => q.refundTo), rec.st.tIn]).size === P.length + 1 && o.every(q => /^t1/.test(q.refundTo)) && new Set(P.map(p => p.refundAcct)).size === P.length && P.every(p => p.refundAcct >= 1));
   ok("H1 parts have their own deposit addresses and all pay the recipient", new Set(P.map(p => p.quote.depositAddress)).size === P.length && o.every(q => q.recipient === A) && w.delivered > 0n);
-  ok("H1 private mode spreads the payouts over 1..6 h of (virtual) time", off >= 3600_000 && off < 6 * 3600_000 + 2 * 3600_000, Math.round(off / 60000) + " min");
+  ok("H1 private mode spreads the payouts over 8..15 min of (virtual) time", off >= 8 * 60_000 && off < 15 * 60_000 + 2 * 3600_000, Math.round(off / 60000) + " min");
   ok("H1 sends happen in order at/after each part's own time", P.every((p, i) => i === 0 || p.at > P[i - 1].at));
   ok("H1 progress says 'payout i of k'", msgs.some(m => new RegExp("payout 2 of " + P.length).test(m)) && /payout 1 of/.test(msgs.join("|")));
   ok("H1 done: total delivered text sums all parts", rec.st.outTotal === P.reduce((x, p) => x + BigInt(p.quote.amountOut), 0n).toString() && rec.st.payoutTxs !== undefined); }
@@ -231,9 +231,9 @@ const patchSend = (w, fn) => { const orig = w.Zjs.WebWallet.prototype.send_autho
 { const M = 60_000, now = 10_000_000, S = H.STEP_MIN, send = (S.QUOTE_OUT + S.SEND_OUT) * M, parts = [{ at: now - 1 }, { at: now + 3600_000 }, { at: now + 7200_000 }];
   ok("H1 ETA: part states are simulated one after the other (waits overlap the sends)", H.remainingMs({ step: "DELAY", mode: "private", partIdx: 1, parts, delayUntil: now + 3600_000, stepAt: now }, now) === 7200_000 + send
     && H.remainingMs({ step: "DELAY", mode: "private", partIdx: 0, parts, delayUntil: now - 1, stepAt: now }, now) === 7200_000 + send);
-  ok("H1 ETA: private plan not made yet is far longer than fast; legacy state unchanged", H.remainingMs({ step: "QUOTE_IN", mode: "private", stepAt: now }, now) > 2.5 * 3600_000 && H.remainingMs({ step: "QUOTE_IN", mode: "fast", stepAt: now }, now) < 50 * M
+  ok("H1 ETA: private plan not made yet is longer than fast and within 1 h; legacy state unchanged", H.remainingMs({ step: "QUOTE_IN", mode: "private", stepAt: now }, now) > H.remainingMs({ step: "QUOTE_IN", mode: "fast", stepAt: now }, now) && H.remainingMs({ step: "QUOTE_IN", mode: "private", stepAt: now }, now) <= 60 * M && H.remainingMs({ step: "QUOTE_IN", mode: "fast", stepAt: now }, now) < 50 * M
     && H.remainingMs({ step: "QUOTE_IN", stepAt: now }, now) === (M + (Object.values(S).reduce((a, b) => a + b, 0) - S.QUOTE_IN * 1) * M));
-  ok("H1 labels: ETA text per mode, progress text with 'payout 2 of 3'", H.etaLabel("fast") === "33–57 min" && /h$/.test(H.etaLabel("private")) && /^88 min–/.test(H.etaLabel("private"))
+  ok("H1 labels: ETA text per mode, progress text with 'payout 2 of 3'", H.etaLabel("fast") === "31–47 min" && H.etaLabel("private") === "36–60 min"
     && /\(payout 2 of 3\)/.test(H.progressText({ step: "DELAY", mode: "private", partIdx: 1, parts: [{}, {}, {}] })) && H.progressText({ step: "WAIT_T" }) === "Private transfer: step 3/7 · keep this tab open · ~35 min");
   const C = await import("../web/hop-card.js"); C.resetLeft();
   const v = C.hopView({ running: true, msg: "", st: { step: "SEND_OUT", chain: "rh", dest: "base", amount: "5000000", recipient: A, stealth: STEALTH, startedAt: now - 3600_000, stepAt: now, mode: "private", partIdx: 1, parts: [{}, { at: now }, { at: now + 1 }] } }, now);

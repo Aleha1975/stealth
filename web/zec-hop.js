@@ -16,8 +16,8 @@ export const STEP_MIN = { QUOTE_IN: 0.5, DEPOSIT_IN: 4, WAIT_T: 12, SHIELD: 3, D
 /** Payout modes (audit H-1): the shielded balance is paid out in k parts of random size, each with its own random delay, quote and deposit.
  *  Limit (1105 L-7): the split defeats a match on ONE amount only. The parts sum to the in-leg amount minus known fees, all go to the same recipient, and the pipeline latency is
  *  near-constant, so an observer who can see both legs can still match on sum and time window, especially with few concurrent users.
- *  fast = 1..2 parts, 5..20 min in total; private = 2..4 parts spread over 1..6 h. totalMin/totalMax: minutes from "shielded" to the LAST part's send time. */
-export const MODES = { fast: { kMin: 1, kMax: 2, totalMin: 5, totalMax: 20 }, private: { kMin: 2, kMax: 4, totalMin: 60, totalMax: 360 } };
+ *  fast = 1..2 parts, 3..10 min in total; private = 2..3 parts spread over 8..15 min (owner 30.10: the whole private transfer stays within ~1 h). totalMin/totalMax: minutes from "shielded" to the LAST part's send time. */
+export const MODES = { fast: { kMin: 1, kMax: 2, totalMin: 3, totalMax: 10 }, private: { kMin: 2, kMax: 3, totalMin: 8, totalMax: 15 } };
 export const modeOf = m => MODES[m] || MODES.fast;
 export const accountsFor = mode => 1 + modeOf(mode).kMax * PART_TRIES;            // account 0 holds the shielded funds, every part attempt gets a fresh refund account
 const MIN = 60_000, BASE_MIN = Object.values(STEP_MIN).reduce((a, b) => a + b, 0) - STEP_MIN.DELAY - STEP_MIN.QUOTE_OUT - STEP_MIN.SEND_OUT;
