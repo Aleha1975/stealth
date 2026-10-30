@@ -15,7 +15,7 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"; OUT="${OUT:-$ROOT/web/v
 COMMIT=a50df944c32243cb8da9f86e7d52cb65ac926439; CLANG=18.1.8; WBG=0.2.100; NIGHTLY=nightly-2025-06-20; RUSTC_PIN="rustc 1.89.0-nightly (255aa2208 2025-06-19)"; JUST=1.59.0; WASMPACK=0.15.0
 # sha256 of the downloads; empty = not recorded yet: the script prints the hash it got and refuses until it is filled in (CLANG_SHA256_<platform>, RUSTUP_INIT_SHA256)
 CLANG_SHA256_Darwin_arm64="${CLANG_SHA256_Darwin_arm64:-4573b7f25f46d2a9c8882993f091c52f416c83271db6f5b213c93f0bd0346a10}"; CLANG_SHA256_Linux_x86_64="${CLANG_SHA256_Linux_x86_64:-}"; RUSTUP_INIT_SHA256="${RUSTUP_INIT_SHA256:-9502b514362a21096210d498f143b8cdacda365d3dfcf45e8f5541e089ccafc0}"
-PATCH="${PATCH:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/webzjs-ironwood.patch}"; PATCH_SHA256=af76b20dbcb2e9ee432a6aa08667a4d56b997558d464468961e6b0847952eecc   # fixed: the audited patch (not overridable by the environment)
+PATCH="${PATCH:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/webzjs-ironwood.patch}"; PATCH_SHA256=baefc84dd7c945903e4be06193f05bf796ebc6e4c226ac22d43b82ada80d67ae   # fixed: the audited patch (not overridable by the environment)
 WORK="${WORK:-$HOME/.cache/webzjs-build}"
 # 1123 I-3: OUT and WORK are removed / reset by this script, so refuse the obviously wrong values: OUT must be absent, empty or a previous output of this script; neither may be /, $HOME or the repo root
 safe_dir() { local d; d="$(cd "$1" 2>/dev/null && pwd -P || echo "$1")"; [ -n "$d" ] && [ "$d" != "/" ] && [ "$d" != "$HOME" ] && [ "$d" != "$ROOT" ] || { echo "refusing to use $1 (too broad)"; exit 1; }; }

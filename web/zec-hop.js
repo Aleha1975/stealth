@@ -270,8 +270,8 @@ const WEBZJS_SHA256 = { "snippets/wasm-bindgen-rayon-38edf6e439f6d70d/src/worker
   "snippets/wasm_thread-8ee53d0673203880/src/wasm32/js/module_worker_start.js": "ab01d522953252ac38bfebedf17a2049db7aca39804b860e11ecc8b67156235b",
   "snippets/wasm_thread-8ee53d0673203880/src/wasm32/js/module_workers_polyfill.min.js": "8a1b206907df127c5477d4ae4d78799a5bae18ca31b6b386fe835a0bb7fe55e7",
   "snippets/wasm_thread-8ee53d0673203880/src/wasm32/js/web_worker_module.bundler.js": "4bac092d7b282bd22e9f485be7a45b6b0409179b50b705694efcb9f296718fbd",
-  "webzjs_wallet.js": "a907bca3e7acbe1757e41e2c4d7f7d3ffa65a654cacdcabfb151c921c8b6264f",
-  "webzjs_wallet_bg.wasm": "a56a6d5e48222d9d172892a1113f2270d84cf59ec15ff5eecd74cf960d5c598a" };   // keep in step with web/vendor/webzjs/SHA256SUMS
+  "webzjs_wallet.js": "728a97807b04ce52c3e8f1cd0c77de9a0072935d9c97d90831d0171d0ac91195",
+  "webzjs_wallet_bg.wasm": "8b218ea3d3058f24c4e2b0b5097cf588c5a08eafc1b0722e5a6b11474d7fdcd4" };   // keep in step with web/vendor/webzjs/SHA256SUMS
 /** 1104 M-1: the bytes that are hashed are the bytes that run. The glue and the snippets it imports are fetched once, hashed, and executed from Blob URLs of exactly those bytes (the glue's three static
  *  imports are pointed at blobs of the verified snippet bytes). Worker threads started by the wasm still load the vendor files by URL (workerHelpers.js, web_worker_module.bundler.js and the glue they import):
  *  those are the same-origin files whose hashes were just checked, but their second fetch is not pinned. `base` must be an absolute URL. `fetchFn` / `doImport` are injectable for tests. */

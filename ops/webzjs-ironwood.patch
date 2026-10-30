@@ -15996,7 +15996,7 @@ index 0000000..6481301
 +                transaction_id: TxId::from_bytes(output.transaction_id.clone().try_into()?),
 +                account_id: output.account_id.into(),
 +                address: TransparentAddress::decode(&EncodingParams, &output.address)?,
-+                key_scope: TransparentKeyScope::custom(u32::MAX).expect("FIXME"),
++                key_scope: TransparentKeyScope::EXTERNAL,
 +                txout: read_optional!(output, txout)?.try_into()?,
 +                max_observed_unspent_height: output.max_observed_unspent_height.map(|h| h.into()),
 +            })
@@ -16328,7 +16328,7 @@ new file mode 100644
 index 0000000..dc90a17
 --- /dev/null
 +++ b/vendor/zcash_client_memory/src/wallet_read.rs
-@@ -0,0 +1,974 @@
+@@ -0,0 +1,988 @@
 +use std::{
 +    collections::{HashMap, hash_map::Entry},
 +    num::NonZeroU32,
@@ -17112,6 +17112,20 @@ index 0000000..dc90a17
 +            })
 +            .collect();
 +        Ok(t_addresses)
++    }
++
++    #[cfg(feature = "transparent-inputs")]
++    fn get_transparent_address_metadata(
++        &self,
++        account: Self::AccountId,
++        address: &TransparentAddress,
++    ) -> Result<Option<TransparentAddressMetadata>, Self::Error> {
++        // No ephemeral or change addresses exist in this wallet, so the exposed external
++        // receivers (get_transparent_receivers) are the whole set.
++        Ok(self
++            .get_transparent_receivers(account, true, true)?
++            .get(address)
++            .cloned())
 +    }
 +
 +    /// Returns a mapping from each transparent receiver associated with the specified account
