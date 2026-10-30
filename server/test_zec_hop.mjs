@@ -446,7 +446,9 @@ const timed = (msgs, st) => (x, m) => msgs.push([off, m]);
   const w3 = makeWorld(), s3 = H.memStore(); off = 0; let want = null;
   await H.startHop(mkCtx(w3, s3, { waitReceipt: async (h, expect) => { want = expect; return { ok: true }; } }));
   const r3 = await latest(s3), dep = r3.st.inQuote.depositAddress, pad32 = a => "0x" + a.slice(2).toLowerCase().padStart(64, "0"), TT = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef";
-  const good = { ok: true, logs: [{ address: rh.token.address, topics: [TT, pad32(STEALTH), pad32(dep)], data: "0x" + BigInt(r3.st.inQuote.amountIn).toString(16) }] };
+  const AU = "0x98de503528ee59b575ef0c0a2576a82497bfc029a5685b209e9ec333479b10a5";      // keccak("AuthorizationUsed(address,bytes32)")
+  const good = { ok: true, logs: [{ address: rh.token.address, topics: [TT, pad32(STEALTH), pad32(dep)], data: "0x" + BigInt(r3.st.inQuote.amountIn).toString(16) }, { address: rh.token.address, topics: [AU, pad32(STEALTH), r3.st.auth.nonce], data: "0x" }] };
+  ok("1111 I-1 the deposit receipt is bound to THIS authorization (nonce): an identical transfer without AuthorizationUsed(nonce) does not count", want(good) === true && want({ ok: true, logs: [good.logs[0]] }) === false && want({ ok: true, logs: [good.logs[0], { ...good.logs[1], topics: [AU, pad32(STEALTH), "0x" + "11".repeat(32)] }] }) === false);
   ok("1105 M-1 the deposit receipt must hold Transfer(stealth -> deposit address, amount): another transaction does not count", typeof want === "function" && want(good) === true && want({ ok: true, logs: [] }) === false
     && want({ ok: true, logs: [{ ...good.logs[0], topics: [TT, pad32(STEALTH), pad32(A)] }] }) === false && want({ ok: true, logs: [{ ...good.logs[0], data: "0x1" }] }) === false);
   const w4 = makeWorld(), s4 = H.memStore(); off = 0;
@@ -483,6 +485,40 @@ const timed = (msgs, st) => (x, m) => msgs.push([off, m]);
     ok("1104 M-1 one flipped byte in the " + name + " is refused before anything runs", /do not match the audited build/.test(e || "") && texts.length === 0, e);
   }
   self.crossOriginIsolated = hadIso; }
+
+// ---------- round 4 (audits 1111 / 1109): no unsynced balance after a timeout, no second shield, no orphaned hop wallet ----------
+{ // 1111 M-1: the summary pre-read times out -> the wallet is dropped; the balance read must come from a wallet that was synced (an unsynced restore shows nothing)
+  const w = makeWorld(), s = H.memStore(); off = 0; const proto = w.Zjs.WebWallet.prototype, sum = proto.get_wallet_summary; let n = 0;
+  proto.sync = async function () { this.synced = true; };
+  proto.get_wallet_summary = function () { if (n++ === 0) return new Promise(() => {}); if (!this.synced) return Promise.resolve({ account_balances: this.d.accts.map(id => [id, {}]) }); return sum.call(this); };
+  const st = await H.startHop(mkCtx(w, s, { walletTimeoutMs: 40, txKnown: async () => false }));
+  ok("1111 M-1 a summary timeout drops the wallet, the next one is re-created AND synced before any balance read (transfer finishes)", st.step === "DONE" && !st.err, st.step + " " + st.err); }
+for (const name of ["create_proposed_transactions", "db_to_bytes", "get_current_address_transparent"]) {      // 1111 L-2: formerly unbounded wallet calls
+  const w = makeWorld(), s = H.memStore(); off = 0; const proto = w.Zjs.WebWallet.prototype, orig = proto[name]; let n = 0;
+  proto[name] = function (...a) { return n++ === 0 ? new Promise(() => {}) : orig.apply(this, a); };
+  const t0 = realNow(), st = await H.startHop(mkCtx(w, s, { walletTimeoutMs: 40, txKnown: async () => false }));
+  ok("1111 L-2 " + name + ": a hung call is cut and retried; the transfer still finishes", st.step === "DONE" && !st.err && n >= 2 && realNow() - t0 < 20000, st.step + " " + st.err + " calls=" + n); }
+{ const e = await H.withTimeout(new Promise(() => {}), 10, "x").catch(e => e);
+  ok("1111 I-2 a timeout is a typed error (timedOut), not just text", e && e.timedOut === true && /timed out/.test(e.message)); }
+{ // 1111 L-3: pczt_send answers nothing but the transaction DOES go out later (orphaned wallet): no second shield
+  const w = makeWorld(), s = H.memStore(); off = 0; const proto = w.Zjs.WebWallet.prototype, orig = proto.pczt_send; let n = 0;
+  proto.pczt_send = function (p) { if (n++ === 0) { setTimeout(() => orig.call(this, p), 5); return new Promise(() => {}); } return orig.call(this, p); };
+  const st = await H.startHop(mkCtx(w, s, { walletTimeoutMs: 40, txKnown: async () => false }));
+  ok("1111 L-3 a shield broadcast with no answer that completes later is not shielded a second time", st.step === "DONE" && w.sig === 1 && w.shieldCalls === 1, st.step + " " + st.err + " sig=" + w.sig + " calls=" + w.shieldCalls); }
+{ // 1111 L-4: a hidden record whose hop wallet still holds ZEC blocks a new hop and comes back as a card with Return money
+  const s = H.memStore(), key = STEALTH.toLowerCase() + "#0"; await s.put(key, { st: { v: 2, n: 0, stealth: STEALTH, chain: "rh", dest: "base", step: "FAILED", result: "RETURNED", hidden: true }, db: null });
+  const w = makeWorld(); off = 0; let err = null;
+  try { await H.startHop(mkCtx(w, s, { getUtxos: async () => [{ txid: "cd".repeat(32), n: 0, value: 50_000n, height: 3_500_000 }] })); } catch (e) { err = e; }
+  const rec = await s.get(key), keys = await s.keys();
+  ok("1111 L-4 a new hop is refused while the hidden earlier record's hop wallet holds ZEC; the record is un-hidden and no new record exists", err && err.code === "EARLIER_HOP" && /Finish or return the earlier transfer first/.test(err.message) && rec.st.hidden === false && rec.st.earlierFunds === true && keys.length === 1, err && err.message);
+  const C = await import("../web/hop-card.js"), v = C.hopView({ st: rec.st, running: false, msg: "" }, 1_000_000_000_000);
+  ok("1111 L-4 ... and that record's card offers Return money (warn + zec, no Continue)", v.kind === "warn" && v.zec === true && v.action === null && /Return money/.test(v.body), JSON.stringify([v.kind, v.zec, v.action]));
+  err = null; const s2 = H.memStore(); await s2.put(key, { st: { v: 2, n: 0, stealth: STEALTH, chain: "rh", dest: "base", step: "FAILED", result: "RETURNED", hidden: true }, db: null });
+  try { await H.startHop(mkCtx(makeWorld(), s2, { getUtxos: async () => { throw new Error("lightwalletd down"); } })); } catch (e) { err = e; }
+  ok("1111 L-4 an unreadable earlier hop wallet fails closed (nothing started)", err && /could not check/.test(err.message) && (await s2.keys()).length === 1, err && err.message);
+  const w3 = makeWorld(), s3 = H.memStore(); off = 0; await s3.put(key, { st: { v: 2, n: 0, stealth: STEALTH, chain: "rh", dest: "base", step: "FAILED", result: "RETURNED", hidden: true }, db: null });
+  let k = 0; const gu = withUtxo(w3)().getUtxos; const st3 = await H.startHop(mkCtx(w3, s3, { getUtxos: async a => (k++ < 12 ? [] : gu(a)) }));
+  ok("1111 L-4 an earlier hop wallet that is really empty does not block a new hop", st3.step === "DONE" && (await s3.keys()).length === 2, st3.step + " " + st3.err); }
 
 Date.now = realNow;
 console.log(fails ? fails + " FAILED" : "all passed"); process.exit(fails ? 1 : 0);

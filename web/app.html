@@ -5,6 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <meta name="referrer" content="no-referrer">
 <title>Loophole — app</title>
+<!-- 1109 I-7: script-src/worker-src blob: is deliberate and stays. The Zcash loader (loadZjs) imports the WebZjs files from blobs it built itself from bytes whose SHA-256 it checked first (verified-bytes import); without blob: that cannot run. -->
 <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' blob: 'wasm-unsafe-eval'; worker-src 'self' blob:; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self' https://1click.chaindefuser.com https://zcash-mainnet.chainsafe.dev https://rpc.mainnet.chain.robinhood.com https://mainnet.base.org; object-src 'none'; base-uri 'none'; form-action 'none'">
 <link rel="icon" href="/favicon.svg">
 <link rel="stylesheet" href="./loophole.css">

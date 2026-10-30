@@ -147,4 +147,47 @@ const PRIV = new Uint8Array(32).fill(9), ACC = addressFromPriv(PRIV), A2 = "0x" 
   t("1103 L-1: the sweep is recorded BEFORE it is broadcast, and an earlier one that is on the network is resumed, not rebuilt", src.indexOf("const intent =") > 0 && src.indexOf("const intent =") < src.indexOf("await ZR.sendAndConfirm") && /ZR\.txKnown\(ZC\.lightwalletd, prev\.txid\)/.test(src));
   t("1103 M-1: a dust-only or too-long list is never an 'empty' observation", /unspendable = true/.test(src) && src.indexOf("unspendable) {") < src.indexOf("noteEmptyFor(HM, h, true)"));
   t("statuses still tick every second", /setInterval\(\(\) => \{ const r = \[\.\.\.hops\.values\(\)\]\.filter\(h => h\.running\);[^]*?\}, 1000\);/.test(src)); }
+
+// ---------- round 4 (audits 1109 / 1110): confirmation depth, resilient polling, armed-before-send guard ----------
+{ const src = fs.readFileSync(new URL("../web/app.js", import.meta.url), "utf8");
+  // 1109 I-3: timeoutSignal without AbortSignal.timeout still times out
+  const saved = AbortSignal.timeout; delete AbortSignal.timeout; let sg; try { sg = CR.timeoutSignal(20); } finally { AbortSignal.timeout = saved; }
+  await new Promise(r => setTimeout(r, 60));
+  t("1109 I-3: without AbortSignal.timeout an AbortController fallback still aborts", sg instanceof AbortSignal && sg.aborted === true);
+  // 1109 L-4: one failed poll does not end the wait; persistent failures still say 'not mined yet'
+  const H1 = "0x" + "cc".repeat(32); let calls = 0;
+  const flaky = async (m, p) => { if (m === "eth_getTransactionReceipt") { if (calls++ < 2) throw new Error("the chain RPC did not answer"); return { transactionHash: H1, status: "0x1", logs: [], from: "0x" + "11".repeat(20), blockNumber: "0x10" }; } return null; };
+  const fr = await CR.waitFinal(flaky, H1, { sleep: async () => {}, tries: 6, everyMs: 0 });
+  t("1109 L-4: a failed receipt poll is retried, the wait still ends in the result", fr.ok === true && calls === 3);
+  const dead = async (m) => { if (m === "eth_getTransactionReceipt") throw new Error("the chain RPC did not answer"); return null; };
+  const de = await CR.waitFinal(dead, H1, { sleep: async () => {}, tries: 3, everyMs: 0 }).then(() => null, e => e.message);
+  t("1109 L-4: if every poll fails the error is the 'not mined yet' one (which carries the do-not-pay-again wording in the app)", /^not mined yet: /.test(de || "") && /last read error/.test(de));
+  // 1109 I-8: confirmation depth
+  let tipN = 16; const deep = async (m) => m === "eth_blockNumber" ? "0x" + tipN.toString(16) : m === "eth_getTransactionReceipt" ? { transactionHash: H1, status: "0x1", logs: [], from: "0x" + "11".repeat(20), blockNumber: "0x10" } : null;
+  const d1 = await CR.waitFinal(deep, H1, { sleep: async () => { tipN++; }, tries: 5, everyMs: 0, confirmations: 2 });
+  t("1109 I-8: with 2 confirmations the first inclusion is not 'Done' until the next block is on top", d1.ok === true && tipN === 17);
+  tipN = 16; const d2 = await CR.waitFinal(deep, H1, { sleep: async () => {}, tries: 3, everyMs: 0, confirmations: 2 }).then(() => "done", e => /not mined yet/.test(e.message) ? "waiting" : e.message);
+  t("1109 I-8: a stuck tip never reports Done at depth 1", d2 === "waiting");
+  t("1109 I-8: the app asks for 2 confirmations on Robinhood Chain", /confirmations: C\.key === "rh" \? 2 : 1/.test(src));
+  // 1109 L-2: the relay POST carries a timeout signal; hung history fetches are bounded
+  let rs; await postRelay(async (u, i) => { rs = i.signal; return { ok: true, status: 200, json: async () => ({ hash: "0x" + "1".repeat(64) }) }; }, "u", {}, {});
+  t("1109 L-2: the relay POST carries a timeout signal (a hang becomes an ambiguous outcome settled on chain)", rs && typeof rs.aborted === "boolean");
+  let qs; await requestQuote({ fetchFn: async (u, i) => { qs = i.signal; return { ok: true, status: 200, json: async () => ({}) }; }, req: {} }).catch(() => {});
+  t("1111 L-2: quote / deposit / status calls to NEAR Intents carry a timeout signal", qs && typeof qs.aborted === "boolean");
+  t("1109 L-2: history pages and the manifest fetch are bounded", /\/pages\/p"[^;]*signal: timeoutSignal\(60000\)/.test(src) && /manifest\.json", \{ cache: "no-cache", signal: timeoutSignal\(\) \}/.test(src));
+  // 1109 L-1: the guard is armed BEFORE the request leaves, persisted, and cleared only by a confirmed outcome
+  const wdSrc = src.slice(src.indexOf('$("btn-wd").addEventListener("click"'), src.indexOf("async function waitReceipt"));
+  t("1109 L-1: pendingWd is set (until the authorization expires) before postRelay, and persisted", wdSrc.indexOf("pendingWd.set(") > 0 && wdSrc.indexOf("pendingWd.set(") < wdSrc.indexOf("await postRelay(") && /\(now \+ 3600 \+ 60\) \* 1000/.test(wdSrc) && /localStorage\.setItem\(PW_KEY/.test(src));
+  t("1109 L-1: it is cleared only on the relayer's own JSON refusal, a revert or success (not on an unknown outcome)", /if \(d\.error\) pendingWd\.delete/.test(wdSrc) && (wdSrc.match(/pendingWd\.delete/g) || []).length === 3 && !/Date\.now\(\) \+ 600_000/.test(src));
+  // 1109 L-3, I-1, I-2, I-5, I-6
+  t("1109 L-3: a failed log read inside txOfLogs is retried; the final message says the withdrawal is already on chain", /try \{ l = \(await recentLogs\(rpcOne, filter\)\)/.test(src) && /already on chain \(its authorization is used\)/.test(src));
+  t("1109 I-1/I-2: the left-over uses the captured amount; a non-bigint balance is refused", /left: all - value/.test(src) && /typeof all !== "bigint" \|\| !\(value > 0n\)/.test(src) && !/left: w\.usdc - value/.test(src));
+  t("1109 I-5: a failed re-read always marks the row unread", /if \(!x\) \{ f\.usdc = null; unread\+\+; continue; \}/.test(src));
+  t("1109 I-6: hopCtx defines authUsed once; the stale wallet-RPC comment is gone", (src.slice(src.indexOf("const hopCtx"), src.indexOf("const rpcOne")).match(/authUsed:/g) || []).length === 1 && !/go through the connected wallet's own RPC/.test(src));
+  const html = fs.readFileSync(new URL("../web/app.html", import.meta.url), "utf8");
+  t("1109 I-7: the CSP keeps blob: and says why", /script-src 'self' blob:/.test(html) && /I-7: script-src\/worker-src blob: is deliberate/.test(html));
+  // 1110 L-1 / L-2 (returnZec lives in app.js: checked on its text, like the other sweep guards)
+  const rz = src.slice(src.indexOf("async function returnZec"), src.indexOf("async function staleV1"));
+  t("1110 L-1: an unresolved sweep intent is followed in the empty branch BEFORE any empty observation, and an ended one only pauses it", rz.indexOf("const sp = await prevOf()") > 0 && rz.indexOf("const sp = await prevOf()") < rz.indexOf("noteEmptyFor(HM, h, true)") && /if \(!sp\.ended\) return await finishSweep/.test(rz) && /ended: fin\.status/.test(rz));
+  t("1110 L-2: no second sweep before the first one's expiry height has passed (the intent stores it)", /expiry: sw\.expiry/.test(rz) && /tipNow <= until/.test(rz) && /!prev\.ended/.test(rz)); }
 console.log(fail ? "FAILED " + fail : "all passed"); process.exit(fail ? 1 : 0);

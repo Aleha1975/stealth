@@ -151,4 +151,8 @@ ok("r2 L-1 tipWithinClock: anchor block, +1 day, and a tip 1 day ahead of the cl
 // I-1 compressed flag, I-2 output floor
 ok("r2 I-1 compressed-flag frame (0x01) refused", await rejects(R.getUtxos("https://lw", key.addr, mk(fr(0x01, []))), /flags/));
 ok("r2 I-2 a sweep paying under the output floor is refused", (() => { try { R.buildSweep({ utxos: [{ ...utx[0], value: 5_001n }, { ...utx[0], txid: "dd".repeat(32), value: 5_001n }], key, to: TO, tip: 3_600_010 }); return false; } catch (e) { return /nothing/.test(e.message); } })());
+// r4 1110 L-2: the sweep reports its expiry height (tip + EXPIRY_DELTA); the app stores it in the intent and builds no second sweep before the tip passes it
+ok("r4 L-2 buildSweep returns the expiry height the intent records", (() => { const tip = 3_600_000, sw = R.buildSweep({ utxos: [{ ...utx[0], height: tip - 5 }], key, to: TO, tip }); return sw.expiry === tip + R.EXPIRY_DELTA; })());
+// r4 1110 L-1: an unresolved intent must keep "nothing here" from ever counting as an empty observation: the verdict function alone never hides on <3 answers
+ok("r4 L-1 noteEmpty needs 3 answers over 30 min (the app does not even ask while a sweep intent is open)", !R.noteEmpty(null, true, 1e12).hide && !R.noteEmpty({ first: 1e12, last: 1e12, count: 1 }, true, 1e12 + 6e5).hide);
 console.log(bad ? bad + " failed" : "all passed"); process.exit(bad ? 1 : 0);

@@ -6,6 +6,7 @@
    confidentiality "basic" needs a User-Session token (sessionSignIn below) and is OFF in the app until SESSION_SIGNIN is switched on. */
 import { keccak, signDigest, unhex, hex } from "./stealth-crypto.js";
 import { postRelay } from "./relay-post.js";
+import { timeoutSignal } from "./chain-read.js";
 
 export const ONECLICK = "https://1click.chaindefuser.com";
 export const NEAR_RPCS = ["https://rpc.mainnet.near.org", "https://free.rpc.fastnear.com"];   // read-only: current_salt of intents.near
@@ -96,7 +97,7 @@ export function buildQuoteRequest({ from, to, amount, recipient, refundTo, dry, 
     deadline: new Date(now + deadlineMs).toISOString(), confidentiality };
 }
 async function call(fetchFn, url, init) {
-  const r = await fetchFn(url, init); const j = await r.json().catch(() => ({}));
+  const r = await fetchFn(url, { ...init, signal: init.signal || timeoutSignal(30000) }); const j = await r.json().catch(() => ({}));
   if (!r.ok) throw new Error(j.message || ("NEAR Intents error " + r.status));
   return j;
 }

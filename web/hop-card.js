@@ -59,6 +59,8 @@ export function hopView(h, now = Date.now()) {
   } else if (st.step === "FAILED_IN") {
     v.kind = "warn"; v.title = "Swap refunded"; v.body = "Your " + amt(st.amount, tok.decimals) + " " + tok.symbol + " should be back on the stealth address (minus a small refund fee): check the balance. Nothing was sent.";
     v.detail = "First swap ended as " + (st.result || "unknown") + "." + (st.inDeposit ? " Deposit address " + st.inDeposit + (st.txIn ? ", transaction " + st.txIn : "") + "." : "");
+  } else if (st.step === "FAILED" && st.earlierFunds) {       // 1111 L-4: a new transfer was refused because this earlier one still holds ZEC
+    v.kind = "warn"; v.title = "Earlier transfer still holds ZEC"; v.body = "Finish or return the earlier transfer first. Press Return money to send the ZEC back to your wallet, then start the new transfer."; v.zec = true;
   } else if (st.step === "FAILED") {
     v.kind = "bad"; v.title = "Transfer stopped"; v.body = "Your funds are safe. Any ZEC left sits in a temporary wallet that can be rebuilt from this payment's key."; v.action = "funds";
     v.detail = "Last swap ended as " + (st.result || "unknown") + (st.outQuote && st.outQuote.depositAddress ? " (deposit address " + st.outQuote.depositAddress + ")" : "") + "." + (h.extra ? "\n" + h.extra : "");

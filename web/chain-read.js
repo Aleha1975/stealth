@@ -10,7 +10,11 @@ export const TRANSFER_TOPIC = topic("Transfer(address,address,uint256)");
 export const PAID_TOPIC = topic("Paid(address,address,uint256)");           // StealthPay: Paid(stealthAddress indexed, token indexed, amount)
 export const AUTH_USED_TOPIC = topic("AuthorizationUsed(address,bytes32)");   // EIP-3009: AuthorizationUsed(authorizer indexed, nonce indexed)
 export const FETCH_TIMEOUT_MS = 15000;
-export const timeoutSignal = (ms = FETCH_TIMEOUT_MS) => typeof AbortSignal !== "undefined" && AbortSignal.timeout ? AbortSignal.timeout(ms) : undefined;     // 1101 L-5: no chain/API fetch may hang forever
+export const timeoutSignal = (ms = FETCH_TIMEOUT_MS) => {     // 1101 L-5: no chain/API fetch may hang forever. 1109 I-3: old browsers (no AbortSignal.timeout) get an AbortController + timer instead of no timeout at all
+  if (typeof AbortSignal !== "undefined" && AbortSignal.timeout) return AbortSignal.timeout(ms);
+  if (typeof AbortController === "undefined") return undefined;
+  const c = new AbortController(); setTimeout(() => c.abort(), ms); return c.signal;
+};
 export const ETH_TOKEN = "0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";      // the sentinel StealthPay uses for native payments (metadata selector 0xeeeeeeee)
 const isAddr = a => /^0x[0-9a-fA-F]{40}$/.test(a || ""), isHash = h => /^0x[0-9a-fA-F]{64}$/.test(h || "");
 const pad = a => a.toLowerCase().replace(/^0x/, "").padStart(64, "0");
@@ -68,12 +72,15 @@ export async function recentLogs(rpc, { address, topics, span = 5000 }) {
 /** Wait for the final receipt of `hash` on the chain. `expect(receipt)` must be true for a success, otherwise a mined transaction does not count as the thing we wanted.
  *  A replacement hash offered by the API (`follow()` -> hash) is polled only if the chain says it came from the same sender with the same nonce as the original transaction.
  *  -> { ok, hash } ; throws on timeout. */
-export async function waitFinal(rpc, hash, { expect = null, follow = null, sleep = ms => new Promise(r => setTimeout(r, ms)), tries = 60, everyMs = 2000 } = {}) {
-  let orig = null; const first = hash, polled = [hash];             // 1101 L-4: the original stays polled after a replacement is followed (it may still be the one that mines)
+export async function waitFinal(rpc, hash, { expect = null, follow = null, sleep = ms => new Promise(r => setTimeout(r, ms)), tries = 60, everyMs = 2000, confirmations = 1 } = {}) {
+  let orig = null, lastErr = null; const first = hash, polled = [hash];             // 1101 L-4: the original stays polled after a replacement is followed (it may still be the one that mines)
   const tx = async h => { const t = await rpc("eth_getTransactionByHash", [h]); return t && String(t.hash || "").toLowerCase() === h.toLowerCase() ? { from: String(t.from).toLowerCase(), nonce: String(t.nonce) } : null; };
   for (let i = 0; i < tries; i++) {
     for (const h of polled) {
-      const rc = await fetchReceipt(rpc, h);
+      let rc = null; try { rc = await fetchReceipt(rpc, h); } catch (e) { lastErr = e; continue; }     // 1109 L-4: one failed poll out of 60 must not end the wait
+      if (rc && confirmations > 1) {        // 1109 I-8: "Done" only once the block is `confirmations` deep (a reorg could still revert the first inclusion)
+        try { const bn = Number(word(await rpc("eth_blockNumber", []))), blk = Number(BigInt(rc.block)); if (!(bn - blk + 1 >= confirmations)) rc = null; } catch (e) { lastErr = e; rc = null; }
+      }
       if (rc) { if (!rc.ok) return { ok: false, hash: rc.hash }; if (expect && !expect(rc)) return { ok: false, hash: rc.hash, unexpected: true }; return { ok: true, hash: rc.hash, receipt: rc }; }
     }
     if (!orig) orig = await tx(first).catch(() => null);
@@ -83,5 +90,5 @@ export async function waitFinal(rpc, hash, { expect = null, follow = null, sleep
     }
     await sleep(everyMs);
   }
-  throw new Error("not mined yet: " + first);
+  throw new Error("not mined yet: " + first + (lastErr ? " (last read error: " + ((lastErr && lastErr.message) || lastErr) + ")" : ""));
 }
