@@ -144,9 +144,9 @@ function startSite(SP, pagesDir) {
   const rd = f => fs.readFileSync(path.join(WEB, f), "utf8");
   const patch = (txt, from, to, what) => { if (!txt.includes(from)) throw new Error("patch target missing: " + what); return txt.split(from).join(to); };
   const patched = {
-    "chains.js": patch(rd("chains.js"), "stealthPay: null,", `stealthPay: "${SP}",`, "stealthPay placeholder"),
+    "chains.js": patch(patch(rd("chains.js"), 'stealthPay: "0x6f488f9036519b9eb0f3db98b76c2c1b02b08ac7",', `stealthPay: "${SP}",`, "rh stealthPay"), 'rpc: "https://rpc.mainnet.chain.robinhood.com",', `rpc: "${RPC}",`, "rh rpc"),
     "private-withdraw.js": patch(rd("private-withdraw.js"), 'export const ONECLICK = "https://1click.chaindefuser.com";', `export const ONECLICK = "${MOCK}";`, "ONECLICK constant"),
-    "index.html": patch(rd("index.html"), "https://1click.chaindefuser.com", MOCK, "CSP connect-src entry"),
+    "app.html": patch(patch(rd("app.html"), "https://1click.chaindefuser.com", MOCK, "CSP connect-src 1click"), "https://rpc.mainnet.chain.robinhood.com", RPC, "CSP connect-src rpc"),
   };
   const proxy = async (req, res, base, plainPath, body) => {
     try {
@@ -159,7 +159,7 @@ function startSite(SP, pagesDir) {
       const body = Buffer.concat(chunks);
       if (p === "/stealth") { res.writeHead(301, { location: "/stealth/" + u.search }); return res.end(); }
       if (p.startsWith("/stealth/")) {
-        const rel = p.slice("/stealth/".length) || "index.html"; if (rel.includes("..")) { res.writeHead(400); return res.end(); }
+        const rel = p.slice("/stealth/".length) || "app.html"; if (rel.includes("..")) { res.writeHead(400); return res.end(); }
         if (patched[rel]) { res.writeHead(200, { "content-type": MIME[path.extname(rel)] }); return res.end(patched[rel]); }
         const f = path.join(WEB, rel); if (!fs.existsSync(f) || fs.statSync(f).isDirectory()) { res.writeHead(404); return res.end("nf"); }
         res.writeHead(200, { "content-type": MIME[path.extname(f)] || "application/octet-stream" }); return res.end(fs.readFileSync(f));
@@ -174,6 +174,7 @@ function startSite(SP, pagesDir) {
         const plain = "/stealth-api/" + m[1] + u.search;
         if (/^relay(\/pay)?$/.test(m[1]) && req.method === "POST") return proxy(req, res, RELAY, plain, body);
         if (m[1] === "relay/stats" && req.method === "GET") return proxy(req, res, RELAY, plain);
+        if (/^relay\/(sanctions-list|screen|status)$/.test(m[1]) && req.method === "GET") return proxy(req, res, RELAY, plain);
         if (/^(head|known|balances|receipt|usdc-domain|announcements)$/.test(m[1]) && req.method === "GET") return proxy(req, res, IDX, plain);
       }
       res.writeHead(404, { "content-type": "application/json" }); res.end('{"error":"not an API"}');
@@ -219,6 +220,50 @@ function sessionUnit() {
   });
 }
 
+
+// ================= PART 1b (no network): route "private, fast" = NEAR Intents only (runFast) =================
+async function fastUnit() {
+  const sd = n => { let a = n >>> 0; return () => { a = (a + 0x6D2B79F5) >>> 0; let t = a; t = Math.imul(t ^ (t >>> 15), t | 1); t ^= t + Math.imul(t ^ (t >>> 7), t | 61); return ((t ^ (t >>> 14)) >>> 0) / 4294967296; }; };
+  // plan: 1-2 parts, sum exact, each >= MIN_PART, delay 0..3 min, tiny amounts are not split
+  let good = true, seen = new Set();
+  for (let i = 1; i <= 300; i++) { const rng = sd(i), tot = 5_000_000n + BigInt(Math.floor(rng() * 1e9)), pl = PW.fastPlan(tot, rng); seen.add(pl.length);
+    if (pl.length < 1 || pl.length > 2 || pl.reduce((a, p) => a + BigInt(p.amount), 0n) !== tot || pl.some(p => BigInt(p.amount) < PW.MIN_PART || p.delayMs < 0 || p.delayMs > 3 * 60_000 || p.state !== "PLANNED")) good = false; }
+  ok("fast plan: 1-2 parts (both occur), sum exact, each >= 1 token, delay 0..3 min, PLANNED (300 seeds)", good && seen.has(1) && seen.has(2));
+  ok("fast plan: an amount below splitMin is never split", PW.fastPlan(4_000_000n, sd(1)).length === 1);
+  // ETA labels come from the constants
+  const [lo, hi] = PW.fastEtaRangeMin();
+  ok("ETA: fast = " + PW.fastEtaLabel() + " from FAST/FAST_STEP_MIN; standard = " + PW.standardEtaLabel() + " from STANDARD_SEC; fast is well under the 5-15 min of the old split-with-delay", lo === 3 && hi === 11 && PW.fastEtaLabel() === lo + "–" + hi + " min" && PW.standardEtaLabel() === PW.STANDARD_SEC[0] + "–" + PW.STANDARD_SEC[1] + " s" && hi < 15);
+  // runFast with stubbed 1Click and relayer
+  const world = (o = {}) => { const w = { relays: [], quotes: [], submits: [], polls: {}, deps: 0, saves: [] };
+    w.fetchFn = async (url, init = {}) => { const u = String(url), j = x => ({ ok: true, status: 200, json: async () => x });
+      if (u.endsWith("/v0/quote")) { const q = JSON.parse(init.body); w.quotes.push(q); if (o.quoteFailAt === w.quotes.length) return { ok: false, status: 500, json: async () => ({ message: "quote service down" }) };
+        const dep = "0x" + (0xd0 + ++w.deps).toString(16).padStart(2, "0").repeat(20); return j({ quote: { amountIn: q.amount, amountOut: String(BigInt(q.amount) - 3000n), depositAddress: dep, timeEstimate: 30 }, quoteRequest: q }); }
+      if (u.endsWith("/relay")) { const b = JSON.parse(init.body); w.relays.push(b); return j({ hash: "0x" + String(w.relays.length).padStart(64, "0") }); }
+      if (u.endsWith("/v0/deposit/submit")) { w.submits.push(JSON.parse(init.body)); return j({}); }
+      if (u.includes("/v0/status")) { const a = new URL(u).searchParams.get("depositAddress"); w.polls[a] = (w.polls[a] || 0) + 1; return j({ status: w.polls[a] >= 2 ? "SUCCESS" : "PROCESSING" }); }
+      throw new Error("unexpected url " + u); };
+    return w; };
+  const mk = (w, o = {}) => ({ from: CHAINS.base, to: CHAINS.base, priv: "0x" + "45".repeat(32), stealth: "0x" + "ab".repeat(20), recipient: "0x" + "cd".repeat(20), api: "http://relay", base: "http://1click", fetchFn: w.fetchFn, sleep: async () => {}, pollMs: 1,
+    randomNonce: () => "0x" + "11".repeat(32), waitReceipt: async h => ({ ok: true, hash: h }), onProgress: () => {}, ...o });
+  const rec = n => ({ v: 1, stealth: "0x" + "ab".repeat(20), parts: Array.from({ length: n }, (_, i) => ({ amount: String(3_000_000 + i * 1111), delayMs: 0, state: "PLANNED", depositAddress: null, txHash: null })) });
+  { const w = world(), r = rec(2), hooks = []; const ctx = mk(w, { onSigned: i => hooks.push("signed" + i.index), onDeposited: i => hooks.push("dep" + i.index) });
+    await PW.runFast(ctx, r, x => w.saves.push(JSON.stringify(x)));
+    ok("runFast: 2 parts, one real quote + one relay + one submit per part, both SUCCESS, record saved at every step", r.parts.every(p => p.state === "SUCCESS") && w.relays.length === 2 && w.quotes.length === 2 && w.submits.length === 2 && w.saves.length >= 6 && PW.fastDone(r));
+    ok("runFast: guard hooks fire in order (signed before the relay, deposited after the receipt), parts one after the other", hooks.join() === "signed0,dep0,signed1,dep1");
+    ok("runFast: the saved record holds no recipient (no stealth -> recipient link kept in the browser)", !w.saves.some(x => x.includes("cd".repeat(20))));
+    ok("runFast: refundTo is the stealth address, recipient the typed one, public quotes", w.quotes.every(q => q.refundTo === ctx.stealth && q.recipient === ctx.recipient && q.confidentiality === "public" && q.dry === false)); }
+  { const w = world({ quoteFailAt: 2 }), r = rec(2); let err = null; try { await PW.runFast(mk(w), r, () => {}); } catch (e) { err = e.message; }
+    ok("runFast: part 2 fails at the quote -> error, part 1 SUCCESS, part 2 NOT_SENT (money still on the stealth address), nothing signed for it", /quote service down/.test(err) && r.parts[0].state === "SUCCESS" && r.parts[1].state === "NOT_SENT" && w.relays.length === 1 && PW.fastDone(r));
+    ok("fastSummary says it plainly", PW.fastSummary(r, v => v.toString(), "USDC").some(l => /Part 2 of 2 .* was not sent: the money is still on the stealth address/.test(l))); }
+  { const w = world(), r = rec(3); r.parts[0].state = "DEPOSITED"; r.parts[0].depositAddress = "0x" + "e1".repeat(20); r.parts[0].txHash = "0x" + "aa".repeat(32); r.parts[1].state = "SIGNED"; r.parts[1].depositAddress = "0x" + "e2".repeat(20);
+    await PW.runFast(mk(w), r, () => {}, { resume: true });
+    ok("resume after a closed tab: DEPOSITED part is followed to SUCCESS, SIGNED becomes UNKNOWN, PLANNED becomes NOT_SENT; nothing is signed, quoted or relayed again", r.parts.map(p => p.state).join() === "SUCCESS,UNKNOWN,NOT_SENT" && w.relays.length === 0 && w.quotes.length === 0);
+    ok("resume: the UNKNOWN part is reported with its deposit address, not silently dropped", PW.fastSummary(r, v => v.toString(), "X").some(l => /signed, but the deposit was not seen confirmed/.test(l) && l.includes("0x" + "e2".repeat(20))) && PW.fastDone(r)); }
+  { const w = world(), r = rec(1); r.parts[0].state = "DEPOSITED"; r.parts[0].depositAddress = "0x" + "e1".repeat(20); const x = world(); x.fetchFn = async u => ({ ok: true, status: 200, json: async () => ({ status: "REFUNDED" }) });
+    await PW.runFast(mk(x), r, () => {}, { resume: true });
+    ok("a REFUNDED part is reported as refunded to the stealth address", r.parts[0].state === "REFUNDED" && PW.fastSummary(r)[0].includes("refunded") && PW.fastDone(r)); }
+}
+
 // ================= PART 1 (network): REAL dry quotes =================
 async function realQuotes() {
   const stealth = "0x" + "11".repeat(20), dest = "0x" + "22".repeat(20), amount = 5_000_000n;
@@ -239,10 +284,11 @@ async function realQuotes() {
 // ---------------- main ----------------
 try {
   await sessionUnit();
+  await fastUnit();
   await realQuotes();
   console.log("-- browser E2E on anvil fork of Robinhood Chain with a local mock of 1Click --");
   await startMock();
-  const anvil = spawn("anvil", ["--fork-url", "https://rpc.mainnet.chain.robinhood.com", "--port", String(APORT), "--silent"], { stdio: "inherit" }); procs.push(anvil);
+  const anvil = spawn("anvil", ["--fork-url", "https://rpc.mainnet.chain.robinhood.com", "--port", String(APORT), "--block-time", "1", "--silent"], { stdio: "inherit" }); procs.push(anvil);
   await until(() => rpc("eth_chainId"), "anvil", 60000, 500);
   const pub = createPublicClient({ chain: pubChain, transport: vhttp(RPC) });
   const deployer = createWalletClient({ account: privateKeyToAccount(ANVIL0), chain: pubChain, transport: vhttp(RPC) });
@@ -273,11 +319,11 @@ try {
   const ver = await until(() => fetch("http://127.0.0.1:" + CPORT + "/json/version").then(r => r.json()), "chrome", 30000);
   const browser = new CDP(ver.webSocketDebuggerUrl); await browser.ready;
   const R = await openPage(browser, "receiver", recvPk), Y = await openPage(browser, "payer", payerPk);
-  await R.goto(SITE + "/stealth/?chain=rh"); await sleep(300);
+  await R.goto(SITE + "/stealth/app.html?chain=rh"); await sleep(300);
   await R.click("#btn-keys"); await until(async () => !(await R.eval("document.getElementById('recv-out').hidden")), "keys derived", 15000, 150);
   const meta = (await R.text("meta")).trim();
   const pay = async amt => {
-    await Y.goto(SITE + "/stealth/?chain=rh&to=" + encodeURIComponent(meta)); await Y.type("amount", amt); await Y.click("#btn-pay");
+    await Y.goto(SITE + "/stealth/app.html?chain=rh&to=" + encodeURIComponent(meta)); await Y.type("amount", amt); await Y.click("#btn-pay");
     await until(async () => /^Paid\./.test(await Y.text("send-hint")) || /bad/.test(await Y.eval("document.getElementById('send-hint').className")), "payer finished", 90000, 300);
     ok("payer paid " + amt + " USDG gaslessly", /^Paid\./.test(await Y.text("send-hint")), (await Y.text("send-hint")).slice(0, 60));
   };
@@ -290,35 +336,39 @@ try {
   const walletTotal = P => Object.keys(P.counts).filter(k => WALLET_METHODS.includes(k)).reduce((s, k) => s + P.counts[k], 0);
   const hintBad = () => R.eval("/bad/.test(document.getElementById('pay-hint').className)");
 
-  // ---- A. UI: option visible, destination list, guards
+  // ---- A. UI: three ways to send (the Zcash one needs a cross-origin isolated page, which this test site is not), guards
   await openW();
-  ok("UI: Private option offered on rh (feature flag privateWithdraw)", !(await R.eval("document.getElementById('wd-priv-wrap').hidden")));
+  const routes = await R.eval("[...document.querySelectorAll('#wd-route option')].map(o => o.value + '|' + o.textContent).join('\\n')");
+  ok("UI: standard + private fast offered on rh; maximum privacy (Zcash) is not offered without cross-origin isolation", !(await R.eval("document.getElementById('wd-priv-wrap').hidden")) && routes.split("\n").map(x => x.split("|")[0]).join() === "std,fast", routes.replace(/\n/g, " ; "));
+  ok("UI: each label carries its ETA computed from the code constants", routes.includes(PW.standardEtaLabel()) && routes.includes(PW.fastEtaLabel()), routes.replace(/\n/g, " ; "));
   const stealthFull = await R.text("wd-from");
-  ok("UI: destination choices = Base (USDC) and Robinhood Chain (USDG), Base first", (await R.eval("[...document.querySelectorAll('#wd-dest option')].map(o => o.value).join()")) === "base,rh");
-  await R.click("#wd-private"); ok("UI: options panel opens, button says Preview", !(await R.eval("document.getElementById('wd-priv-opts').hidden")) && /Preview/.test(await R.text("btn-wd")));
+  ok("UI: payout chain list = this chain only", (await R.eval("[...document.querySelectorAll('#wd-dest option')].map(o => o.value).join()")) === "rh");
+  const pickRoute = v => R.eval(`(() => { const s = document.getElementById('wd-route'); s.value = ${JSON.stringify(v)}; s.dispatchEvent(new Event('change', { bubbles: true })); return true; })()`);
+  ok("UI: standard shows its note and the Send button, fast opens the panel with the honest line and the Preview button", /Send without gas/.test(await R.text("btn-wd")) && (await R.eval("document.getElementById('wd-priv-opts').hidden")));
+  await pickRoute("fast"); ok("UI: fast: options panel opens, button says Preview, the note says the link is broken by the swap, not by cryptography", !(await R.eval("document.getElementById('wd-priv-opts').hidden")) && /Preview/.test(await R.text("btn-wd")) && /not by cryptography/.test(await R.text("wd-route-note")));
   const q0 = mock.quotes.length;
   await R.type("wd-to", recvA); await R.click("#btn-wd");
   await until(async () => await hintBad(), "guard: key wallet", 8000, 100);
   ok("guard: destination == key wallet refused in private mode, no quote requested", /Refused: that is the wallet your keys came from/.test(await R.text("pay-hint")) && mock.quotes.length === q0);
   await R.type("wd-to", payerA); await R.click("#btn-wd");     // the indexer now records the REAL payer (the signer) for a gasless payment, not the relayer (tx.from)
-  await until(async () => /that paid you/.test(await R.text("pay-hint")), "guard: payer", 8000, 100).catch(async e => { console.log("  payer guard: hint=", await R.text("pay-hint"), "| payer field of the found payment:", await R.eval("1") , "| payer", payerA); throw e; });
-  ok("guard: destination == real payer (the signer of the gasless payment, not the relayer) refused in private mode, no quote requested", mock.quotes.length === q0);
+  await until(async () => /that paid you/.test(await R.text("pay-hint")), "guard: payer", 8000, 100);
+  ok("guard: destination == real payer refused in private mode, no quote requested", mock.quotes.length === q0);
 
-  // ---- B. preview (dry quote) -> confirm -> relayer -> submit -> status SUCCESS
+  // ---- B. preview (dry quote) -> confirm -> relayer -> submit -> status SUCCESS (4.95 < splitMin: one part)
   const sBefore = await bal(stealthFull), w0 = walletTotal(R), dl0 = R.dialogs.length;
   await R.type("wd-to", destAddr); await R.click("#btn-wd");
   await until(async () => !(await R.eval("document.getElementById('wd-quote').hidden")), "preview shown", 20000, 150);
   const qt = await R.text("wd-quote");
-  ok("preview: shows send/receive amounts, fee, ETA and the honest privacy note", /You send 4\.95 USDG/.test(qt) && /receives about 4\.9\d+ USDC on Base/.test(qt) && /Fees: 0\.0\d+ \(\d\.\d+%\)/.test(qt) && /Estimated 20 s/.test(qt) && /public swap/.test(qt), qt.replace(/\n/g, " | ").slice(0, 230));
-  ok("preview: the honest note about public deposit/payout is on the page", /deposit to NEAR Intents and the payout are both public/.test(await R.eval("document.getElementById('wd-priv-opts').innerText")));
+  ok("preview: shows what the recipient gets, the fee, the ETA from the constants and the honest line", /Recipient gets≈ 4\.9\d+ USDG/.test(qt.replace(/\s+/g, " ").replace("gets ≈", "gets≈")) && /Fee/.test(qt) && qt.includes(PW.fastEtaLabel()) && /not by cryptography/.test(qt), qt.replace(/\n/g, " | ").slice(0, 260));
   ok("preview: only a dry quote was requested, nothing sent (stealth balance unchanged, relayer idle)", mock.quotes.length === q0 + 1 && mock.quotes.at(-1).dry === true && (await bal(stealthFull)) === sBefore && mock.submits.length === 0);
   ok("preview: button now asks to confirm", /Confirm/.test(await R.text("btn-wd")));
+  await R.eval("(() => { const q = [0], orig = Math.random.bind(Math); Math.random = () => q.length ? q.shift() : orig(); return true; })()");      // one part (4.95 < splitMin), random delay scripted to 0
   await R.click("#btn-wd");
-  await until(async () => { const h = await R.text("pay-hint"); if (await hintBad()) throw new Error("private withdraw: " + h); return /^Done privately:/.test(h) && /announcements scanned/.test(h); }, "private withdraw done", 120000, 300)
+  await until(async () => { const h = await R.text("pay-hint"); if (await hintBad()) throw new Error("private withdraw: " + h); return /^Done privately:/.test(h); }, "private withdraw done", 120000, 300)
     .catch(async e => { console.log("  hint:", await R.text("pay-hint"), "| errors:", R.errors.join(";"), "| relayer log:", fs.existsSync(path.join(tmp, "r.log")) ? fs.readFileSync(path.join(tmp, "r.log"), "utf8").slice(-500) : "", "| mock:", JSON.stringify(mock.log)); throw e; });
   const real = mock.quotes.filter(x => !x.dry); const rq = real[0];
   ok("flow: one real quote (dry:false) after the preview dry quote", real.length === 1 && mock.quotes.length === q0 + 2);
-  ok("quote fields: originAsset USDG(hood), destinationAsset Base USDC, EXACT_INPUT, slippage 100, ORIGIN_CHAIN deposit, DESTINATION_CHAIN recipient", rq.originAsset === CHAINS.rh.oneClick.assetId && rq.destinationAsset === CHAINS.base.oneClick.assetId && rq.swapType === "EXACT_INPUT" && rq.slippageTolerance === 100 && rq.depositType === "ORIGIN_CHAIN" && rq.recipientType === "DESTINATION_CHAIN" && rq.amount === "4950000");
+  ok("quote fields: USDG(hood) -> same asset on the same chain, EXACT_INPUT, slippage 100, ORIGIN_CHAIN deposit, DESTINATION_CHAIN recipient", rq.originAsset === CHAINS.rh.oneClick.assetId && rq.destinationAsset === CHAINS.rh.oneClick.assetId && rq.swapType === "EXACT_INPUT" && rq.slippageTolerance === 100 && rq.depositType === "ORIGIN_CHAIN" && rq.recipientType === "DESTINATION_CHAIN");
   ok("quote fields: recipient = typed destination, refundTo = THE STEALTH ADDRESS (not the key wallet, not the payer), refundType ORIGIN_CHAIN", rq.recipient.toLowerCase() === destAddr.toLowerCase() && rq.refundTo.toLowerCase() === stealthFull.toLowerCase() && rq.refundTo.toLowerCase() !== recvA.toLowerCase() && rq.refundTo.toLowerCase() !== payerA.toLowerCase() && rq.refundType === "ORIGIN_CHAIN");
   ok("quote fields: confidentiality public (no session token), deadline in the future, dry false", rq.confidentiality === "public" && rq.dry === false && Date.parse(rq.deadline) > Date.now());
   const dep1 = Object.keys(mock.deposits)[0];
@@ -329,26 +379,36 @@ try {
   ok("deposit/submit body {txHash, depositAddress}: the relayer tx that paid the deposit address", mock.submits.length === 1 && sub.depositAddress.toLowerCase() === dep1 && txRc && txRc.status === "0x1" && txRc.to.toLowerCase() === TOKEN.toLowerCase(), JSON.stringify(Object.keys(sub)));
   ok("status polled until SUCCESS (mock: PROCESSING then SUCCESS)", (mock.statusPolls[dep1] || 0) >= 2 && mock.deposits[dep1].state === "SUCCESS", "polls=" + mock.statusPolls[dep1]);
   ok("0 wallet prompts, 0 confirm() dialogs during the private withdraw", walletTotal(R) === w0 && R.dialogs.length === dl0, "prompts=" + (walletTotal(R) - w0));
-  ok("hint says Done privately: 4.95 USDG ... Base", /Done privately: 4\.95 USDG sent through NEAR Intents to 0x[0-9a-fA-F]{6}… on Base\./.test(await R.text("pay-hint")), (await R.text("pay-hint")).split("\n")[0]);
+  ok("hint says Done privately: 4.95 USDG ... Robinhood Chain", /Done privately: 4\.95 USDG sent through NEAR Intents to 0x[0-9a-fA-F]{6}… on Robinhood Chain\./.test(await R.text("pay-hint")), (await R.text("pay-hint")).split("\n")[0]);
+  ok("after a confirmed deposit the double-send guard and the resume record are cleared (and the record never held the recipient)", await R.eval("(() => { const g = JSON.parse(localStorage.getItem('stealth-pending-wd') || '{}'); return Object.values(g).every(v => Number(v) < Date.now()) && !localStorage.getItem('stealth-fast-wd'); })()"));
   ok("/v0/auth/* was never called", !mock.log.some(l => /AUTH/.test(l)));
 
-  // ---- C. split into 2 random parts from a second payment (relayer allows up to 3 withdrawals per address per day)
-  await pay("5"); await rpc("anvil_mine", ["0x4"]);
+  // ---- C. two parts from a second, larger payment (the page's random numbers are scripted: 2 parts, unequal weights, no delay)
+  await pay("6"); await rpc("anvil_mine", ["0x4"]);
   await R.click('[data-pane="payments"]');
   await until(async () => /, 2 are yours/.test(await scan()), "second payment visible", 40000, 500);
   await R.eval("[...document.querySelectorAll('#pay-list button')].filter(b => /^Withdraw/.test(b.textContent)).at(-1).click(); true");
   const st2 = await R.text("wd-from"); ok("second stealth address differs from the first", st2.toLowerCase() !== stealthFull.toLowerCase());
   const depsBefore = Object.keys(mock.deposits).length, rqBefore = mock.quotes.filter(x => !x.dry).length;
-  await R.click("#wd-private"); await R.eval("(() => { const s = document.getElementById('wd-parts'); s.value = '2'; s.dispatchEvent(new Event('change', { bubbles: true })); return true; })()");
-  await R.eval("document.getElementById('wd-delay-on').click(); true"); await R.type("wd-delay", "0.02");          // random delay up to 1.2 s per part (keeps the test fast)
-  await R.type("wd-to", destAddr); await R.click("#btn-wd");
+  await pickRoute("fast"); await R.type("wd-to", destAddr); await R.click("#btn-wd");
   await until(async () => !(await R.eval("document.getElementById('wd-quote').hidden")), "split preview", 20000, 150);
-  ok("split preview mentions 2 random parts and the delay", /cut into 2 random parts/.test(await R.text("wd-quote")) && /random time up to 0\.02 min/.test(await R.text("wd-quote")), (await R.text("wd-quote")).replace(/\n/g, " | ").slice(-170));
+  await R.eval("(() => { const q = [0.99, 0.2, 0.9, 0, 0], orig = Math.random.bind(Math); Math.random = () => q.length ? q.shift() : orig(); return true; })()");
   const tSplit = Date.now(); await R.click("#btn-wd");
-  const fin = await until(async () => { const h = await R.text("pay-hint"); return (/^Done privately:/.test(h) && /announcements scanned/.test(h)) || (await hintBad()) ? h : null; }, "split finished", 120000, 300);
+  const fin = await until(async () => { const h = await R.text("pay-hint"); return /^Done privately:/.test(h) || (await hintBad()) ? h : null; }, "split finished", 120000, 300);
   const deps = Object.keys(mock.deposits).slice(depsBefore); const got = await Promise.all(deps.map(bal)); const parts = mock.quotes.filter(x => !x.dry).slice(rqBefore).map(x => BigInt(x.amount));
   console.log("  split hint:", fin.split("\n")[0].slice(0, 200), "| quotes:", parts.join("+"), "| deposits got:", got.join("+"), "| took", Date.now() - tSplit, "ms");
-  ok("split: both parts delivered through the relayer (3/day per address), sum == 4.95 USDG, each >= 1 USDG and unequal", /^Done privately/.test(fin) && got.length === 2 && got[0] + got[1] === 4_950_000n && parts.every(p => p >= 1_000_000n) && parts[0] !== parts[1] && /Done privately: 4\.95 USDG/.test(fin) && !/already withdrew|limit/.test(fin), fin.split("\n")[0].slice(0, 160));
+  ok("split: both parts delivered through the relayer, sum == 5.95 USDG, each >= 1 USDG, one deposit address each", /^Done privately/.test(fin) && got.length === 2 && got[0] + got[1] === 5_950_000n && parts.every(p => p >= 1_000_000n) && new Set(deps).size === 2, fin.replace(/\n/g, " | ").slice(0, 300));
+  ok("split: the summary names both parts as sent", /Part 1 of 2/.test(fin) && /Part 2 of 2/.test(fin) && !/not sent/.test(fin));
+
+  // ---- D. a closed tab: a saved record with one part handed to NEAR Intents, one signed and one never started; the reloaded page follows the first, reports the others, and keeps no recipient
+  const depD = Object.keys(mock.deposits)[0]; mock.deposits[depD].state = "PROCESSING";
+  const recD = { v: 1, stealth: stealthFull.toLowerCase(), chain: "rh", dest: "rh", startedAt: Date.now(), parts: [
+    { amount: "2000000", delayMs: 0, state: "DEPOSITED", depositAddress: depD, txHash: "0x" + "ab".repeat(32) }, { amount: "1500000", delayMs: 0, state: "SIGNED", depositAddress: "0x" + "ee".repeat(20), txHash: null }, { amount: "1450000", delayMs: 0, state: "PLANNED", depositAddress: null, txHash: null }] };
+  await R.eval(`localStorage.setItem('stealth-fast-wd', ${JSON.stringify(JSON.stringify({ [stealthFull.toLowerCase()]: recD }))}); true`);
+  const qBeforeD = mock.quotes.length; await R.goto(SITE + "/stealth/app.html?chain=rh");
+  const rt = await until(async () => { const t = await R.text("fast-resume"); return /was not sent/.test(t) ? t : null; }, "resume text", 30000, 300);
+  ok("closed tab: the DEPOSITED part is followed to its end, the signed one is reported UNKNOWN with its deposit address, the never-started one NOT_SENT", /Part 1 of 3 .*was sent to the recipient/.test(rt) && /Part 2 of 3 .*deposit was not seen confirmed/.test(rt) && rt.includes("0x" + "ee".repeat(20)) && /Part 3 of 3 .*money is still on the stealth address/.test(rt), rt.replace(/\n/g, " | ").slice(0, 400));
+  ok("closed tab: nothing was quoted, signed or relayed again; the record is gone once nothing is open", mock.quotes.length === qBeforeD && (await R.eval("!localStorage.getItem('stealth-fast-wd')")));
 
   ok("no JS exceptions / console errors on either page", R.errors.length === 0 && Y.errors.length === 0 && R.console.length === 0 && Y.console.length === 0, [...R.errors, ...Y.errors, ...R.console, ...Y.console].join(" | ").slice(0, 300));
   console.log("wallet calls receiver:", JSON.stringify(R.counts), " payer:", JSON.stringify(Y.counts));

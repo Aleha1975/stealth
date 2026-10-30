@@ -5,12 +5,12 @@ import { remainingMs, STEPS, STEP_MIN, partsLabel, modeOf } from "./zec-hop.js";
 
 export const STEP_UI = [   // one entry per zec-hop.js STEPS item, in order
   { name: "Preparing", line: "Preparing the swap", wait: "a few seconds" },
-  { name: "Converting to ZEC", line: "Converting to ZEC", wait: "~3–5 min" },
-  { name: "Receiving ZEC", line: "Waiting for Zcash confirmations", wait: "~12 min" },
-  { name: "Entering the shielded pool", line: "Moving the ZEC into the shielded pool", wait: "usually 2–5 min" },
+  { name: "Converting to ZEC", line: "Converting to ZEC", wait: "~" + Math.round(STEP_MIN.DEPOSIT_IN) + " min" },
+  { name: "Receiving ZEC", line: "Waiting for Zcash confirmations", wait: "~" + Math.round(STEP_MIN.WAIT_T) + " min" },
+  { name: "Entering the shielded pool", line: "Moving the ZEC into the shielded pool", wait: "~" + Math.round(STEP_MIN.SHIELD) + " min" },
   { name: "Mixing delay", line: "Mixing delay", wait: "random" },
   { name: "Converting back", line: "Preparing the swap back", wait: "a few seconds" },
-  { name: "Sending to recipient", line: "Sending to the recipient", wait: "usually 3–10 min" },
+  { name: "Sending to recipient", line: "Sending to the recipient", wait: "~" + Math.round(STEP_MIN.SEND_OUT) + " min" },
 ];
 const STEP_ORDER = ["QUOTE_IN", "DEPOSIT_IN", "WAIT_T", "SHIELD", "DELAY", "QUOTE_OUT", "SEND_OUT"];
 /** raw 1Click status -> friendly word (the raw name never reaches the screen) */

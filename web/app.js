@@ -185,7 +185,7 @@ async function scan() {
     if (!Array.isArray(d.rows) || !d.rows.length || d.next === since) break; since = d.next;
   }
   if (keys !== K) return;                                    // the account changed while scanning: nothing of this run is shown
-  found = mine; render(); showResume().catch(() => {});      // 1101 M-1: the payments are listed BEFORE any balance is read; a failing RPC can no longer hide them
+  found = mine; render(); showResume().catch(() => {}); resumeFast().catch(() => {});      // 1101 M-1: the payments are listed BEFORE any balance is read; a failing RPC can no longer hide them
   const unread = await refreshBalances(true);
   const msg = n + " announcements scanned, " + found.length + " are yours." + (found.some(f => f.legacy) ? " Some are under your legacy keys (withdraw only)." : "") + (unread ? " Balances of " + unread + " could not be read from the chain right now; scan again to retry." : "");
   if (head.lag != null && head.lag > 50) say("pay-hint", msg + " Index is " + head.lag + " blocks behind.", "warn"); else say("pay-hint", msg, unread ? "warn" : "ok");
@@ -208,6 +208,7 @@ async function refreshBalances(redraw = true) {
   return unread;
 }
 // ---- private transfers in flight or unfinished: stealth -> { f, hit, st, msg, running, extra }; drawn as cards at the top of My payments
+const fastBusy = new Set();     // stealth addresses with a "private, fast" withdraw running in this tab
 const autoTries = new Map(), hops = new Map(), TERMINAL = ["DONE", "FAILED_IN", "FAILED"];
 const activeHop = f => { const h = hops.get(f.stealth.toLowerCase()); return h && !TERMINAL.includes(h.st.step) ? h : null; };
 function renderHops() {
@@ -332,20 +333,42 @@ $("btn-scan").addEventListener("click", once(() => scan().catch(e => say("pay-hi
 // ---- withdraw the stablecoin gaslessly: EIP-3009 authorization signed by the stealth key, submitted by the relayer
 let wd = null;
 function openWithdraw(i) {
+  if (fastBusy.has(found[i].stealth.toLowerCase())) { $("withdraw").hidden = true; say("pay-hint", "A private withdraw from this payment is running: wait for it to finish.", "warn"); return; }
   if (activeHop(found[i])) { $("withdraw").hidden = true; say("pay-hint", "This payment has a transfer in progress: use the card above.", "warn"); return; }
   wd = found[i]; $("wd-from").textContent = wd.stealth; $("wd-to").value = ""; $("wd-amt").value = ""; $("withdraw").hidden = false;
-  // Private = the hidden Zcash hop (web/zec-hop.js): offered only on a cross-origin isolated page, on chains with 1Click, and only if the module loads; then it is on by default
-  const mine = wd; $("wd-priv-wrap").hidden = true; $("wd-private").checked = false; $("wd-priv-opts").hidden = true; pvReset();
+  // Three ways to send (labels and ETAs come from code constants): standard (direct, gasless), private fast (NEAR Intents only), maximum privacy (the hidden Zcash hop, web/zec-hop.js:
+  // only on a cross-origin isolated page and only if the module loads). Fast and maximum need a chain with 1Click and a non-legacy key.
+  const mine = wd; $("wd-priv-wrap").hidden = true; setRoutes(null); pvReset();
   const dest = $("wd-dest"); dest.textContent = "";
   for (const k of [C.key]) {   /* one payout chain for now: the same chain */ const c = CHAINS[k]; if (c && c.oneClick && !Array.from(dest.options).some(o => o.value === c.key)) { const o = el("option", null, c.name + " (" + c.token.symbol + ")" + (c.key === C.key ? " · same chain" : "")); o.value = c.key; dest.appendChild(o); } }
-  if (self.crossOriginIsolated && C.privateWithdraw && C.oneClick && !wd.legacy) hopMod().then(() => { if (wd !== mine) return; $("wd-priv-wrap").hidden = false; $("wd-private").checked = true; $("wd-priv-opts").hidden = false; pvReset(); }).catch(() => {});
+  if (C.privateWithdraw && C.oneClick && !wd.legacy) {
+    $("wd-priv-wrap").hidden = false; setRoutes(null);
+    if (self.crossOriginIsolated) hopMod().then(HM => { if (wd === mine) setRoutes(HM); }).catch(() => {});
+  }
 }
+// route select: std / fast / max. `HM` (the hop module) is only known once it has loaded; without it "max" is not offered.
+const ROUTE_NOTE = {
+  std: "Gasless, straight from the stealth address to the recipient. Anyone can see that link on-chain.",
+  fast: "No Zcash: NEAR Intents swaps the money in 1–2 parts at random times. The link is broken by the swap, not by cryptography: someone who sees both sides and matches amounts and times can still connect them.",
+  max: "Through the Zcash shielded pool and back, paid out in 2 parts at random times. Keep this tab open; it can be resumed if you close it.",
+};
+function setRoutes(HM) {
+  const sel = $("wd-route"), prev = sel.value, priv = !$("wd-priv-wrap").hidden; sel.textContent = "";
+  const add = (v, t) => { const o = el("option", null, t); o.value = v; sel.appendChild(o); };
+  add("std", "Standard · gasless, direct · " + PW.standardEtaLabel());
+  if (priv) add("fast", "Private, fast · no Zcash · about " + PW.fastEtaLabel());
+  if (priv && HM) add("max", "Maximum privacy · via Zcash · about " + HM.etaLabel(HM.DEFAULT_MODE));
+  sel.value = Array.from(sel.options).some(o => o.value === prev) ? prev : (HM ? "max" : priv ? "fast" : "std");
+  routeChanged();
+}
+const route = () => $("wd-route").value || "std";
+function routeChanged() { $("wd-route-note").textContent = ROUTE_NOTE[route()]; $("wd-priv-opts").hidden = route() === "std"; pvReset(); }
 // ---- private withdraw: preview (two dry quotes) first, then a second click starts the hop. Any input change drops the preview.
 let pv = null, HOPM = null;
 const hopMod = () => HOPM || (HOPM = import("./zec-hop.js"));
-function pvReset() { pv = null; $("wd-quote").hidden = true; $("btn-wd").textContent = $("wd-private").checked ? "Preview" : "Send without gas"; }
-$("wd-private").addEventListener("change", () => { $("wd-priv-opts").hidden = !$("wd-private").checked; pvReset(); });
-["wd-to", "wd-amt", "wd-dest", "wd-mode"].forEach(id => { $(id).addEventListener("input", pvReset); $(id).addEventListener("change", pvReset); });
+function pvReset() { pv = null; $("wd-quote").hidden = true; $("btn-wd").textContent = route() === "std" ? "Send without gas" : "Preview"; }
+$("wd-route").addEventListener("change", routeChanged);
+["wd-to", "wd-amt", "wd-dest"].forEach(id => { $(id).addEventListener("input", pvReset); $(id).addEventListener("change", pvReset); });
 // wallet-RPC fallback, used ONLY for the token's domain separator (no stealth address in it); same JSON-RPC shape as fetch, so zec-hop.js stays injectable
 const walletRpc = async (_u, init) => { const { method, params } = JSON.parse(init.body); try { if (method !== "eth_chainId" && String(await wallet("eth_chainId", [])).toLowerCase() !== CHAIN_HEX) throw new Error("your wallet is on another network than " + C.name); const result = await wallet(method, params); return { ok: true, json: async () => ({ result }) }; } catch (e) { return { ok: true, json: async () => ({ error: { message: String((e && e.message) || e) } }) }; } };
 // chain reads: the chain's public RPC directly (CORS open, listed in the page CSP)
@@ -395,7 +418,7 @@ async function runHop(f, hit, o) {
 }
 async function privateWithdraw(to, value, hit) {
   const dest = CHAINS[$("wd-dest").value]; if (!dest || !dest.oneClick) throw new Error("pick a destination chain");
-  const HM = await hopMod(), mode = $("wd-mode").value === "private" ? "private" : "fast", key = [to.toLowerCase(), value, dest.key, mode].join("|");
+  const HM = await hopMod(), mode = HM.DEFAULT_MODE, key = [to.toLowerCase(), value, dest.key, mode, "max"].join("|");
   if (!pv || pv.key !== key) {                                    // step 1: show what it will cost, send nothing
     say("pay-hint", "Asking NEAR Intents for a quote…");
     const q1 = await PW.requestQuote({ base: PW.ONECLICK, req: HM.reqIn({ chain: C, amount: value, tAddr: HM.DRY_T, stealth: wd.stealth, dry: true }) }), zec = BigInt(q1.quote.amountOut);
@@ -406,12 +429,65 @@ async function privateWithdraw(to, value, hit) {
     c1.appendChild(el("span", "note", "Recipient gets")); c1.appendChild(el("span", "big", "≈ " + (Number(out) / 10 ** dest.token.decimals).toFixed(2) + " " + dest.token.symbol));
     c2.appendChild(el("span", "note", "Fee")); c2.appendChild(el("span", "big", "≈ " + (Number(fee) / TUNIT).toFixed(2) + " (" + pct + "%)"));
     const c3 = el("div"); c3.appendChild(el("span", "note", "Takes about")); c3.appendChild(el("span", "big", HM.etaLabel(mode)));
-    qt.appendChild(c1); qt.appendChild(c2); qt.appendChild(c3); box.appendChild(qt); box.appendChild(el("div", "note", "Takes about " + HM.etaLabel(mode) + " · keep this tab open" + (mode === "private" ? " (it can be resumed if you close it)" : "")));
+    qt.appendChild(c1); qt.appendChild(c2); qt.appendChild(c3); box.appendChild(qt); box.appendChild(el("div", "note", "Takes about " + HM.etaLabel(mode) + " · keep this tab open (it can be resumed if you close it)"));
     box.hidden = false; pv = { key }; $("btn-wd").textContent = "Confirm private transfer";
     say("pay-hint", "Check the quote, then confirm.", "warn"); return;
   }
   $("btn-wd").disabled = true; $("withdraw").hidden = true;
   try { await runHop(wd, hit, { recipient: to, amount: value, dest, mode }); } finally { $("btn-wd").disabled = false; pvReset(); }
+}
+
+// ---- route "private, fast": NEAR Intents only (web/private-withdraw.js runFast). The record (no recipient in it) is kept in localStorage while a part is open, so a closed tab can still follow the swaps.
+const FAST_KEY = "stealth-fast-wd";
+const fastRecs = { read() { try { return JSON.parse(localStorage.getItem(FAST_KEY) || "{}") || {}; } catch { return {}; } }, write(m) { try { Object.keys(m).length ? localStorage.setItem(FAST_KEY, JSON.stringify(m)) : localStorage.removeItem(FAST_KEY); } catch {} },
+  put(rec) { const m = this.read(); m[rec.stealth] = rec; this.write(m); }, del(k) { const m = this.read(); delete m[k]; this.write(m); } };
+async function fastWithdraw(to, value, hit) {
+  const dest = CHAINS[$("wd-dest").value]; if (!dest || !dest.oneClick) throw new Error("pick a destination chain");
+  const key = [to.toLowerCase(), value, dest.key, "fast"].join("|");
+  if (!pv || pv.key !== key) {                                    // step 1: show what it will cost, send nothing
+    say("pay-hint", "Asking NEAR Intents for a quote…");
+    const j = await PW.requestQuote({ base: PW.ONECLICK, req: PW.buildQuoteRequest({ from: C, to: dest, amount: value, recipient: to, refundTo: wd.stealth, dry: true }) }), sm = PW.summarizeQuote(j, TOK.decimals, dest.token.decimals);
+    const box = $("wd-quote"); box.textContent = "";
+    const qt = el("div", "qt"), c1 = el("div"), c2 = el("div"), c3 = el("div");
+    c1.appendChild(el("span", "note", "Recipient gets")); c1.appendChild(el("span", "big", "≈ " + sm.outText + " " + dest.token.symbol));
+    c2.appendChild(el("span", "note", "Fee")); c2.appendChild(el("span", "big", "≈ " + sm.feeText + " (" + sm.feePct + "%)"));
+    c3.appendChild(el("span", "note", "Takes about")); c3.appendChild(el("span", "big", PW.fastEtaLabel()));
+    qt.appendChild(c1); qt.appendChild(c2); qt.appendChild(c3); box.appendChild(qt);
+    box.appendChild(el("div", "note", "Sent in 1–2 parts at random times, up to " + PW.FAST.delayMaxMin + " min apart · keep this tab open. The link is broken by the swap, not by cryptography."));
+    box.hidden = false; pv = { key, ratio: Number(sm.amountOut) / Number(sm.amountIn) }; $("btn-wd").textContent = "Confirm private withdraw";
+    say("pay-hint", "Check the quote, then confirm.", "warn"); return;
+  }
+  const w = wd, k = w.stealth.toLowerCase(), plan = PW.fastPlan(value), ratio = pv.ratio;
+  const rec = { v: 1, stealth: k, chain: C.key, dest: dest.key, startedAt: Date.now(), parts: plan };
+  $("btn-wd").disabled = true; $("withdraw").hidden = true; fastBusy.add(k);
+  const lock = await holdScreen(), fmt = v => fmtTok(v);
+  const save = r => fastRecs.put(r);
+  let cur = null;
+  const ctx = { from: C, to: dest, priv: hit.stealthPriv, stealth: w.stealth, recipient: to, api: API, base: PW.ONECLICK, fetchFn: fetch, minRatio: ratio * 0.98, randomNonce: randomBytes32,
+    authUsed: (a, n) => authorizationUsed(rpcOne, USDC, a, n), onProgress: m => say("pay-hint", m, "ok"),
+    onSigned: info => { cur = info; pendingWd.set(k, (info.validBefore + 60) * 1000); },       // armed before the request leaves; cleared only when the deposit is confirmed
+    waitReceipt: h => waitReceipt(h, x => hasTransfer(x, { token: USDC, from: w.stealth, to: cur.depositAddress, value: cur.amount }) && hasAuthUsed(x, { token: USDC, authorizer: w.stealth, nonce: cur.auth.nonce }), true),
+    onDeposited: info => { pendingWd.delete(k); spent.set(k, { left: (spent.get(k) || { left: w.usdc }).left - BigInt(rec.parts[info.index].amount), until: Date.now() + 120_000 }); render(); } };
+  try {
+    save(rec); const run = () => PW.runFast(ctx, rec, save);
+    if (navigator.locks) await navigator.locks.request("fast-wd:" + k, { ifAvailable: true }, l => l ? run() : Promise.reject(new Error("A withdraw from this address is already running in another tab."))); else await run();
+    const sums = PW.fastSummary(rec, fmt, SYM), ok = rec.parts.every(p => p.state === "SUCCESS");
+    if (PW.fastDone(rec)) fastRecs.del(k);
+    say("pay-hint", (ok ? "Done privately: " + fmtTok(value) + " " + SYM + " sent through NEAR Intents to " + to.slice(0, 8) + "… on " + dest.name + "." : "Finished with problems:") + (ok && rec.parts.length < 2 ? "" : "\n" + sums.join("\n")), ok ? "ok" : "warn");
+  } catch (e) { say("pay-hint", (e.message || String(e)) + "\n" + PW.fastSummary(rec, fmt, SYM).join("\n"), "bad"); if (PW.fastDone(rec)) fastRecs.del(k); }
+  finally { fastBusy.delete(k); if (lock) lock.release().catch(() => {}); $("btn-wd").disabled = false; pvReset(); await refreshBalances().catch(() => {}); render(); }
+}
+// after a reload: follow parts that were handed to NEAR Intents, mark the rest (never signed -> still on the stealth address; signed but unconfirmed -> check the explorer)
+async function resumeFast() {
+  const m = fastRecs.read(), box = $("fast-resume");
+  for (const k of Object.keys(m)) {
+    const rec = m[k]; if (!rec || !Array.isArray(rec.parts) || fastBusy.has(k)) continue;
+    const go = async () => { fastBusy.add(k); try { await PW.runFast({ base: PW.ONECLICK, fetchFn: fetch, onProgress: t => { box.hidden = false; box.textContent = "Earlier private withdraw: " + t; } }, rec, r => fastRecs.put(r), { resume: true }); } finally { fastBusy.delete(k); } };
+    try { if (navigator.locks) await navigator.locks.request("fast-wd:" + k, { ifAvailable: true }, l => l ? go() : undefined); else await go(); } catch (e) { box.hidden = false; box.textContent = "Earlier private withdraw: " + (e.message || e); continue; }
+    const chain = CHAINS[rec.chain] || C, sums = PW.fastSummary(rec, v => (Number(v) / 10 ** chain.token.decimals).toFixed(2), chain.token.symbol);
+    box.hidden = false; box.textContent = "Earlier private withdraw (" + chain.name + "):\n" + sums.join("\n");
+    if (PW.fastDone(rec)) { fastRecs.del(k); pendingWd.delete(k); }
+  }
 }
 // ---- unfinished hops of the payments found: banner with Resume (needs the keys, so it appears after Scan)
 async function showResume() {
@@ -451,14 +527,14 @@ $("btn-wd").addEventListener("click", once(async () => {
     // audit 1086 L-4: the token's own DOMAIN_SEPARATOR() read from the chain RPC / the wallet (not from our indexer, which would only prove config drift)
     const dsep = await chainRpc(C.rpc, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "eth_call", params: [{ to: USDC, data: "0x3644e515" }, "latest"] }) }, true).then(r => r.json()).then(j => j.result).catch(() => null);
     if (String(dsep).toLowerCase() !== hex(domainSeparator()).toLowerCase()) throw new Error(SYM + " domain mismatch (or could not be read from the chain); refusing to sign");
-    if ($("wd-private").checked && !$("wd-priv-wrap").hidden) {
+    if (route() !== "std" && !$("wd-priv-wrap").hidden) {
       // audit 1087 M-3: the relayer only sees the 1Click deposit address, so the real recipient is screened here, before anything is signed (fail closed if the check cannot run)
       // the whole list is fetched and checked here, so the recipient never reaches our server; /relay/screen only while a relayer without the list endpoint is live
       const sl = await api("/relay/sanctions-list").catch(() => null), local = sl && Array.isArray(sl.addresses) && sl.addresses.length === sl.count && sl.count > 0;
       if (!local) say("pay-hint", "The sanctions list could not be loaded here, so this recipient address is checked by the relayer instead (it will see it).", "warn");     // 1101 I-1
       const sc = local ? { listed: sl.addresses.includes(to.toLowerCase()) } : await api("/relay/screen?addr=" + to).catch(() => null);
       if (!sc || sc.listed !== false) throw new Error(sc && sc.listed ? "That recipient address is on a sanctions list; refusing." : "Could not check the recipient against the sanctions list; nothing was sent. Try again.");
-      return await privateWithdraw(to, value, hit);
+      return route() === "fast" ? await fastWithdraw(to, value, hit) : await privateWithdraw(to, value, hit);
     }
     const now = Math.floor(Date.now() / 1000); const validBefore = BigInt(now + 3600); const nonce = randomBytes32();
     pendingWd.set(w.stealth.toLowerCase(), (now + 3600 + 60) * 1000);                    // 1109 L-1: from here on an unknown outcome blocks a second send until this authorization has expired
@@ -596,3 +672,4 @@ async function doPay(own) {
 }
 const doPayOnce = once(doPay);
 $("btn-pay").addEventListener("click", () => doPayOnce(false));
+resumeFast().catch(() => {});     // follows the parts of an earlier "private, fast" withdraw whose tab was closed (needs no keys)

@@ -11,18 +11,22 @@ import { zcash as ZC } from "./chains.js";
 
 export const STEPS = ["QUOTE_IN", "DEPOSIT_IN", "WAIT_T", "SHIELD", "DELAY", "QUOTE_OUT", "SEND_OUT"];
 export const DONE_STEPS = new Set(["DONE", "FAILED_IN", "FAILED"]);
-export const HOP_TAG = "stealth-zec-hop/v1", MAX_OUT = 3, PART_TRIES = 2, PENDING = "PENDING_DEPOSIT", ETA_MIN = 35, T_CONFS = 10;   // T_CONFS: WebZjs spends transparent coins received from others only after 10 confirmations (ZIP-315)
-export const STEP_MIN = { QUOTE_IN: 0.5, DEPOSIT_IN: 4, WAIT_T: 12, SHIELD: 3, DELAY: 6, QUOTE_OUT: 0.5, SEND_OUT: 8 };   // typical minutes per step (sum 34)
+export const HOP_TAG = "stealth-zec-hop/v1", MAX_OUT = 3, PART_TRIES = 2, PENDING = "PENDING_DEPOSIT", ETA_MIN = 35, T_CONFS = 3;   // T_CONFS: confirmations of the hop wallet's own t-deposit before we try to shield. The wallet policy (constructor args, 1/1 below) already allows 1; 3 blocks (~4 min) keep a shallow reorg from hitting the shield. A too-early shield only raises InsufficientFunds, which SHIELD retries every 60 s
+export const STEP_MIN = { QUOTE_IN: 0.5, DEPOSIT_IN: 4, WAIT_T: 4, SHIELD: 3, DELAY: 6, QUOTE_OUT: 0.5, SEND_OUT: 8 };   // typical minutes per step (sum 26.5)
 /** Payout modes (audit H-1): the shielded balance is paid out in k parts of random size, each with its own random delay, quote and deposit.
  *  Limit (1105 L-7): the split defeats a match on ONE amount only. The parts sum to the in-leg amount minus known fees, all go to the same recipient, and the pipeline latency is
  *  near-constant, so an observer who can see both legs can still match on sum and time window, especially with few concurrent users.
- *  fast = 1..2 parts, 3..10 min in total; private = 2..3 parts spread over 8..15 min (owner 30.10: the whole private transfer stays within ~1 h). totalMin/totalMax: minutes from "shielded" to the LAST part's send time. */
-export const MODES = { fast: { kMin: 1, kMax: 2, totalMin: 3, totalMax: 10 }, private: { kMin: 2, kMax: 3, totalMin: 8, totalMax: 15 } };
-export const modeOf = m => MODES[m] || MODES.fast;
+ *  max = 2 parts spread over 5..12 min (owner 30.10: full privacy within 30-40 min; the first part is sent within firstMax min so the second never waits long behind it).
+ *  fast / private are the OLD modes (up to 47 / 60 min): no longer offered, kept so that a saved hop of those modes resumes with its own plan. totalMin/totalMax: minutes from "shielded" to the LAST part's send time. */
+export const MODES = { max: { kMin: 2, kMax: 2, totalMin: 5, totalMax: 12, firstMax: 6 }, fast: { kMin: 1, kMax: 2, totalMin: 3, totalMax: 10 }, private: { kMin: 2, kMax: 3, totalMin: 8, totalMax: 15 } };
+export const DEFAULT_MODE = "max";
+export const modeOf = m => MODES[m] || MODES[DEFAULT_MODE];
 export const accountsFor = mode => 1 + modeOf(mode).kMax * PART_TRIES;            // account 0 holds the shielded funds, every part attempt gets a fresh refund account
 const MIN = 60_000, BASE_MIN = Object.values(STEP_MIN).reduce((a, b) => a + b, 0) - STEP_MIN.DELAY - STEP_MIN.QUOTE_OUT - STEP_MIN.SEND_OUT;
-/** [low, high] minutes for the whole private transfer of a mode (steps before the delay + the delay + sequential sends). */
-export const etaRangeMin = mode => { const m = modeOf(mode), send = STEP_MIN.QUOTE_OUT + STEP_MIN.SEND_OUT; return [Math.round(BASE_MIN + m.totalMin + send), Math.round(BASE_MIN + m.totalMax + send * m.kMax)]; };
+/** Minutes from "shielded" until the last of k parts is paid, parts sent one after the other: part i is sent at its time (spread evenly over `total`, the first capped by firstMax) or when the previous one ended. */
+const payoutMin = (m, k, total) => { const send = STEP_MIN.QUOTE_OUT + STEP_MIN.SEND_OUT; let end = 0; for (let i = 0; i < k; i++) { let t = total * (i + 1) / k; if (i === 0 && m.firstMax) t = Math.min(t, m.firstMax); end = Math.max(t, end) + send; } return end; };
+/** [low, high] minutes for the whole private transfer of a mode (steps before the delay + payout of kMin parts over totalMin / of kMax parts over totalMax). */
+export const etaRangeMin = mode => { const m = modeOf(mode); return [Math.round(BASE_MIN + payoutMin(m, m.kMin, m.totalMin)), Math.round(BASE_MIN + payoutMin(m, m.kMax, m.totalMax))]; };
 export const etaLabel = mode => { const [a, b] = etaRangeMin(mode), h = x => (x / 60).toFixed(1).replace(/\.0$/, ""); return b < 120 ? a + "–" + b + " min" : a < 120 ? a + " min–" + h(b) + " h" : h(a) + "–" + h(b) + " h"; };
 /** Time left for an unfinished hop, in ms: rest of the current step (min 1 min) + typical time of the later steps. DELAY uses its exact end; with payout parts the parts are simulated one after the other
  *  (each waits for its own time, then needs a quote and a send). Never below 1 min while unfinished, 0 once finished. */
@@ -31,7 +35,7 @@ export function remainingMs(st, now = Date.now()) {
   const sm = k => STEP_MIN[k] * MIN, send = sm("QUOTE_OUT") + sm("SEND_OUT"), di = STEPS.indexOf("DELAY"), parts = Array.isArray(st.parts) ? st.parts : null;
   const cur = st.step === "DELAY" && st.delayUntil ? Math.max(0, st.delayUntil - now) : Math.max(MIN, sm(st.step) - (now - (st.stepAt || now)));
   if (!parts) {
-    const m = st.mode ? modeOf(st.mode) : null, dl = m ? (m.totalMin + m.totalMax) / 2 * MIN + ((m.kMin + m.kMax) / 2 - 1) * send : sm("DELAY");   // plan not made yet: typical delay of the mode
+    const m = st.mode ? modeOf(st.mode) : null, dl = m ? (payoutMin(m, m.kMin, m.totalMin) + payoutMin(m, m.kMax, m.totalMax)) / 2 * MIN - send : sm("DELAY");   // plan not made yet: typical delay of the mode
     return Math.max(MIN, cur + STEPS.slice(i + 1).reduce((a, k) => a + (k === "DELAY" ? dl : sm(k)), 0));
   }
   let t = now, j = st.partIdx || 0;
@@ -94,8 +98,8 @@ export const okSize = zatsOut => zatsOut >= ZC.minIn + SHIELD_FEE + RESERVE + 25
 export const delayMs = (rand = Math.random) => Math.floor((2 + 8 * rand()) * 60_000);       // 2..10 min
 /** Conservative (too early) Zcash height for a unix time: assumes 60 s blocks (real ~75 s) and 500 blocks of slack. */
 export const birthdayFromTime = (tSec, tip, nowSec = Date.now() / 1000) => Math.max(ZC.orchardActivation, tip - Math.ceil(Math.max(0, nowSec - tSec) / 60) - 500);
-export const newState = ({ stealth, chain, dest, recipient, amount, dry, n = 0, mode = "fast", now = Date.now() }) => ({ v: 2, n, stealth: stealth.toLowerCase(), chain: chain.key, dest: dest.key, recipient, amount: amount.toString(),
-  dry: !!dry, step: "QUOTE_IN", attempt: 0, reserve: RESERVE.toString(), startedAt: now, err: null, mode: MODES[mode] ? mode : "fast", nAccts: accountsFor(mode), nextAcct: 1 });
+export const newState = ({ stealth, chain, dest, recipient, amount, dry, n = 0, mode = DEFAULT_MODE, now = Date.now() }) => ({ v: 2, n, stealth: stealth.toLowerCase(), chain: chain.key, dest: dest.key, recipient, amount: amount.toString(),
+  dry: !!dry, step: "QUOTE_IN", attempt: 0, reserve: RESERVE.toString(), startedAt: now, err: null, mode: MODES[mode] ? mode : DEFAULT_MODE, nAccts: accountsFor(mode), nextAcct: 1 });
 export const afterIn = status => (status === "SUCCESS" ? { step: "WAIT_T" } : { step: "FAILED_IN", result: status });
 /** Legacy (v1 state, one out-leg). */
 export const afterOut = (st, status) => status === "SUCCESS" ? { step: "DONE" }
@@ -144,10 +148,12 @@ export function splitAmounts(total, k, floor, rand = Math.random) {
 /** k ascending send times (ms after the shield finished): the last one is a random total in the mode's range, the others split it by random weights. */
 export function planDelays(mode, k, rand = Math.random) {
   const m = modeOf(mode), T = (m.totalMin + rand() * (m.totalMax - m.totalMin)) * MIN, w = Array.from({ length: k }, () => 0.6 + 0.8 * rand()), sw = w.reduce((a, b) => a + b, 0);
-  let c = 0; return w.map((x, i) => { c += x; return i === k - 1 ? Math.round(T) : Math.round(T * c / sw); });
+  let c = 0; const o = w.map((x, i) => { c += x; return i === k - 1 ? Math.round(T) : Math.round(T * c / sw); });
+  if (k > 1 && m.firstMax) o[0] = Math.min(o[0], Math.round(m.firstMax * MIN));      // the first part goes early enough that the last one is not queued behind it
+  return o;
 }
 /** The payout plan from the shielded balance `orchard`: k from the mode, every part pays its own fee reserve; k shrinks if the balance is too small for k parts. */
-export function planParts({ orchard, reserve = RESERVE, mode = "fast", rand = Math.random, now = Date.now(), acct = 0 }) {
+export function planParts({ orchard, reserve = RESERVE, mode = DEFAULT_MODE, rand = Math.random, now = Date.now(), acct = 0 }) {
   const m = modeOf(mode), floor = PART_FLOOR > ZC.minIn ? PART_FLOOR : ZC.minIn; let k = m.kMin + pickInt(rand, m.kMax - m.kMin + 1);
   let amounts, dist;
   for (;; k--) {                                                                           // k shrinks until the balance can carry k parts of at least `floor` each
@@ -296,7 +302,7 @@ export async function loadZjs(base = new URL("./vendor/webzjs/", import.meta.url
 let zjsP; export const sharedZjs = () => zjsP ||= loadZjs().catch(e => { zjsP = null; throw e; });
 
 // ---------------------------------------------------------------- the machine
-/** ctx: { store, stealth, priv, chain, dest, recipient, amount, dry, mode("fast"|"private"), stopAt, api, words, loadZjs, fetchFn, fetchFnOut, sleep, rand, base, maxLoss,
+/** ctx: { store, stealth, priv, chain, dest, recipient, amount, dry, mode("max"; old "fast"/"private" only to resume), stopAt, api, words, loadZjs, fetchFn, fetchFnOut, sleep, rand, base, maxLoss,
  *          waitReceipt(hash)->{ok}, balance()->BigInt, randomNonce(), authUsed(authorizer,nonce)->bool, txKnown(txid)->bool, countPriorHops(stealth)->n, onProgress(st,msg) }
  *  Returns the state. st.err set = halted (resume = call runHop again); DONE_STEPS = finished. */
 export async function runHop(ctx) {

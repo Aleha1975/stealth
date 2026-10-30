@@ -187,13 +187,69 @@ export async function runPart(ctx, amount, delayMs) {
   const validBefore = Math.floor(Date.now() / 1000) + 3600;
   const auth = signTransferAuth({ chain: ctx.from, priv: ctx.priv, from: ctx.stealth, to: q.depositAddress, value: amount, validBefore, nonce: ctx.randomNonce() });
   say("Sending through the relayer (no gas for you)…");
+  if (ctx.onSigned) ctx.onSigned({ auth, depositAddress: q.depositAddress, amount, validBefore });      // from here on the outcome of this transfer may be unknown to us: the caller arms its double-send guard
   const { r, d } = await postRelay(fetchFn, ctx.api + "/relay", auth, { onBusy: m => say(m), check: ctx.authUsed ? () => ctx.authUsed(ctx.stealth, auth.nonce) : null });
   if (d.used) throw new Error("The relayer received the deposit transfer (its authorization is used on chain) but its transaction hash was lost. Check the explorer; deposit address " + q.depositAddress + ".");
   if (!r.ok || d.error) throw new Error(d.error || "relayer error");
   say("Deposit sent (tx " + d.hash.slice(0, 12) + "…), waiting for the block…");
   const rc = await ctx.waitReceipt(d.hash); if (!rc.ok) throw new Error("the deposit transfer reverted (tx " + d.hash.slice(0, 12) + "…)");
+  if (ctx.onDeposited) ctx.onDeposited({ depositAddress: q.depositAddress, txHash: rc.hash || d.hash });
   await submitDeposit({ base: ctx.base, txHash: d.hash, depositAddress: q.depositAddress, fetchFn }).catch(e => say("Could not notify NEAR Intents (" + e.message + "); it will still detect the deposit."));
   say("NEAR Intents is swapping (deposit address " + q.depositAddress + ")…");
   const fin = await pollStatus({ base: ctx.base, depositAddress: q.depositAddress, fetchFn, sleep, intervalMs: ctx.pollMs || 3000, onUpdate: s => say("Status: " + s.status + " (deposit address " + q.depositAddress.slice(0, 10) + "…)") });
   return { status: fin.status, depositAddress: q.depositAddress, txHash: d.hash, quote: q, final: fin };
 }
+
+// ---------------------------------------------------------------- route "private, fast": NEAR Intents only, no Zcash
+/** 1-2 parts of random size, each with its own random delay (0..delayMaxMin) before its quote; parts go one after the other. The link is broken by the swap, not by cryptography.
+ *  splitMin: below this the amount is not split (1Click fees and its minimum make tiny parts pointless). */
+export const FAST = { kMin: 1, kMax: 2, delayMaxMin: 3, splitMin: 5_000_000n };
+/** typical minutes of one part: quote, gasless deposit + block, 1Click swap (a real dry quote said timeEstimate 29-37 s; the rest is polling and the block) */
+export const FAST_STEP_MIN = { QUOTE: 0.25, DEPOSIT: 0.75, SWAP: 1.5 };
+/** the standard (direct, gasless) withdraw: relayer + one block, in seconds */
+export const STANDARD_SEC = [10, 30];
+const partMin = Object.values(FAST_STEP_MIN).reduce((a, b) => a + b, 0);
+export const fastEtaRangeMin = () => [Math.round(partMin), Math.round(FAST.kMax * (FAST.delayMaxMin + partMin))];
+export const fastEtaLabel = () => { const [a, b] = fastEtaRangeMin(); return a + "–" + b + " min"; };
+export const standardEtaLabel = () => STANDARD_SEC[0] + "–" + STANDARD_SEC[1] + " s";
+/** Plan of a fast withdraw: { parts: [{ amount (decimal string), delayMs, state:"PLANNED", depositAddress:null, txHash:null }] } */
+export function fastPlan(total, rng = Math.random) {
+  const k = total >= FAST.splitMin ? FAST.kMin + Math.min(FAST.kMax - FAST.kMin, Math.floor(rng() * (FAST.kMax - FAST.kMin + 1))) : 1;
+  return randomSplit(total, k, rng).map(a => ({ amount: a.toString(), delayMs: randomDelayMs(FAST.delayMaxMin, rng), state: "PLANNED", depositAddress: null, txHash: null }));
+}
+export const FAST_OPEN = new Set(["PLANNED", "SIGNED", "DEPOSITED"]);
+/** Runs (or, with `resume`, only follows) the parts of `rec` one after the other. `save(rec)` is called at every transition, so a closed tab loses nothing that was sent:
+ *  DEPOSITED parts are followed to their end on resume (1Click swaps whether or not the tab is open); a PLANNED part that was never signed becomes NOT_SENT (its money never left the stealth address);
+ *  a SIGNED part whose deposit we did not see confirmed becomes UNKNOWN (check the explorer and the deposit address).
+ *  ctx = what runPart needs + { onProgress, onSigned, onDeposited }. Returns rec. Throws after saving when a part fails before the money left. */
+export async function runFast(ctx, rec, save = () => {}, { resume = false } = {}) {
+  const say = ctx.onProgress || (() => {}), n = rec.parts.length;
+  for (let i = 0; i < n; i++) {
+    const p = rec.parts[i], tag = n > 1 ? "Part " + (i + 1) + " of " + n + ": " : "";
+    if (p.state === "SIGNED" && resume) { p.state = "UNKNOWN"; save(rec); continue; }
+    if (p.state === "PLANNED" && resume) { p.state = "NOT_SENT"; save(rec); continue; }
+    if (p.state === "DEPOSITED") {
+      const fin = await pollStatus({ base: ctx.base, depositAddress: p.depositAddress, fetchFn: ctx.fetchFn, sleep: ctx.sleep, intervalMs: ctx.pollMs || 3000, onUpdate: s => say(tag + "Status: " + s.status) });
+      p.state = fin.status; save(rec); continue;
+    }
+    if (p.state !== "PLANNED") continue;
+    const c = { ...ctx, onProgress: m => say(tag + m),
+      onSigned: info => { p.state = "SIGNED"; p.depositAddress = info.depositAddress; save(rec); if (ctx.onSigned) ctx.onSigned({ ...info, index: i }); },
+      onDeposited: info => { p.state = "DEPOSITED"; p.depositAddress = info.depositAddress; p.txHash = info.txHash; save(rec); if (ctx.onDeposited) ctx.onDeposited({ ...info, index: i }); } };
+    try { const r = await runPart(c, BigInt(p.amount), p.delayMs); p.state = r.status; p.final = r.status; save(rec); }
+    catch (e) { if (p.state === "PLANNED") p.state = "NOT_SENT"; for (const q of rec.parts) if (q.state === "PLANNED") q.state = "NOT_SENT"; save(rec); throw e; }      // the parts after a failed one are not started
+  }
+  return rec;
+}
+/** What happened, as lines for the screen. amountFmt(BigInt) formats a token amount. */
+export function fastSummary(rec, amountFmt = v => v.toString(), sym = "") {
+  const out = [], n = rec.parts.length, lbl = i => (n > 1 ? "Part " + (i + 1) + " of " + n + " (" : "(") + amountFmt(BigInt(rec.parts[i].amount)) + " " + sym + ")";
+  rec.parts.forEach((p, i) => {
+    const m = { SUCCESS: "was sent to the recipient.", REFUNDED: "was refunded by NEAR Intents: the money is back on the stealth address.", FAILED: "failed: check the status of deposit address " + p.depositAddress + ".",
+      NOT_SENT: "was not sent: the money is still on the stealth address.", UNKNOWN: "was signed, but the deposit was not seen confirmed. Check the explorer and deposit address " + p.depositAddress + " before sending again.",
+      DEPOSITED: "is with NEAR Intents (deposit address " + p.depositAddress + ") and still swapping.", SIGNED: "was signed and handed to the relayer; the result is not known yet.", PLANNED: "has not started yet." }[p.state] || p.state;
+    out.push(lbl(i) + " " + m);
+  });
+  return out;
+}
+export const fastDone = rec => rec.parts.every(p => !FAST_OPEN.has(p.state));

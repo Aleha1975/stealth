@@ -34,7 +34,7 @@ try {
   const ev = async expr => { const r = await send("Runtime.evaluate", { expression: expr, awaitPromise: true, returnByValue: true }); if (r.exceptionDetails) throw new Error(r.exceptionDetails.exception?.description || r.exceptionDetails.text); return r.result.value; };
   for (let i = 0; i < 40; i++) { if (await ev("document.readyState === 'complete' && !!document.getElementById('btn-keys')").catch(() => false)) break; await sleep(250); }
   ok("app loaded under COOP/COEP, cross-origin isolated", await ev("crossOriginIsolated === true && typeof SharedArrayBuffer === 'function'"));
-  ok("UI: Private checkbox present, speed selector, old split/delay options gone", await ev("!!document.getElementById('wd-private') && !document.getElementById('wd-parts') && !document.getElementById('wd-delay') && !!document.getElementById('wd-mode') && /^\\s*Private\\s*$/.test(document.getElementById('wd-private').parentElement.textContent)"));
+  ok("UI: one route selector (standard / fast / max filled by the app), no checkbox, old speed/split/delay controls gone", await ev("!!document.getElementById('wd-route') && !document.getElementById('wd-private') && !document.getElementById('wd-mode') && !document.getElementById('wd-parts') && !document.getElementById('wd-delay') && !!document.getElementById('fast-resume')"));
   const t0 = Date.now();
   const tmo = setTimeout(() => { console.log('TIMEOUT errors:', errors, 'last reqs:', reqs.slice(-12)); done(3); }, 240000);
   const out = JSON.parse(await ev(`(async () => {

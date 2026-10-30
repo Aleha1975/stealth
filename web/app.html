@@ -44,6 +44,7 @@
       <div class="pane" id="pane-payments" hidden>
         <h3>Payments found for your keys</h3>
         <div id="hop-resume" hidden></div>
+        <div id="fast-resume" class="note" style="white-space:pre-line" hidden></div>
         <div class="row"><button class="btn" id="btn-scan">Scan</button><span class="note" id="scan-note">Derive your keys first.</span></div>
         <div id="pay-list"></div>
         <div id="withdraw" hidden>
@@ -52,10 +53,10 @@
             <label>to address</label><input id="wd-to" placeholder="0x… (not your public wallet)" autocomplete="off" spellcheck="false">
             <label>amount, <span class="tok-sym"></span> (empty = all)</label><input id="wd-amt" placeholder="all" inputmode="decimal">
             <div id="wd-priv-wrap" hidden>
-              <label><input type="checkbox" id="wd-private" style="width:auto;margin:0 8px 0 0"> Private</label>
+              <label>how to send</label><select id="wd-route"></select>
+              <div class="note" id="wd-route-note"></div>
               <div id="wd-priv-opts" hidden>
                 <label hidden>pay out on</label><select id="wd-dest" hidden></select>
-                <label>speed</label><select id="wd-mode"><option value="fast">Fast: 1–2 payouts, about 30–45 min</option><option value="private">More private: 2–3 payouts, about 35–60 min</option></select>
                 <div class="box" id="wd-quote" hidden></div>
               </div>
             </div>
