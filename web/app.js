@@ -225,7 +225,7 @@ function renderHops() {
 // (and has no local record) are asked for UTXOs: one cheap call each, no wallet sync, rate limited. A finding becomes a card with Return money / Continue; shielded ZEC needs a wallet sync, so it has its own button.
 const lost = new Map(), lostBusy = { v: false }, LOST_CHECK_KEY = "stealth-lost-checked", LOST_RECHECK_MS = 6 * 3600_000, LOST_PER_PASS = 10;
 const lostSeen = { read() { try { const o = JSON.parse(localStorage.getItem(LOST_CHECK_KEY) || "{}"); return o && typeof o === "object" ? o : {}; } catch { return {}; } },
-  fresh(k) { return Date.now() - (Number(this.read()[k]) || 0) < LOST_RECHECK_MS; }, mark(k) { const o = this.read(); o[k] = Date.now(); const ks = Object.keys(o); if (ks.length > 500) for (const x of ks.slice(0, ks.length - 500)) delete o[x]; try { localStorage.setItem(LOST_CHECK_KEY, JSON.stringify(o)); } catch {} } };
+  fresh(k) { return Date.now() - (Number(this.read()[k]) || 0) < LOST_RECHECK_MS; }, unmark(k) { const o = this.read(); delete o[k]; try { localStorage.setItem(LOST_CHECK_KEY, JSON.stringify(o)); } catch {} }, mark(k) { const o = this.read(); o[k] = Date.now(); const ks = Object.keys(o); if (ks.length > 500) for (const x of ks.slice(0, ks.length - 500)) delete o[x]; try { localStorage.setItem(LOST_CHECK_KEY, JSON.stringify(o)); } catch {} } };
 const lostNone = new Set();      // payments checked on the chain with nothing found: they get the explicit "Check shielded balance" button
 const zecText = z => (Number(z) / 1e8).toFixed(8).replace(/0+$/, "").replace(/\.$/, "");
 async function checkLost() {
@@ -244,43 +244,61 @@ async function checkLost() {
       if (res.error) continue;                              // not marked: the next Scan tries again
       lostSeen.mark(k);
       if (res.skipped) continue;
-      if (res.found.length) lost.set(k, { f, hit, n: res.found[0].n, found: res.found, total: res.total, truncated: res.truncated }); else lostNone.add(k);
+      if (res.found.length) { let tip = null; try { tip = await (await import("./zec-return.js")).getTip((await import("./chains.js")).zcash.lightwalletd); } catch {}      // 1133 M-1: no tip = young (fail closed)
+        lost.set(k, { f, hit, n: res.found[0].n, found: res.found, total: res.total, truncated: res.truncated, maxLocal: res.maxLocal, young: HM.lostYoung(res.found, tip), contAcct: HM.lostContinueAcct(res.found) }); } else lostNone.add(k);
       renderHops(); render();
     }
   } finally { lostBusy.v = false; }
 }
 function lostCard(k, l) {
-  const card = el("div", "hop warn"), line = el("div", "hop-line"), acts = el("div", "row hop-act");
+  const card = el("div", "hop warn"), line = el("div", "hop-line"), acts = el("div", "row hop-act"), older = l.maxLocal != null && l.n < l.maxLocal;
   card.appendChild(el("div", "hop-t", "Unfinished private transfer found: " + zecText(l.total) + " ZEC" + (l.shielded ? " (shielded)" : "")));
-  card.appendChild(el("div", "hop-line", "This browser has no record of it (storage was cleared, or it ran on another device), but the ZEC is still on the transfer's temporary wallet, rebuilt from your key. " + (l.shielded ? "Continue sends it on to a recipient you enter now." : "Return it to your wallet, or continue the transfer to a recipient you enter now.") + (l.truncated ? " More outputs exist than could be read at once; Return money handles them in rounds." : "")));
-  card.appendChild(line);
+  const why = l.young ? "The ZEC arrived recently, so this transfer may still be running on another device. It is available here later (about 2 hours after it arrived); nothing can be sent or returned from this card yet."      // 1133 M-1
+    : older ? "This is an earlier transfer wallet of this address, and a newer transfer record exists in this browser, so it cannot be recovered from here."
+    : "This browser has no record of it (storage was cleared, or it ran on another device), but the ZEC is still on the transfer's temporary wallet, rebuilt from your key. " + (l.shielded && !l.found.length ? "Continue sends it on to a recipient you enter now." : l.shielded || l.found.length ? "Return it to your wallet" + (l.shielded || l.contAcct == null ? " first (it sweeps every account, in rounds)." : ", or continue the transfer to a recipient you enter now.") : "") + (l.truncated ? " More outputs exist than could be read at once; Return money handles them in rounds." : "");
+  card.appendChild(el("div", "hop-line", why)); card.appendChild(line);
   const btn = (txt, cls, fn) => { const b = el("button", "btn " + cls, txt); b.type = "button"; b.addEventListener("click", () => fn(b)); acts.appendChild(b); return b; };
   const fail = (b, e) => { if (b) b.disabled = false; line.textContent = (e && e.message) || String(e); };
-  if (!l.shielded) btn("Return money", "", b => { b.disabled = true; lostReturn(k, l, card, line).catch(e => fail(b, e)); });
-  const canContinue = self.crossOriginIsolated && (l.shielded || l.found.every(x => x.index === 0));
-  if (canContinue) btn("Continue", "ghost", b => { const f = el("div", "row"); const inp = el("input"); inp.placeholder = "Recipient address 0x…"; inp.setAttribute("aria-label", "Recipient address"); inp.autocomplete = "off"; inp.spellcheck = false;
-    const go = el("button", "btn", "Continue transfer"); go.type = "button"; go.addEventListener("click", () => { go.disabled = true; lostContinue(k, l, inp.value.trim(), line).catch(e => { go.disabled = false; line.textContent = (e && e.message) || String(e); }); });
-    f.appendChild(inp); f.appendChild(go); card.insertBefore(f, acts); b.disabled = true; line.textContent = "Enter the recipient again: it cannot be read from the chain. It is checked like a normal withdraw."; });
-  if (!l.shielded) btn("Check shielded balance", "ghost", b => { b.disabled = true; lostShielded(k, l.f, l.hit, line).catch(e => fail(b, e)).finally(() => { b.disabled = false; }); });
+  if (l.young) btn("Check again", "ghost", b => { lost.delete(k); lostSeen.unmark(k); renderHops(); checkLost().catch(() => {}); });
+  else if (!older) {
+    if (l.found.length) btn("Return money", "", b => { b.disabled = true; lostReturn(k, l, card, line).catch(e => fail(b, e)); });
+    const canContinue = self.crossOriginIsolated && (l.shielded ? !l.found.length : l.contAcct != null);      // 1133 L-4: one account only; ZEC on several accounts goes back first
+    if (canContinue) btn("Continue", "ghost", b => { const f = el("div", "row"); const inp = el("input"); inp.placeholder = "Recipient address 0x…"; inp.setAttribute("aria-label", "Recipient address"); inp.autocomplete = "off"; inp.spellcheck = false;
+      const go = el("button", "btn", "Continue transfer"); go.type = "button"; go.addEventListener("click", () => { go.disabled = true; lostContinue(k, l, inp.value.trim(), line).catch(e => { go.disabled = false; line.textContent = (e && e.message) || String(e); }); });
+      f.appendChild(inp); f.appendChild(go); card.insertBefore(f, acts); b.disabled = true; line.textContent = "Enter the recipient again: it cannot be read from the chain. It is checked like a normal withdraw."; });
+    if (!l.shielded) btn("Check shielded balance", "ghost", b => { b.disabled = true; lostShielded(k, l.f, l.hit, line).catch(e => fail(b, e)).finally(() => { b.disabled = false; }); });
+  }
   card.appendChild(acts); return card;
 }
 const blockTimeSec = async n => { const b = await rpcOne("eth_getBlockByNumber", ["0x" + Number(n).toString(16), false]); const t = b && Number(BigInt(b.timestamp)); if (!Number.isFinite(t)) throw new Error("could not read the payment's block time"); return t; };
 // shielded ZEC needs a wallet sync (minutes), so it only runs on this button
 async function lostShielded(k, f, hit, line) {
   if (!self.crossOriginIsolated) throw new Error("This page cannot run the Zcash wallet here (it is not cross-origin isolated).");
-  const HM = await hopMod(), base = await hopCtx(HM, f, hit, {}); let cnt = 1; try { cnt = await base.countPriorHops(f.stealth); } catch {}
+  const HM = await hopMod(), base = await hopCtx(HM, f, hit, {}); let cnt = null; try { cnt = await base.countPriorHops(f.stealth); } catch {}
   if (cnt === 0) { line.textContent = "No private transfer was ever started from this address."; return; }
-  const bt = await blockTimeSec(f.block); let best = null;
-  for (let n = 0; n < Math.min(HM.LOST_N, Math.max(1, cnt)); n++) {
+  const bt = await blockTimeSec(HM.firstBlock(found, f.stealth) || f.block), rg = HM.lostRange(cnt, await HM.localNs(base.store, f.stealth)), prev = lost.get(k) || {}; let best = null;      // 1133 I-4: the note cannot predate the FIRST payment to this address
+  for (const n of rg.ns) {      // 1133 L-4: every wallet is looked at (bounded by LOST_MAX_N) and the richest wins; transparent ZEC already found counts for its own wallet
     line.textContent = "Syncing the Zcash wallet to look for shielded ZEC (hop wallet " + (n + 1) + ")… this takes a few minutes. Keep this tab open.";
     const rows = await HM.hopSummary({ ...base, n, blockTimeSec: bt, nAccts: HM.scanAccts(null) }, null), row = rows.filter(x => x.orchard >= HM.HOLD_DUST).sort((a, b) => (b.orchard > a.orchard ? 1 : -1))[0];
-    if (row) { best = { n, row, rows }; break; }
+    if (row) { const sum = row.orchard + (prev.found && prev.found.length && prev.n === n ? prev.total : 0n); if (!best || sum > best.sum) best = { n, row, rows, sum }; }
   }
   if (!best) { line.textContent = "No shielded ZEC found on this address's transfer wallets."; lostNone.delete(k); render(); return; }
-  const prev = lost.get(k) || {}; lost.set(k, { ...prev, f, hit, n: best.n, found: prev.found && prev.n === best.n ? prev.found : [], total: best.row.orchard, shielded: { account: best.row.account, blockTimeSec: bt } }); lostNone.delete(k); renderHops(); render();
+  const keep = prev.found && prev.n === best.n;      // transparent findings of another wallet are not mixed in; a note says they exist
+  const other = prev.found && prev.found.length && !keep ? " Transparent ZEC (" + zecText(prev.total) + ") also sits on another transfer wallet of this address; recover this one first, then check again." : "";
+  lost.set(k, { ...prev, f, hit, n: best.n, found: keep ? prev.found : [], total: best.row.orchard + (keep ? prev.total : 0n), young: keep ? prev.young : false, contAcct: keep ? prev.contAcct : null, maxLocal: rg.maxLocal, truncated: !!(rg.capped || (keep && prev.truncated)), shielded: { account: best.row.account, blockTimeSec: bt } });
+  line.textContent = other.trim(); lostNone.delete(k); renderHops(); render();
+}
+const lostLock = stealth => fn => underHopLock(stealth, fn);      // 1133 M-2: the app's own hop lock around find + write (undefined = another tab holds it)
+const NOT_ADOPTED = r => new Error(r.reason === "newer" ? "A newer transfer record exists in this browser, so this earlier transfer wallet cannot be recovered from here." : "A transfer record for this payment already exists in this browser (another tab or an earlier press). Nothing was changed; reload and use its card.");
+// 1133 M-1: re-checked at the moment of the click with a fresh tip, not only when the card was drawn
+async function lostGuard(l) {
+  const ZR = await import("./zec-return.js"), { zcash: ZC } = await import("./chains.js"), HM = await hopMod(); let tip = null; try { tip = await ZR.getTip(ZC.lightwalletd); } catch {}
+  if (l.found.length && HM.lostYoung(l.found, tip)) { l.young = true; renderHops(); throw new Error("This may still be running on another device: its ZEC is too recent to touch. Try again in about 2 hours."); }
 }
 async function lostReturn(k, l, card, line) {
-  const HM = await hopMod(), ctx = { store: HM.idbStore(), stealth: l.f.stealth }, r = await HM.adoptLostHop(ctx, { as: "return", n: l.n, zats: l.total, chain: C, dest: C });
+  await lostGuard(l);
+  const HM = await hopMod(), ctx = { store: HM.idbStore(), stealth: l.f.stealth, lock: lostLock(l.f.stealth) }, r = await HM.adoptLostHop(ctx, { as: "return", n: l.n, zats: l.total, chain: C, dest: C });
+  if (!r.created) throw NOT_ADOPTED(r);
   const rec = await HM.findHop(ctx.store, l.f.stealth); if (!rec) throw new Error("could not save the recovered transfer");
   lost.delete(k); const h = { f: l.f, hit: l.hit, running: false, msg: "", st: rec.rec.st }; hops.set(k, h);
   await returnZec(h, card);
@@ -288,12 +306,14 @@ async function lostReturn(k, l, card, line) {
 async function lostContinue(k, l, to, line) {
   if (!self.crossOriginIsolated) throw new Error("This page cannot run the Zcash wallet here (it is not cross-origin isolated).");
   if (!vetRecipient(to, l.f)) { line.textContent = "Cancelled."; return; }
+  await lostGuard(l);
   line.textContent = "Checking the recipient…"; await screenRecipient(to);
-  const HM = await hopMod(), { zcash: ZC } = await import("./chains.js"), ZR = await import("./zec-return.js"), ctx = { store: HM.idbStore(), stealth: l.f.stealth };
+  const HM = await hopMod(), { zcash: ZC } = await import("./chains.js"), ZR = await import("./zec-return.js"), ctx = { store: HM.idbStore(), stealth: l.f.stealth, lock: lostLock(l.f.stealth) };
   let birthday, account, zats = l.total;
-  if (l.shielded) { birthday = HM.birthdayFromTime(l.shielded.blockTimeSec, await ZR.getTip(ZC.lightwalletd)); account = l.shielded.account; }
-  else { const top = l.found.slice().sort((a, b) => (b.value > a.value ? 1 : -1))[0]; account = top.account; zats = top.value; const hs = l.found.map(x => x.height).filter(x => x > 0); birthday = (hs.length ? Math.min(...hs) : (await ZR.getTip(ZC.lightwalletd)) - 5000) - 10; }
-  await HM.adoptLostHop(ctx, { as: "continue", n: l.n, account, birthday, zats, recipient: to, chain: C, dest: C });
+  if (l.shielded) { if (l.found.length) throw new Error("ZEC also sits on the transparent addresses: press Return money first."); birthday = HM.birthdayFromTime(l.shielded.blockTimeSec, await ZR.getTip(ZC.lightwalletd)); account = l.shielded.account; }
+  else { account = HM.lostContinueAcct(l.found); if (account == null) throw new Error("The ZEC is on several accounts: press Return money first, it sweeps all of them."); zats = l.found.reduce((s, x) => s + x.value, 0n); const hs = l.found.map(x => x.height).filter(x => x > 0); birthday = (hs.length ? Math.min(...hs) : (await ZR.getTip(ZC.lightwalletd)) - 5000) - 10; }
+  const r = await HM.adoptLostHop(ctx, { as: "continue", n: l.n, account, birthday, zats, recipient: to, chain: C, dest: C });
+  if (!r.created) throw NOT_ADOPTED(r);      // 1133 L-1: never run on another record's recipient
   lost.delete(k); renderHops(); render(); await runHop(l.f, l.hit, null);
 }
 // 1105 L-4: every writer of a hop record outside the machine takes the machine's own Web Lock (non-blocking). If the hop is running (or another writer is) the write is skipped, never interleaved.
@@ -345,9 +365,11 @@ async function returnZec(h, card) {
   const sw = ZR.buildSweep({ utxos, key, to: j.quote.depositAddress, tip: await ZR.getTip(ZC.lightwalletd) });
   if (sw.amount !== BigInt(j.quote.amountIn)) throw new Error("amount mismatch; refusing");
   const intent = { txid: sw.txid, deposit: j.quote.depositAddress, amountOut: j.quote.amountOut, at: Date.now(), expiry: sw.expiry };
-  const saved = await underHopLock(h.f.stealth, async () => { const rr = await HM.findHop(HM.idbStore(), h.f.stealth); if (!rr) return false; rr.rec.st = { ...rr.rec.st, sweep: intent }; await HM.idbStore().put(rr.key, rr.rec); return true; }).catch(() => false);
-  if (!saved) throw new Error("Could not record the return before sending it (the transfer may be running in another tab). Nothing was sent; try again in a minute.");        // recorded BEFORE broadcasting
-  await ZR.sendAndConfirm(ZC.lightwalletd, sw.raw, undefined, sw.txid);        // 1100 L-2: the node must hand our exact bytes back before this counts as sent
+  // 1133 L-3: the hop lock is held from recording the intent through the broadcast, so a resume (Halt / auto-retry) cannot shield the same outputs meanwhile. Nothing inside takes the lock again; the broadcast is bounded by its own request timeouts plus 5 min
+  const saved = await underHopLock(h.f.stealth, async () => {
+    try { const rr = await HM.findHop(HM.idbStore(), h.f.stealth); if (!rr) return false; rr.rec.st = { ...rr.rec.st, sweep: intent }; await HM.idbStore().put(rr.key, rr.rec); } catch { return false; }      // recorded BEFORE broadcasting
+    await HM.withTimeout(ZR.sendAndConfirm(ZC.lightwalletd, sw.raw, undefined, sw.txid), 5 * 60_000, "Zcash broadcast"); return true; });        // 1100 L-2: the node must hand our exact bytes back before this counts as sent
+  if (!saved) throw new Error("Could not record the return before sending it (the transfer may be running in another tab). Nothing was sent; try again in a minute.");
   await finishSweep(HM, h, step, intent);
 }
 async function finishSweep(HM, h, step, sw) {
@@ -454,8 +476,10 @@ const walletRpc = async (_u, init) => { const { method, params } = JSON.parse(in
 // chain reads: the chain's public RPC directly (CORS open, listed in the page CSP)
 // 1101 L-3/L-5: reads that name a stealth address NEVER fall back to the wallet's provider (it already knows the account and IP); only `allowWallet` calls (the token's domain separator) may. All reads time out.
 const chainRpc = async (u, init, allowWallet = false) => { try { const r = await fetch(u, { ...init, signal: init.signal || timeoutSignal() }); if (r.ok) { const j = await r.clone().json().catch(() => null); if (j && j.result !== undefined) return r; } } catch {} if (allowWallet) return walletRpc(u, init); throw new Error("the chain RPC did not answer"); };
+// 1133 L-5: a rebuilt transfer has no original amount to check a quote against, so the user sees what was found, what is sent and what comes out, and confirms
+const confirmRebuiltQuote = q => confirm("Found on the transfer wallet: " + zecText(q.zecFound) + " ZEC.\nThis payout sends " + zecText(q.amount) + " ZEC" + (q.zatsLeft > q.amount ? " (of " + zecText(q.zatsLeft) + " ZEC still to send)" : "") + " and pays out about " + fmtTok(q.amountOut) + " " + SYM + " (≈ " + (Number(q.amountOut) / TUNIT / (Number(q.amount) / 1e8)).toFixed(2) + " " + SYM + " per ZEC) to " + q.recipient + ".\nThe network fee and swap fee are inside that figure. Pay out at this quote?");
 const hopCtx = async (HM, f, hit, o) => ({ getUtxos: HM.makeGetUtxos(), authUsed: HM.makeAuthUsed(C, chainRpc), countPriorHops: HM.makeCountPriorHops(C, chainRpc), txKnown: HM.makeTxKnown(), store: HM.idbStore(), stealth: f.stealth, priv: hit.stealthPriv, chain: C, api: API, words: await HM.loadWords(), loadZjs: HM.sharedZjs, waitReceipt, randomNonce: randomBytes32,
-  balance: async () => (await getBalances(rpcBatch, USDC, [f.stealth])).get(f.stealth.toLowerCase()).usdc, onProgress: (s, m) => hopProgress(f, s, m), ...o });
+  confirmQuote: q => confirmRebuiltQuote(q), balance: async () => (await getBalances(rpcBatch, USDC, [f.stealth])).get(f.stealth.toLowerCase()).usdc, onProgress: (s, m) => hopProgress(f, s, m), ...o });
 const rpcOne = async (method, params) => { const r = await chainRpc(C.rpc, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ jsonrpc: "2.0", id: 1, method, params }) }); const j = await r.json(); if (j.error) throw new Error(j.error.message || "rpc error"); return j.result; };
 const rpcBatch = async calls => { try { return await fetchBatch(fetch, C.rpc, calls); } catch { const out = []; for (let i = 0; i < calls.length; i += 10) out.push(...await Promise.all(calls.slice(i, i + 10).map(([m, p]) => rpcOne(m, p)))); return out; } };
 async function holdScreen() { try { return navigator.wakeLock ? await navigator.wakeLock.request("screen") : null; } catch { return null; } }

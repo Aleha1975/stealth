@@ -628,7 +628,7 @@ const tAddrOf = async (n, a, i = 0) => ZRm.deriveT(await H.mnemonicSeed(await H.
   const gaps = []; await H.findLostFunds({ ...base0, gapMs: 150, sleep: async ms => gaps.push(ms), store: sA, priorHops: 1, getUtxos: gu({}) });
   ok("G lookups are rate limited (a pause after every query)", gaps.length === 15 && gaps.every(g => g === 150));
   const sB = H.memStore(); await sB.put(STEALTH.toLowerCase() + "#0", { st: { v: 2, n: 0, stealth: STEALTH, step: "SHIELD", marker: "mine" }, db: null }); calls = 0;
-  const skip = await H.findLostFunds({ ...base0, store: sB, getUtxos: gu({ [a40]: [{ txid: "11".repeat(32), n: 0, value: FOUND, height: 3_500_100 }] }) });
+  const skip = await H.findLostFunds({ ...base0, store: sB, priorHops: 1, getUtxos: gu({ [a40]: [{ txid: "11".repeat(32), n: 0, value: FOUND, height: 3_500_100 }] }) });
   ok("G a payment that has a local hop record is left alone (no lookups, nothing offered)", skip.skipped === "record" && calls === 0);
   // adopt
   const sC = H.memStore(); const r1 = await H.adoptLostHop({ store: sC, stealth: STEALTH }, { as: "return", n: 0, zats: FOUND, chain: rh, dest: rh }); const rec1 = await H.findHop(sC, STEALTH);
@@ -642,11 +642,97 @@ const tAddrOf = async (n, a, i = 0) => ZRm.deriveT(await H.mnemonicSeed(await H.
   // the rebuilt record runs: the existing machine shields and pays out
   const wG = makeWorld(), sG = H.memStore(); off = 0; await H.adoptLostHop({ store: sG, stealth: STEALTH }, { as: "continue", n: 0, account: 0, birthday: 3_499_990, zats: FOUND, recipient: A, chain: rh, dest: base });
   const addr0 = await tAddrOf(0, 0); wG.tBal[tOf(mn.slice(0, 20) + 0)] = 10_000_000n;
-  const stG = await H.runHop(mkCtx(wG, sG, { chain: rh, dest: base, getUtxos: async () => [] }));
+  let asked = null; const stG = await H.runHop(mkCtx(wG, sG, { chain: rh, dest: base, getUtxos: async () => [], confirmQuote: async q => { asked = q; return true; } }));
   ok("G the rebuilt record is resumed by the normal machine: shielded and paid out to the entered recipient, without the original-amount loss check", stG.step === "DONE" && wG.relays === 0 && wG.sig === 1 && wG.quotes.filter(q => !q.dry).every(q => q.recipient === A) && wG.delivered > 0n, stG.step + " " + stG.err);
   const srcApp = fs.readFileSync(path.join(WEB, "app.js"), "utf8");
   ok("G UI: Continue asks for the recipient and vets/screens it like a withdraw; Return uses the existing sweep; shielded balance only on an explicit button; lookups rate limited and capped; no key logging", /vetRecipient\(to, l\.f\)/.test(srcApp) && /await screenRecipient\(to\)/.test(srcApp) && /await returnZec\(h, card\)/.test(srcApp) && /Check shielded balance/.test(srcApp) && /LOST_PER_PASS/.test(srcApp) && /lostSeen\.fresh\(k\)/.test(srcApp) && !/console\.(log|info|warn|error)\([^)]*(hit|priv|mnemonic)/.test(srcApp));
-  ok("G the scan never syncs a wallet on its own (the shielded check is a separate function behind a button)", !/hopSummary/.test(srcApp.slice(srcApp.indexOf("async function checkLost"), srcApp.indexOf("function lostCard")))); }
+  ok("G the scan never syncs a wallet on its own (the shielded check is a separate function behind a button)", !/hopSummary/.test(srcApp.slice(srcApp.indexOf("async function checkLost"), srcApp.indexOf("function lostCard"))));
 
+  // ---- 1133 (round 6) regressions
+  const hu = (h, v = FOUND) => [{ txid: "11".repeat(32), n: 0, value: v, height: h }];
+  { // M-1: age of the outputs
+    const T = 3_500_500, mk = (x, extra = {}) => [{ n: 0, account: 0, index: 0, value: 1n, height: x, latest: x, pending: false, ...extra }];
+    ok("1133 M-1 LOST_MIN_AGE = 100 blocks", H.LOST_MIN_AGE === 100);
+    ok("1133 M-1 an output 99 blocks old is young, 100 is not; unconfirmed / unknown height / unknown tip are young (fail closed)", H.lostYoung(mk(T - 99), T) && !H.lostYoung(mk(T - 100), T) && H.lostYoung(mk(0, { pending: true }), T) && H.lostYoung(mk(0), T) && H.lostYoung(mk(T - 500), null) && H.lostYoung(mk(T - 500), NaN));
+    ok("1133 M-1 one young output among old ones makes the whole finding young", H.lostYoung([...mk(T - 900), ...mk(T - 5)], T) && !H.lostYoung([...mk(T - 900), ...mk(T - 700)], T));
+    const fy = await H.findLostFunds({ ...base0, store: H.memStore(), priorHops: 1, getUtxos: gu({ [a40]: [...hu(3_500_100), ...hu(3_500_300), ...hu(0)] }) });
+    ok("1133 M-1 finder reports oldest (height), newest (latest) and pending", fy.found[0].height === 3_500_100 && fy.found[0].latest === 0 && fy.found[0].pending === true);
+    const fz = await H.findLostFunds({ ...base0, store: H.memStore(), priorHops: 1, getUtxos: gu({ [a40]: [...hu(3_500_100), ...hu(3_500_300)] }) });
+    ok("1133 M-1 confirmed outputs: latest = the newest height, not pending", fz.found[0].latest === 3_500_300 && fz.found[0].height === 3_500_100 && !fz.found[0].pending);
+    const srcApp2 = fs.readFileSync(path.join(WEB, "app.js"), "utf8"), card = srcApp2.slice(srcApp2.indexOf("function lostCard"), srcApp2.indexOf("const blockTimeSec"));
+    ok("1133 M-1 UI: a young card has no Return / Continue, says it may be running elsewhere, and both actions re-check with a fresh tip", /if \(l\.young\) btn\("Check again"/.test(card) && /else if \(!older\)/.test(card) && /may still be running on another device/.test(card) && (srcApp2.match(/await lostGuard\(l\)/g) || []).length === 2 && /lostYoung\(l\.found, tip\)/.test(srcApp2));
+  }
+  { // M-2: find + write is one step
+    const slow = () => { const m = H.memStore(); return { get: async k => { await new Promise(r => setTimeout(r, 5)); return m.get(k); }, put: async (k, v) => { await new Promise(r => setTimeout(r, 5)); return m.put(k, v); }, add: m.add, keys: async () => { await new Promise(r => setTimeout(r, 5)); return m.keys(); } }; };
+    const sR = slow(), a1 = { store: sR, stealth: STEALTH }, args = (r, as = "continue") => ({ as, n: 0, recipient: r, chain: rh, dest: rh, birthday: 3_499_990 });
+    const rs = await Promise.all([H.adoptLostHop(a1, args(A)), H.adoptLostHop(a1, args("0x" + "22".repeat(20))), H.adoptLostHop(a1, args(null, "return"))]);
+    ok("1133 M-2 three parallel adopts (no lock, store.add): exactly one record is written, the others report created:false", rs.filter(r => r.created).length === 1 && (await sR.keys()).length === 1 && rs.every(r => r.key === STEALTH.toLowerCase() + "#0"), JSON.stringify(rs));
+    const winner = (await H.findHop(sR, STEALTH)).rec.st; ok("1133 M-2 ...and the stored record is the winner's, not overwritten", [A, "0x" + "22".repeat(20), null].includes(winner.recipient));
+    const putOnly = (() => { const m = H.memStore(); return { get: m.get, put: m.put, keys: async () => { await new Promise(r => setTimeout(r, 5)); return m.keys(); } }; })(); let q = Promise.resolve();
+    const lk = fn => { const r = q.then(fn); q = r.catch(() => {}); return r; };
+    const rp = await Promise.all([1, 2, 3].map(() => H.adoptLostHop({ store: putOnly, stealth: STEALTH, lock: lk }, args(A))));
+    ok("1133 M-2 a store without add still works under ctx.lock (find + put serialised): one record", rp.filter(r => r.created).length === 1 && (await putOnly.keys()).length === 1);
+    const busy = await H.adoptLostHop({ store: H.memStore(), stealth: STEALTH, lock: async () => undefined }, args(A)).then(() => "no", e => e.message);
+    ok("1133 M-2 a lock another tab holds (undefined) is an error, nothing written", /another tab/.test(busy));
+    const sE = H.memStore(); await sE.add("k", { a: 1 }); const dup = await sE.add("k", { a: 2 }).then(() => null, e => e.code);
+    ok("1133 M-2 store.add fails on an existing key and keeps the old value", dup === "EXISTS" && (await sE.get("k")).a === 1);
+    const srcHop = fs.readFileSync(path.join(WEB, "zec-hop.js"), "utf8"); ok("1133 M-2 the IndexedDB store's add is a readwrite add() that maps ConstraintError to EXISTS", /add: \(k, v\) => open\(\)/.test(srcHop) && /\.add\(v, k\)/.test(srcHop) && /ConstraintError/.test(srcHop));
+    const srcA = fs.readFileSync(path.join(WEB, "app.js"), "utf8"); ok("1133 M-2 UI: both adopt calls carry the app's hop lock", (srcA.match(/lock: lostLock\(l\.f\.stealth\)/g) || []).length === 2);
+    const sN = H.memStore(); await sN.put(STEALTH.toLowerCase() + "#3", { st: { v: 2, n: 3, step: "DONE" }, db: null });
+    const low = await H.adoptLostHop({ store: sN, stealth: STEALTH }, args(A));
+    ok("1133 M-2 a record below the newest one is not adopted (findHop would hide it): created:false, reason newer", !low.created && low.reason === "newer" && (await sN.keys()).length === 1);
+  }
+  { // L-1
+    const srcA = fs.readFileSync(path.join(WEB, "app.js"), "utf8"), lc = srcA.slice(srcA.indexOf("async function lostContinue"), srcA.indexOf("// 1105 L-4"));
+    ok("1133 L-1 lostContinue aborts when no record was created, before running the machine", /if \(!r\.created\) throw NOT_ADOPTED\(r\)/.test(lc) && lc.indexOf("NOT_ADOPTED(r)") < lc.indexOf("await runHop(") && /already exists/.test(srcA) && /const r = await HM\.adoptLostHop/.test(lc));
+    ok("1133 L-1 ...and so does Return (it would otherwise sweep the wallet of another record)", /if \(!r\.created\) throw NOT_ADOPTED\(r\)/.test(srcA.slice(srcA.indexOf("async function lostReturn"), srcA.indexOf("async function lostContinue"))));
+  }
+  { // L-2
+    let c = 0; const g2 = async () => { c++; return []; }, mkS = async ns => { const s = H.memStore(); for (const n of ns) await s.put(STEALTH.toLowerCase() + "#" + n, { st: { v: 2, n }, db: null }); return s; };
+    c = 0;
+    const r7 = await H.findLostFunds({ ...base0, store: await mkS([2]), priorHops: 7, getUtxos: async addr => { c++; return []; } });
+    ok("1133 L-2 priorHops 7, a record only for n=2: the other six wallets are scanned (n >= 4 too), n=2 is skipped", c === 6 * 15 && r7.found.length === 0 && r7.maxLocal === 2, "calls " + c);
+    const hit6 = await (async () => { const ZRm = await import("../web/zec-return.js"); const seed = await H.mnemonicSeed(await H.mnemonicFor(PRIV, words, 6)); return ZRm.deriveT(seed, ZRm.tPath(0, 0)).addr; })();
+    const f6 = await H.findLostFunds({ ...base0, store: H.memStore(), priorHops: 7, getUtxos: gu({ [hit6]: hu(3_500_100) }) });
+    ok("1133 L-2 a hop wallet n=6 (the seventh transfer) is found", f6.found.length === 1 && f6.found[0].n === 6 && f6.total === FOUND && f6.maxLocal === -1);
+    c = 0; const rb = await H.findLostFunds({ ...base0, store: await mkS([0, 1]), priorHops: 2, getUtxos: g2 });
+    ok("1133 L-2 every n below the count has a record -> skipped, no lookups", rb.skipped === "record" && c === 0);
+    calls = 0; const rh2 = await H.findLostFunds({ ...base0, store: H.memStore(), priorHops: 1_000_000_000, getUtxos: gu({}) });
+    ok("1133 L-2 bounded: a huge count scans only the newest LOST_MAX_N wallets and says it is truncated", calls === H.LOST_MAX_N * 15 && rh2.truncated === true && H.LOST_MAX_N === 8, "calls " + calls);
+    const rg = H.lostRange(3, [1]); ok("1133 L-2 lostRange: unknown count -> LOST_N, local records excluded, negative / fractional counts are not trusted", JSON.stringify(H.lostRange(null, []).ns) === "[0,1,2,3]" && JSON.stringify(rg.ns) === "[0,2]" && rg.maxLocal === 1 && H.lostRange(-5, []).ns.length === 4 && H.lostRange(2.5, []).ns.length === 4);
+  }
+  { // L-3
+    const srcA = fs.readFileSync(path.join(WEB, "app.js"), "utf8"), rz = srcA.slice(srcA.indexOf("async function returnZec"), srcA.indexOf("async function finishSweep")), i0 = rz.indexOf("underHopLock(h.f.stealth"), i1 = rz.indexOf("ZR.sendAndConfirm"), i2 = rz.indexOf("if (!saved)");
+    ok("1133 L-3 returnZec records the intent AND broadcasts inside one hop lock, bounded by a timeout, with no second underHopLock inside it", i0 > 0 && i0 < i1 && i1 < i2 && /withTimeout\(ZR\.sendAndConfirm/.test(rz) && (rz.slice(i0, i2).match(/underHopLock/g) || []).length === 1);
+    ok("1133 L-3 ...and the polling of the swap (finishSweep) stays outside the lock", rz.indexOf("await finishSweep(HM, h, step, intent)") > i2);
+  }
+  { // L-4
+    const f = (account, index) => ({ n: 0, account, index, value: 1n, height: 1, latest: 1 });
+    ok("1133 L-4 Continue only when all the ZEC is on one account at index 0; several accounts -> null (Return sweeps them)", H.lostContinueAcct([f(2, 0)]) === 2 && H.lostContinueAcct([f(2, 0), f(2, 0)]) === 2 && H.lostContinueAcct([f(0, 0), f(1, 0)]) === null && H.lostContinueAcct([f(0, 1)]) === null && H.lostContinueAcct([]) === null);
+    const srcA = fs.readFileSync(path.join(WEB, "app.js"), "utf8"), ls = srcA.slice(srcA.indexOf("async function lostShielded"), srcA.indexOf("const lostLock")), lc = srcA.slice(srcA.indexOf("async function lostContinue"), srcA.indexOf("// 1105 L-4"));
+    ok("1133 L-4 lostShielded looks at every wallet (lostRange), keeps transparent findings of the same wallet, notes those of another, and does not stop at the first n", /HM\.lostRange\(cnt/.test(ls) && !/\bbreak\b/.test(ls) && /prev\.found && prev\.n === best\.n/.test(ls) && /also sits on another transfer wallet/.test(ls));
+    ok("1133 L-4 lostContinue refuses ZEC spread over accounts, and a shielded find with transparent ZEC beside it", /lostContinueAcct\(l\.found\)/.test(lc) && /several accounts/.test(lc) && /Return money first/.test(lc));
+  }
+  { // L-5
+    const mkW = () => { const w = makeWorld(); off = 0; w.tBal[tOf(mn.slice(0, 20) + 0)] = 10_000_000n; return w; };
+    const adopt = async () => { const s = H.memStore(); await H.adoptLostHop({ store: s, stealth: STEALTH }, { as: "continue", n: 0, account: 0, birthday: 3_499_990, zats: FOUND, recipient: A, chain: rh, dest: base }); return s; };
+    const w0 = mkW(), s0 = await adopt(), st0 = await H.runHop(mkCtx(w0, s0, { chain: rh, dest: base, getUtxos: async () => [] }));
+    ok("1133 L-5 no way to ask -> the rebuilt hop halts before any payout (fails closed)", st0.step !== "DONE" && st0.halted === true && /confirmation/.test(st0.err) && !w0.delivered && !(await latest(s0)).st.quoteOk && !(await latest(s0)).st.parts.some(p => p.raw), st0.step + " " + st0.err);
+    const w1 = mkW(), s1 = await adopt(), st1 = await H.runHop(mkCtx(w1, s1, { chain: rh, dest: base, getUtxos: async () => [], confirmQuote: async () => false }));
+    ok("1133 L-5 the user declines -> Halt, nothing signed or sent, not remembered as confirmed", st1.halted === true && /not confirmed/.test(st1.err) && !w1.delivered && !(await latest(s1)).st.quoteOk, st1.step + " " + st1.err);
+    ok("1133 L-5 the confirmation gets st.zecFound, the amount to send, what comes out and the recipient; asked once for the whole transfer", asked && asked.zecFound === FOUND && asked.amount > 0n && asked.amountOut > 0n && asked.recipient === A && asked.zatsLeft >= asked.amount && stG.quoteOk === true);
+    let n2 = 0; const w2 = mkW(), s2 = await adopt(), st2 = await H.runHop(mkCtx(w2, s2, { chain: rh, dest: base, getUtxos: async () => [], confirmQuote: async () => { n2++; return true; } }));
+    ok("1133 L-5 confirmed -> pays out; one question even with several payout parts", st2.step === "DONE" && n2 === 1 && (st2.parts || []).length >= 1, st2.step + " " + st2.err + " asked " + n2);
+    const srcA = fs.readFileSync(path.join(WEB, "app.js"), "utf8"); ok("1133 L-5 UI: hopCtx passes confirmQuote, which shows the found amount and the quote and asks", /confirmQuote: q => confirmRebuiltQuote\(q\)/.test(srcA) && /Pay out at this quote\?/.test(srcA) && /zecText\(q\.zecFound\)/.test(srcA));
+    const srcH = fs.readFileSync(path.join(WEB, "zec-hop.js"), "utf8"); ok("1133 L-5 no price cap was invented: the rebuilt record is still exempt from the loss limit", /const loss = st\.rebuilt \? 0 :/.test(srcH));
+  }
+  { // I-4
+    const rows = [{ stealth: STEALTH, block: 900 }, { stealth: STEALTH.toUpperCase().replace("0X", "0x"), block: 500 }, { stealth: "0x" + "cd".repeat(20), block: 100 }, { stealth: STEALTH, block: 0 }];
+    ok("1133 I-4 firstBlock: the EARLIEST announcement of the address (a later top-up announcement can never move the birthday past the note), ignoring other addresses and unknown blocks", H.firstBlock(rows, STEALTH) === 500 && H.firstBlock([], STEALTH) === null);
+    const srcA = fs.readFileSync(path.join(WEB, "app.js"), "utf8"); ok("1133 I-4 lostShielded derives the birthday from firstBlock, not from whichever payment row came first", /blockTimeSec\(HM\.firstBlock\(found, f\.stealth\) \|\| f\.block\)/.test(srcA));
+    const late = H.birthdayFromTime(1_000_000, 3_500_000, 1_000_000 + 6000), early = H.birthdayFromTime(1_000_000 - 3600, 3_500_000, 1_000_000 + 6000);
+    ok("1133 I-4 an earlier anchor gives an earlier birthday (so the earliest payment is the safe one)", early < late);
+  }
+}
 Date.now = realNow;
 console.log(fails ? fails + " FAILED" : "all passed"); process.exit(fails ? 1 : 0);
