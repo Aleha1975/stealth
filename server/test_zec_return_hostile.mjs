@@ -109,15 +109,34 @@ ok("r2 L-1 tipWithinClock: anchor block, +1 day, and a tip 1 day ahead of the cl
   ok("r2 L-2 abort of SendTransaction is resolved by the lookup (known -> sent; unknown -> error that names the abort)", (await R.sendAndConfirm("https://lw", RAW, node({ sendThrows: true, get: got(RAW) }), TX, noSleep)) === TX && await rejects(R.sendAndConfirm("https://lw", RAW, node({ sendThrows: true }), TX, noSleep), /aborted/));
   ok("r2 L-2 network rejection is final and never looked up", await rejects(R.sendAndConfirm("https://lw", RAW, node({ send: cat(fr(0, cat(vf(1, 18), ld(2, enc("bad-txns")))), OKT), get: got(RAW) }), TX, noSleep), /Rejected by network/)); }
 
-// L-3 dust flood: reads stop after the first 500 valid entries instead of failing
-{ const ent = i => ld(1, U({ txid: ld(1, Uint8Array.from({ length: 32 }, (_, k) => k === 0 ? i & 255 : k === 1 ? i >> 8 : 7)), value: vf(4, 1000 + i) }));
-  const big = n => cat(...Array.from({ length: n }, (_, i) => ent(i)));
+// L-3 / 1103 M-1 flood: the cap counts entries worth spending (>= 5001 zat); dust never pushes the real deposit out of view
+{ const ent = (i, v = 6000 + i, h = 3_600_000) => ld(1, U({ txid: ld(1, Uint8Array.from({ length: 32 }, (_, k) => k === 0 ? i & 255 : k === 1 ? i >> 8 : 7)), value: vf(4, v), height: vf(5, h) }));
+  const big = (n, v) => cat(...Array.from({ length: n }, (_, i) => ent(i, v === undefined ? undefined : v + i)));
   const flood = await R.getUtxos("https://lw", key.addr, mk(cat(fr(0, big(9000)), OKT)));
-  ok("r2 L-3 9000 entries (frame > 1 MiB): first 500 returned, truncated flagged, no failure", flood.length === 500 && flood.truncated === true && flood[0].value === 1000n, flood.length);
-  const huge = cat([0, 0, 0x40, 0, 0], big(30000));    // 3+ MiB body, never completed: the read stops at the cap and still yields 500
-  ok("r2 L-3 body over the 2 MiB cap (streamed, incomplete) still yields the first 500", (await R.getUtxos("https://lw", key.addr, async () => ({ ok: true, status: 200, headers: { get: () => null }, body: { getReader: () => { let n = 0; return { read: async () => n < huge.length ? { done: false, value: huge.slice(n, n += 1 << 18) } : { done: true }, cancel: async () => {} }; } } }))).length === 500);
-  ok("r2 L-3 a malformed entry AFTER the first 500 is ignored; before it, still refused", (await R.getUtxos("https://lw", key.addr, mk(cat(fr(0, cat(big(500), ld(1, [1, 2]))), OKT)))).length === 500 && await rejects(R.getUtxos("https://lw", key.addr, mk(cat(fr(0, cat(big(3), ld(1, [1, 2]))), OKT)))));
-  ok("r2 L-3 under the cap nothing is flagged", (await R.getUtxos("https://lw", key.addr, mk(cat(fr(0, big(10)), OKT)))).truncated === false); }
+  ok("r2 L-3 9000 spendable entries (frame > 1 MiB): read in capped pages (stops when the height does not advance), truncated flagged, no failure", flood.length === 1000 && flood.truncated === true && flood[0].value === 6000n, flood.length);
+  const huge = cat([0, 0, 0x40, 0, 0], big(30000));    // 3+ MiB body, never completed: each page stops at 500 spendable entries
+  const streamed = body => async () => ({ ok: true, status: 200, headers: { get: () => null }, body: { getReader: () => { let n = 0; return { read: async () => n < body.length ? { done: false, value: body.slice(n, n += 1 << 18) } : { done: true }, cancel: async () => {} }; } } });
+  ok("r2 L-3 body over the 2 MiB cap (streamed, incomplete) still yields entries", (await R.getUtxos("https://lw", key.addr, streamed(huge))).length >= 500);
+  ok("r2 L-3 a malformed entry AFTER the first 500 spendable is ignored; before it, still refused", (await R.getUtxos("https://lw", key.addr, mk(cat(fr(0, cat(big(500), ld(1, [1, 2]))), OKT)))).length >= 500 && await rejects(R.getUtxos("https://lw", key.addr, mk(cat(fr(0, cat(big(3), ld(1, [1, 2]))), OKT)))));
+  ok("r2 L-3 under the cap nothing is flagged", (await R.getUtxos("https://lw", key.addr, mk(cat(fr(0, big(10)), OKT)))).truncated === false);
+  // 1103 M-1: a dust prefix (600 x 1000 zat) in front of the real deposit
+  const prefix = cat(big(600, 1000), ent(700, 2_000_000, 3_600_005)), dl = await R.getUtxos("https://lw", key.addr, mk(cat(fr(0, prefix), OKT)));
+  ok("1103 M-1 dust prefix: the real deposit is still listed and swept", dl.length === 601 && dl.truncated === false && R.sweepSet(dl).length === 1 && R.sweepSet(dl)[0].value === 2_000_000n);
+  const dustOnly = await R.getUtxos("https://lw", key.addr, mk(cat(fr(0, big(900, 1000)), OKT)));
+  ok("1103 M-1 dust only: listed (not empty), nothing spendable, not flagged as empty-able", dustOnly.length === 900 && R.sweepSet(dustOnly).length === 0);
+  // paging by height against a server that honours startHeight
+  const startOf = body => { const b = body.slice(5); let i = 0; while (i < b.length) { const k = b[i++]; const no = k >> 3, w = k & 7; if (w === 2) { const l = b[i++]; i += l; } else { let n = 0, sh = 0, x; do { x = b[i++]; n |= (x & 127) << sh; sh += 7; } while (x & 128); if (no === 2) return n; } } return 0; };
+  const all = Array.from({ length: 1300 }, (_, i) => ({ i, h: 3_600_000 + i }));
+  const honest = total => async (u, init) => { const st = startOf(init.body), rows = Array.from({ length: total }, (_, i) => ({ i, h: 3_600_000 + i })).filter(r => r.h >= st); return resp(cat(fr(0, cat(...rows.map(r => ent(r.i, 6000 + r.i, r.h)))), OKT)); };
+  const pg = await R.getUtxos("https://lw", key.addr, honest(1300));
+  ok("1103 M-1 paging: 1300 spendable entries are read across pages (boundary entries not duplicated), not truncated", pg.length === 1300 && new Set(pg.map(u => u.txid)).size === 1300 && pg.truncated === false, pg.length);
+  const pg2 = await R.getUtxos("https://lw", key.addr, honest(4000));
+  ok("1103 M-1 paging is bounded (6 pages) and says so", pg2.length === 3000 && pg2.truncated === true, pg2.length);
+  // 1103 L-3: a cut reply honours the first frame's length; inner-entry errors are not mistaken for a cut
+  const one = fr(0, ent(1, 9000)), junk = new Uint8Array(3 << 20).fill(0x0a), cutOk = await R.getUtxos("https://lw", key.addr, streamed(cat(one, junk)));
+  ok("1103 L-3 cut reply: only the first frame's message is parsed, trailing bytes are not content", cutOk.length === 1 && cutOk[0].value === 9000n, cutOk.length);
+  ok("1103 L-3 cut reply: an inner entry error (even one saying 'truncated') is reported as itself", await rejects(R.getUtxos("https://lw", key.addr, streamed(cat([0, 0, 0x40, 0, 0], ld(1, [0x0a, 0x30]), big(30000)))), /protobuf: truncated field/));
+  ok("1103 L-3 cut reply with a bad grpc-status trailer inside the read is refused", await rejects(R.getUtxos("https://lw", key.addr, streamed(cat(one, trailer("grpc-status: 13\r\n"), junk))), /error 13/)); }
 
 // M-1 "empty" never hides by itself
 { const T0 = 1_000_000_000_000, min = 60_000; let o = R.noteEmpty(null, true, T0);

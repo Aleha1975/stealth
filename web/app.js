@@ -4,7 +4,7 @@ import { paymentNonce, receiveTypedData, splitSig, payAmounts as calcAmounts, fe
 import { CHAINS, pickChain, chainOfMeta, addChainParams } from "./chains.js";
 import * as PW from "./private-withdraw.js";
 import { hopCard, hopView, statusLine } from "./hop-card.js";
-import { getBalances, fetchBatch, authorizationUsed, waitFinal, hasTransfer, hasPaid, recentLogs, TRANSFER_TOPIC, PAID_TOPIC, ETH_TOKEN } from "./chain-read.js";
+import { getBalances, fetchBatch, authorizationUsed, waitFinal, hasTransfer, hasPaid, hasAuthUsed, recentLogs, timeoutSignal, TRANSFER_TOPIC, PAID_TOPIC, AUTH_USED_TOPIC, ETH_TOKEN } from "./chain-read.js";
 
 const C = pickChain(), TOK = C.token, SYM = TOK.symbol, NAT = C.native.symbol;
 const USDC = TOK.address, STEALTHPAY = C.stealthPay, CHAIN_HEX = C.chainHex, API = C.api || "/stealth-api";
@@ -38,7 +38,7 @@ if (q.get("to")) { $("to-meta").value = q.get("to"); document.querySelector('[da
 else if (["receive", "payments", "pay"].includes(q.get("tab"))) document.querySelector('[data-pane="' + q.get("tab") + '"]').click();
 
 // ---- wallet (payer path only talks to the wallet's own provider; reads go through our API)
-async function api(path) { const r = await fetch(API + path, { cache: "no-store" }); const d = await r.json(); if (!r.ok || d.error) throw new Error(d.error || ("api " + r.status)); return d; }
+async function api(path) { const r = await fetch(API + path, { cache: "no-store", signal: timeoutSignal(30000) }); const d = await r.json(); if (!r.ok || d.error) throw new Error(d.error || ("api " + r.status)); return d; }
 async function wallet(method, params) { return window.ethereum.request({ method, params }); }
 function setAcct(a) {
   const changed = acct && (a || "").toLowerCase() !== acct;
@@ -83,7 +83,7 @@ if (window.ethereum) {
 }
 
 // ---- receive: keys from one typed-data signature, verified to come from this account
-$("btn-keys").addEventListener("click", async () => {
+$("btn-keys").addEventListener("click", once(async () => {
   try {
     if (!acct && !(await connect())) return;
     // audit 1086/1098 M-1 (accepted risk): this signature IS the master key of every stealth address of this account on every chain; any site that obtains the same signature can spend and see everything.
@@ -112,7 +112,7 @@ $("btn-keys").addEventListener("click", async () => {
     else say("recv-hint", "Keys derived in this browser. They are not stored anywhere. Remember: the key signature is the master key; sign it only on " + location.host + ".", "ok");
     $("scan-note").textContent = "Ready to scan " + C.name + " for payments to your keys.";
   } catch (e) { say("recv-hint", e.message || String(e), "bad"); }
-});
+}));
 $("copy-link").addEventListener("click", () => navigator.clipboard.writeText($("paylink").textContent).then(() => say("recv-hint", "Link copied.", "ok")));
 $("copy-meta").addEventListener("click", () => navigator.clipboard.writeText($("meta").textContent).then(() => say("recv-hint", "Meta-address copied.", "ok")));
 
@@ -143,21 +143,22 @@ async function getPages(man) {
 }
 // ---- payments: scan announcements (indexed by us), check each with the viewing key, balances via our API
 // After a withdraw the indexer's balance cache (~15 s) can still show the old amount: cap it by what we know is left.
+const pendingWd = new Map();   // stealth -> until (ms): a withdrawal was handed to the relayer and is not confirmed yet (1101 L-2)
 const spent = new Map();   // stealth -> { left, until }
 async function scan() {
   if (!keys) { say("pay-hint", "Derive your keys first (Receive tab).", "bad"); return; }
   const head = await api("/head");
   if (head.lag != null && head.lag > 50) say("pay-hint", "Index is " + head.lag + " blocks behind the chain; very recent payments may not show yet.", "warn");
   else say("pay-hint", "Reading announcements on " + C.name + "…");
-  found = []; let n = 0;
+  const K = keys, mine = []; let n = 0;                      // 1101 I-2: this run works on its own list and its own keys; a changed account discards it
   const check = (id, block, tx, stealth, eph, meta, payer) => {
     n++;
     if (!eph || !isHash(tx) || !isAddr(stealth)) return;
     const md = decodeMetadata(meta) || {};
-    for (const [k, legacy] of keys.legacy ? [[keys, false], [keys.legacy, true]] : [[keys, false]]) {       // 1098 L-1: legacy (raw high-s) keys are scanned too
+    for (const [k, legacy] of K.legacy ? [[K, false], [K.legacy, true]] : [[K, false]]) {       // 1098 L-1: legacy (raw high-s) keys are scanned too
       const hit = checkAnnouncement(k, eph, md.viewTag);          // view-tag filter first, full check only on a tag match
       if (!hit || hit.stealth.toLowerCase() !== stealth.toLowerCase()) continue;
-      found.push({ stealth: hit.stealth, tx, block: Number(block) || 0, token: md.token, amount: md.amount, payer: isAddr(payer) ? payer : null, eph, legacy }); return;
+      mine.push({ stealth: hit.stealth, tx, block: Number(block) || 0, token: md.token, amount: md.amount, payer: isAddr(payer) ? payer : null, eph, legacy }); return;
     }
   };
   let since = 0;
@@ -179,18 +180,28 @@ async function scan() {
     if (n % 2000 === 0 && n) say("pay-hint", n + " announcements checked…");
     if (!Array.isArray(d.rows) || !d.rows.length || d.next === since) break; since = d.next;
   }
-  await refreshBalances(false);
-  render(); showResume().catch(() => {});
-  const msg = n + " announcements scanned, " + found.length + " are yours." + (found.some(f => f.legacy) ? " Some are under your legacy keys (withdraw only)." : "");
-  if (head.lag != null && head.lag > 50) say("pay-hint", msg + " Index is " + head.lag + " blocks behind.", "warn"); else say("pay-hint", msg, "ok");
+  if (keys !== K) return;                                    // the account changed while scanning: nothing of this run is shown
+  found = mine; render(); showResume().catch(() => {});      // 1101 M-1: the payments are listed BEFORE any balance is read; a failing RPC can no longer hide them
+  const unread = await refreshBalances(true);
+  const msg = n + " announcements scanned, " + found.length + " are yours." + (found.some(f => f.legacy) ? " Some are under your legacy keys (withdraw only)." : "") + (unread ? " Balances of " + unread + " could not be read from the chain right now; scan again to retry." : "");
+  if (head.lag != null && head.lag > 50) say("pay-hint", msg + " Index is " + head.lag + " blocks behind.", "warn"); else say("pay-hint", msg, unread ? "warn" : "ok");
 }
 // audit 1098 M-2: balances are read from the chain RPC (batched), never from our indexer, so the operator cannot learn which stealth addresses belong to one user
+// Best effort and in pages (1101 M-1): one failing page leaves its rows as "not read" (usdc = null) instead of failing the whole scan. -> number of rows left unread
 async function refreshBalances(redraw = true) {
-  if (!found.length) return;
-  const list = found, b = await getBalances(rpcBatch, USDC, list.map(f => f.stealth));
-  for (const f of list) { const x = b.get(f.stealth.toLowerCase()); f.usdc = x.usdc; f.eth = x.eth;
-    const sp = spent.get(f.stealth.toLowerCase()); if (sp && Date.now() < sp.until && f.usdc > sp.left) f.usdc = sp.left; }
+  if (!found.length) return 0;
+  const list = found, PAGE = 50, pages = []; for (let i = 0; i < list.length; i += PAGE) pages.push(list.slice(i, i + PAGE));
+  let unread = 0, next = 0;
+  const worker = async () => { for (;;) {
+    const part = pages[next++]; if (!part) return;
+    let b = null; for (let t = 0; t < 2 && !b; t++) { try { b = await getBalances(rpcBatch, USDC, part.map(f => f.stealth)); } catch { if (t === 0) await new Promise(z => setTimeout(z, 1500)); } }
+    for (const f of part) { const x = b && b.get(f.stealth.toLowerCase());
+      if (!x) { if (f.usdc === undefined) f.usdc = null; unread++; continue; }
+      f.usdc = x.usdc; f.eth = x.eth; const sp = spent.get(f.stealth.toLowerCase()); if (sp && Date.now() < sp.until && f.usdc > sp.left) f.usdc = sp.left; }
+  } };
+  await Promise.all(Array.from({ length: Math.min(3, pages.length) }, worker));
   if (redraw && list === found) render();
+  return unread;
 }
 // ---- private transfers in flight or unfinished: stealth -> { f, hit, st, msg, running, extra }; drawn as cards at the top of My payments
 const autoTries = new Map(), hops = new Map(), TERMINAL = ["DONE", "FAILED_IN", "FAILED"];
@@ -202,14 +213,20 @@ function renderHops() {
     onReturn: (b, card) => { b.disabled = true; returnZec(h, card).catch(e => { b.disabled = false; say("pay-hint", e.message || String(e), "bad"); }); } }));
   box.hidden = !hops.size;
 }
+// 1105 L-4: every writer of a hop record outside the machine takes the machine's own Web Lock (non-blocking). If the hop is running (or another writer is) the write is skipped, never interleaved.
+const underHopLock = (stealth, fn) => navigator.locks ? navigator.locks.request("zec-hop:" + stealth.toLowerCase(), { ifAvailable: true }, l => l ? fn() : undefined) : fn();
 // ZEC stuck on the hop t-address (shielding is refused since NU6.3): sign a plain transparent tx here and swap it back to the connected wallet
 async function returnZec(h, card) {
   const [HM, ZR] = await Promise.all([hopMod(), import("./zec-return.js")]), { zcash: ZC } = await import("./chains.js");
   if (!acct) throw new Error("Connect your wallet first.");
   const line = el("div", "hop-line", "Looking for the ZEC…"); card.appendChild(line); const step = t => { line.textContent = t; };
   const seed = await HM.mnemonicSeed(await HM.mnemonicFor(h.hit.stealthPriv, await HM.loadWords(), h.st.n || 0));
-  let key = null, utxos = [];
-  for (let a = 0; a < 4 && !utxos.length; a++) for (let i = 0; i < 3 && !utxos.length; i++) { key = ZR.deriveT(seed, ZR.tPath(a, i)); utxos = ZR.sweepSet(await ZR.getUtxos(ZC.lightwalletd, key.addr)); }
+  let key = null, utxos = [], unspendable = false;
+  for (let a = 0; a < 4 && !utxos.length; a++) for (let i = 0; i < 3 && !utxos.length; i++) {
+    key = ZR.deriveT(seed, ZR.tPath(a, i)); const raw = await ZR.getUtxos(ZC.lightwalletd, key.addr); utxos = ZR.sweepSet(raw);
+    if (!utxos.length && (raw.length || raw.truncated)) unspendable = true;      // 1103 M-1: dust only, or a list too long to read to the end: that is NOT "empty"
+  }
+  if (!utxos.length && unspendable) { step("This address holds only tiny outputs (below the network fee) or more outputs than can be read at once. Nothing was removed and nothing can be swept from them yet. Try again later."); return; }
   if (!utxos.length) {                                   // the server lists nothing: that is an ANSWER of an untrusted server, not proof (1100 M-1). Never hide on one answer.
     step("Checking the shielded balance…");
     const r = await HM.findHop(HM.idbStore(), h.f.stealth), left = await HM.hopSummary(await hopCtx(HM, h.f, h.hit, null), r && r.rec);
@@ -220,17 +237,30 @@ async function returnZec(h, card) {
   }
   noteEmptyFor(HM, h, false).catch(() => {});
   const total = utxos.reduce((s, u) => s + u.value, 0n), amount = total - ZR.sweepFee(utxos.length);
+  { // 1103 L-1: an earlier press recorded its sweep BEFORE broadcasting. If that transaction is on the network, carry on with it instead of building a conflicting second one.
+    const prev = await HM.findHop(HM.idbStore(), h.f.stealth).then(r => r && r.rec.st.sweep).catch(() => null);
+    if (prev && /^[0-9a-f]{64}$/i.test(prev.txid || "") && /^t1[1-9A-HJ-NP-Za-km-z]{33}$/.test(prev.deposit || "") && Date.now() - (prev.at || 0) < 6 * 3600_000) {
+      let on = null; try { on = await ZR.txKnown(ZC.lightwalletd, prev.txid); } catch {}
+      if (on === true) return await finishSweep(HM, h, step, { txid: prev.txid, deposit: prev.deposit, amountOut: prev.amountOut });
+      if (on === undefined || on === null) throw new Error("Cannot tell whether your earlier return transaction (" + prev.txid.slice(0, 12) + "…) went out. Not sending another yet: press Return money again in a minute.");
+    }
+  }
   step("Getting a quote…");
   const j = await PW.requestQuote({ req: HM.reqOut({ dest: C, amount, recipient: acct, refundT: key.addr }), okDeposit: a => /^t1[1-9A-HJ-NP-Za-km-z]{33}$/.test(a || "") });
   step("Sending " + (Number(amount) / 1e8) + " ZEC…");
   const sw = ZR.buildSweep({ utxos, key, to: j.quote.depositAddress, tip: await ZR.getTip(ZC.lightwalletd) });
   if (sw.amount !== BigInt(j.quote.amountIn)) throw new Error("amount mismatch; refusing");
+  const intent = { txid: sw.txid, deposit: j.quote.depositAddress, amountOut: j.quote.amountOut, at: Date.now() };
+  const saved = await underHopLock(h.f.stealth, async () => { const rr = await HM.findHop(HM.idbStore(), h.f.stealth); if (!rr) return false; rr.rec.st = { ...rr.rec.st, sweep: intent }; await HM.idbStore().put(rr.key, rr.rec); return true; }).catch(() => false);
+  if (!saved) throw new Error("Could not record the return before sending it (the transfer may be running in another tab). Nothing was sent; try again in a minute.");        // recorded BEFORE broadcasting
   await ZR.sendAndConfirm(ZC.lightwalletd, sw.raw, undefined, sw.txid);        // 1100 L-2: the node must hand our exact bytes back before this counts as sent
-  try { const rr = await HM.findHop(HM.idbStore(), h.f.stealth); if (rr) { rr.rec.st = { ...rr.rec.st, sweep: { txid: sw.txid, deposit: j.quote.depositAddress, at: Date.now() } }; await HM.idbStore().put(rr.key, rr.rec); } } catch {}
-  let note = ""; await PW.submitDeposit({ txHash: sw.txid, depositAddress: j.quote.depositAddress }).catch(e => { note = " (could not notify NEAR Intents: " + ((e && e.message) || e) + ")"; });
+  await finishSweep(HM, h, step, intent);
+}
+async function finishSweep(HM, h, step, sw) {
+  let note = ""; await PW.submitDeposit({ txHash: sw.txid, depositAddress: sw.deposit }).catch(e => { note = " (could not notify NEAR Intents: " + ((e && e.message) || e) + ")"; });
   if (note) step("Sent" + note);
-  const fin = await PW.pollStatus({ depositAddress: j.quote.depositAddress, timeoutMs: 60 * 60_000, intervalMs: 10_000, onUpdate: s => step("Returning · " + s.status.toLowerCase().replace(/_/g, " ") + " · usually 10–20 min" + note) });
-  step(fin.status === "SUCCESS" ? "Done: ≈ " + (Number(j.quote.amountOut) / 1e6).toFixed(2) + " " + SYM + " sent to your wallet." : "Swap ended as " + fin.status + ". The ZEC is back on the hop address; press Return money again.");
+  const fin = await PW.pollStatus({ depositAddress: sw.deposit, timeoutMs: 60 * 60_000, intervalMs: 10_000, onUpdate: s => step("Returning · " + s.status.toLowerCase().replace(/_/g, " ") + " · usually 10–20 min" + note) });
+  step(fin.status === "SUCCESS" ? "Done: ≈ " + (Number(sw.amountOut) / 1e6).toFixed(2) + " " + SYM + " sent to your wallet." : "Swap ended as " + fin.status + ". The ZEC is back on the hop address; press Return money again.");
   if (fin.status === "SUCCESS") await hideHop(HM, h);
 }
 // A transfer from the first version (before Ironwood) could never shield, so its ZEC only ever sat on the hop t-addresses:
@@ -243,21 +273,23 @@ async function staleV1(HM, r, hit) {
     let empty = true;
     for (let a = 0; a < 4 && empty; a++) for (let i = 0; i < 3 && empty; i++) if ((await ZR.getUtxos(ZC.lightwalletd, ZR.deriveT(seed, ZR.tPath(a, i)).addr)).length) empty = false;
     // 1100 M-1: one "empty" answer proves nothing (lagging, restarting or lying server); only repeated answers over 30+ minutes hide the card
-    const v = ZR.noteEmpty(r.rec.st.emptyObs, empty); r.rec.st = { ...r.rec.st, emptyObs: v.obs }; await HM.idbStore().put(r.key, r.rec);
+    const v = ZR.noteEmpty(r.rec.st.emptyObs, empty); r.rec.st = { ...r.rec.st, emptyObs: v.obs }; await underHopLock(r.rec.st.stealth, async () => { const cur = await HM.findHop(HM.idbStore(), r.rec.st.stealth); if (cur) { cur.rec.st = { ...cur.rec.st, emptyObs: v.obs }; await HM.idbStore().put(cur.key, cur.rec); } });
     return v;
   } catch { return { hide: false }; }
 }
 // record one observation of "the server lists no UTXOs" (or reset it); the verdict says whether it is now safe to hide the hop
 async function noteEmptyFor(HM, h, empty) {
-  const ZR = await import("./zec-return.js"), store = HM.idbStore(), r = await HM.findHop(store, h.f.stealth);
-  if (!r) return { hide: false, obs: null };
-  const v = ZR.noteEmpty(r.rec.st.emptyObs, empty); if (JSON.stringify(v.obs) !== JSON.stringify(r.rec.st.emptyObs || null)) { r.rec.st = { ...r.rec.st, emptyObs: v.obs }; await store.put(r.key, r.rec); }
-  return v;
+  const ZR = await import("./zec-return.js"), store = HM.idbStore();
+  const out = await underHopLock(h.f.stealth, async () => {
+    const r = await HM.findHop(store, h.f.stealth); if (!r) return { hide: false, obs: null };
+    const v = ZR.noteEmpty(r.rec.st.emptyObs, empty); if (JSON.stringify(v.obs) !== JSON.stringify(r.rec.st.emptyObs || null)) { r.rec.st = { ...r.rec.st, emptyObs: v.obs }; await store.put(r.key, r.rec); }
+    return v; });
+  return out || { hide: false, obs: null };           // the hop is running elsewhere: no observation counts
 }
 // a finished or returned transfer leaves no card behind (the record stays in IndexedDB, flagged)
 async function hideHop(HM, h) {
-  const store = HM.idbStore(), r = await HM.findHop(store, h.f.stealth);
-  if (r) { r.rec.st = { ...r.rec.st, step: "FAILED", result: "RETURNED", hidden: true }; await store.put(r.key, r.rec); }
+  const store = HM.idbStore();
+  await underHopLock(h.f.stealth, async () => { const r = await HM.findHop(store, h.f.stealth); if (r) { r.rec.st = { ...r.rec.st, step: "FAILED", result: "RETURNED", hidden: true }; await store.put(r.key, r.rec); } });
   hops.delete(h.f.stealth.toLowerCase()); renderHops(); render();
 }
 setInterval(() => { const r = [...hops.values()].filter(h => h.running); if (!r.length && $("pay-hint").textContent.startsWith("●")) say("pay-hint", ""); if (r.length) { renderHops(); const v = hopView(r[0]); if (v.kind === "run" && v.what && $("pay-hint").textContent.startsWith("●")) say("pay-hint", statusLine(v), "ok"); } }, 1000);
@@ -270,13 +302,13 @@ function render() {
     top.appendChild(el("span", "amt", label)); top.appendChild(el("span", "mono", f.stealth.slice(0, 8) + "…" + f.stealth.slice(-4)));
     row.appendChild(top);
     const hp = activeHop(f);
-    const small = el("small", null, "block " + f.block + " · " + (hp ? fmtTok(BigInt(hp.st.amount)) + " " + SYM + " · in private transfer" : "now holds " + fmtTok(f.usdc) + " " + SYM + (f.eth ? " + " + (Number(f.eth) / NUNIT).toFixed(5) + " " + NAT : "")) + " · ");
+    const small = el("small", null, "block " + f.block + " · " + (hp ? fmtTok(BigInt(hp.st.amount)) + " " + SYM + " · in private transfer" : (f.usdc === undefined ? "reading balance…" : f.usdc === null ? "balance not read (scan again)" : "now holds " + fmtTok(f.usdc) + " " + SYM) + (f.eth ? " + " + (Number(f.eth) / NUNIT).toFixed(5) + " " + NAT : "")) + " · ");
     const a = el("a", null, "tx"); a.href = C.explorer + "/tx/" + f.tx; a.target = "_blank"; a.rel = "noopener noreferrer"; small.appendChild(a); row.appendChild(small);
     if (!hp && f.usdc > 0n) { const d = el("div"); d.style.marginTop = "8px"; const b = el("button", "btn ghost", "Withdraw " + SYM); b.type = "button"; b.addEventListener("click", () => openWithdraw(i)); d.appendChild(b); row.appendChild(d); }
     list.appendChild(row);
   });
 }
-$("btn-scan").addEventListener("click", () => scan().catch(e => say("pay-hint", e.message || String(e), "bad")));
+$("btn-scan").addEventListener("click", once(() => scan().catch(e => say("pay-hint", e.message || String(e), "bad"))));
 
 // ---- withdraw the stablecoin gaslessly: EIP-3009 authorization signed by the stealth key, submitted by the relayer
 let wd = null;
@@ -298,7 +330,8 @@ $("wd-private").addEventListener("change", () => { $("wd-priv-opts").hidden = !$
 // chain reads for the hop go through the connected wallet's own RPC (the page CSP allows no direct RPC); same JSON-RPC shape as fetch, so zec-hop.js stays injectable
 const walletRpc = async (_u, init) => { const { method, params } = JSON.parse(init.body); try { if (method !== "eth_chainId" && String(await wallet("eth_chainId", [])).toLowerCase() !== CHAIN_HEX) throw new Error("your wallet is on another network than " + C.name); const result = await wallet(method, params); return { ok: true, json: async () => ({ result }) }; } catch (e) { return { ok: true, json: async () => ({ error: { message: String((e && e.message) || e) } }) }; } };
 // chain reads for the hop: the chain's public RPC directly (CORS open, listed in the page CSP), the wallet's RPC as a fallback
-const chainRpc = async (u, init) => { try { const r = await fetch(u, init); if (r.ok) { const j = await r.clone().json().catch(() => null); if (j && j.result !== undefined) return r; } } catch {} return walletRpc(u, init); };
+// 1101 L-3/L-5: reads that name a stealth address NEVER fall back to the wallet's provider (it already knows the account and IP); only `allowWallet` calls (the token's domain separator) may. All reads time out.
+const chainRpc = async (u, init, allowWallet = false) => { try { const r = await fetch(u, { ...init, signal: init.signal || timeoutSignal() }); if (r.ok) { const j = await r.clone().json().catch(() => null); if (j && j.result !== undefined) return r; } } catch {} if (allowWallet) return walletRpc(u, init); throw new Error("the chain RPC did not answer"); };
 const hopCtx = async (HM, f, hit, o) => ({ getUtxos: HM.makeGetUtxos(), authUsed: HM.makeAuthUsed(C, chainRpc), countPriorHops: HM.makeCountPriorHops(C, chainRpc), txKnown: HM.makeTxKnown(), store: HM.idbStore(), stealth: f.stealth, priv: hit.stealthPriv, chain: C, api: API, words: await HM.loadWords(), loadZjs: HM.sharedZjs, waitReceipt, randomNonce: randomBytes32,
   balance: async () => (await getBalances(rpcBatch, USDC, [f.stealth])).get(f.stealth.toLowerCase()).usdc, authUsed: HM.makeAuthUsed(C, chainRpc), onProgress: (s, m) => hopProgress(f, s, m), ...o });
 const rpcOne = async (method, params) => { const r = await chainRpc(C.rpc, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ jsonrpc: "2.0", id: 1, method, params }) }); const j = await r.json(); if (j.error) throw new Error(j.error.message || "rpc error"); return j.result; };
@@ -371,7 +404,7 @@ async function showResume() {
     if (f.legacy) continue;                                         // legacy keys: scan and plain withdraw only
     const hit = checkAnnouncement(keys, f.eph, null); if (!hit || hit.stealth.toLowerCase() !== k) continue;
     const sv = await staleV1(HM, r, hit);
-    if (sv.hide) { r.rec.st = { ...r.rec.st, hidden: true }; await store.put(r.key, r.rec); continue; }
+    if (sv.hide) { await underHopLock(f.stealth, async () => { const cur = await HM.findHop(store, f.stealth); if (cur) { cur.rec.st = { ...cur.rec.st, hidden: true }; await store.put(cur.key, cur.rec); } }); continue; }
     hops.set(k, { f, hit, running: false, msg: sv.obs ? "The server says there is no ZEC here; rechecking (" + sv.obs.count + "/3)" : "", st: r.rec.st });
   }
   renderHops(); render();
@@ -394,16 +427,17 @@ $("btn-wd").addEventListener("click", once(async () => {
     const value = amtIn ? exact.send : all;
     if (!(value > 0n) || value > all) throw new Error("amount must be within the balance");
     const w = wd, hit = hitOf(w);
+    if ((pendingWd.get(w.stealth.toLowerCase()) || 0) > Date.now() && !confirm("An earlier withdrawal from this address was sent to the network and has not been confirmed yet. Sending again may pay twice. Check the explorer first. Send anyway?")) return;
     if (!hit || hit.stealth.toLowerCase() !== w.stealth.toLowerCase()) throw new Error("could not re-derive the key for this address");
     // audit 1086 L-4: the token's own DOMAIN_SEPARATOR() read from the chain RPC / the wallet (not from our indexer, which would only prove config drift)
-    const dsep = await chainRpc(C.rpc, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "eth_call", params: [{ to: USDC, data: "0x3644e515" }, "latest"] }) }).then(r => r.json()).then(j => j.result).catch(() => null);
+    const dsep = await chainRpc(C.rpc, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "eth_call", params: [{ to: USDC, data: "0x3644e515" }, "latest"] }) }, true).then(r => r.json()).then(j => j.result).catch(() => null);
     if (String(dsep).toLowerCase() !== hex(domainSeparator()).toLowerCase()) throw new Error(SYM + " domain mismatch (or could not be read from the chain); refusing to sign");
     if ($("wd-private").checked && !$("wd-priv-wrap").hidden) {
       // audit 1087 M-3: the relayer only sees the 1Click deposit address, so the real recipient is screened here, before anything is signed (fail closed if the check cannot run)
       // the whole list is fetched and checked here, so the recipient never reaches our server; /relay/screen only while a relayer without the list endpoint is live
-      const sl = await api("/relay/sanctions-list").catch(() => null);
-      const sc = sl && Array.isArray(sl.addresses) && sl.addresses.length === sl.count && sl.count > 0
-        ? { listed: sl.addresses.includes(to.toLowerCase()) } : await api("/relay/screen?addr=" + to).catch(() => null);
+      const sl = await api("/relay/sanctions-list").catch(() => null), local = sl && Array.isArray(sl.addresses) && sl.addresses.length === sl.count && sl.count > 0;
+      if (!local) say("pay-hint", "The sanctions list could not be loaded here, so this recipient address is checked by the relayer instead (it will see it).", "warn");     // 1101 I-1
+      const sc = local ? { listed: sl.addresses.includes(to.toLowerCase()) } : await api("/relay/screen?addr=" + to).catch(() => null);
       if (!sc || sc.listed !== false) throw new Error(sc && sc.listed ? "That recipient address is on a sanctions list; refusing." : "Could not check the recipient against the sanctions list; nothing was sent. Try again.");
       return await privateWithdraw(to, value, hit);
     }
@@ -415,13 +449,14 @@ $("btn-wd").addEventListener("click", once(async () => {
     const { r, d } = await postRelay(fetch, API + "/relay", { from: w.stealth, to, value: value.toString(), validAfter: "0", validBefore: validBefore.toString(), nonce, v: sig.v, r: sig.r, s: sig.s },
       { onBusy: m => say("pay-hint", m, "warn"), check: () => authorizationUsed(rpcOne, USDC, w.stealth, nonce) });
     if (!r.ok || d.error) throw new Error(d.error || "relayer error");
-    if (d.used) d.hash = await txOfLogs({ address: USDC, topics: [TRANSFER_TOPIC, "0x" + padAddr(w.stealth), "0x" + padAddr(to)] }, l => /^0x[0-9a-fA-F]{1,64}$/.test(l.data) && BigInt(l.data) === value);
+    if (d.used) d.hash = await txOfLogs({ address: USDC, topics: [AUTH_USED_TOPIC, "0x" + padAddr(w.stealth), nonce] }, () => true);      // 1101 L-1: found by THIS request's nonce, not by "an identical transfer"
     if (!isHash(d.hash)) throw new Error("the relayer answered without a valid transaction hash; check the explorer before sending again");
-    $("withdraw").hidden = true;
+    $("withdraw").hidden = true; pendingWd.set(w.stealth.toLowerCase(), Date.now() + 600_000);
     say("pay-hint", "Submitted: " + fmtTok(value) + " " + SYM + " → " + to.slice(0, 8) + "… waiting for the block…");
-    const rc = await waitReceipt(d.hash, x => hasTransfer(x, { token: USDC, from: w.stealth, to, value }), true);
+    const rc = await waitReceipt(d.hash, x => hasTransfer(x, { token: USDC, from: w.stealth, to, value }) && hasAuthUsed(x, { token: USDC, authorizer: w.stealth, nonce }), true);
+    if (!rc.ok && !rc.unexpected) pendingWd.delete(w.stealth.toLowerCase());
     if (!rc.ok) throw new Error(rc.unexpected ? "the transaction is mined but does not contain the expected transfer (tx " + rc.hash.slice(0, 12) + "…). Check the explorer." : "the transfer reverted on chain (tx " + rc.hash.slice(0, 12) + "…). Nothing moved.");
-    d.hash = rc.hash;
+    d.hash = rc.hash; pendingWd.delete(w.stealth.toLowerCase());
     spent.set(w.stealth.toLowerCase(), { left: w.usdc - value, until: Date.now() + 120_000 });
     const doneMsg = "Done: " + fmtTok(value) + " " + SYM + " sent, tx " + d.hash.slice(0, 12) + "…";
     say("pay-hint", doneMsg, "ok"); await scan();
@@ -432,7 +467,8 @@ $("btn-wd").addEventListener("click", once(async () => {
 // of a relayed transaction, and that hash is followed only if the chain shows the same sender and nonce. -> { ok, hash, unexpected? }
 async function waitReceipt(h, expect = null, relayed = false) {
   if (!isHash(h)) throw new Error("bad transaction hash");
-  return waitFinal(rpcOne, h, { expect, follow: relayed ? () => api("/relay/status?hash=" + h).then(s => s && s.hash) : null });
+  try { return await waitFinal(rpcOne, h, { expect, follow: relayed ? () => api("/relay/status?hash=" + h).then(s => s && s.hash) : null }); }
+  catch (e) { if (/^not mined yet/.test(e.message || "")) throw new Error("The transaction was handed to the network but is not confirmed yet (tx " + h + "). It may still go through: check the explorer and your balance before sending again."); throw e; }
 }
 // a relayed request whose answer was lost but whose authorization is used on chain: find its transaction from the event it produced
 async function txOfLogs(filter, match) {

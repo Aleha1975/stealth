@@ -124,4 +124,27 @@ const PRIV = new Uint8Array(32).fill(9), ACC = addressFromPriv(PRIV), A2 = "0x" 
   t("1098 M-2: app.js never puts a stealth address in an API URL (no /balances, no addrs=)", !/\/balances/.test(src) && !/addrs=/.test(src));
   t("1098 M-2: the only API reads left carry no stealth address (head, announcements, pages, relay stats/status/screen/sanctions-list)", [...src.matchAll(/api\("([^"]*)"/g)].every(m => /^\/(head|announcements\?|relay\/stats|relay\/status\?hash=|relay\/screen\?addr=|relay\/sanctions-list$)/.test(m[1])));
   t("1098 L-4: receipts are not read from our API any more", !/\/receipt\?/.test(src)); }
+// ---- round 3 (audit 1101)
+{ const TOK = "0x" + "77".repeat(20), pad32 = a => "0x" + "0".repeat(24) + a.slice(2).toLowerCase(), nonce = "0x" + "12".repeat(32), nonce2 = "0x" + "13".repeat(32);
+  const au = (n, o = {}) => ({ ok: true, logs: [{ address: TOK, topics: [CR.AUTH_USED_TOPIC, pad32(A2), n], data: "0x" }], ...o });
+  t("1101 L-1: a receipt counts for THIS request only if the token emitted AuthorizationUsed(authorizer, nonce) with its nonce", CR.hasAuthUsed(au(nonce), { token: TOK, authorizer: A2, nonce }) && !CR.hasAuthUsed(au(nonce2), { token: TOK, authorizer: A2, nonce }) && !CR.hasAuthUsed(au(nonce), { token: TOK, authorizer: A3, nonce }) && !CR.hasAuthUsed(au(nonce), { token: "0x" + "78".repeat(20), authorizer: A2, nonce }) && !CR.hasAuthUsed({ ...au(nonce), ok: false }, { token: TOK, authorizer: A2, nonce }));
+  t("1101 L-1: AUTH_USED_TOPIC is keccak(AuthorizationUsed(address,bytes32))", CR.AUTH_USED_TOPIC === "0x98de503528ee59b575ef0c0a2576a82497bfc029a5685b209e9ec333479b10a5");
+  // L-4: the original hash keeps being polled after a replacement is followed
+  const orig = "0x" + "aa".repeat(32), repl = "0x" + "bb".repeat(32); let step = 0;
+  const rpc = async (m, p) => m === "eth_getTransactionByHash" ? { hash: p[0], from: A2, nonce: "0x5" } : m === "eth_getTransactionReceipt" ? (p[0] === orig && step >= 6 ? { transactionHash: orig, status: "0x1", logs: [], from: A2 } : null) : (() => { throw new Error(m); })();
+  const r = await CR.waitFinal(rpc, orig, { sleep: async () => { step++; }, tries: 12, everyMs: 0, follow: async () => repl });
+  t("1101 L-4: after following a replacement, the ORIGINAL that mines first is still found", r.ok && r.hash === orig);
+  // L-5: timeouts
+  let sig; await CR.fetchBatch(async (u, i) => { sig = i.signal; return { ok: true, json: async () => [{ id: 1, result: "0x1" }] }; }, "u", [["a", []]]);
+  t("1101 L-5: batch reads carry a timeout signal; timeoutSignal aborts", sig && typeof sig.aborted === "boolean" && CR.timeoutSignal(1) instanceof AbortSignal); }
+{ const src = fs.readFileSync(new URL("../web/app.js", import.meta.url), "utf8");
+  const scanSrc = src.slice(src.indexOf("async function scan()"), src.indexOf("async function refreshBalances"));
+  t("1101 M-1: scan lists the payments (render) BEFORE the balance read, and the read is best effort in pages", scanSrc.indexOf("render()") > 0 && scanSrc.indexOf("render()") < scanSrc.indexOf("await refreshBalances") && /PAGE = 50/.test(src) && /catch \{ if \(t === 0\)/.test(src));
+  t("1101 L-3: reads never fall back to the wallet provider unless asked (only the token's domain separator asks)", /const chainRpc = async \(u, init, allowWallet = false\)/.test(src) && (src.match(/\}, true\)/g) || []).length === 1 && /if \(allowWallet\) return walletRpc/.test(src));
+  t("1101 I-2: key derivation and scan are single-flight; a scan works on its own list and keys", /\$\("btn-keys"\)\.addEventListener\("click", once\(/.test(src) && /\$\("btn-scan"\)\.addEventListener\("click", once\(/.test(src) && /const K = keys, mine = \[\]/.test(src) && /if \(keys !== K\) return;/.test(src));
+  t("1101 L-1/L-2: the withdraw receipt must carry the request's nonce; a confirmation timeout says 'do not send again' and arms a pending guard", /hasAuthUsed\(x, \{ token: USDC, authorizer: w\.stealth, nonce \}\)/.test(src) && /not confirmed yet \(tx/.test(src) && /pendingWd\.set/.test(src) && /AUTH_USED_TOPIC, "0x" \+ padAddr\(w\.stealth\), nonce/.test(src));
+  t("1105 L-4: every hop-record writer outside the machine takes the machine's Web Lock", (src.match(/underHopLock\(/g) || []).length >= 5);
+  t("1103 L-1: the sweep is recorded BEFORE it is broadcast, and an earlier one that is on the network is resumed, not rebuilt", src.indexOf("const intent =") > 0 && src.indexOf("const intent =") < src.indexOf("await ZR.sendAndConfirm") && /ZR\.txKnown\(ZC\.lightwalletd, prev\.txid\)/.test(src));
+  t("1103 M-1: a dust-only or too-long list is never an 'empty' observation", /unspendable = true/.test(src) && src.indexOf("unspendable) {") < src.indexOf("noteEmptyFor(HM, h, true)"));
+  t("statuses still tick every second", /setInterval\(\(\) => \{ const r = \[\.\.\.hops\.values\(\)\]\.filter\(h => h\.running\);[^]*?\}, 1000\);/.test(src)); }
 console.log(fail ? "FAILED " + fail : "all passed"); process.exit(fail ? 1 : 0);

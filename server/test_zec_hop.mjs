@@ -416,5 +416,73 @@ const timed = (msgs, st) => (x, m) => msgs.push([off, m]);
   C2.resetLeft(); const v6 = C2.hopView(mk("WAIT_T", { running: false, st: { ...mk("WAIT_T").st, err: "ZEC to arrive is taking too long" } }), now);
   ok("card: a deliberate stop shows the cause and the Continue button", /^Stopped: ZEC to arrive is taking too long\./.test(v6.body) && v6.action === "continue"); }
 
+// ---------- round 3 (audits 1105 / 1101): bounded wallet calls, no forged outcome, no dead ends ----------
+{ const names = ["get_latest_block", "create_account", "get_wallet_summary", "pczt_send", "propose_transfer", "send_authorized_transactions"];
+  for (const name of names) {
+    const w = makeWorld(), s = H.memStore(); off = 0; const proto = w.Zjs.WebWallet.prototype, orig = proto[name]; let n = 0;
+    proto[name] = function (...a) { return n++ === 0 ? new Promise(() => {}) : orig.apply(this, a); };      // the first call never answers
+    const t0 = realNow(), st = await H.startHop(mkCtx(w, s, { walletTimeoutMs: 40, txKnown: async () => false }));
+    ok("1105 L-3 " + name + ": one hung call is cut after the timeout and retried; the transfer still finishes", st.step === "DONE" && !st.err && n >= 2 && realNow() - t0 < 20000, st.step + " " + st.err + " calls=" + n);
+  }
+  const w = makeWorld(), s = H.memStore(); off = 0; w.Zjs.WebWallet.prototype.get_wallet_summary = () => new Promise(() => {});
+  const t0 = realNow(), st = await H.startHop(mkCtx(w, s, { walletTimeoutMs: 40 }));
+  ok("1105 L-3 a wallet call that never answers ends the run with a one-line retryable cause (not a Halt, not a hang)", /timed out/.test(st.err || "") && st.halted === false && !/\n/.test(st.err) && realNow() - t0 < 20000, st.err); }
+{ const forged = async (w, body) => { const f0 = w.fetch; w.fetch = async (u, i) => String(u).endsWith("/relay") ? { ok: body.ok ?? false, status: body.ok ? 200 : 400, json: async () => body.j } : f0(u, i); };
+  let w = makeWorld(), s = H.memStore(); off = 0; await forged(w, { j: { error: "authorization already used" } });
+  let st = await H.startHop(mkCtx(w, s, { authUsed: async () => false }));
+  ok("1105 M-1 a forged 'already used' answer is checked on chain: unused -> Halt, nothing recorded as sent", st.halted === true && /does not confirm/.test(st.err) && !st.relayed && !st.txIn, st.err);
+  w = makeWorld(); s = H.memStore(); off = 0; await forged(w, { j: { error: "authorization already used" } });
+  st = await H.startHop(mkCtx(w, s, { authUsed: async () => { throw new Error("rpc down"); } }));
+  ok("1105 M-1 'already used' with an unreadable chain also stops (cannot tell is not 'used')", st.halted === true && !st.relayed, st.err);
+  w = makeWorld(); s = H.memStore(); off = 0; await forged(w, { ok: true, j: { hash: "0xzz" } });
+  st = await H.startHop(mkCtx(w, s));
+  const rec = await latest(s);
+  ok("1105 M-1 a malformed hash from the API is never saved as the deposit hash (retryable error)", /malformed/.test(st.err || "") && st.halted === false && !rec.st.txIn, st.err);
+  // a bad hash saved by an older build heals itself
+  const { w: w2, s: s2 } = await haltedAtDeposit(); const r2 = await latest(s2); r2.st.txIn = "0xzz"; await s2.put((await H.findHop(s2, STEALTH)).key, r2);
+  const done = await H.runHop(mkCtx(w2, s2, { authUsed: async () => true }));
+  ok("1105 M-1 an already-saved malformed txIn is discarded, not retried forever", !/bad transaction hash/.test(done.err || ""), done.err);
+  // the receipt must contain THIS transfer
+  const w3 = makeWorld(), s3 = H.memStore(); off = 0; let want = null;
+  await H.startHop(mkCtx(w3, s3, { waitReceipt: async (h, expect) => { want = expect; return { ok: true }; } }));
+  const r3 = await latest(s3), dep = r3.st.inQuote.depositAddress, pad32 = a => "0x" + a.slice(2).toLowerCase().padStart(64, "0"), TT = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef";
+  const good = { ok: true, logs: [{ address: rh.token.address, topics: [TT, pad32(STEALTH), pad32(dep)], data: "0x" + BigInt(r3.st.inQuote.amountIn).toString(16) }] };
+  ok("1105 M-1 the deposit receipt must hold Transfer(stealth -> deposit address, amount): another transaction does not count", typeof want === "function" && want(good) === true && want({ ok: true, logs: [] }) === false
+    && want({ ok: true, logs: [{ ...good.logs[0], topics: [TT, pad32(STEALTH), pad32(A)] }] }) === false && want({ ok: true, logs: [{ ...good.logs[0], data: "0x1" }] }) === false);
+  const w4 = makeWorld(), s4 = H.memStore(); off = 0;
+  const bad = await H.startHop(mkCtx(w4, s4, { waitReceipt: async () => ({ ok: false, unexpected: true, hash: "0x" + "ab".repeat(32) }) }));
+  ok("1105 M-1 a mined transaction without the deposit transfer is a Halt, txIn cleared", bad.halted === true && /does not contain/.test(bad.err) && !bad.txIn, bad.err); }
+{ const { w, s } = await haltedAtDeposit(); const st = await H.runHop(mkCtx(w, s, { balance: async () => 0n, authUsed: async () => { throw new Error("rpc down"); } }));
+  ok("1105 L-2 low balance + unreadable chain: Halt, not 'already spent' (no 40-minute wait on an unsent authorization)", st.halted === true && /could not check on chain/.test(st.err) && !st.relayed, st.err); }
+{ const w = makeWorld(), s = H.memStore(); await s.put(STEALTH.toLowerCase() + "#0", { st: { v: 2, n: 0, stealth: STEALTH, chain: "rh", step: "FAILED", result: "RETURNED", hidden: true, amount: "1" }, db: null });
+  off = 0; const st = await H.startHop(mkCtx(w, s));
+  ok("1105 L-1 a returned/hidden record no longer blocks the next private transfer", st.step === "DONE" && st.n === 1, st.step + " " + st.err);
+  const w5 = makeWorld(), s5 = H.memStore(); await s5.put(STEALTH.toLowerCase() + "#0", { st: { v: 2, n: 0, stealth: STEALTH, chain: "rh", step: "FAILED", amount: "1" }, db: null });
+  ok("1105 L-1 an unreturned FAILED record (funds may be in the hop wallet) still blocks", await H.startHop(mkCtx(w5, s5)).then(() => false, e => /unfinished/.test(e.message))); }
+{ const w = makeWorld({ inOutcome: "REFUNDED" }), s = H.memStore(); off = 0; const st = await H.startHop(mkCtx(w, s, { waitReceipt: async () => ({ ok: true }) }));
+  const before = await latest(s); await H.scrubFinished(s, STEALTH); const after = await latest(s);
+  ok("1105 L-6 a refunded in-leg keeps its deposit address and hash for support after the scrub; the stealth->recipient link is gone", st.step === "FAILED_IN" && after.st.scrubbed === true && after.st.inDeposit === before.st.inQuote.depositAddress && after.st.txIn === before.st.txIn && !after.st.recipient && !after.st.auth, JSON.stringify(after.st)); }
+{ const C3 = await import("../web/hop-card.js"), now = 1_000_000_000_000, base0 = { step: "DEPOSIT_IN", chain: "rh", dest: "rh", amount: "1000000", recipient: A, stealth: STEALTH, startedAt: now - 60000, stepAt: now - 30000, err: "x" };
+  const sent = C3.hopView({ running: false, msg: "", st: { ...base0, auth: { nonce: "0x1" } } }, now), none = C3.hopView({ running: false, msg: "", st: base0 }, now);
+  ok("1105 L-5 a paused card with a signed authorization does not claim the money has not moved", /may already be on its way/.test(sent.body) && !/has not moved/.test(sent.body) && /has not moved/.test(none.body));
+  const fi = C3.hopView({ running: false, msg: "", st: { ...base0, step: "FAILED_IN", result: "FAILED", inDeposit: "0x" + "12".repeat(20), txIn: "0x" + "34".repeat(32) } }, now);
+  ok("1105 L-6 the refund card does not promise the balance and shows the support details", /check the balance/.test(fi.body) && /0x1212/.test(fi.detail) && /0x3434/.test(fi.detail)); }
+
+// ---------- 1104 M-1: the bytes that are hashed are the bytes that run ----------
+{ const { resolveObjectURL } = await import("node:buffer"), VD = path.join(WEB, "vendor/webzjs"), BASEU = "https://x.test/vendor/webzjs/";
+  if (typeof globalThis.self === "undefined") globalThis.self = globalThis; const hadIso = self.crossOriginIsolated; self.crossOriginIsolated = true;
+  const files = async tamper => async u => { const rel = decodeURIComponent(new URL(u).pathname.replace("/vendor/webzjs/", "")); let b = fs.readFileSync(path.join(VD, rel)); if (tamper && tamper.file === rel) { b = Buffer.from(b); b[tamper.at] ^= 1; } return { ok: true, arrayBuffer: async () => b.buffer.slice(b.byteOffset, b.byteOffset + b.length) }; };
+  const texts = []; const imp = async u => { texts.push(await resolveObjectURL(u).text()); return { default: async () => {}, initThreadPool: async () => {} }; };
+  const m = await H.loadZjs(BASEU, { fetchFn: await files(null), doImport: imp });
+  const glue = fs.readFileSync(path.join(VD, "webzjs_wallet.js"), "utf8");
+  ok("1104 M-1 clean build loads; the module that runs is a blob of the verified glue with its three imports pointed at blobs", typeof m.default === "function" && texts.length === 1 && !/from '\.\/snippets/.test(texts[0]) && (texts[0].match(/from "blob:/g) || []).length === 3 && texts[0].length > glue.length * 0.99);
+  const stripped = glue.replace(/^import .*\n/gm, "").replace(/import\.meta\.url/g, "X"), ran = texts[0].replace(/^import .*\n/gm, "").replace(/"https:\/\/x\.test\/vendor\/webzjs\/webzjs_wallet\.js"/g, "X");
+  ok("1104 M-1 apart from the import lines and import.meta.url the executed text IS the hashed text", stripped === ran);
+  for (const [name, t] of [["glue", { file: "webzjs_wallet.js", at: 5000 }], ["wasm", { file: "webzjs_wallet_bg.wasm", at: 100 }], ["workerHelpers snippet", { file: "snippets/wasm-bindgen-rayon-38edf6e439f6d70d/src/workerHelpers.js", at: 10 }], ["thread-start snippet", { file: "snippets/wasm_thread-8ee53d0673203880/src/wasm32/js/module_worker_start.js", at: 10 }], ["polyfill snippet", { file: "snippets/wasm_thread-8ee53d0673203880/src/wasm32/js/module_workers_polyfill.min.js", at: 10 }], ["worker module snippet", { file: "snippets/wasm_thread-8ee53d0673203880/src/wasm32/js/web_worker_module.bundler.js", at: 10 }]]) {
+    texts.length = 0; const e = await H.loadZjs(BASEU, { fetchFn: await files(t), doImport: imp }).then(() => null, e => e.message);
+    ok("1104 M-1 one flipped byte in the " + name + " is refused before anything runs", /do not match the audited build/.test(e || "") && texts.length === 0, e);
+  }
+  self.crossOriginIsolated = hadIso; }
+
 Date.now = realNow;
 console.log(fails ? fails + " FAILED" : "all passed"); process.exit(fails ? 1 : 0);

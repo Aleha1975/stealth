@@ -6,6 +6,7 @@
 import { keccak, unhex, hex } from "./stealth-crypto.js";
 import * as PW from "./private-withdraw.js";
 import { postRelay } from "./relay-post.js";
+import { hasTransfer } from "./chain-read.js";
 import { zcash as ZC } from "./chains.js";
 
 export const STEPS = ["QUOTE_IN", "DEPOSIT_IN", "WAIT_T", "SHIELD", "DELAY", "QUOTE_OUT", "SEND_OUT"];
@@ -13,6 +14,8 @@ export const DONE_STEPS = new Set(["DONE", "FAILED_IN", "FAILED"]);
 export const HOP_TAG = "stealth-zec-hop/v1", MAX_OUT = 3, PART_TRIES = 2, PENDING = "PENDING_DEPOSIT", ETA_MIN = 35, T_CONFS = 10;   // T_CONFS: WebZjs spends transparent coins received from others only after 10 confirmations (ZIP-315)
 export const STEP_MIN = { QUOTE_IN: 0.5, DEPOSIT_IN: 4, WAIT_T: 12, SHIELD: 3, DELAY: 6, QUOTE_OUT: 0.5, SEND_OUT: 8 };   // typical minutes per step (sum 34)
 /** Payout modes (audit H-1): the shielded balance is paid out in k parts of random size, each with its own random delay, quote and deposit.
+ *  Limit (1105 L-7): the split defeats a match on ONE amount only. The parts sum to the in-leg amount minus known fees, all go to the same recipient, and the pipeline latency is
+ *  near-constant, so an observer who can see both legs can still match on sum and time window, especially with few concurrent users.
  *  fast = 1..2 parts, 5..20 min in total; private = 2..4 parts spread over 1..6 h. totalMin/totalMax: minutes from "shielded" to the LAST part's send time. */
 export const MODES = { fast: { kMin: 1, kMax: 2, totalMin: 5, totalMax: 20 }, private: { kMin: 2, kMax: 4, totalMin: 60, totalMax: 360 } };
 export const modeOf = m => MODES[m] || MODES.fast;
@@ -215,6 +218,7 @@ export const makeCountPriorHops = (chain, fetchFn = fetch) => async stealth => {
 /** ctx.txKnown(txid) -> true / false (lightwalletd GetTransaction through the gRPC-web proxy, like zec-return.js); throws when it cannot tell. */
 /** UTXOs of a t-address straight from lightwalletd (one cheap call, no wallet sync): [{ value, height }]. Times out after 20 s so a hung proxy cannot freeze the wait loop. */
 export const makeGetUtxos = (fetchFn = fetch, base = ZC.lightwalletd) => async addr => withTimeout((async () => (await import("./zec-return.js")).getUtxos(base, addr, fetchFn))(), 20000, "lightwalletd UTXO query");
+const oneLineErr = e => String((e && e.message) || e).split("\n")[0].slice(0, 120);
 export const withTimeout = (p, ms, what) => { let t; return Promise.race([p, new Promise((_, rej) => { t = setTimeout(() => rej(new Error(what + " timed out after " + Math.round(ms / 1000) + " s")), ms); })]).finally(() => clearTimeout(t)); };
 export const makeTxKnown = (fetchFn = fetch, base = ZC.lightwalletd) => async txid => (await import("./zec-return.js")).txKnown(base, txid, fetchFn);
 
@@ -233,7 +237,7 @@ export async function findHop(store, stealth) {
 }
 export async function startHop(ctx) {
   const old = await findHop(ctx.store, ctx.stealth);
-  if (old && !["DONE", "FAILED_IN"].includes(old.rec.st.step)) throw new Error("an earlier private transfer from this address is unfinished: resume it first");
+  if (old && !["DONE", "FAILED_IN"].includes(old.rec.st.step) && old.rec.st.hidden !== true) throw new Error("an earlier private transfer from this address is unfinished: resume it first");
   const local = old ? old.rec.st.n + 1 : 0;                                   // the IndexedDB counter is only a cache (M-4): the chain's count wins when it is higher; if it cannot be read we do not start
   let chainN = 0; if (ctx.countPriorHops) { try { chainN = await ctx.countPriorHops(ctx.stealth); } catch (e) { throw new Error("could not read this address's earlier hops from the chain (" + e.message + "); nothing was started"); }
     if (!Number.isInteger(chainN) || chainN < 0) throw new Error("bad hop count from the chain"); }
@@ -241,15 +245,36 @@ export async function startHop(ctx) {
   await ctx.store.put(ctx.stealth.toLowerCase() + "#" + n, { st, db: null });
   return runHop(ctx);
 }
-const WEBZJS_SHA256 = { "webzjs_wallet.js": "66e5bb0537784ba61b47b68e0ee48848b52711c54b5d26b4717ede29b61db0eb", "webzjs_wallet_bg.wasm": "386148364d7578d8520bb674bb6618ba726ebdde2c62c6682ca59b25a2b7c067" };   // keep in step with web/vendor/webzjs/SHA256SUMS
-export async function loadZjs(base = new URL("./vendor/webzjs/", import.meta.url)) {
+const WEBZJS_SHA256 = { "webzjs_wallet.js": "66e5bb0537784ba61b47b68e0ee48848b52711c54b5d26b4717ede29b61db0eb", "webzjs_wallet_bg.wasm": "386148364d7578d8520bb674bb6618ba726ebdde2c62c6682ca59b25a2b7c067",
+  "snippets/wasm-bindgen-rayon-38edf6e439f6d70d/src/workerHelpers.js": "ced20c0060b44d75ea4b16adc149130cf29aea92362b526812133d94ec5b9d42",
+  "snippets/wasm_thread-8ee53d0673203880/src/wasm32/js/module_worker_start.js": "ab01d522953252ac38bfebedf17a2049db7aca39804b860e11ecc8b67156235b",
+  "snippets/wasm_thread-8ee53d0673203880/src/wasm32/js/module_workers_polyfill.min.js": "8a1b206907df127c5477d4ae4d78799a5bae18ca31b6b386fe835a0bb7fe55e7",
+  "snippets/wasm_thread-8ee53d0673203880/src/wasm32/js/web_worker_module.bundler.js": "4bac092d7b282bd22e9f485be7a45b6b0409179b50b705694efcb9f296718fbd" };   // keep in step with web/vendor/webzjs/SHA256SUMS
+/** 1104 M-1: the bytes that are hashed are the bytes that run. The glue and the snippets it imports are fetched once, hashed, and executed from Blob URLs of exactly those bytes (the glue's three static
+ *  imports are pointed at blobs of the verified snippet bytes). Worker threads started by the wasm still load the vendor files by URL (workerHelpers.js, web_worker_module.bundler.js and the glue they import):
+ *  those are the same-origin files whose hashes were just checked, but their second fetch is not pinned. `base` must be an absolute URL. `fetchFn` / `doImport` are injectable for tests. */
+export async function loadZjs(base = new URL("./vendor/webzjs/", import.meta.url), { fetchFn = fetch, doImport = u => import(u), hashes = WEBZJS_SHA256 } = {}) {
   if (!self.crossOriginIsolated) throw new Error("this page is not cross-origin isolated (COOP/COEP), so the Zcash wallet cannot run here");
   // The wasm below receives the seed phrase: refuse to run any bytes other than the audited build (hashes = web/vendor/webzjs/SHA256SUMS; ops/build_webzjs.sh refreshes them).
-  const hex = async b => [...new Uint8Array(await crypto.subtle.digest("SHA-256", b))].map(x => x.toString(16).padStart(2, "0")).join("");
-  const get = async f => { const r = await fetch(new URL(f, base), { cache: "no-store", credentials: "omit" }); if (!r.ok) throw new Error("cannot load " + f); return r.arrayBuffer(); };
-  const [glue, wasm] = await Promise.all([get("webzjs_wallet.js"), get("webzjs_wallet_bg.wasm")]);
-  if (await hex(glue) !== WEBZJS_SHA256["webzjs_wallet.js"] || await hex(wasm) !== WEBZJS_SHA256["webzjs_wallet_bg.wasm"]) throw new Error("the Zcash wallet files do not match the audited build; refusing to load them");
-  const m = await import(new URL("webzjs_wallet.js", base)); await m.default({ module_or_path: wasm }); await m.initThreadPool(Math.min(4, navigator.hardwareConcurrency || 2)); return m;
+  const hexOf = async b => [...new Uint8Array(await crypto.subtle.digest("SHA-256", b))].map(x => x.toString(16).padStart(2, "0")).join("");
+  const get = async f => { const r = await fetchFn(new URL(f, base), { cache: "no-store", credentials: "omit" }); if (!r.ok) throw new Error("cannot load " + f); return r.arrayBuffer(); };
+  const names = Object.keys(hashes), bytes = await Promise.all(names.map(get)), by = {};
+  for (let k = 0; k < names.length; k++) { if (await hexOf(bytes[k]) !== hashes[names[k]]) throw new Error("the Zcash wallet files do not match the audited build (" + names[k] + "); refusing to load them"); by[names[k]] = bytes[k]; }
+  const dec = new TextDecoder("utf-8", { fatal: true }), urls = [], blob = text => { const u = URL.createObjectURL(new Blob([text], { type: "text/javascript" })); urls.push(u); return u; };
+  const abs = f => new URL(f, base).href;
+  try {
+    const SN = "snippets/wasm-bindgen-rayon-38edf6e439f6d70d/src/workerHelpers.js", MS = "snippets/wasm_thread-8ee53d0673203880/src/wasm32/js/module_worker_start.js", PF = "snippets/wasm_thread-8ee53d0673203880/src/wasm32/js/module_workers_polyfill.min.js";
+    const swap = (text, from, to, what) => { if (!text.includes(from)) throw new Error("unexpected shape of " + what + "; refusing to load it"); return text.split(from).join(to); };
+    // worker-spawning URLs inside the snippets would resolve against a blob: point them at the real (hash-checked) vendor files
+    const helpers = swap(dec.decode(by[SN]), "new URL('./workerHelpers.js', import.meta.url)", JSON.stringify(abs(SN)), "workerHelpers.js").replace("import('../../../webzjs_wallet.js')", "import(" + JSON.stringify(abs("webzjs_wallet.js")) + ")");
+    const start = swap(dec.decode(by[MS]), "new URL('./web_worker_module.bundler.js', import.meta.url)", JSON.stringify(abs("snippets/wasm_thread-8ee53d0673203880/src/wasm32/js/web_worker_module.bundler.js")), "module_worker_start.js");
+    let glue = dec.decode(by["webzjs_wallet.js"]);
+    glue = swap(glue, "from './" + SN + "'", "from " + JSON.stringify(blob(helpers)), "the glue (rayon import)");
+    glue = swap(glue, "from './" + MS + "'", "from " + JSON.stringify(blob(start)), "the glue (thread start import)");
+    glue = swap(glue, "from './" + PF + "'", "from " + JSON.stringify(blob(dec.decode(by[PF]))), "the glue (polyfill import)");
+    glue = glue.split("import.meta.url").join(JSON.stringify(abs("webzjs_wallet.js")));
+    const m = await doImport(blob(glue)); await m.default({ module_or_path: by["webzjs_wallet_bg.wasm"] }); await m.initThreadPool(Math.min(4, navigator.hardwareConcurrency || 2)); return m;
+  } finally { setTimeout(() => urls.forEach(u => URL.revokeObjectURL(u)), 60_000); }
 }
 let zjsP; export const sharedZjs = () => zjsP ||= loadZjs().catch(e => { zjsP = null; throw e; });
 
@@ -270,12 +295,14 @@ export async function runHop(ctx) {
     get expiry() { return st.outExpiry; }, set expiry(v) { st.outExpiry = v; }, get acct() { return st.attempt; }, set acct(_) {}, get amount() { return null; }, get reserve() { return st.reserve; }, set reserve(v) { st.reserve = v; }, get tries() { return st.attempt; }, set tries(_) {} };
   const P = () => partsOn() ? st.parts[st.partIdx || 0] : legacy;     // the payout part in work; an old (v1) state has one out-leg kept in the old fields
   let W = null, Z = null;
+  // 1105 L-3: every call into WebZjs / lightwalletd is bounded. A hang becomes a retryable error with a one-line cause; the wallet object is dropped so the retry restores a fresh one from the saved bytes.
+  const wc = (fn, ms, what) => withTimeout(Promise.resolve().then(fn), ctx.walletTimeoutMs ?? ms, what).catch(e => { if (/timed out/.test(String(e && e.message))) W = null; throw e; });
   const wallet = async () => {                                   // restore from the saved bytes, or create the accounts at the stored birthday (re-creating gives the same addresses)
     if (W) return W; Z = ctx.Zjs || (ctx.Zjs = await ctx.loadZjs());
     W = new Z.WebWallet(ZC.network, ZC.lightwalletd, 1, 1, rec.db || null);
     if (!rec.db) {
-      if (st.birthday == null) { st.birthday = Number(await retry(() => W.get_latest_block())) - 10; await save(); }
-      st.accts = []; for (let i = 0; i < (st.nAccts || MAX_OUT + 1); i++) st.accts.push(await W.create_account("hop" + i, mn, i, st.birthday));
+      if (st.birthday == null) { const lw = W; st.birthday = Number(await retry(() => wc(() => lw.get_latest_block(), 20000, "Zcash tip query"))) - 10; await save(); }
+      st.accts = []; const lw2 = W; for (let i = 0; i < (st.nAccts || MAX_OUT + 1); i++) st.accts.push(await wc(() => lw2.create_account("hop" + i, mn, i, st.birthday), 60000, "Zcash account setup"));
       rec.db = await W.db_to_bytes(); await save();
     }
     return W;
@@ -287,7 +314,7 @@ export async function runHop(ctx) {
   const beatMs = ctx.beatMs || 5000, syncMax = ctx.syncMaxMs || 15 * 60_000;
   const syncW = async () => {
     const w = await wallet(); let blocks = null;
-    try { const s0 = await withTimeout(w.get_wallet_summary(), 15000, "wallet summary"); if (s0 && s0.chain_tip_height > 0 && s0.fully_scanned_height > 0) blocks = s0.chain_tip_height - s0.fully_scanned_height; if (blocks <= 0) blocks = null; } catch {}
+    try { const s0 = await wc(() => w.get_wallet_summary(), 15000, "wallet summary"); if (s0 && s0.chain_tip_height > 0 && s0.fully_scanned_height > 0) blocks = s0.chain_tip_height - s0.fully_scanned_height; if (blocks <= 0) blocks = null; } catch {}
     const again = !!st.syncedOnce, t0 = Date.now(), n = (st.accts || []).length || 1;
     const est = again ? 100_000 + 60_000 * n : 4000 + (blocks == null ? 100 : blocks) * 120;
     const line = () => { const e = Date.now() - t0; return "Syncing Zcash wallet " + Math.min(95, Math.floor(100 * e / est)) + "%" + (again ? " (a repeat refresh takes ~" + Math.round(est / 60_000) + " min)" : blocks != null ? " (" + blocks + " blocks)" : "") + " · " + Math.round(e / 1000) + " s"; };
@@ -296,11 +323,11 @@ export async function runHop(ctx) {
   };
   const bal = async i => {                                       // sync, then the balances of account i
     await retry(() => syncW()); const w = await wallet();
-    const e = ((await w.get_wallet_summary()).account_balances.find(x => x[0] === st.accts[i]) || [0, {}])[1];
+    const e = ((await wc(() => w.get_wallet_summary(), 30000, "wallet summary")).account_balances.find(x => x[0] === st.accts[i]) || [0, {}])[1];
     return { t: BigInt(e.unshielded_balance || 0), o: BigInt(e.orchard_balance || 0) + BigInt(e.ironwood_balance || 0), p: BigInt(e.pending_change || 0) + BigInt(e.pending_spendable || 0) };
   };
   const taddr = async i => (await wallet()).get_current_address_transparent(st.accts[i]);
-  const tip = async () => { const w = await wallet(); return Number(await retry(() => withTimeout(w.get_latest_block(), 20000, "Zcash tip query"))); };
+  const tip = async () => { const w = await wallet(); return Number(await retry(() => wc(() => w.get_latest_block(), 20000, "Zcash tip query"))); };
   const utxoOf = async a => { if (!ctx.getUtxos) return undefined; try { const u = (await ctx.getUtxos(a)).filter(x => x.height > 0); return { sum: u.reduce((s, x) => s + BigInt(x.value), 0n), height: u.reduce((m, x) => Math.max(m, x.height), 0) }; } catch { return undefined; } };   // undefined = cannot tell
   const allocAcct = async () => { const a = st.nextAcct || MAX_OUT + 1; if (a >= st.accts.length) throw new Halt("no fresh hop account left for a refund address; nothing was sent"); st.nextAcct = a + 1; await save(); return a; };
   const until = async (what, ms, fn, every = 10000) => { const t0 = Date.now(); for (;;) { if (await fn()) return; if (Date.now() - t0 > ms) throw new Halt(what + " is taking too long"); say("Waiting for " + what + "… " + Math.round((Date.now() - t0) / 1000) + " s"); await sleep(every); } };
@@ -311,9 +338,13 @@ export async function runHop(ctx) {
   const relay = async () => {
     if (st.dry) throw new Error("dry run never calls the relayer");
     const { r, d } = await postRelay(fetchFn, ctx.api + "/relay", st.auth, { sleep: ctx.sleep, onBusy: m => ctx.onProgress && ctx.onProgress(m), check: ctx.authUsed ? () => ctx.authUsed(st.auth.from, st.auth.nonce) : null });   // 1098 L-3: a 502/504 is settled on chain before any retry
-    if (d.used) return null;                                     // the relayer did get it: the authorization is used on chain
-    if (r.ok && d.hash) return d.hash;
-    if (/already used/.test(d.error || "")) return null;         // this very authorization was sent before: the transfer exists
+    if (d.used) return null;                                     // the relayer did get it: the authorization is used on chain (postRelay read that from the chain)
+    if (r.ok && d.hash) { if (!/^0x[0-9a-fA-F]{64}$/.test(String(d.hash))) throw new Error("the relayer answered with a malformed transaction hash; nothing was recorded"); return d.hash; }   // 1105 M-1: never save an unchecked string as the deposit hash
+    if (/already used/.test(d.error || "")) {                    // 1105 M-1: the API's words alone prove nothing; the chain must say this nonce is used
+      let used; try { used = ctx.authUsed ? await ctx.authUsed(st.auth.from, st.auth.nonce) : undefined; } catch { used = undefined; }
+      if (used === true) return null;
+      throw new Halt("the relayer says this authorization was already used, but the chain does not confirm it; nothing new was signed. Press Continue to check again");
+    }
     throw new Error(d.error || "relayer error");
   };
   const H = {
@@ -334,7 +365,7 @@ export async function runHop(ctx) {
           if (!st.auth && Date.now() > q.deadlineMs - 120_000) return go("QUOTE_IN", { inQuote: null });      // quote nearly expired and nothing signed: start over
           const spent = st.auth && !st.txIn && ctx.balance && (await ctx.balance()) < BigInt(q.amountIn);       // authorization used but the answer got lost
           let skip = !!spent;
-          if (skip && ctx.authUsed) { try { if ((await ctx.authUsed(st.stealth, st.auth.nonce)) === false) skip = false; } catch {} }   // 1088 L-3: a low or missing balance reading alone is no proof; the chain must say the nonce was used (else the SAME authorization is sent again, which is safe)
+          if (skip && ctx.authUsed) { let u; try { u = await ctx.authUsed(st.stealth, st.auth.nonce); } catch (e) { throw new Halt("could not check on chain whether the deposit authorization was used (" + oneLineErr(e) + "); nothing new was sent"); } if (u === false) skip = false; }   // 1105 L-2: "cannot tell" stops, it is not "already spent"   // 1088 L-3: a low or missing balance reading alone is no proof; the chain must say the nonce was used (else the SAME authorization is sent again, which is safe)
           if (!skip && st.auth && !st.txIn && st.auth.validBefore * 1000 <= Date.now()) {
             // M-1: the saved authorization has expired. It may still have been settled. A new one (new nonce) is allowed ONLY if the chain says this nonce was never used.
             let used; try { used = ctx.authUsed ? await ctx.authUsed(st.stealth, st.auth.nonce) : undefined; } catch (e) { throw new Halt("could not check the earlier authorization on chain (" + e.message + "); nothing new was signed"); }
@@ -347,9 +378,12 @@ export async function runHop(ctx) {
               st.auth = PW.signTransferAuth({ chain: ctx.chain, priv: ctx.priv, from: st.stealth, to: q.depositAddress, value: BigInt(q.amountIn), validBefore: Math.min(Math.floor(Date.now() / 1000) + 3600, Math.floor(q.deadlineMs / 1000) - 30), nonce: ctx.randomNonce() });     // 1088 M-3: never valid past the quote
               await save();                                      // recorded BEFORE it can leave the device
             }
+            if (st.txIn && !/^0x[0-9a-fA-F]{64}$/.test(String(st.txIn))) { st.txIn = null; await save(); }      // 1105 M-1: a malformed hash saved by an older build would fail every resume
             if (!st.txIn) { say("Sending through the relayer…"); st.txIn = await relay(); await save(); }
             if (st.txIn) {
-              if (!(await ctx.waitReceipt(st.txIn)).ok) { st.txIn = null; await save(); throw new Halt("the deposit transfer reverted; nothing moved"); }   // the SAME authorization stays saved: it is public now and may still be valid
+              const want = rc => hasTransfer(rc, { token: ctx.chain.token.address, from: st.stealth, to: q.depositAddress, value: BigInt(q.amountIn) });      // 1105 M-1: it must be THIS transfer, not any successful transaction
+              const got = await ctx.waitReceipt(st.txIn, want);
+              if (!got.ok) { st.txIn = null; await save(); throw new Halt(got.unexpected ? "the transaction the relayer named does not contain the deposit transfer; nothing was recorded as sent. Press Continue to check again" : "the deposit transfer reverted; nothing moved"); }   // the SAME authorization stays saved: it is public now and may still be valid
               await PW.submitDeposit({ base, txHash: st.txIn, depositAddress: q.depositAddress, fetchFn: fIn }).catch(() => {});
             }
           }
@@ -385,11 +419,11 @@ export async function runHop(ctx) {
         const b = await bal(i); if (b.t < MIN_SHIELD) break;     // nothing left to shield (already sent: a resume skips this)
         try {
           say("Shielding: preparing the transaction…"); const w = await wallet(), seed = await mnemonicSeed(mn);
-          let p = await w.pczt_shield(st.accts[i]);
+          let p = await wc(() => w.pczt_shield(st.accts[i]), 120000, "Shield preparation");
           p = await Z.pczt_sign(ZC.network, p, new Z.UnifiedSpendingKey(ZC.network, seed, i), new Z.SeedFingerprint(seed));
           const tp = Date.now(), iv = setInterval(() => say("Shielding: building the zero-knowledge proof · " + Math.round((Date.now() - tp) / 1000) + " s"), beatMs); say("Shielding: building the zero-knowledge proof…");
           let pr; try { pr = await withTimeout(w.pczt_prove(p, null), 10 * 60_000, "Shield proof"); } finally { clearInterval(iv); }
-          say("Shielding: sending to the Zcash network…"); await w.pczt_send(pr); await saveWallet(); break;
+          say("Shielding: sending to the Zcash network…"); await wc(() => w.pczt_send(pr), 120000, "Shield broadcast"); await saveWallet(); break;
         } catch (e) {
           if (!/InsufficientFunds/.test(String((e && e.message) || e))) throw e;          // coins not spendable yet (confirmations): wait and try again
           if (Date.now() - t0 > 30 * 60_000) throw new Halt("The ZEC has arrived but is not spendable yet. Press Continue in a few minutes.");
@@ -443,10 +477,10 @@ export async function runHop(ctx) {
         } else if (!p.raw && stale) { p.quote = null; return go("QUOTE_OUT"); }
         if (send) {
           if (!p.raw) {
-            let proposal; try { proposal = await w.propose_transfer(st.accts[p.acct], oq.depositAddress, BigInt(oq.amountIn)); }
+            let proposal; try { proposal = await wc(() => w.propose_transfer(st.accts[p.acct], oq.depositAddress, BigInt(oq.amountIn)), 120000, "Zcash fee proposal"); }
             catch (e) {
               const r = BigInt(p.reserve || st.reserve);
-              if (!/insufficient|fee|funds/i.test(String((e && e.message) || e))) throw e;                              // 1088 L-2: only a fee shortfall doubles the reserve; sync / network errors just retry
+              if (/timed out/.test(String((e && e.message) || e)) || !/insufficient|fee|funds/i.test(String((e && e.message) || e))) throw e;                              // 1088 L-2: only a fee shortfall doubles the reserve; sync / network errors just retry
               if (r >= RESERVE * 8n) throw new Halt("the Zcash fee does not fit even with a reserve of " + r + " zatoshi (" + e.message + ")");   // ... and never without bound
               p.reserve = (r * 2n).toString(); p.quote = null;
               if (partsOn()) { p.amount = (BigInt(p.amount) - r).toString(); if (BigInt(p.amount) < ZC.minIn) throw new Halt("the Zcash fee does not fit into this payout part (" + e.message + ")"); }
@@ -454,7 +488,7 @@ export async function runHop(ctx) {
             }
             p.raw = hex(await w.create_proposed_transactions(proposal, mn, p.acct)).slice(2); p.expiry = (await tip()) + TX_EXPIRY_DELTA; await saveWallet();      // txid(s) recorded and the wallet saved BEFORE broadcasting
           }
-          try { await w.send_authorized_transactions(unhex(p.raw)); }
+          try { await wc(() => w.send_authorized_transactions(unhex(p.raw)), 120000, "Zcash broadcast"); }
           catch (e) {                                                              // M-2: only a clean return counts as sent. Any error: ask the network whether the txid is known.
             const kn = await known(p.raw);
             if (kn === true) { /* already in the mempool / chain: fine */ }
@@ -491,14 +525,15 @@ export async function runHop(ctx) {
  *  Called by the app once the result has been shown (not inside runHop: the caller and tests still read the full state). */
 export async function scrubFinished(store, stealth) {
   const f = await findHop(store, stealth); if (!f || !["DONE", "FAILED_IN"].includes(f.rec.st.step)) return false;
-  const st = f.rec.st; await store.put(f.key, { st: { v: st.v, n: st.n, stealth: st.stealth, chain: st.chain, dest: st.dest, step: st.step, result: st.result, doneAt: st.doneAt, amount: st.amount, hidden: st.hidden, scrubbed: true }, db: null }); return true;
+  const st = f.rec.st; await store.put(f.key, { st: { v: st.v, n: st.n, stealth: st.stealth, chain: st.chain, dest: st.dest, step: st.step, result: st.result, doneAt: st.doneAt, amount: st.amount, hidden: st.hidden, scrubbed: true,
+    ...(st.step === "FAILED_IN" ? { inDeposit: st.inQuote && st.inQuote.depositAddress, txIn: st.txIn } : {}) }, db: null });   // 1105 L-6: support needs the in-leg deposit address and hash return true;
 }
 
 /** Funds left in the hop wallet: per account t-address and balances. Works from the saved wallet, or from the keys alone (fallback birthday from the payment's block time). */
 export async function hopSummary(ctx, rec = null) {
   const Zj = ctx.Zjs || await ctx.loadZjs(), mn = await mnemonicFor(ctx.priv, ctx.words, rec ? rec.st.n || 0 : ctx.n || 0), w = new Zj.WebWallet(ZC.network, ZC.lightwalletd, 1, 1, rec && rec.db || null);
   let ids = rec && rec.st.accts;
-  if (!ids) { const bd = rec && rec.st.birthday != null ? rec.st.birthday : birthdayFromTime(ctx.blockTimeSec, Number(await w.get_latest_block())); ids = []; for (let i = 0; i < (rec && rec.st.nAccts || MAX_OUT + 1); i++) ids.push(await w.create_account("hop" + i, mn, i, bd)); }
-  await w.sync(); const s = await w.get_wallet_summary();
+  if (!ids) { const bd = rec && rec.st.birthday != null ? rec.st.birthday : Number.isFinite(ctx.blockTimeSec) ? birthdayFromTime(ctx.blockTimeSec, Number(await withTimeout(w.get_latest_block(), 20000, "Zcash tip query"))) : ZC.orchardActivation; ids = []; for (let i = 0; i < (rec && rec.st.nAccts || MAX_OUT + 1); i++) ids.push(await w.create_account("hop" + i, mn, i, bd)); }
+  await withTimeout(w.sync(), 15 * 60_000, "Zcash wallet sync"); const s = await withTimeout(w.get_wallet_summary(), 30000, "wallet summary");
   return Promise.all(ids.map(async (id, i) => { const e = (s.account_balances.find(x => x[0] === id) || [0, {}])[1]; return { account: i, t: await w.get_current_address_transparent(id), transparent: BigInt(e.unshielded_balance || 0), orchard: BigInt(e.orchard_balance || 0) + BigInt(e.ironwood_balance || 0) }; }));
 }

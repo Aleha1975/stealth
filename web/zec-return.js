@@ -107,7 +107,7 @@ export const MIN_INPUT = 5_001n;                 // an input worth <= its own 50
 export const MIN_OUTPUT = 1_000n;                // the sweep must pay at least this (above the relay dust rule); a caller that skips the quote minimum is still covered
 export const MAX_INPUTS = 50;                    // per transaction (far below the 100 kB standardness limit); the rest is swept by the next press
 const MAX_TIP = 0x7fffffff, MAX_MONEY = 2_100_000_000_000_000n;
-/** Consensus branch id for the chain tip height. Refuses heights below the NU6.3 activation. */
+/** Consensus branch id for the chain tip height. Refuses heights below the NU6.3 activation. (Known: it does NOT fail closed on a later upgrade; a stale branch id is rejected by the network after the quote, nothing is lost. 1103 I-4.) */
 export function branchForHeight(h) {
   if (!Number.isInteger(h) || h < BRANCH_ACTIVATION || h > MAX_TIP) throw new Error("chain tip " + h + " is below the NU6.3 activation (or invalid); refusing to build");
   return NU6_3_BRANCH;
@@ -147,8 +147,9 @@ function pbRead(b, { each = null, partial = false } = {}) {
       let v;
       if (w === 0) v = vi(); else if (w === 2) { const l = vi(); if (l > BigInt(MAX_BODY)) throw new Error("protobuf: field too long"); v = take(Number(l)); }
       else if (w === 1) v = take(8); else if (w === 5) v = take(4); else throw new Error("protobuf wire " + w);
-      out.push([no, v]); if (each && each(no, v)) { cut = true; break; }
+      out.push([no, v]);
     } catch (e) { if (partial && /truncated/.test(e.message)) { i = start; cut = true; break; } throw e; }
+    if (each && each(out[out.length - 1][0], out[out.length - 1][1])) { cut = true; break; }      // 1103 L-3: an error raised by `each` (a bad inner entry) is never mistaken for the end of a cut reply
   }
   out.cut = cut; return out;
 }
@@ -189,6 +190,12 @@ async function grpc(base, method, msg, fetchFn = fetch, { maxFrame = MAX_FRAME, 
   if (b.cut) {                                      // flood: only a prefix was read; the first data frame's start is all we use (status cannot be seen, a bad header status still counts)
     const hs = r.headers.get("grpc-status"); if (hs != null && hs !== "0") throw new Error("lightwalletd: error " + hs);
     if (b.length < 5 || b[0] !== 0) throw new Error("lightwalletd: bad truncated reply");
+    const l = ((b[1] << 24) | (b[2] << 16) | (b[3] << 8) | b[4]) >>> 0;       // 1103 L-3: the first frame's own length is honoured; bytes after it are not message content
+    if (5 + l <= b.length) {
+      const d = b.slice(5, 5 + l), rest = b.slice(5 + l);
+      if (rest.length >= 5 && (rest[0] & 0x80)) { const rl = ((rest[1] << 24) | (rest[2] << 16) | (rest[3] << 8) | rest[4]) >>> 0; if (5 + rl <= rest.length) { const tr = new TextDecoder().decode(rest.slice(5, 5 + rl)), m = /^grpc-status:[ \t]*(\d+)/mi.exec(tr); if (m && m[1] !== "0") throw new Error("lightwalletd: error " + m[1]); } }
+      return d;                                                              // the message is complete (only the trailer was cut off)
+    }
     const d = b.slice(5); d.partial = true; return d;
   }
   const { data, trailer } = grpcFrames(b, maxFrame);
@@ -203,8 +210,9 @@ async function grpc(base, method, msg, fetchFn = fetch, { maxFrame = MAX_FRAME, 
 }
 const bigOf = (v, what) => { if (typeof v !== "bigint") throw new Error("lightwalletd: bad " + what); return v; };
 /** Wall-clock bound on the tip (audit 1100 L-1). The chain makes one block per ~75 s, so the height cannot be far from anchor + (now - anchorTime)/75. A lying lightwalletd could
- *  otherwise pick the expiry (a tip of 499,999,000 = a transaction that never expires). The anchor is a real block (height 3,535,162 at 2026-10-29 14:34 UTC); the tolerance is 200 blocks
- *  plus 0.3% of the elapsed blocks, which covers the slow drift of the real average block time as the anchor ages. */
+ *  otherwise pick the expiry (a tip of 499,999,000 = a transaction that never expires). The anchor is a real block (height 3,535,162 at 2026-10-29 21:54:31 UTC); the tolerance is 200 blocks
+ *  plus 0.3% of the elapsed blocks, which covers the slow drift of the real average block time as the anchor ages.
+ *  1103 L-2 (known, not changed): 200 blocks is ~4.2 h, so a lying server can still choose a tip that far ahead; the loss is bounded by the refund path. A device clock off by more than that is refused too. */
 export const TIP_ANCHOR = { height: 3_535_162, time: 1_793_310_871 }, TIP_SLACK = 200, BLOCK_SECONDS = 75;
 export function tipWithinClock(h, nowMs = Date.now()) {
   const elapsed = Math.max(0, (nowMs / 1000 - TIP_ANCHOR.time) / BLOCK_SECONDS), expect = TIP_ANCHOR.height + elapsed, slack = TIP_SLACK + elapsed * 0.003;
@@ -214,34 +222,45 @@ export function tipWithinClock(h, nowMs = Date.now()) {
 export async function getTip(base, fetchFn, opts = {}) {
   const h = bigOf((pbRead(await grpc(base, "GetLatestBlock", new Uint8Array(0), fetchFn)).find(([no]) => no === 1) || [])[1], "tip height");
   if (h < BigInt(BRANCH_ACTIVATION) || h > BigInt(MAX_TIP)) throw new Error("lightwalletd: implausible chain tip " + h);
-  if (!tipWithinClock(Number(h), opts.now)) throw new Error("lightwalletd reported chain tip " + h + ", which does not match the clock; refusing to build a transaction on it");
+  if (!tipWithinClock(Number(h), opts.now)) throw new Error("lightwalletd reported chain tip " + h + ", which does not match this device's clock (is the date and time on this device right? it must be within about 4 hours); refusing to build a transaction on it");
   return Number(h);
 }
 /** UTXOs of one t-address: [{ txid (display hex), n, value, script, height }], each one validated; duplicates and foreign scripts are errors.
- *  Audit 1100 L-3: reading stops after the first MAX_UTXO_ENTRIES (500) valid entries, so a dust flood cannot make the whole read fail; `list.truncated` is true when more existed. */
+ *  Audit 1100 L-3 / 1103 M-1: a page stops after MAX_UTXO_ENTRIES (500) entries WORTH SPENDING (>= MIN_INPUT), so a dust prefix cannot push the real deposit out of view; dust is still listed
+ *  (it counts as "not empty"). Further pages continue from the last height (at most MAX_UTXO_PAGES). `list.truncated` is true when more may exist beyond what was read; a caller must then
+ *  never treat an empty sweepSet() as "nothing here". */
 export async function getUtxos(base, addr, fetchFn) {
-  const mine = tAddrScript(addr);
-  const res = await grpc(base, "GetAddressUtxos", cat(pbField(1, 2, enc(addr)), pbField(2, 0, pbVarint(0)), pbField(3, 0, pbVarint(0))), fetchFn, { maxFrame: MAX_BODY, partial: true });
-  const seen = new Set(), list = [];
-  const entry = m => {
-    if (!(m instanceof Uint8Array)) throw new Error("lightwalletd: bad UTXO entry");
-    const u = { n: 0, value: 0n, height: 0 }; let has = 0;
-    for (const [no, v] of pbRead(m)) {
-      if (no === 1) { if (!(v instanceof Uint8Array) || v.length !== 32) throw new Error("lightwalletd: bad UTXO txid"); u.txid = hex(v.slice().reverse()); has |= 1; }
-      else if (no === 2) { if (bigOf(v, "UTXO index") >= 0x100000000n) throw new Error("lightwalletd: bad UTXO index"); u.n = Number(v); }
-      else if (no === 3) { if (!(v instanceof Uint8Array)) throw new Error("lightwalletd: bad UTXO script"); u.script = v; }
-      else if (no === 4) { if (bigOf(v, "UTXO value") <= 0n || v > MAX_MONEY) throw new Error("lightwalletd: bad UTXO value"); u.value = v; has |= 2; }
-      else if (no === 5) { if (bigOf(v, "UTXO height") > BigInt(MAX_TIP)) throw new Error("lightwalletd: bad UTXO height"); u.height = Number(v); }
-      else if (no === 6) { if (!(v instanceof Uint8Array) || new TextDecoder().decode(v) !== addr) throw new Error("lightwalletd: UTXO of another address"); } }
-    if (has !== 3) throw new Error("lightwalletd: incomplete UTXO");
-    if (u.script && hex(u.script) !== hex(mine)) throw new Error("lightwalletd: UTXO script is not this address's");
-    const id = u.txid + ":" + u.n; if (seen.has(id)) throw new Error("lightwalletd: duplicate UTXO"); seen.add(id);
-    list.push(u);
-  };
-  const fields = pbRead(res, { partial: !!res.partial, each: (no, v) => { if (no === 1) entry(v); return list.length >= MAX_UTXO_ENTRIES; } });
-  if (res.partial && !fields.cut) throw new Error("lightwalletd: truncated reply");
-  if (res.partial && list.length < MAX_UTXO_ENTRIES) throw new Error("lightwalletd: reply too large");
-  list.truncated = fields.cut && list.length >= MAX_UTXO_ENTRIES;
+  const mine = tAddrScript(addr), MAX_UTXO_PAGES = 6, seen = new Set(), list = []; let start = 0, more = false;
+  for (let pg = 0; pg < MAX_UTXO_PAGES; pg++) {
+    let res; try { res = await grpc(base, "GetAddressUtxos", cat(pbField(1, 2, enc(addr)), pbField(2, 0, pbVarint(start)), pbField(3, 0, pbVarint(0))), fetchFn, { maxFrame: MAX_BODY, partial: true }); }
+    catch (e) { if (pg === 0) throw e; more = true; break; }          // a later page that fails keeps what the first pages proved (flood protection); the list is flagged truncated
+    const before = new Set(seen); let big = 0, added = 0, maxH = start;
+    const entry = m => {
+      if (!(m instanceof Uint8Array)) throw new Error("lightwalletd: bad UTXO entry");
+      const u = { n: 0, value: 0n, height: 0 }; let has = 0;
+      for (const [no, v] of pbRead(m)) {
+        if (no === 1) { if (!(v instanceof Uint8Array) || v.length !== 32) throw new Error("lightwalletd: bad UTXO txid"); u.txid = hex(v.slice().reverse()); has |= 1; }
+        else if (no === 2) { if (bigOf(v, "UTXO index") >= 0x100000000n) throw new Error("lightwalletd: bad UTXO index"); u.n = Number(v); }
+        else if (no === 3) { if (!(v instanceof Uint8Array)) throw new Error("lightwalletd: bad UTXO script"); u.script = v; }
+        else if (no === 4) { if (bigOf(v, "UTXO value") <= 0n || v > MAX_MONEY) throw new Error("lightwalletd: bad UTXO value"); u.value = v; has |= 2; }
+        else if (no === 5) { if (bigOf(v, "UTXO height") > BigInt(MAX_TIP)) throw new Error("lightwalletd: bad UTXO height"); u.height = Number(v); }
+        else if (no === 6) { if (!(v instanceof Uint8Array) || new TextDecoder().decode(v) !== addr) throw new Error("lightwalletd: UTXO of another address"); } }
+      if (has !== 3) throw new Error("lightwalletd: incomplete UTXO");
+      if (u.script && hex(u.script) !== hex(mine)) throw new Error("lightwalletd: UTXO script is not this address's");
+      const id = u.txid + ":" + u.n; if (seen.has(id)) { if (before.has(id)) return; throw new Error("lightwalletd: duplicate UTXO"); } seen.add(id);     // an entry repeated from an earlier page (same boundary height) is skipped
+      list.push(u); added++; if (u.height > maxH) maxH = u.height; if (u.value >= MIN_INPUT) big++;
+    };
+    let fields; try {
+      fields = pbRead(res, { partial: !!res.partial, each: (no, v) => { if (no === 1) entry(v); return big >= MAX_UTXO_ENTRIES; } });
+      if (res.partial && !fields.cut) throw new Error("lightwalletd: truncated reply");
+      if (res.partial && big < MAX_UTXO_ENTRIES) throw new Error("lightwalletd: reply too large");
+    } catch (e) { if (pg === 0) throw e; more = true; break; }
+    more = fields.cut && big >= MAX_UTXO_ENTRIES;
+    if (!more) break;
+    if (!added || maxH <= start) break;                                  // no progress: the rest cannot be reached
+    start = maxH;
+  }
+  list.truncated = more;
   return list;
 }
 /** Send a raw tx. Succeeds only on a well-formed reply with errorCode 0 whose returned txid equals `expectTxid` (display hex, the locally computed one). */

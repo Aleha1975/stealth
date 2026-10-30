@@ -57,8 +57,8 @@ export function hopView(h, now = Date.now()) {
     v.line = "Total time " + v.elapsed + " (min:sec).";
     if (p && p.hash) v.link = { text: "Payout tx " + p.hash.slice(0, 10) + "…", href: /^https:\/\//.test(p.url || "") ? p.url : (dst.explorer || "") + "/tx/" + p.hash };
   } else if (st.step === "FAILED_IN") {
-    v.kind = "warn"; v.title = "Swap refunded"; v.body = "Your " + amt(st.amount, tok.decimals) + " " + tok.symbol + " is back on the stealth address (minus a small refund fee). Nothing was sent.";
-    v.detail = "First swap ended as " + (st.result || "unknown") + ".";
+    v.kind = "warn"; v.title = "Swap refunded"; v.body = "Your " + amt(st.amount, tok.decimals) + " " + tok.symbol + " should be back on the stealth address (minus a small refund fee): check the balance. Nothing was sent.";
+    v.detail = "First swap ended as " + (st.result || "unknown") + "." + (st.inDeposit ? " Deposit address " + st.inDeposit + (st.txIn ? ", transaction " + st.txIn : "") + "." : "");
   } else if (st.step === "FAILED") {
     v.kind = "bad"; v.title = "Transfer stopped"; v.body = "Your funds are safe. Any ZEC left sits in a temporary wallet that can be rebuilt from this payment's key."; v.action = "funds";
     v.detail = "Last swap ended as " + (st.result || "unknown") + (st.outQuote && st.outQuote.depositAddress ? " (deposit address " + st.outQuote.depositAddress + ")" : "") + "." + (h.extra ? "\n" + h.extra : "");
@@ -74,7 +74,7 @@ export function hopView(h, now = Date.now()) {
   } else {
     const early = idx < STEPS.indexOf("WAIT_T");               // nothing has left the stealth address yet / no ZEC exists yet
     const cause = oneLine(st.err), wait = h.retryAt && h.retryAt > now ? Math.ceil((h.retryAt - now) / 1000) : 0;
-    v.kind = "warn"; v.title = "Transfer paused"; v.body = (wait ? "Problem: " + (cause || "network hiccup") + ". Retrying by itself in " + (wait < 120 ? wait + " s" : Math.ceil(wait / 60) + " min") + ". " : st.err ? "Stopped: " + cause + ". " : "") + (early ? "Your money has not moved." : "Your funds are safe.") + " Press Continue transfer to try again.";
+    v.kind = "warn"; v.title = "Transfer paused"; v.body = (wait ? "Problem: " + (cause || "network hiccup") + ". Retrying by itself in " + (wait < 120 ? wait + " s" : Math.ceil(wait / 60) + " min") + ". " : st.err ? "Stopped: " + cause + ". " : "") + (early && !(st.auth || st.relayed || st.txIn) ? "Your money has not moved." : early ? "The deposit may already be on its way: your funds are safe, but do not send from this address again until this transfer finishes." : "Your funds are safe.") + " Press Continue transfer to try again.";
     v.action = "continue"; v.detail = ""; v.zec = !early; v.pct = shownPct((st.stealth || "") + "#" + (st.n || 0), st, remainingMs(st, now), now);
   }
   return v;
