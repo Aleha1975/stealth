@@ -31,3 +31,23 @@ Relayer state (audit 1116)
   answers 503 and sends nothing ("ALERT state save failed"). A state file that exists but cannot be loaded makes the relayer REFUSE TO START ("ALERT state load failed"); fix or move the file
   deliberately (a missing file is a normal fresh start). The unsure table is capped (STEALTH_RELAY_UNSURE_MAX, 2000): when full, new sends get 503 ("ALERT unsure table full") instead of evicting.
   A pair (feeAuth + main) is relayed fee first; if the main send fails, the retry with the same signatures skips the already collected fee.
+
+Charging model and nonce model (audit 1120, round 8; supersedes the M-2 text above where they differ)
+  Charging.  A signer's budgets (STEALTH_RELAY_FAIL_PER_SIGNER, the RPC token bucket, the daily per-address / per-payer counters) are charged ONLY by a request that carries a valid signature
+       over an authorization that is still UNUSED (the relayer reads authorizationState once, before it charges anyone). Replays of public signatures (dedupe hit, known-used cache, used on chain,
+       expired, not yet valid, "still being confirmed") are charged to the NETWORK key (STEALTH_RELAY_FAIL_PER_IP, weight 0.2 for honest-class refusals) and never to the signer. A fresh signed
+       request that fails is charged to its signer AND to the network's signed-failure budget (STEALTH_RELAY_FAIL_PER_NET_SIGNED, default 10 x FAIL_PER_SIGNER per hour): throwaway signers are
+       bounded by it (429 "too many failed requests from this network", before any RPC). Offline junk only fills the junk counter, which never blocks a fresh signed request.
+       Cost: a valid-signature request costs one authorizationState read before the other checks (an empty-wallet pay: 2 reads, was 1).
+       ACCEPTED (unchanged): availability against distributed IP rotation. No global ceiling exists or is to be added; nginx limit_req + MAX_CONCURRENT + the daily gas budget are the outer bounds.
+       Accepted residual: an attacker who bypasses nginx per-IP limits (rotating IPs) can still spend one authorizationState read per distinct (victim, nonce) once; the result is cached forever (used is permanent).
+  Nonce.  The local nonce is reconciled with the node's PENDING count at every lock acquisition. A send on the wire (also one whose holder hit the lock deadline) is tracked in `flights` until it
+       settles; later sends stay above it. If it then never reached the node, the next holder finds a gap (local > pending, nothing on the wire, no recent send of ours at the pending nonce:
+       STEALTH_RELAY_GAP_GRACE_MS, 15 s) and fills it with a self-transfer (signed locally, deadline checked, broadcast without an await in between), or simply resets. No restart is ever needed.
+  Counters. The daily per-address / per-payer count is incremented and decremented through ONE per-send record (info.counted), also for a send that settles after the lock deadline.
+  I-1 (1120)  rh.env.example sets STEALTH_RELAY_FEE_MIN=0: the withdraw-fee path (and the fee-skip-on-retry logic, audit 1116 L-5) is dormant on RH. feePaid is capped at 2000 entries: if a pair retry came
+       after 2000 other fee sends, the retry would be refused "authorization already used" after the fee was collected (bounded by the daily gas budget). Enable fees only after re-running the pair tests.
+  I-2 (1120)  FIXED: the dedupe key covers from, nonce, recipient, value and validBefore (pay: nonce, amount, validBefore), so a re-signed different transfer under an old nonce is never answered with
+       the old hash (it gets "authorization already used").
+  I-3 (1120)  FIXED for the second "nonce too low" attempt (its unsure entry is removed). A record that was written but whose send never happened (directory fsync failure after the rename) is
+       rewritten away by the next successful state write (the failed write sets the dirty flag); until then it blocks only that authorization's retry, for at most DEDUPE_MS, and counts toward UNSURE_MAX.

@@ -88,7 +88,7 @@ export const isLowS = s => { try { const x = BigInt(s); return x > 0n && x <= SE
  *  behind a shared IPv4 cannot lock honest users out with ordinary errors). failWeight looks at the class, never at message text
  *  (messages can embed user input, e.g. BigInt SyntaxErrors). */
 export class Refusal extends Error {
-  constructor(msg, { honest = false, unknown = false } = {}) { super(msg); this.name = "Refusal"; this.honest = honest; this.unknown = unknown; }
+  constructor(msg, { honest = false, unknown = false, net = false } = {}) { super(msg); this.name = "Refusal"; this.honest = honest; this.unknown = unknown; this.net = net; }   // audit 1120 M-1: net = not caused by a fresh signed request of the signer (replay, used, expired, being confirmed): charged to the NETWORK key, never to the signer
 }
 /** Infrastructure trouble (RPC / indexer down or slow) after the offline checks. Answered 503; consumes no failure budget. */
 export class Upstream extends Error { constructor(msg) { super(msg); this.name = "Upstream"; } }
