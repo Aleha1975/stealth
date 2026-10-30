@@ -12,7 +12,7 @@ Object.assign(process.env, { STEALTH_CHAIN: "rh", STEALTH_ENV_ONLY: "1", STEALTH
   STEALTH_RELAY_STATE: path.join(tmp, "s.json"), STEALTHPAY: "0x" + "99".repeat(20), RELAYER_KEY: "0x" + "11".repeat(32), STEALTH_RELAY_PAY_FEE_MIN: "0" });
 const R = await import("./relayer.mjs");
 let fails = 0; const t = (name, ok) => { console.log(ok ? "PASS" : "FAIL", name); if (!ok) fails++; };
-const sig = { nonce: "0x" + "00".repeat(32), r: "0x" + "00".repeat(32), s: "0x" + "00".repeat(32), v: 27, value: "300000", validBefore: "99999999999" };
+const sig = { nonce: "0x" + "00".repeat(32), r: "0x" + "00".repeat(32), s: "0x" + "00".repeat(31) + "01", v: 27, value: "300000", validBefore: "99999999999" };
 const err = p => p.then(() => null, e => String(e.message));
 rpcCalls = 0;
 t("relay: listed from refused", (await err(R.relay({ ...sig, from: BAD, to: OK }, "1.1.1.1"))) === "address is on a sanctions list");
@@ -23,7 +23,7 @@ t("pay: listed payer refused", (await err(R.relayPay(pay({ auth: { ...pay().auth
 t("pay: listed stealth refused", (await err(R.relayPay(pay({ stealth: BAD }), "1.1.1.1"))) === "address is on a sanctions list");
 t("pay: listed feeRecipient refused", (await err(R.relayPay(pay({ feeRecipient: BAD }), "1.1.1.1"))) === "address is on a sanctions list");
 t("zero RPC calls (no gas, no reads) for refusals", rpcCalls === 0);
-t("refusal does not consume IP/payer quota", Object.keys(R.st.perIp).length === 0 && Object.keys(R.st.perPayer).length === 0);
+t("refusal does not consume from/payer quota", Object.keys(R.st.perFrom).length === 0 && Object.keys(R.st.perPayer).length === 0);
 t("refusals are logged", (fs.readFileSync(path.join(tmp, "r.log"), "utf8").match(/sanctions refused/g) || []).length === 5);
 const e1 = await err(R.relay({ ...sig, from: OK, to: OK2 }, "1.1.1.1")); t("unlisted address is NOT refused for sanctions (fails later)", e1 !== "address is on a sanctions list");
 t("unlisted passes screen", R.screen.isListed(OK) === false && R.screen.isListed(BAD) === true);
