@@ -252,6 +252,8 @@ try {
     const s1 = await snap([W.feelow.stealth, W.nofee.stealth]);
     await refused("B5 withdraw: feeAuth below minimum refused", post(RELAY, "/relay", await wbody(W.feelow.stealth, C, 2n * U, FEE - 1n), nip()), /fee below the minimum/, s1, [W.feelow.stealth, W.nofee.stealth]);
     await refused("B5 withdraw: no feeAuth at all refused", post(RELAY, "/relay", await wbody(W.nofee.stealth, C, 2n * U, null), nip()), /fee authorization required/, s1, [W.feelow.stealth, W.nofee.stealth]);
+    { const r1 = await post(RELAY, "/relay", await wbody(W.nofee.stealth, C, 2n * U, null), nip()), r2 = await post(RELAY, "/relay", await wbody(W.feelow.stealth, C, 2n * U, FEE - 1n), nip());
+      ok("B5 1131 L-2 env-dependent refusals (fee authorization required / fee below the minimum) are 400 WITHOUT definite:true", r1.status === 400 && r1.definite === undefined && r2.status === 400 && r2.definite === undefined, JSON.stringify([r1, r2])); }
     await refused("B5 withdraw: fee paid to someone else (not the relayer) refused", post(RELAY, "/relay", await wbody(W.nofee.stealth, C, 2n * U, FEE, { feeTo: C }), nip()), /.+/, s1, [W.feelow.stealth, W.nofee.stealth]); }
   // B6 sanctioned recipient (test address injected into the sanctions list file the relayer watches)
   { const dd = newDest(); const s0 = await snap([sanctioned]);
@@ -859,6 +861,14 @@ try {
       ok("B14 1128 L-1 primary answers JSON-RPC -32005 'limit exceeded' over HTTP 200, or 'header not found': same, the healthy endpoint is used", rLim.o.a === 4663 && rLim.o.i === 1 && rHdr.o.a === 4663 && rHdr.o.i === 1, rLim.out.slice(0, 120) + rHdr.out.slice(0, 120));
       ok("B14 1128 L-1 a deterministic node answer ('nonce too low') does NOT switch endpoints and is rethrown", rNon.o.a === null && rNon.o.i === 0 && rNon.o.e && !/Upstream/.test(rNon.o.e), rNon.out.slice(0, 200));
       ok("B14 1128 L-1 every endpoint refuses (403 / 401): the error is Upstream (503, the honest signer is not charged), not an unclassified refusal", rAll.o.e === "Upstream:", rAll.out.slice(0, 200)); }
+    { const run = (a, b) => childMod(RM + 'let e = null; try { await R.nodeCall(c => c.getChainId()); } catch (x) { e = x.name + ":" + (x.status || x.code || ""); } console.log(JSON.stringify({ e }));', [a, b]);
+      const r429 = await run(await fakeRpc(() => ({ http: 429 })), await fakeRpc(() => ({ http: 429 })));
+      ok("B14 1131 L-1 a plain HTTP 429 from every endpoint is Upstream (503, the signer is not charged), not an unclassified 400", r429.o.e === "Upstream:", r429.out.slice(0, 200)); }
+    // 1131 L-2: env-dependent refusals are not definite; byte-only ones are. 1132 L-1: PAY_FEE < PAY_FEE_MIN stops startup
+    { const src = fs.readFileSync(path.join(HERE, "relayer.mjs"), "utf8");
+      ok("B14 1131 L-2 early(): MIN_VALUE / fees not enabled / fee below minimum / fee authorization required are early(..., false); bad fields, bad v, high s, signature mismatch, nonce equality stay definite", ["below the minimum of $0.10", "fees are not enabled", "fee below the minimum", "fee authorization required"].every(m => src.includes('early("' + m + '", false)')) && ["bad signature fields", "bad v", "bad signature (high s)", "signature does not match the address", "the fee and the transfer need different nonces"].every(m => new RegExp('early\\("' + m.replace(/[()]/g, "\\$&") + '"[^,)]*\\)').test(src) ));
+      const bad = spawnSync("node", ["--input-type=module", "-e", RM + "console.log('started')"], { encoding: "utf8", timeout: 30000, env: { ...process.env, STEALTH_ENV_ONLY: "1", STEALTH_CHAIN: "rh", STEALTH_RPC: RPC, RELAYER_KEY: generatePrivateKey(), STEALTH_RELAY_STATE: path.join(tmp, "pf.json"), STEALTH_RELAY_LOG: path.join(tmp, "pf.log"), STEALTH_RELAY_PAY_FEE_MIN: "50000", STEALTH_RELAY_PAY_FEE: "40000" } });
+      ok("B14 1132 L-1 STEALTH_RELAY_PAY_FEE below STEALTH_RELAY_PAY_FEE_MIN: the relayer refuses to start (exit 1, clear message)", bad.status === 1 && /PAY_FEE must be at least/.test(bad.stderr) && !/started/.test(bad.stdout), bad.status + " " + bad.stderr.slice(0, 200)); }
 
     // L-2: the proof of "gone" is read from ONE endpoint: A answers 'not found' once, then dies; B (lagging) says 'not found', unused, nonce passed. Without the pin this would be PROVEN.
     { let n = 0; const A = await fakeRpc(j => { if (/^eth_getTransaction(Receipt|ByHash)$/.test(j.method) && ++n <= 2) return { body: { result: null } }; return { http: 500 }; });

@@ -45,6 +45,7 @@ function setAcct(a) {
   acct = a ? a.toLowerCase() : null;
   $("wbtn").textContent = acct ? acct.slice(0, 6) + "…" + acct.slice(-4) : "Connect wallet"; $("wbtn").classList.toggle("on", !!acct);
   if (changed) { keys = null; found = []; $("recv-out").hidden = true; $("pay-list").textContent = ""; $("withdraw").hidden = true; say("recv-hint", "Account changed: derive the keys again for this account.", "warn"); }
+  try { if (typeof showFastBox === "function" && $("fast-resume")) showFastBox(); } catch {}      // 1132 M-1: this account's recovery notes
 }
 async function connect() {
   if (!window.ethereum) { say("recv-hint", "No wallet found. Open this page inside MetaMask.", "bad"); return null; }
@@ -775,7 +776,7 @@ async function payGasless({ amount, raw: rawIn = null, d, ephLen, ephData, tagWo
 let payFee = null, payBpsNow = 0, amtSrc = "amount";
 const PAY_BPS_CAP = 100;       // this page never accepts a percentage fee above 1% of the payment, whatever the relayer announces
 const payBps = s => { const b = Number(s.pay_fee_bps || 0); if (!Number.isInteger(b) || b < 0 || b > PAY_BPS_CAP) throw new Error("The relayer announces an unusual fee rate; refusing."); return b; };
-api("/relay/stats").then(s => { if (s.pay_enabled && s.pay_fee != null) { payFee = BigInt(s.pay_fee); payBpsNow = payBps(s); } calc(); }).catch(() => {});
+api("/relay/stats").then(s => { if (s.pay_enabled && s.pay_fee != null) { const f = BigInt(s.pay_fee), b = payBps(s); payFee = f; payBpsNow = b; } calc(); }).catch(() => {});
 const curFee = () => $("token").value === "TOKEN" ? (payFee ?? 0n) : 0n, unit = () => $("token").value === "TOKEN" ? TUNIT : NUNIT;
 /** Returns { send, get, fee } in token units from the field the user last edited, or null. */
 function payAmounts() {

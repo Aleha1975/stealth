@@ -55,6 +55,7 @@ const PAY_FEE_MIN = BigInt(E.STEALTH_RELAY_PAY_FEE_MIN || "0");                 
 const PAY_FEE_BPS = Number(E.STEALTH_RELAY_PAY_FEE_BPS || 0);                                      // 0 = off (the fixed fee only); else fee >= this share of the payment, in basis points (rounded up), never below the minimum
 if (!Number.isInteger(PAY_FEE_BPS) || PAY_FEE_BPS < 0 || PAY_FEE_BPS > 100) { console.error("STEALTH_RELAY_PAY_FEE_BPS must be an integer 0..100"); process.exit(1); }
 const PAY_FEE = BigInt(E.STEALTH_RELAY_PAY_FEE || PAY_FEE_MIN.toString());                       // комиссия, которую предлагает веб (в /relay/stats)
+if (PAY_FEE < PAY_FEE_MIN) { console.error("STEALTH_RELAY_PAY_FEE must be at least STEALTH_RELAY_PAY_FEE_MIN"); process.exit(1); }   // 1132 L-1
 const MAX_PER_PAYER_PER_DAY = Number(E.STEALTH_RELAY_PAY_PER_PAYER || 20);
 const GAS_BUDGET_WEI_PER_DAY = BigInt(E.STEALTH_RELAY_GAS_BUDGET_WEI || "200000000000000");   // 0.0002 ETH/day
 const MIN_VALUE = BigInt(E.STEALTH_RELAY_MIN_USDC || "100000");                                  // $0.10 (токен 6 знаков на обеих цепях)
@@ -98,7 +99,7 @@ export const nodeCall = async (fn) => {
     try { const r = await fn(pubs[k]); if (k !== sticky) { log("rpc endpoint switched", sticky, "->", k); sticky = k; } return r; }
     catch (e) { if (!isTransport(e)) throw e; last = e; }
   }
-  if (classifyError(last) instanceof Upstream || !isBadEndpoint(last)) throw last;
+  if (classifyError(last) instanceof Upstream || !isTransport(last)) throw last;       // 1131 L-1: transport includes a plain HTTP 429 from every endpoint
   throw new Upstream("rpc endpoints unavailable");     // audit 1128 L-1: every endpoint refused us (auth / quota): infrastructure trouble, an honest signer is not charged for it
 };
 const node = {
@@ -212,8 +213,9 @@ const alertOnce = (...a) => { if (Date.now() - lastAlert > 60000) { lastAlert = 
 const HEX32 = /^0x[0-9a-fA-F]{64}$/;
 
 // audit 1130 M-1: `definite: true` in a 400 is a PROMISE that this request was refused by offline validation, before any state was read or anything could be broadcast, and that
-// every repeat of the same bytes is refused the same way. Everything else (STILL, "in progress", limits, balance, expiry, upstream) may follow an earlier attempt that did broadcast: no flag.
-const early = m => Object.assign(new Error(m), { definite: true });
+// every repeat of the same bytes is refused the same way. So only checks that depend purely on the request bytes carry it (bad fields, bad v, high s, signature mismatch, nonce equality);
+// refusals that depend on env config (MIN_VALUE, FEE_MIN: fees not enabled / fee below minimum / fee authorization required) can change with a restart, so they are NOT definite (1131 L-2). Everything else (STILL, "in progress", limits, balance, expiry, upstream) may follow an earlier attempt that did broadcast: no flag.
+const early = (m, definite = true) => Object.assign(new Error(m), definite ? { definite: true } : {});   // 1131 L-2: definite=false for refusals that depend on this process's env config
 function parseAuth(o, what) {
   if (!o || !HEX32.test(o.nonce) || !HEX32.test(o.r) || !HEX32.test(o.s)) throw early("bad signature fields" + what);
   const v = Number(o.v); if (![27, 28].includes(v)) throw early("bad v" + what);
@@ -500,14 +502,14 @@ export async function relay(b, ip, ctx = {}) {
   // the web app screens it itself via /relay/screen before signing (sending it here would tell this server who receives the money).
   screen.check({ from, to, feeRecipient: account.address, ...(b.endRecipient ? { endRecipient: getAddress(b.endRecipient) } : {}) }, ip);      // before any RPC / counters / gas
   const main = parseAuth(b, ""); const value = main.value;
-  if (value < MIN_VALUE) throw early("below the minimum of $0.10");
+  if (value < MIN_VALUE) throw early("below the minimum of $0.10", false);
   let fee = null;
   if (b.feeAuth) {
-    if (FEE_MIN === 0n) throw early("fees are not enabled");
+    if (FEE_MIN === 0n) throw early("fees are not enabled", false);
     fee = parseAuth(b.feeAuth, " (fee)");
-    if (fee.value < FEE_MIN) throw early("fee below the minimum");
+    if (fee.value < FEE_MIN) throw early("fee below the minimum", false);
     if (fee.nonce === main.nonce) throw early("the fee and the transfer need different nonces");   // audit 1128 L-4: one nonce would share one unsure / feePaid key
-  } else if (FEE_MIN > 0n) throw early("fee authorization required");
+  } else if (FEE_MIN > 0n) throw early("fee authorization required", false);
   // audit 1099 M-2/I-6: everything that can be decided without the network is decided now: the EIP-712 signature (so a stranger cannot take the address lock, and junk costs no RPC)
   for (const [a, dst] of fee ? [[main, to], [fee, account.address]] : [[main, to]]) {
     const signer = await recoverTypedDataAddress({ domain: { name: CC.domain.name, version: CC.domain.version, chainId: CC.id, verifyingContract: TOKEN }, types: TRANSFER_TYPES, primaryType: "TransferWithAuthorization",

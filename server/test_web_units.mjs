@@ -273,6 +273,9 @@ const PRIV = new Uint8Array(32).fill(9), ACC = addressFromPriv(PRIV), A2 = "0x" 
     t("1130 L-2: both call sites pass the window derived from validBefore", (src.match(/span: logSpanSince\(/g) || []).length === 2); }
   // F-3
   const ro = PWm.relayOutcome;
+  { const appSrc = fs.readFileSync(new URL("../web/app.js", import.meta.url), "utf8"), sa = appSrc.slice(appSrc.indexOf("function setAcct("), appSrc.indexOf("async function connect("));
+    t("1132 M-1: setAcct() ends with a guarded showFastBox() (cannot throw, needs the DOM box) so per-account notes appear after connecting", /try \{ if \(typeof showFastBox === "function" && \$\("fast-resume"\)\) showFastBox\(\); \} catch \{\}[^\n]*\n\}\s*$/.test(sa.trim() + "\n") || /showFastBox\(\); \} catch \{\}/.test(sa));
+    t("1132 I-1: the stats handler computes payFee and payBpsNow into locals first and assigns both together", /const f = BigInt\(s\.pay_fee\), b = payBps\(s\); payFee = f; payBpsNow = b;/.test(appSrc) && !/payFee = BigInt\(s\.pay_fee\); payBpsNow/.test(appSrc)); }
   t("1130 M-1: relayOutcome: only a 400 with the explicit definite:true is a definite refusal; plain 400 / 403 / 429 / 500 / no-JSON are in progress; 'already used', d.used, ok unchanged", ro({ ok: false, status: 400 }, { error: "x", definite: true }).definite === true && ro({ ok: false, status: 400 }, { error: "x" }).definite === false
     && ro({ ok: false, status: 429 }, { error: "x", definite: true }).definite === false && ro({ ok: false, status: 403 }, { error: "x" }).definite === false && ro({ ok: false, status: 400 }, { error: "a previous attempt for this authorization is still being confirmed" }).definite === false
     && ro({ ok: false, status: 400 }, { error: "a withdrawal from this address is already in progress" }).definite === false
