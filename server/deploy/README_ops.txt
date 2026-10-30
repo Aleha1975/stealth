@@ -55,7 +55,7 @@ Charging model and nonce model (audit 1120, round 8; supersedes the M-2 text abo
   Audit 1124 (round 9). All findings are non-fund-loss: an EIP-3009 authorization is one-use on chain.
   F1  FIXED: gas-budget and low-balance refusals are net:true (relayer-wide state, not the signer's doing): charged to the network key, never to the signer.
   F2/F3/F4 FIXED at the root: nonce truth and every transaction probe (pending/latest count, getTransaction, receipt, authorizationState as a proof, sendRawTransaction) go to ONE sticky RPC
-       (the first STEALTH_RPC entry); it moves to the next entry only on a transport failure (5xx, timeout, connection, 429) and the switch is logged ("rpc endpoint switched"). Balances, gas and fee
+       (the first STEALTH_RPC entry); it moves to the next entry only when the endpoint is unusable (5xx, timeout, connection, 429, HTTP 401/402/403/408, JSON-RPC limit exceeded / header not found / missing trie node; audit 1128 L-1) and the switch is logged ("rpc endpoint switched"). Balances, gas and fee
        estimates keep the failover transport. A gap fill needs two pending-count reads STEALTH_RELAY_GONE_GAP_MS apart that agree. Restart: the persisted unsure records (written before every send, with
        the nonce) refill nonceOfHash and lift the starting local nonce for sends younger than STEALTH_RELAY_GAP_GRACE_MS; nothing new is persisted.
   F4 residual (documented): provenGone() can still be wrong if a node lies consistently for >= 2 probes. A false "gone" makes the relayer sign a second transaction for the same authorization; because the
@@ -64,3 +64,11 @@ Charging model and nonce model (audit 1120, round 8; supersedes the M-2 text abo
   I2  FIXED: a variable that is present but empty in the own environment is no longer refilled from the foreign env file.
   I1  Partly covered: test_fork_e2e.mjs now exercises the sticky endpoint with a dead first RPC and a lagging pending read; a full two-backend divergence harness is not built.
   I3  ACCEPTED: a malformed numeric field (BigInt SyntaxError) is thrown before any state-dependent step and answered 400 from the generic handler; it is charged to the network key as junk (ctx.signer unset). The message only echoes the caller's own input.
+
+  Audit 1128 (round 10). No fund loss.
+  L-1 FIXED: an endpoint refused for auth / quota / lag is left like a dead one; when every endpoint refuses, the answer is Upstream (503), the signer is not charged.
+  L-2 FIXED: provenGone() reads its whole proof from one endpoint; a switch during the proof means "not proven" (keep waiting). The watcher's two "dropped" probes are pinned the same way.
+  L-3 FIXED: only a receipt-wait TIMEOUT means "stuck"; an RPC error is retried twice (GONE_GAP_MS apart) and then logged as "ALERT receipt wait failed" with the reservation kept; the wait fails over like every node call.
+  L-4 FIXED: a feeAuth with the same nonce as the transfer is refused offline.
+  L-5 FIXED: an unconfirmed (ambiguous) send keeps its gas reservation (the day budget never undercounts); a retry reserves again (safe direction, like I-1).
+  I-1 ACCEPTED (safe direction, now also true for L-5). I-2 ACCEPTED (self-healing within GAP_GRACE_MS, delay only; the lift is what protects a real recent send). I-3 ACCEPTED (availability, per the client's decision).

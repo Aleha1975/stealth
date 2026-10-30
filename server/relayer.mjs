@@ -84,7 +84,11 @@ export const pub = createPublicClient({ chain, transport }); const wal = createW
 // Plain reads (balances, estimates, fees) may keep using `pub` (fallback).
 const pubs = RPCS.map(u => createPublicClient({ chain, transport: vhttp(u, { timeout: 30000 }) }));
 let sticky = 0; export const stickyIndex = () => sticky;
-const isTransport = e => { if (classifyError(e) instanceof Upstream) return true; for (let x = e, i = 0; x && i < 8; i++, x = x.cause) if (x.status === 429) return true; return false; };
+// audit 1128 L-1: an endpoint that is ONLY unusable (auth / quota / lagging answers) is left like a dead one: HTTP 401/402/403/408, JSON-RPC "limit exceeded" (-32005) and the "header not found" /
+// "missing trie node" family. Deterministic rejections of OUR transaction (nonce too low, already known, underpriced, reverts) are not in this list: they must be answered, never retried elsewhere.
+const BAD_ENDPOINT = /limit exceeded|rate limit|quota|unauthori[sz]ed|forbidden|invalid api key|header not found|missing trie node|historical state/i;
+const isBadEndpoint = e => { for (let x = e, i = 0; x && i < 8; i++, x = x.cause) { if ([401, 402, 403, 408].includes(x.status) || x.code === -32005 || (x.code !== undefined && BAD_ENDPOINT.test(String(x.details || x.shortMessage || x.message || "")))) return true; } return false; };
+const isTransport = e => { if (classifyError(e) instanceof Upstream) return true; for (let x = e, i = 0; x && i < 8; i++, x = x.cause) if (x.status === 429) return true; return isBadEndpoint(e); };
 export const nodeCall = async (fn) => {
   let last;
   for (let i = 0; i < pubs.length; i++) {
@@ -92,7 +96,8 @@ export const nodeCall = async (fn) => {
     try { const r = await fn(pubs[k]); if (k !== sticky) { log("rpc endpoint switched", sticky, "->", k); sticky = k; } return r; }
     catch (e) { if (!isTransport(e)) throw e; last = e; }
   }
-  throw last;
+  if (classifyError(last) instanceof Upstream || !isBadEndpoint(last)) throw last;
+  throw new Upstream("rpc endpoints unavailable");     // audit 1128 L-1: every endpoint refused us (auth / quota): infrastructure trouble, an honest signer is not charged for it
 };
 const node = {
   count: blockTag => nodeCall(c => c.getTransactionCount({ address: account.address, blockTag })),
@@ -100,7 +105,7 @@ const node = {
   getTransactionReceipt: hash => nodeCall(c => c.getTransactionReceipt({ hash })),
   sendRawTransaction: serializedTransaction => nodeCall(c => c.sendRawTransaction({ serializedTransaction })),
   authorizationState: (from, nonce) => nodeCall(c => c.readContract({ address: TOKEN, abi, functionName: "authorizationState", args: [from, nonce] })),
-  waitForTransactionReceipt: args => pubs[sticky].waitForTransactionReceipt(args),
+  waitForTransactionReceipt: args => nodeCall(c => c.waitForTransactionReceipt(args)),   // audit 1128 L-3: same failover as every other node call
 };
 // audit 1099 M-1: the FIRST argument is a fixed template (the watchdog keys on it: "ALERT <template>" / "reverted"); every further argument is data and goes through neutral()
 // (no line breaks, and the words ALERT / reverted are broken up), so no request can forge or mute a watchdog line. Write user text only as later arguments.
@@ -300,15 +305,17 @@ async function findTx(h, polls, deadline) {      // h: one hash or a list; retur
 // audit 1116 L-2: a resend of an authorization needs PROOF that the earlier transaction cannot land: every hash it may have (original + replacement) answered "not found" by TWO probes GONE_GAP_MS apart
 // with no RPC error between (a lying / lagging backend or an error is "unknown" and means: keep waiting), authorizationState unused on chain (a failed read counts as unknown), and, unless the node
 // itself already said "nonce too low", the relayer's confirmed nonce has passed the nonce of that transaction (so it can no longer be mined).
-async function provenGone(hs, nonce, used, ctl, needNonce) {
+// audit 1128 L-2: the whole proof is read from ONE endpoint: if the sticky endpoint moves at any step, the agreeing probes may come from two different (lagging) backends, so the proof fails (keep waiting).
+export async function provenGone(hs, nonce, used, ctl, needNonce) {
   if (!used) return false;
+  const k = sticky, same = () => sticky === k && !ctl.dead;
   for (let round = 0; round < 2; round++) {
-    for (const x of hs) if ((await probeTx(x)) !== true) return false;
-    if (round === 0) { await sleep(GONE_GAP_MS); if (ctl.dead) return false; }
+    for (const x of hs) if ((await probeTx(x)) !== true || !same()) return false;
+    if (round === 0) { await sleep(GONE_GAP_MS); if (!same()) return false; }
   }
   try { if (await used()) return false; } catch { return false; }
   if (needNonce) { const latest = await node.count("latest").catch(() => null); if (latest === null || Number(latest) <= Number(nonce)) return false; }
-  return !ctl.dead;
+  return same();
 }
 const STILL = () => new Refusal("a previous attempt for this authorization is still being confirmed, try again in a minute", { honest: true, net: true });
 // audit 1108 L-1/L-2: the hash of a signed transaction is written to `unsure` (and the state file) BEFORE it is sent, and removed only when it is mined or proven gone. A retry, also after a
@@ -358,7 +365,7 @@ async function submit(call, gasLimit, used, retried = false, prevHash = null, uk
       const amb = AMBIGUOUS.test(msg) || /^(HttpRequestError|TimeoutError|WebSocketRequestError)$/.test(String(e && e.name));
       if (await findTx(h, amb ? POLLS : 1, Date.now() + RECOVER_MS)) { noteNonce(h, nonce); log("send answer lost, transaction found", h); return h; }
       if (!amb && ukey) { unsure.delete(ukey); saveSoon(); }   // the node refused it outright: nothing is out there
-      if (amb) throw new Upstream("the send could not be confirmed, try again in a minute");   // audit 1108 M-3: lost answer of OUR transaction (entry stays in `unsure`): infrastructure trouble, not the caller's
+      if (amb) { info.keepReserve = true; throw new Upstream("the send could not be confirmed, try again in a minute"); }   // audit 1108 M-3: lost answer of OUR transaction (entry stays in `unsure`): infrastructure trouble, not the caller's; audit 1128 L-5: its gas may still be spent, the reservation stays (day budget never undercounts)
     }
     // локальный nonce устарел (ключ релеера использовал кто-то ещё, рестарт узла): один повтор с nonce, взятым заново с узла, вместо отказа клиенту
     if (!retried && /nonce too low|nonce.*(lower|too low)/i.test(msg)) {
@@ -405,6 +412,8 @@ async function sendAndTrack(call, gasLimit, reserve, from, tag, onGone = () => {
   const own = x => !!x && !!hash && (x.h === hash || (x.alt || []).includes(hash));
   const charge = () => { const x = ukey && unsure.get(ukey); if (info.charge && x && !x.counted && st.day === d0) { bump(info.charge.map(), info.charge.key); x.counted = true; saveSoon(); } };
   const uncharge = () => { const x = ukey && unsure.get(ukey); if (info.charge && own(x) && x.counted && st.day === d0) { dec(info.charge.map(), info.charge.key); x.counted = false; } };
+  const isWaitTimeout = e => !!e && e.name === "WaitForTransactionReceiptTimeoutError";
+  const waitRc = async (h) => { for (let i = 0; ; i++) { try { return await node.waitForTransactionReceipt({ hash: h, timeout: STUCK_S * 1000 }); } catch (e) { if (isWaitTimeout(e) || i >= 2) throw e; await sleep(GONE_GAP_MS); } } };   // audit 1128 L-3: a blip is retried, not mistaken for a stuck transaction
   const track = h => {
     hash = h; issued.set(h.toLowerCase(), 1); capMap(issued, 5000);
     if (watchers.has(h)) { adj(d0, -reserve); saveSoon(); return; }
@@ -427,10 +436,11 @@ async function sendAndTrack(call, gasLimit, reserve, from, tag, onGone = () => {
   function clearUnsure() { const x = ukey && unsure.get(ukey); if (x && (x.h === hash || (x.alt || []).includes(hash))) unsure.delete(ukey); nonceOfHash.delete(hash); }   // mined or proven gone: no longer "unconfirmed" (1116 I-4: nor needed for a gap fill)
   async function watch() {
     let rc; mine.push(hash);
-    try { rc = await node.waitForTransactionReceipt({ hash, timeout: STUCK_S * 1000 }); }
-    catch {
+    try { rc = await waitRc(hash); }
+    catch (e) {
+      if (!isWaitTimeout(e)) { log("ALERT receipt wait failed", tag, hash, String(e).slice(0, 80)); return; }   // audit 1128 L-3: only a TIMEOUT means "stuck"; an RPC error says nothing about the transaction (reserve stays, the retry finds the hash)
       // audit 1099 L-3: dropped only if two independent probes a few seconds apart both say "not found" with no RPC error in between
-      let gone = false; if ((await probeTx(hash)) === true) { await sleep(GONE_GAP_MS); gone = (await probeTx(hash)) === true; }
+      let gone = false; if ((await probeTx(hash)) === true) { const k1 = sticky; await sleep(GONE_GAP_MS); gone = (await probeTx(hash)) === true && sticky === k1; }   // audit 1128 L-3: both probes from the same endpoint
       if (gone) {                                              // узел выбросил транзакцию (не в пуле, не в блоке): закрыть дыру в nonce, иначе все следующие повиснут за ней
         const n = (nonceOfHash.get(hash) || {}).n;
         log("dropped", tag, hash, "nonce", n);
@@ -491,6 +501,7 @@ export async function relay(b, ip, ctx = {}) {
     if (FEE_MIN === 0n) throw new Error("fees are not enabled");
     fee = parseAuth(b.feeAuth, " (fee)");
     if (fee.value < FEE_MIN) throw new Error("fee below the minimum");
+    if (fee.nonce === main.nonce) throw new Error("the fee and the transfer need different nonces");   // audit 1128 L-4: one nonce would share one unsure / feePaid key
   } else if (FEE_MIN > 0n) throw new Error("fee authorization required");
   // audit 1099 M-2/I-6: everything that can be decided without the network is decided now: the EIP-712 signature (so a stranger cannot take the address lock, and junk costs no RPC)
   for (const [a, dst] of fee ? [[main, to], [fee, account.address]] : [[main, to]]) {

@@ -611,6 +611,7 @@ try {
     // fault proxy for this section: lie "not found", delay / fail / answer-with-error the Nth eth_sendRawTransaction
     const fz = { lieNF: false, sendDelay: 0, errAfterSend: null, failSendNth: 0, sends: 0 };
     const fzf = async o => {
+      if (fz.blipTxLeft > 0 && o.method === "eth_getTransactionReceipt") { fz.blipTxLeft--; return { jsonrpc: "2.0", id: o.id, error: { code: -32000, message: "header not found" } }; }   // 1128 L-3: ONE RPC blip on viem's poll of the receipt wait (call 1 is viem's swallowed prefetch, call 2 is the poll, which rejects the wait on any error but 'not found')
       if (o.method === "eth_fillTransaction") return { jsonrpc: "2.0", id: o.id, error: { code: -32601, message: "Method not found" } };   // viem falls back to eth_estimateGas, which is pinned to a mined block below
       if (fz.lieNF && /^eth_getTransaction(Receipt|ByHash)$/.test(o.method)) return { jsonrpc: "2.0", id: o.id, result: null };
       if (o.method === "eth_sendRawTransaction") {
@@ -621,6 +622,7 @@ try {
         const dl = fz.sendDelay; if (dl) { fz.sendDelay = 0; await sleep(dl); }
         const j = await fetch(RPC, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(o) }).then(r => r.json());
         if (fz.errAfterSend && !j.error) return { jsonrpc: "2.0", id: o.id, error: { code: -32000, message: fz.errAfterSend } };
+        if (fz.blipTxN) { fz.blipTxLeft = fz.blipTxN; fz.blipTxN = 0; }
         if (fz.respDelay) { const d = fz.respDelay; fz.respDelay = 0; await sleep(d); }   // 1124 F5: the node HAS the transaction, the ANSWER is slow
         return j;
       }
@@ -839,6 +841,52 @@ try {
       ok("B14 1124 F2/F4 sticky endpoint: dead first RPC -> the call is answered by the second, the switch is logged once, the index stays there; a plain error does not switch and is rethrown", o.a === 4663 && o.i1 === 1 && o.i2 === 1 && o.e === "plain" && (fs.readFileSync(lf, "utf8").match(/rpc endpoint switched 0 -> 1/g) || []).length === 1, r.stdout + r.stderr.slice(0, 200)); }
     { const src = fs.readFileSync(path.join(HERE, "relayer.mjs"), "utf8");
       ok("B14 1124 F2/F4 every nonce / probe / proof / send call goes through the sticky `node` object (no pub.getTransactionCount / getTransaction / getTransactionReceipt / sendRawTransaction / waitForTransactionReceipt left)", !/pub\.(getTransactionCount|getTransaction|getTransactionReceipt|sendRawTransaction|waitForTransactionReceipt)\(/.test(src.replace(/const rc = await pub\.getTransactionReceipt\(\{ hash: cur \}\)/, ""))); }
+
+    // ---- audit 1128 (round 10): L-1 ... L-5
+    // tiny fake JSON-RPC endpoints + a child process importing the real relayer.mjs (spawn, not spawnSync: the fake servers live in this process)
+    const fakeRpc = async handler => { const sv = httpServer.createServer((q, r) => { let b = ""; q.on("data", c => b += c); q.on("end", () => { let j = {}; try { j = JSON.parse(b); } catch {} const out = handler(j); r.writeHead(out.http || 200, { "content-type": "application/json" }); r.end(JSON.stringify(out.http ? { error: "x" } : { jsonrpc: "2.0", id: j.id, ...out.body })); }); }); const port = await freePort(); await new Promise(r => sv.listen(port, "127.0.0.1", r)); procs.push({ kill: () => sv.close() }); return "http://127.0.0.1:" + port; };
+    const childMod = (code, rpcs, extra = {}) => new Promise(res => { const p = spawn("node", ["--input-type=module", "-e", code], { env: { ...process.env, STEALTH_ENV_ONLY: "1", STEALTH_CHAIN: "rh", STEALTH_RPC: rpcs.join(","), RELAYER_KEY: generatePrivateKey(), STEALTH_RELAY_STATE: path.join(tmp, "c" + Math.random() + ".json"), STEALTH_RELAY_LOG: path.join(tmp, "c.log"), ...extra }, stdio: ["ignore", "pipe", "pipe"] });
+      let out = ""; p.stdout.on("data", d => out += d); p.stderr.on("data", d => out += d); const t = setTimeout(() => p.kill("SIGKILL"), 30000); p.on("close", () => { clearTimeout(t); let o = {}; try { o = JSON.parse(out.trim().split("\n").pop()); } catch {} res({ o, out }); }); });
+    const RM = 'import * as R from "file://' + path.join(HERE, "relayer.mjs") + '"; ';
+    const okChain = m => m === "eth_chainId" ? { body: { result: "0x1237" } } : { body: { result: null } };
+    { const good = await fakeRpc(j => okChain(j.method)), run = (bad, tail = "") => childMod(RM + 'let e = null, a = null; try { a = await R.nodeCall(c => c.getChainId()); } catch (x) { e = x.name + ":" + (x.status || x.code || ""); } console.log(JSON.stringify({ a, e, i: R.stickyIndex() }));', [bad, ...(tail ? [tail] : [good])]);
+      const r403 = await run(await fakeRpc(() => ({ http: 403 }))), rLim = await run(await fakeRpc(() => ({ body: { error: { code: -32005, message: "daily request count exceeded" } } })));
+      const rHdr = await run(await fakeRpc(() => ({ body: { error: { code: -32000, message: "header not found" } } })));
+      const rNon = await run(await fakeRpc(() => ({ body: { error: { code: -32000, message: "nonce too low" } } })));
+      const b1 = await fakeRpc(() => ({ http: 403 })), b2 = await fakeRpc(() => ({ http: 401 })), rAll = await run(b1, b2);
+      ok("B14 1128 L-1 primary answers HTTP 403 (revoked key): the call is answered by the second endpoint and the sticky index moves to it", r403.o.a === 4663 && r403.o.i === 1, r403.out.slice(0, 200));
+      ok("B14 1128 L-1 primary answers JSON-RPC -32005 'limit exceeded' over HTTP 200, or 'header not found': same, the healthy endpoint is used", rLim.o.a === 4663 && rLim.o.i === 1 && rHdr.o.a === 4663 && rHdr.o.i === 1, rLim.out.slice(0, 120) + rHdr.out.slice(0, 120));
+      ok("B14 1128 L-1 a deterministic node answer ('nonce too low') does NOT switch endpoints and is rethrown", rNon.o.a === null && rNon.o.i === 0 && rNon.o.e && !/Upstream/.test(rNon.o.e), rNon.out.slice(0, 200));
+      ok("B14 1128 L-1 every endpoint refuses (403 / 401): the error is Upstream (503, the honest signer is not charged), not an unclassified refusal", rAll.o.e === "Upstream:", rAll.out.slice(0, 200)); }
+
+    // L-2: the proof of "gone" is read from ONE endpoint: A answers 'not found' once, then dies; B (lagging) says 'not found', unused, nonce passed. Without the pin this would be PROVEN.
+    { let n = 0; const A = await fakeRpc(j => { if (/^eth_getTransaction(Receipt|ByHash)$/.test(j.method) && ++n <= 2) return { body: { result: null } }; return { http: 500 }; });
+      const B = await fakeRpc(j => /^eth_getTransactionCount$/.test(j.method) ? { body: { result: "0x10" } } : { body: { result: null } });
+      const r = await childMod(RM + 'const g = await R.provenGone(["0x' + "11".repeat(32) + '"], 5, async () => false, { dead: false }, true); console.log(JSON.stringify({ g, i: R.stickyIndex() }));', [A, B], { STEALTH_RELAY_GONE_GAP_MS: "100" });
+      ok("B14 1128 L-2 provenGone: the sticky endpoint switches between its two probes (A answers once then fails, B lags) -> NOT proven gone", r.o.g === false && r.o.i === 1, r.out.slice(0, 300)); }
+
+    // L-3: a short RPC blip on the receipt wait is not a stuck transaction: no replacement, no 'receipt wait failed', the transaction is tracked to 'mined'
+    { await rpc("evm_setAutomine", [false]);
+      const R = await withDir("q1128l3", { STEALTH_RPC: FZ, STEALTH_RELAY_STUCK_S: "30", STEALTH_RELAY_GONE_GAP_MS: "300" }), x = await mkp(R);
+      fz.blipTxN = 2; const w = await post(R.url, "/relay/pay", x.body, nip()); await sleep(3000);   // the transaction is healthy and pending; viem's poll hits the blip
+      await rpc("evm_setAutomine", [true]); await mine(1);
+      const tracked = await waitFor(async () => R.log().split("\n").some(l => / mined pay /.test(l) && w.hash && l.includes(w.hash)), 15000);
+      ok("B14 1128 L-3 one RPC blip ('header not found') on the receipt wait of a healthy pending transaction: the watcher retries, NO 'stuck' replacement, no 'receipt wait failed', the transaction ends 'mined'", w.status === 200 && tracked && !/ stuck pay /.test(R.log()) && !/ replacement pay /.test(R.log()) && !/ALERT receipt wait failed/.test(R.log()), R.log().split("\n").slice(-5).join(" | ").slice(0, 400)); }
+
+    // L-4: feeAuth.nonce === main.nonce is refused offline
+    { const acc = privateKeyToAccount(generatePrivateKey()), vb = now() + 3600, n1 = rnd32(), n0 = await nonceOf(R1.addr);
+      const sg = async (to, v) => { const q = splitSig(await acc.signTypedData({ domain: dom(), types: TT, primaryType: "TransferWithAuthorization", message: { from: acc.address, to, value: v, validAfter: 0n, validBefore: BigInt(vb), nonce: n1 } })); return { v: q.v, r: q.r, s: q.s }; };
+      const body = { from: acc.address, to: C, value: String(U), validAfter: "0", validBefore: String(vb), nonce: n1, ...(await sg(C, U)), feeAuth: { value: FEE.toString(), validAfter: "0", validBefore: String(vb), nonce: n1.toUpperCase().replace("0X", "0x"), ...(await sg(R1.addr, FEE)) } };
+      const w = await post(RELAY, "/relay", body, nip());
+      ok("B14 1128 L-4 feeAuth with the same nonce as the transfer (also in another letter case): 400 'different nonces', refused before any RPC, nothing sent", w.status === 400 && /different nonces/.test(w.error) && (await nonceOf(R1.addr)) === n0, JSON.stringify(w)); }
+
+    // L-5: an unconfirmed send (answer lost, backend lies 'not found') keeps its gas reservation in the day's counter
+    { await rpc("evm_setAutomine", [false]);
+      const R = await withDir("q1128l5", { STEALTH_RPC: FZ, STEALTH_RELAY_POLL_GAP_MS: "200", STEALTH_RELAY_GONE_GAP_MS: "300", STEALTH_RELAY_RECOVER_MS: "1500" }), x = await mkp(R);
+      fz.lieNF = true; fz.errAfterSend = "upstream request timeout"; const w = await post(R.url, "/relay/pay", x.body, nip()); fz.errAfterSend = null; fz.lieNF = false;
+      await sleep(1800); const j = stOf(R);
+      ok("B14 1128 L-5 unconfirmed send (503 'could not be confirmed'): the gas reservation stays in the day's counter (state gas > 0) and the unsure record is kept", w.status === 503 && j && BigInt(j.gas) > 0n && j.unsure.length === 1, JSON.stringify([w, j && j.gas, j && j.unsure.length]));
+      await rpc("evm_setAutomine", [true]); await mine(1); }
 
     // I-5: a state file that cannot be loaded -> the relayer refuses to start, ALERT line the watchdog matches
     { const bad = [["corrupt", "{not json"], ["dir", null]], res = [];
