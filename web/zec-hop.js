@@ -12,10 +12,11 @@ import { zcash as ZC, privateFee, appFeesOf } from "./chains.js";
 export const STEPS = ["QUOTE_IN", "DEPOSIT_IN", "WAIT_T", "SHIELD", "DELAY", "QUOTE_OUT", "SEND_OUT"];
 export const DONE_STEPS = new Set(["DONE", "FAILED_IN", "FAILED"]);
 export const HOP_TAG = "stealth-zec-hop/v1", MAX_OUT = 3, PART_TRIES = 2, PENDING = "PENDING_DEPOSIT", T_CONFS = 3;   // T_CONFS: confirmations of the hop wallet's own t-deposit before we try to shield. The wallet policy (constructor args, 1/1 below) already allows 1; 3 blocks (~4 min) keep a shallow reorg from hitting the shield. A too-early shield only raises InsufficientFunds, which SHIELD retries (10 s pause, but every round starts with a wallet sync that takes minutes)
-/** 1129 F-3: a REPEAT wallet sync (WebZjs, a wallet that already scanned) takes 145-340 s with 1-4 accounts and more with 5 (syncW's own estimate for 5 accounts is ~6.7 min). The shield step does one such sync while it waits for the
- *  shielded balance, and every payout part does one before its quote, so the typical times below include them. */
-export const SYNC_MIN = 6;
-export const STEP_MIN = { QUOTE_IN: 0.5, DEPOSIT_IN: 4, WAIT_T: 4, SHIELD: 3 + SYNC_MIN, DELAY: 6, QUOTE_OUT: 0.5 + SYNC_MIN, SEND_OUT: 8 };   // typical minutes per step (sum 38)
+/** 30.10 MEASURED (Chrome headless, the shipped wasm, mainnet via ZC.lightwalletd, wallet born at tip-20 as a hop does): first sync 5.3-6.4 s; immediate repeat 0.8 s (1 account) / 1.5 s (5 accounts); repeat after +3 blocks 1.8 / 2.5 s;
+ *  after +10 blocks 2.1 / 2.8 s; a wallet restored from db_to_bytes 1.0 / 1.5 s. Worst 2.8 s = 0.05 min, so SYNC_MIN is that rounded up to 0.1 min. The old figure (145-340 s, 6 min) belonged to the wasm before 938d5b6 (skip known subtree roots);
+ *  the card text and this constant were never updated. Every sync() is one wallet pass; the shield step does a few and every payout part does one before its quote, all included in the times below. */
+export const SYNC_MIN = 0.1;
+export const STEP_MIN = { QUOTE_IN: 0.5, DEPOSIT_IN: 4, WAIT_T: 4, SHIELD: 3 + SYNC_MIN, DELAY: 6, QUOTE_OUT: 0.5 + SYNC_MIN, SEND_OUT: 8 };   // typical minutes per step (sum 26.2; the max-mode route comes to 31-35 min, see etaRangeMin)
 export const ETA_MIN = Math.round(Object.values(STEP_MIN).reduce((a, b) => a + b, 0));          // for a saved state without a mode
 /** Payout modes (audit H-1): the shielded balance is paid out in k parts of random size, each with its own random delay, quote and deposit.
  *  Limit (1105 L-7): the split defeats a match on ONE amount only. The parts sum to the in-leg amount minus known fees, all go to the same recipient, and the pipeline latency is
@@ -350,17 +351,16 @@ export async function runHop(ctx) {
     return nw;
   };
   const saveWallet = async () => { const w = await wallet(); rec.db = await wc(() => w.db_to_bytes(), 60000, "Zcash wallet save"); await save(); };
-  // Sync with a live status line. MEASURED against mainnet (Chrome, WebZjs Ironwood build): the first sync() of a wallet that has never synced takes 5-15 s (~0.1 s per block + 2 s subtree roots),
-  // but EVERY later sync() of a wallet that already scanned takes 145-156 s with 1 account and ~340 s with 4 (a fresh WebWallet restored from saved bytes behaves the same). So: the wallet is synced as rarely
-  // as possible (waits use the lightwalletd UTXO query), and a slow sync is shown honestly. WebZjs has no progress callback and blocks get_wallet_summary while syncing, so the percent is an estimate.
+  // Sync with a live status line. MEASURED 30.10 (see SYNC_MIN): the first sync() of a new wallet takes 5-6 s, every later one 1-3 s (1 or 5 accounts, also after a restore from saved bytes); the old 145-340 s was the wasm before the
+  // subtree-root skip (938d5b6). WebZjs has no progress callback and blocks get_wallet_summary while syncing, so the percent is an estimate. A sync is still not free on a slow link, so waits prefer the lightwalletd UTXO query.
   const beatMs = ctx.beatMs || 5000, syncMax = ctx.syncMaxMs || 15 * 60_000;
   const syncW = async () => {
     let w = await wallet(), blocks = null;
     try { const s0 = await wc(() => w.get_wallet_summary(), 15000, "wallet summary"); if (s0 && s0.chain_tip_height > 0 && s0.fully_scanned_height > 0) blocks = s0.chain_tip_height - s0.fully_scanned_height; if (blocks <= 0) blocks = null; }
     catch (e) { if (isTimeout(e)) w = await wallet(); }       // 1111 M-1: the timeout dropped W; the sync below runs on the freshly restored wallet, the one the balance read will use (the estimate just stays rough)
     const again = !!st.syncedOnce, t0 = Date.now(), n = (st.accts || []).length || 1;
-    const est = again ? 100_000 + 60_000 * n : 4000 + (blocks == null ? 100 : blocks) * 120;
-    const line = () => { const e = Date.now() - t0; return "Syncing Zcash wallet " + Math.min(95, Math.floor(100 * e / est)) + "%" + (again ? " (a repeat refresh takes ~" + Math.round(est / 60_000) + " min)" : blocks != null ? " (" + blocks + " blocks)" : "") + " · " + Math.round(e / 1000) + " s"; };
+    const est = again ? 2000 + 200 * n : 4000 + (blocks == null ? 100 : blocks) * 120;      // measured: repeat 0.8-2.8 s for 1-5 accounts; first sync 5.3-6.4 s for 21 blocks (estimate 6.5 s)
+    const line = () => { const e = Date.now() - t0; return "Syncing Zcash wallet " + Math.min(95, Math.floor(100 * e / est)) + "%" + (again ? " (a repeat refresh takes ~" + Math.round(est / 1000) + " s)" : blocks != null ? " (" + blocks + " blocks)" : "") + " · " + Math.round(e / 1000) + " s"; };
     say(line()); const iv = setInterval(() => say(line()), beatMs);
     try { await withTimeout(w.sync(), syncMax, "Zcash wallet sync"); st.syncedOnce = true; } catch (e) { if (isTimeout(e)) { W = null; say("Problem: " + e.message + " · retrying"); } throw e; } finally { clearInterval(iv); }   // W = null: the next call restores a fresh wallet from the last saved bytes
   };
@@ -456,7 +456,7 @@ export async function runHop(ctx) {
           const n = Math.max(0, Math.min(T_CONFS, (await tip()) - st.tSeenHeight)); if (n >= T_CONFS) break;
           if (Date.now() - t0 > 45 * 60_000) throw new Halt("Zcash confirmations are taking too long");
           say("Waiting for Zcash confirmations (" + n + "/" + T_CONFS + ") · ~" + Math.max(1, Math.round((T_CONFS - n) * 1.25)) + " min");
-          await sleep(beatMs * 2);
+          await sleep(beatMs);                                   // 30.10: one beat (5 s), so the shield starts within 5 s of the last confirmation
         }
       }
       await go("SHIELD");
