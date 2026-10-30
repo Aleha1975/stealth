@@ -17,7 +17,7 @@
    API 127.0.0.1:3874: POST /stealth-api/relay {from,to,value,validAfter,validBefore,nonce,v,r,s[,feeAuth:{value,validAfter,validBefore,nonce,v,r,s}]}
    -> {hash[,feeHash]}; GET /stealth-api/relay/stats */
 import { makeScreen } from "./sanctions/screen.mjs";
-import { cleanLog, neutral, safeIp, capMap, makeFailBudget, makeLineLimiter, ipKey, parseEnvLine, isLowS, failWeight } from "./relay-util.mjs";
+import { cleanLog, neutral, safeIp, capMap, makeFailBudget, makeLineLimiter, ipKey, parseEnvLine, isLowS, failWeight, isCostly, Refusal, Upstream } from "./relay-util.mjs";
 import http from "http"; import fs from "fs"; import path from "path"; import { fileURLToPath, pathToFileURL } from "url";
 import { createPublicClient, createWalletClient, http as vhttp, fallback, parseAbi, formatEther, getAddress, defineChain, encodeAbiParameters, encodeFunctionData, keccak256, toHex, recoverTypedDataAddress, isAddress } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
@@ -138,8 +138,29 @@ const seenTx = h => pub.getTransactionReceipt({ hash: h }).then(() => true, () =
 // audit 1099 L-2: the hash of the signed transaction is known BEFORE it is sent. "already known" = our own transaction is in the pool -> success with that hash.
 // "nonce too low" may be our own transaction already mined (the answer of a first attempt was lost): look for it, and for the authorization already used on chain,
 // before signing a second transaction with a new nonce. A second send of the same authorization is never made.
-async function submit(call, gasLimit, used, retried = false, prevHash = null) {
+// audit 1107 L-2: an AMBIGUOUS send error (timeout, dropped connection, 5xx) may hide a transaction the node did accept. Poll for our own hash POLLS times POLL_GAP_MS apart, but never
+// longer than RECOVER_MS in total (the nonce lock is held meanwhile). If it is still unknown, remember the hash per authorization: the user's retry first looks for THAT transaction
+// and is refused (not re-sent) while it may still be known, so a second transaction for the same authorization is never signed.
+const POLLS = 3, POLL_GAP_MS = Number(E.STEALTH_RELAY_POLL_GAP_MS || 1000), RECOVER_MS = Number(E.STEALTH_RELAY_RECOVER_MS || 8000), UNSURE_MS = 60_000;
+const AMBIGUOUS = /timeout|timed out|etimedout|econn|epipe|socket|fetch failed|network|connection|aborted|\b5\d\d\b|bad gateway|unavailable|http request failed|rate limit/i;
+const within = (p, ms) => Promise.race([p.catch(() => false), new Promise(r => setTimeout(() => r(false), Math.max(1, ms)))]);
+async function findTx(h, polls, deadline) {
+  for (let i = 0; i < polls; i++) {
+    if (await within(seenTx(h), deadline - Date.now())) return true;
+    if (i < polls - 1) { if (Date.now() + POLL_GAP_MS >= deadline) break; await sleep(POLL_GAP_MS); }
+  }
+  return false;
+}
+const unsure = new Map();                    // ukey (from:nonce) -> { h, nonce, t }: a send whose outcome could not be established
+async function submit(call, gasLimit, used, retried = false, prevHash = null, ukey = null) {
   let h = null, nonce = null;
+  const u = ukey && unsure.get(ukey);
+  if (u) {
+    unsure.delete(ukey);
+    if (await findTx(u.h, 1, Date.now() + RECOVER_MS)) { capMap(nonceOfHash, 500); nonceOfHash.set(u.h, u.nonce); log("earlier unconfirmed send found", u.h); return u.h; }
+    if (used && await used().catch(() => false)) throw new Refusal("authorization already used", { honest: true, costly: true });
+    if (Date.now() - u.t < UNSURE_MS) { unsure.set(ukey, u); throw new Refusal("a previous attempt for this authorization is still being confirmed, try again in a minute", { honest: true, costly: true }); }
+  }
   try {
     const fees = await cachedFees();
     if (localNonce === null) localNonce = await pub.getTransactionCount({ address: account.address, blockTag: "pending" });
@@ -155,12 +176,16 @@ async function submit(call, gasLimit, used, retried = false, prevHash = null) {
     if (h && /already known/i.test(msg)) { capMap(nonceOfHash, 500); nonceOfHash.set(h, nonce); return h; }
     // audit 1102 L-2: any other send error may be a lost ANSWER (timeout, dropped connection, 5xx) of a transaction the node did accept: look for our own hash before giving up,
     // otherwise the user's retry of the same authorization would sign a second transaction that reverts on our gas
-    if (h && !/nonce too low|nonce.*(lower|too low)/i.test(msg) && await seenTx(h)) { capMap(nonceOfHash, 500); nonceOfHash.set(h, nonce); log("send answer lost, transaction found", h); return h; }
+    if (h && !/nonce too low|nonce.*(lower|too low)/i.test(msg)) {
+      const amb = AMBIGUOUS.test(msg) || /^(HttpRequestError|TimeoutError|WebSocketRequestError)$/.test(String(e && e.name));
+      if (await findTx(h, amb ? POLLS : 1, Date.now() + RECOVER_MS)) { capMap(nonceOfHash, 500); nonceOfHash.set(h, nonce); log("send answer lost, transaction found", h); return h; }
+      if (amb && ukey) { unsure.set(ukey, { h, nonce, t: Date.now() }); capMap(unsure, 2000); }
+    }
     // локальный nonce устарел (ключ релеера использовал кто-то ещё, рестарт узла): один повтор с nonce, взятым заново с узла, вместо отказа клиенту
     if (!retried && /nonce too low|nonce.*(lower|too low)/i.test(msg)) {
       for (const c of [h, prevHash]) if (c && await seenTx(c)) return c;
-      if (used && await used().catch(() => false)) throw new Error("authorization already used");
-      return submit(call, gasLimit, used, true, h);
+      if (used && await used().catch(() => false)) throw new Refusal("authorization already used", { honest: true, costly: true });
+      return submit(call, gasLimit, used, true, h, ukey);
     }
     throw e;
   }
@@ -175,11 +200,11 @@ async function probeTx(hash) {
   try { await pub.getTransaction({ hash }); return false; } catch (e) { if (!isNF(e, "TransactionNotFoundError")) return null; }
   return true;
 }
-async function sendAndTrack(call, gasLimit, reserve, from, tag, onRevert, onGone = () => {}, used) {
+async function sendAndTrack(call, gasLimit, reserve, from, tag, onRevert, onGone = () => {}, used, ukey = null) {
   const d0 = st.day;
   let hash;
   const tq = Date.now(); let tw = 0;
-  await (nonceLock = nonceLock.then(async () => { tw = Date.now() - tq; hash = await submit(call, gasLimit, used); }, () => {}));
+  await (nonceLock = nonceLock.then(() => {}, () => {}).then(async () => { tw = Date.now() - tq; hash = await submit(call, gasLimit, used, false, null, ukey); }));   // the previous holder's failure must not skip THIS send (was: onRejected swallowed the turn -> spurious "send failed")
   tmStats.n++; tmStats.wait += tw; tmStats.maxWait = Math.max(tmStats.maxWait, tw); tmStats.send += Date.now() - tq - tw;   // lock wait vs send time (see /relay/stats)
   // nonceLock не должен залипать после ошибки одной отправки: ошибка уходит вызывающему через throw ниже
   if (!hash) throw new Error("send failed");
@@ -193,7 +218,7 @@ async function sendAndTrack(call, gasLimit, reserve, from, tag, onRevert, onGone
       if (gone) {                                              // узел выбросил транзакцию (не в пуле, не в блоке): закрыть дыру в nonce, иначе все следующие повиснут за ней
         const n = nonceOfHash.get(hash);
         log("dropped", tag, hash, "nonce", n);
-        await (nonceLock = nonceLock.then(async () => {        // the gap fill takes the same lock as every send
+        await (nonceLock = nonceLock.then(() => {}, () => {}).then(async () => {        // the gap fill takes the same lock as every send
           localNonce = null;
           try {
             if (n !== undefined && (await pub.getTransactionCount({ address: account.address, blockTag: "latest" })) <= n && (await pub.getTransactionCount({ address: account.address, blockTag: "pending" })) <= n) {
@@ -250,7 +275,7 @@ export async function relay(b, ip) {
   if (dup) return dup;
   // audit 1099 M-2/I-6: everything that can be decided without the network is decided now: validity window and the EIP-712 signature (so a stranger cannot take the address lock, and junk costs no RPC)
   const nowS = BigInt(Math.floor(Date.now() / 1000));
-  for (const a of fee ? [main, fee] : [main]) { if (a.validBefore <= nowS + 30n) throw new Error("authorization expires too soon"); if (a.validAfter > nowS) throw new Error("authorization not valid yet"); }
+  for (const a of fee ? [main, fee] : [main]) { if (a.validBefore <= nowS + 30n) throw new Refusal("authorization expires too soon", { honest: true }); if (a.validAfter > nowS) throw new Refusal("authorization not valid yet", { honest: true }); }
   for (const [a, dst] of fee ? [[main, to], [fee, account.address]] : [[main, to]]) {
     const signer = await recoverTypedDataAddress({ domain: { name: CC.domain.name, version: CC.domain.version, chainId: CC.id, verifyingContract: TOKEN }, types: TRANSFER_TYPES, primaryType: "TransferWithAuthorization",
       message: { from, to: dst, value: a.value, validAfter: a.validAfter, validBefore: a.validBefore, nonce: a.nonce }, signature: { r: a.r, s: a.s, v: BigInt(a.v) } }).catch(() => null);
@@ -259,21 +284,21 @@ export async function relay(b, ip) {
   roll();
   const d0 = st.day;
   // ---- синхронный блок: проверки суток и замок адреса без await между проверкой и записью
-  if ((st.perIp[ip] || 0) >= MAX_PER_IP_PER_DAY) throw new Error("too many requests from this network today");
-  if ((st.perFrom[from] || 0) >= MAX_PER_FROM) throw new Error("this address reached its withdrawal limit today; try tomorrow");
-  if (inflight.has(from)) throw new Error("a withdrawal from this address is already in progress");
-  if (st.gas >= GAS_BUDGET_WEI_PER_DAY) throw new Error("relayer gas budget for today is spent");
+  if ((st.perIp[ip] || 0) >= MAX_PER_IP_PER_DAY) throw new Refusal("too many requests from this network today", { honest: true });
+  if ((st.perFrom[from] || 0) >= MAX_PER_FROM) throw new Refusal("this address reached its withdrawal limit today; try tomorrow", { honest: true });
+  if (inflight.has(from)) throw new Refusal("a withdrawal from this address is already in progress", { honest: true });
+  if (st.gas >= GAS_BUDGET_WEI_PER_DAY) throw new Refusal("relayer gas budget for today is spent", { honest: true });
   inflight.add(from); st.perIp[ip] = (st.perIp[ip] || 0) + 1;
   let reserve = 0n, used = 0n, sent = false;
   try {
-    const known = await fetch(INDEXER + "/stealth-api/known?addr=" + from, { signal: AbortSignal.timeout(5000) }).then(r => r.json()).catch(() => ({ known: false }));
-    if (!known.known) throw new Error("not a stealth address paid through Stealth");
+    const known = await fetch(INDEXER + "/stealth-api/known?addr=" + from, { signal: AbortSignal.timeout(5000) }).then(r => { if (!r.ok) throw new Error("indexer " + r.status); return r.json(); }).catch(e => { throw new Upstream("indexer unavailable: " + String(e && e.message || e).slice(0, 60)); });   // audit 1107 M-1: an indexer outage is not the caller's failure
+    if (!known.known) throw new Refusal("not a stealth address paid through Stealth", { costly: true });
     const bal = await pub.readContract({ address: TOKEN, abi, functionName: "balanceOf", args: [from] });
-    if (bal < value + (fee ? fee.value : 0n)) throw new Error("the address holds less than the requested amount");
+    if (bal < value + (fee ? fee.value : 0n)) throw new Refusal("the address holds less than the requested amount", { honest: true, costly: true });
     const list = [["main", main, to]]; if (fee) list.unshift(["fee", fee, account.address]);
-    for (const [, a] of list) if (await pub.readContract({ address: TOKEN, abi, functionName: "authorizationState", args: [from, a.nonce] })) throw new Error("authorization already used");
+    for (const [, a] of list) if (await pub.readContract({ address: TOKEN, abi, functionName: "authorizationState", args: [from, a.nonce] })) throw new Refusal("authorization already used", { honest: true, costly: true });
     const bw = await pub.getBalance({ address: account.address });
-    if (bw < MIN_BALANCE_WEI) { alertOnce("relayer balance low:", formatEther(bw), "ETH < threshold", formatEther(MIN_BALANCE_WEI)); throw new Error("relayer is out of gas funds, try again later"); }
+    if (bw < MIN_BALANCE_WEI) { alertOnce("relayer balance low:", formatEther(bw), "ETH < threshold", formatEther(MIN_BALANCE_WEI)); throw new Refusal("relayer is out of gas funds, try again later", { honest: true, costly: true }); }
     const calls = list.map(([tag, a, dst]) => [tag, [from, dst, a.value, a.validAfter, a.validBefore, a.nonce, a.v, a.r, a.s]]);
     let gas = 0n; const lims = [];
     for (const [, args] of calls) {
@@ -283,14 +308,14 @@ export async function relay(b, ip) {
     const fees = await cachedFees();
     const est = gas * GAS_PAD_PCT / 100n * (fees.maxFeePerGas || fees.gasPrice || 0n);
     // резерв под бюджет суток СИНХРОННО (после последнего await): параллельные заявки видят уже зарезервированное
-    if (st.gas + est > GAS_BUDGET_WEI_PER_DAY) throw new Error("relayer gas budget for today is spent");
+    if (st.gas + est > GAS_BUDGET_WEI_PER_DAY) throw new Refusal("relayer gas budget for today is spent", { honest: true, costly: true });
     st.gas += est; reserve = est; save();
     const hashes = {};
     const n = BigInt(calls.length); let left = reserve;
     for (let i = 0; i < calls.length; i++) {                 // комиссия первой; резерв делится поровну между транзакциями
       const [tag, args] = calls[i]; const part = i === calls.length - 1 ? left : reserve / n; left -= part;
       const last = i === calls.length - 1;       // освободить запись о подписи, когда смайнена (или потеряна) последняя транзакция
-      try { hashes[tag] = await sendAndTrack(TRANSFER_CALL(args), lims[i], part, from, tag, undefined, last ? () => pendingAuth.delete(dupKey) : undefined, usedOf(from, args[5])); }
+      try { hashes[tag] = await sendAndTrack(TRANSFER_CALL(args), lims[i], part, from, tag, undefined, last ? () => pendingAuth.delete(dupKey) : undefined, usedOf(from, args[5]), from + ":" + args[5]); }
       catch (e) { if (sent) log("ALERT fee sent but main failed", from, String(e).slice(0, 80)); throw e; }
       sent = true; used += part;
       if (tag === "main") { st.perFrom[from] = (st.perFrom[from] || 0) + 1; save(); }
@@ -302,7 +327,7 @@ export async function relay(b, ip) {
     adj(d0, -(reserve - used));                                 // неотправленная часть резерва возвращается (в том же дне)
     if (!sent) dec(st.perIp, ip);                               // до отправки ничего не потрачено: вернуть и счётчик IP
     if (sent) save(); else saveSoon();                          // audit 1099 M-2: a failed request never writes the state synchronously
-    throw e;
+    throw e instanceof Refusal ? e : new Upstream(String(e && (e.shortMessage || e.message) || e).slice(0, 100));   // audit 1107 M-1: anything but a deliberate refusal after the offline checks is infrastructure trouble
   } finally { inflight.delete(from); }
 }
 
@@ -334,47 +359,47 @@ export async function relayPay(b, ip) {
   if (dup) return dup;                                                  // audit 1087 M-1 / 1099 L-1: the same payment already sent: the same hash, also after it was mined
   // audit 1099 M-2/I-6: validity window and signature are decided offline, before the lock and before any RPC
   const now = BigInt(Math.floor(Date.now() / 1000));
-  if (auth.validBefore <= now + 30n) throw new Error("authorization expires too soon");
-  if (auth.validAfter > now) throw new Error("authorization not valid yet");
+  if (auth.validBefore <= now + 30n) throw new Refusal("authorization expires too soon", { honest: true });
+  if (auth.validAfter > now) throw new Refusal("authorization not valid yet", { honest: true });
   const signer = await recoverTypedDataAddress({
     domain: { name: CC.domain.name, version: CC.domain.version, chainId: CC.id, verifyingContract: TOKEN }, types: RECEIVE_TYPES, primaryType: "ReceiveWithAuthorization",
     message: { from, to: STEALTHPAY, value: amount, validAfter: auth.validAfter, validBefore: auth.validBefore, nonce },
     signature: { r: auth.r, s: auth.s, v: BigInt(auth.v) } }).catch(() => null);
   if (!signer || signer !== from) throw new Error("signature does not match the payer");
   const d0 = st.day;
-  if ((st.perIp[ip] || 0) >= MAX_PER_IP_PER_DAY) throw new Error("too many requests from this network today");
-  if ((st.perPayer[from] || 0) >= MAX_PER_PAYER_PER_DAY) throw new Error("too many payments from this wallet today");
+  if ((st.perIp[ip] || 0) >= MAX_PER_IP_PER_DAY) throw new Refusal("too many requests from this network today", { honest: true });
+  if ((st.perPayer[from] || 0) >= MAX_PER_PAYER_PER_DAY) throw new Refusal("too many payments from this wallet today", { honest: true });
   const lockKey = "pay:" + from;
-  if (inflight.has(lockKey)) throw new Error("a payment from this wallet is already in progress");
-  if (st.gas >= GAS_BUDGET_WEI_PER_DAY) throw new Error("relayer gas budget for today is spent");
+  if (inflight.has(lockKey)) throw new Refusal("a payment from this wallet is already in progress", { honest: true });
+  if (st.gas >= GAS_BUDGET_WEI_PER_DAY) throw new Refusal("relayer gas budget for today is spent", { honest: true });
   inflight.add(lockKey); st.perIp[ip] = (st.perIp[ip] || 0) + 1; st.perPayer[from] = (st.perPayer[from] || 0) + 1;
   let reserve = 0n, sent = false;
   try {
     // независимые чтения -- одним залпом (раньше ~6 последовательных RPC на заявку); проверки применяются в прежнем порядке
     // audit 1102 M-1: ONE cheap read first -- a self-signed junk request from an empty wallet costs one RPC instead of five
     const bal = await pub.readContract({ address: TOKEN, abi, functionName: "balanceOf", args: [from] });
-    if (bal < amount) throw new Error("the wallet holds less than the amount");
+    if (bal < amount) throw new Refusal("the wallet holds less than the amount", { honest: true, costly: true });
     const [onchain, code, used, bw] = await Promise.all([
       pub.readContract({ address: STEALTHPAY, abi: payAbi, functionName: "paymentNonce", args: [token, stealth, eph, tag, fee, feeTo] }),
       pub.getCode({ address: stealth }),
       pub.readContract({ address: TOKEN, abi, functionName: "authorizationState", args: [from, nonce] }),
       pub.getBalance({ address: account.address })]);
-    if (onchain.toLowerCase() !== nonce.toLowerCase()) throw new Error("payment nonce mismatch");
-    if (code) throw new Error("destination is a contract");
-    if (used) throw new Error("authorization already used");
-    if (bw < MIN_BALANCE_WEI) { alertOnce("relayer balance low:", formatEther(bw), "ETH < threshold", formatEther(MIN_BALANCE_WEI)); throw new Error("relayer is out of gas funds, try again later"); }
+    if (onchain.toLowerCase() !== nonce.toLowerCase()) throw new Refusal("payment nonce mismatch", { costly: true });
+    if (code) throw new Refusal("destination is a contract", { costly: true });
+    if (used) throw new Refusal("authorization already used", { honest: true, costly: true });
+    if (bw < MIN_BALANCE_WEI) { alertOnce("relayer balance low:", formatEther(bw), "ETH < threshold", formatEther(MIN_BALANCE_WEI)); throw new Refusal("relayer is out of gas funds, try again later", { honest: true, costly: true }); }
     const call = { address: STEALTHPAY, abi: payAbi, functionName: "payWithAuthorization", args: [token, amount, stealth, eph, tag, fee, feeTo, auth] };
     const [g, fees] = await Promise.all([pub.estimateContractGas({ ...call, account }), cachedFees()]);   // estimateGas reverts iff the tx would revert
     const est = g * GAS_PAD_PCT / 100n * (fees.maxFeePerGas || fees.gasPrice || 0n);
-    if (st.gas + est > GAS_BUDGET_WEI_PER_DAY) throw new Error("relayer gas budget for today is spent");
+    if (st.gas + est > GAS_BUDGET_WEI_PER_DAY) throw new Refusal("relayer gas budget for today is spent", { honest: true, costly: true });
     st.gas += est; reserve = est; save();
-    const hash = await sendAndTrack(call, g * GAS_PAD_PCT / 100n, reserve, from, "pay", () => dec(st.perPayer, from), () => pendingAuth.delete(dupKey), usedOf(from, nonce));   // onRevert = только пропавшая транзакция, не откат (audit 1087 M-1)
+    const hash = await sendAndTrack(call, g * GAS_PAD_PCT / 100n, reserve, from, "pay", () => dec(st.perPayer, from), () => pendingAuth.delete(dupKey), usedOf(from, nonce), from + ":" + nonce);   // onRevert = только пропавшая транзакция, не откат (audit 1087 M-1)
     sent = true; dedupeSet(dupKey, { hash });
     log("relay-pay", from, "->", stealth, (Number(amount) / 1e6).toFixed(6), CC.token_symbol, "fee", (Number(fee) / 1e6).toFixed(6), hash, "ip", ip);
     return { hash };
   } catch (e) {
     if (!sent) { adj(d0, -reserve); dec(st.perIp, ip); dec(st.perPayer, from); saveSoon(); }   // audit 1099 M-2: no synchronous write for a failed request
-    throw e;
+    throw e instanceof Refusal ? e : new Upstream(String(e && (e.shortMessage || e.message) || e).slice(0, 100));   // audit 1107 M-1
   } finally { inflight.delete(lockKey); }
 }
 
@@ -420,9 +445,14 @@ function serve() {
     res.on("close", release);
     let body = ""; req.on("data", c => { body += c; if (body.length > 8192) req.destroy(); });
     req.on("end", async () => {
-      try { send(200, await (isPay ? relayPay : relay)(JSON.parse(body), ip)); }
+      try { const r = await (isPay ? relayPay : relay)(JSON.parse(body), ip); fails.ok(ipk); send(200, r); }
       catch (e) {
-        const msg = String(e && (e.shortMessage || e.message) || e).slice(0, 160); fails.fail(ipk, failWeight(msg));
+        const msg = String(e && (e.shortMessage || e.message) || e).slice(0, 160);
+        if (e instanceof Upstream) {                           // audit 1107 M-1: RPC / indexer trouble: 503, no failure budget consumed (an outage must not lock honest users out)
+          const t = refusedLines.take(); if (t.log) log("upstream trouble", ipk, JSON.stringify(msg));
+          return send(503, { error: "network busy, try again shortly" });
+        }
+        fails.fail(ipk, failWeight(e), isCostly(e));           // audit 1107 L-1: weight by error CLASS, never by message text
         const t = refusedLines.take();   // audit 1099 M-2: at most 20 refusal lines a minute, the rest is summarised
         if (t.summary) log("refused lines suppressed", t.summary);
         if (t.log) log("refused", ipk, JSON.stringify(msg));   // audit 1099 M-1: msg is data (later argument): neutralised; JSON.stringify: audit 1087 L-1, one line per refusal

@@ -12,7 +12,7 @@ import { deriveForPayment, metaAddress, parseMeta, checkAnnouncement, decodeMeta
 import { CHAINS } from "../web/chains.js";
 import { postRelay } from "../web/relay-post.js";
 import { keccak } from "../web/stealth-crypto.js";
-import { makeFailBudget, failWeight, isLowS, SECP_N, ipKey } from "./relay-util.mjs";
+import { makeFailBudget, failWeight, isLowS, SECP_N, ipKey, Refusal } from "./relay-util.mjs";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const FORK_URL = "https://rpc.mainnet.chain.robinhood.com", FORK_BLOCK = 101173445;     // fixed block: anvil caches the state it fetches
@@ -158,7 +158,7 @@ try {
   eq("A2 payer debited exactly 5.000000", usd(a1 - await bal(A.address)), "5.000000");
   eq("A2 stealth got the full 5.000000 (fee 0)", usd(await bal(d2.stealth)), "5.000000");
   // extra stealth payments (own gas, cheap) that the negative tests will withdraw from
-  const W = {}; for (const k of ["rep", "dom", "dom2", "exp", "amt", "feelow", "nofee", "sanc", "par", "stuck", "drop", "nonce", "after", "dup", "dup2", "alk", "ntl", "rd", "lst"]) { W[k] = newDest(); await payOwnGas(A, W[k], 3n * U); }
+  const W = {}; for (const k of ["rep", "dom", "dom2", "exp", "amt", "feelow", "nofee", "sanc", "par", "stuck", "drop", "nonce", "after", "dup", "dup2", "alk", "ntl", "rd", "lst", "pl1", "pl2"]) { W[k] = newDest(); await payOwnGas(A, W[k], 3n * U); }
   await mine(3);
   // B scans announcements through the indexer
   let annRows = []; for (let i = 0; i < 90; i++) { try { annRows = (await (await fetch(IDX + "/announcements?since=0&limit=2000")).json()).rows; } catch {} if (annRows.length >= 2 + Object.keys(W).length) break; await sleep(500); }
@@ -418,14 +418,20 @@ try {
       const many = []; for (let i = 0; i < 30; i++) many.push(await junk("5.5." + i + ".1"));
       const nref = R3.log().split("\n").filter(l => / refused /.test(l)).length;
       ok("B12 M-2 refusal log lines are rate limited (30 more failures: still at most 20 'refused' lines in the minute), requests still answered", many.every(r => r.status === 400) && nref <= 20 && nref >= 10, "lines " + nref); }
-    // global failure rate: after 8 failures in a minute, networks that already failed are refused, clean ones still pass
+    // global failure rate (audit 1107 M-1): only RPC-COSTLY failures (passed the offline checks: here a signed payment from an empty wallet) count; offline junk does not
     { const p5 = await freePort(), R5 = await startRelayer("r5", p5, { STEALTH_RELAY_FAIL_PER_MIN: "8" }), RELAY5 = "http://127.0.0.1:" + p5 + "/stealth-api";
-      for (let i = 0; i < 10; i++) await post(RELAY5, "/relay", { garbage: 1 }, "6.1.1." + i);
+      for (let i = 0; i < 40; i++) await post(RELAY5, "/relay", { garbage: 1 }, "6.0.1." + i);
+      const junkFresh = await post(RELAY5, "/relay", { garbage: 1 }, "6.0.9.9"), junkAgain = await post(RELAY5, "/relay", { garbage: 1 }, "6.0.1.0");
+      ok("B12 1107 M-1 40 offline-rejected junk requests from 40 networks do not trip the global ceiling: a failed-before network and a fresh one are both still answered 400", junkFresh.status === 400 && junkAgain.status === 400, junkFresh.status + "/" + junkAgain.status);
+      const costly = async ip => { const P0 = await newPayer(0n), dd = newDest(), au = await payAuth(P0, dd, 2n * U, FEE, R5.addr); return post(RELAY5, "/relay/pay", payBody(P0, dd, 2n * U, FEE, R5.addr, au), ip); };
+      for (let i = 0; i < 10; i++) await costly("6.1.1." + i);
       const again = await post(RELAY5, "/relay", { garbage: 1 }, "6.1.1.0"), fresh = await post(RELAY5, "/relay", { garbage: 1 }, "6.1.2.1");
-      ok("B12 M-2 global failure rate: a network that already failed is refused (429), a clean one is still served (400)", again.status === 429 && /busy/.test(again.error) && fresh.status === 400, again.status + "/" + fresh.status); }
+      ok("B12 M-2 global failure rate (costly failures): a network that already failed is refused (429), a clean one is still served (400)", again.status === 429 && /busy/.test(again.error) && fresh.status === 400, again.status + "/" + fresh.status); }
     // fault-injecting RPC in front of anvil, for R4: counts calls, can fail receipt reads, can answer a send with an error AFTER it was accepted
-    const fault = { calls: 0, failReads: false, dupErr: null };
-    const fwd = async o => { fault.calls++; if (fault.failReads && /^eth_getTransaction(Receipt|ByHash)$/.test(o.method)) return { jsonrpc: "2.0", id: o.id, error: { code: -32005, message: "rate limited" } };
+    const fault = { calls: 0, failReads: false, dupErr: null, failCalls: false, hide: 0 };
+    const fwd = async o => { fault.calls++; if (fault.failCalls && o.method === "eth_call") return { jsonrpc: "2.0", id: o.id, error: { code: -32603, message: "internal error" } };
+      if (fault.hide > 0 && /^eth_getTransaction(Receipt|ByHash)$/.test(o.method)) { fault.hide--; return { jsonrpc: "2.0", id: o.id, result: null }; }   // 1107 L-2: our own transaction is "not visible yet" on this backend
+      if (fault.failReads && /^eth_getTransaction(Receipt|ByHash)$/.test(o.method)) return { jsonrpc: "2.0", id: o.id, error: { code: -32005, message: "rate limited" } };
       const j = await fetch(RPC, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(o) }).then(r => r.json());
       if (o.method === "eth_sendRawTransaction" && fault.dupErr && !j.error) return { jsonrpc: "2.0", id: o.id, error: { code: -32000, message: fault.dupErr } };
       return j; };
@@ -433,7 +439,7 @@ try {
     const fpPort = await freePort(); await new Promise(r => fproxy.listen(fpPort, "127.0.0.1", r)); procs.push({ kill: () => fproxy.close() });
     const p4 = await freePort(), R4 = await startRelayer("r4", p4, { STEALTH_RPC: "http://127.0.0.1:" + fpPort, STEALTH_RELAY_STUCK_S: "3", STEALTH_RELAY_GONE_GAP_MS: "1000" }), RELAY4 = "http://127.0.0.1:" + p4 + "/stealth-api";
     await rpc("evm_setAutomine", [true]); await mine(1);
-    for (const k of ["alk", "ntl", "rd", "lst"]) await knownWait(W[k].stealth);
+    for (const k of ["alk", "ntl", "rd", "lst", "pl1", "pl2"]) await knownWait(W[k].stealth);
     // cheap validation: bad signature / expired authorization are refused with ZERO RPC calls (and no address lock taken)
     { const c0 = fault.calls, bad = await post(RELAY4, "/relay", await wbody(W.alk.stealth, C, 2n * U, null, { domain: { chainId: 1 } }), nip());
       const P = await newPayer(), dd = newDest(), au = await payAuth(P, dd, 2n * U, FEE, R4.addr, { domain: { chainId: 1 } }), badPay = await post(RELAY4, "/relay/pay", payBody(P, dd, 2n * U, FEE, R4.addr, au), nip());
@@ -466,31 +472,85 @@ try {
       fault.failReads = false; await rpc("evm_setAutomine", [true]); await mine(2);
       const rc = await pub.waitForTransactionReceipt({ hash: w.hash, timeout: 15000 }).catch(() => null); await sleep(800);
       ok("B12 L-3 ...and it still executes exactly once", rc && rc.status === "success" && (await bal(C)) - c0 === 2n * U, usd((await bal(C)) - c0)); }
+    // 1107 M-1: an RPC outage answers 503 "network busy" and consumes NO failure budget (35 > the 30/hour per-network budget), so honest users are not locked out afterwards
+    { const P = await newPayer(), ip = "9.8.7.6"; fault.failCalls = true; const codes = [];
+      for (let i = 0; i < 35; i++) { const dd = newDest(), au = await payAuth(P, dd, 2n * U, FEE, R4.addr); const r = await post(RELAY4, "/relay/pay", payBody(P, dd, 2n * U, FEE, R4.addr, au), ip); codes.push(r.status + (r.status === 503 && /network busy/.test(r.error) ? "" : "!")); }
+      fault.failCalls = false;
+      const dd = newDest(), au = await payAuth(P, dd, 2n * U, FEE, R4.addr), after = await post(RELAY4, "/relay/pay", payBody(P, dd, 2n * U, FEE, R4.addr, au), ip);
+      ok("B12 1107 M-1 RPC outage: 35 requests from one network all 503 'network busy' (no 429), and the same network is served as soon as the RPC is back", codes.every(c => c === "503") && after.status === 200 && !!after.hash, codes.slice(0, 5).join() + " ... " + JSON.stringify(after)); }
+    // 1107 L-2: ambiguous send error + our transaction not visible on the first poll: polled again ~1 s later, found, the ORIGINAL hash returned, exactly one transaction
+    { const c0 = await bal(C), n0 = await nonceOf(R4.addr); fault.dupErr = "upstream request timeout"; fault.hide = 2; const t0 = Date.now();
+      const w = await post(RELAY4, "/relay", await wbody(W.pl1.stealth, C, 2n * U, null), nip()); const dt = Date.now() - t0; fault.dupErr = null; fault.hide = 0;
+      let rc = null; if (w.hash) rc = await pub.waitForTransactionReceipt({ hash: w.hash, timeout: 15000 }).catch(() => null); await sleep(800);
+      ok("B12 1107 L-2 timeout + transaction invisible on poll 1: found on a later poll (>= ~1 s), success, one transaction, money moved once", w.status === 200 && dt >= 900 && dt < 7000 && rc && rc.status === "success" && (await nonceOf(R4.addr)) - n0 === 1 && (await bal(C)) - c0 === 2n * U, dt + " ms " + JSON.stringify(w)); }
+    // ... still invisible after all 3 polls: bounded (lock not held beyond the deadline), 503; the retry of the SAME authorization never signs a second transaction
+    { const c0 = await bal(C), n0 = await nonceOf(R4.addr); await rpc("evm_setAutomine", [false]);
+      const body = await wbody(W.pl2.stealth, C, 2n * U, null); fault.dupErr = "upstream request timeout"; fault.hide = 1000; const t0 = Date.now();
+      const w1 = await post(RELAY4, "/relay", body, nip()); const dt = Date.now() - t0; fault.dupErr = null; fault.hide = 0;
+      ok("B12 1107 L-2 all 3 polls miss: 503 within the recovery deadline (lock hold bounded: 2 gaps of ~1 s, < 7 s)", w1.status === 503 && dt >= 1800 && dt < 7000, dt + " ms " + JSON.stringify(w1));
+      const w2 = await post(RELAY4, "/relay", body, nip());
+      await rpc("evm_setAutomine", [true]); await mine(2);
+      let rc = null; if (w2.hash) rc = await pub.waitForTransactionReceipt({ hash: w2.hash, timeout: 15000 }).catch(() => null); await sleep(800);
+      ok("B12 1107 L-2 retry of the same authorization finds the first transaction (same tx, no second send): one transaction on chain, money moved once", w2.status === 200 && rc && rc.status === "success" && (await nonceOf(R4.addr)) - n0 === 1 && (await bal(C)) - c0 === 2n * U, JSON.stringify(w2) + " nonce+" + ((await nonceOf(R4.addr)) - n0) + " | " + R4.log().split("\n").slice(-4).join(" / ").slice(-400)); }
   }
 
   // ===================================================================================== B13) audit 1102 units
   sect("B13) 1102 M-1 / L-1 units: shared ceiling, honest-refusal weight, nginx map");
   { let t = 0; const fb = makeFailBudget({ perKey: 30, perMin: 10, now: () => t });
-    for (let i = 0; i < 20; i++) fb.fail("k" + i);                                       // 20 distinct networks fail in one minute (hardMin = 2 x perMin)
-    ok("1102 M-1 shared ceiling: a network with NO earlier failure is refused too once the global minute rate hit the ceiling", fb.check("fresh") !== null && /busy/.test(fb.check("fresh")) && fb.check("k0") !== null);
+    for (let i = 0; i < 20; i++) fb.fail("k" + i, 1, true);                              // 20 distinct networks with RPC-costly failures in one minute (hardMin = 2 x perMin)
+    ok("1102/1107 M-1 shared ceiling: a network with NO earlier failure is refused once RPC-costly failures hit the ceiling", fb.check("fresh") !== null && /busy/.test(fb.check("fresh")) && fb.check("k0") !== null);
+    fb.ok("honest");
+    ok("1107 M-1 ...but a key with a recent success keeps reserved capacity (also a key that failed before)", fb.check("honest") === null && (fb.ok("k0"), fb.check("k0")) === null);
+    const fbj = makeFailBudget({ perKey: 30, perMin: 10, now: () => t });
+    for (let i = 0; i < 40; i++) for (let j = 0; j < 30; j++) fbj.fail("junk" + i, 1, false);   // 1200 offline-rejected junk requests from 40 networks
+    ok("1107 M-1 offline-rejected junk never trips the global ceiling: a fresh key is served; the junk keys hit their own per-key budget", fbj.check("fresh") === null && fbj.check("junk0") !== null && /too many failed/.test(fbj.check("junk0")));
     const fb2 = makeFailBudget({ perKey: 30, perMin: 10, now: () => t });
-    for (let i = 0; i < 12; i++) fb2.fail("k" + i);
+    for (let i = 0; i < 12; i++) fb2.fail("k" + i, 1, true);
     ok("1102 M-1 below the ceiling a clean network still passes while a failed one is refused", fb2.check("fresh") === null && fb2.check("k0") !== null);
     t += 61_000; ok("1102 M-1 the window resets after a minute", fb.check("fresh") === null);
     const fb3 = makeFailBudget({ perKey: 30, now: () => t });
-    for (let i = 0; i < 100; i++) fb3.fail("shared", failWeight("a withdrawal from this address is already in progress"));
+    const honest = new Refusal("a withdrawal from this address is already in progress", { honest: true });
+    for (let i = 0; i < 100; i++) fb3.fail("shared", failWeight(honest));
     ok("1102 L-1 100 honest-state refusals (in progress) do not lock a shared network (weight 0.2 -> 20 < 30)", fb3.check("shared") === null);
-    for (let i = 0; i < 30; i++) fb3.fail("shared", failWeight("signature does not match the address"));
-    ok("1102 L-1 ...but forged-input refusals still do", fb3.check("shared") !== null && failWeight("signature does not match the address") === 1 && failWeight("authorization expires too soon") < 1 && failWeight("the address holds less than the requested amount") < 1); }
+    for (let i = 0; i < 30; i++) fb3.fail("shared", failWeight(new Error("signature does not match the address")));
+    ok("1102 L-1 ...but forged-input refusals still do", fb3.check("shared") !== null && failWeight(new Error("signature does not match the address")) === 1 && failWeight(honest) < 1);
+    // 1107 L-1: weight by error CLASS, never by text: a plain Error / SyntaxError whose text contains an "honest" phrase weighs 1
+    ok("1107 L-1 failWeight ignores message text: plain Error / SyntaxError / strings with 'fee below', 'holds less', 'gas budget' weigh 1; only Refusal{honest} weighs 0.2",
+      ["fee below", "holds less", "gas budget"].every(m => failWeight(new Error(m)) === 1 && failWeight(m) === 1) && failWeight(new Refusal("holds less", { costly: true })) === 1
+      && failWeight((() => { try { BigInt("fee below"); } catch (e) { return e; } })()) === 1 && failWeight(new Refusal("x", { honest: true, costly: true })) === 0.2);
+    const src = fs.readFileSync(path.join(HERE, "relayer.mjs"), "utf8");
+    ok("1107 L-1 relayer.mjs: no message-based classification left (no HONEST_REFUSAL / failWeight(msg))", !/HONEST_REFUSAL|failWeight\(msg\)/.test(src) && /failWeight\(e\)/.test(src)); }
   { // the nginx map in deploy/stealth-rh.conf, evaluated in JS (same regex dialect for these constructs): every spelling of one /64 must give one key, and agree with the relayer's ipKey()
     const conf = fs.readFileSync(path.join(HERE, "deploy/stealth-rh.conf"), "utf8");
     const rules = [...conf.matchAll(/^#\s+~(\S+)\s+(\S+);\s*$/gm)].map(m => [new RegExp(m[1]), m[2]]);
     const key = a => { for (const [re, v] of rules) { const m = a.match(re); if (m) return v.replace(/\$(\w+)/g, (_, n) => m.groups?.[n] ?? "$" + n); } return a; };
-    const same = [["2001:db8:abcd:1::5", "2001:db8:abcd:1:0:0:0:9"], ["2001:db8:abcd::5", "2001:db8:abcd:0:1::7", "2001:db8:abcd::9999"], ["2001:db8::5", "2001:db8:0:0:3::1"], ["2001::5", "2001:0:0:0:8:8:8:8"], ["::5", "0:0:0:0:1:2:3:4"]];
+    const same = [["2001:db8:abcd:1::5", "2001:db8:abcd:1:0:0:0:9"], ["2001:db8:abcd::5", "2001:db8:abcd:0:1::7", "2001:db8:abcd::9999"], ["2001:db8::5", "2001:db8:0:0:3::1"], ["2001::5", "2001:0:0:0:8:8:8:8"], ["::5", "0:0:0:0:1:2:3:4"],
+      ["1::2:3:4:5:6:7", "1:0:2:3:4:5:6:7"], ["1:2::4:5:6:7:8", "1:2:0:4:5:6:7:8"], ["::2:3:4:5:6:7:8", "0:2:3:4:5:6:7:8"], ["1:2:3::5:6:7:8", "1:2:3:0:5:6:7:8"]];
     ok("1102 M-1 nginx map has its rules", rules.length >= 6, String(rules.length));
     ok("1102 M-1 nginx map: all spellings of one /64 share a key, also with '::' in the first four groups", same.every(g => new Set(g.map(key)).size === 1), same.map(g => g.map(key).join("=")).join(" ; "));
     ok("1102 M-1 nginx map: different /64s differ; IPv4 and IPv4-mapped IPv6 are the IPv4 address; same bucketing as ipKey()", key("2001:db8:abcd::5") !== key("2001:db8:abce::5") && key("::ffff:1.2.3.4") === "1.2.3.4" && key("1.2.3.4") === "1.2.3.4"
-      && same.every(g => new Set(g.map(ipKey)).size === 1)); }
+      && same.every(g => new Set(g.map(ipKey)).size === 1));
+    ok("1107 I-1 single zero group compressed by '::' (1::2:3:4:5:6:7): distinct /64s stay distinct (1:0:2:3 vs 1:0:9:3 vs 1:0:0:0)", key("1::2:3:4:5:6:7") === "1:0:2:3" && key("1::9:3:4:5:6:7") === "1:0:9:3" && key("1::") === "1:0:0:0" && key("2001:db8::7:8:9:a:b") === "2001:db8:0:7");
+    const loc = conf.split(/^location /m);
+    const sl = loc.find(b => /^= \/stealth-api\/rh\/relay\/sanctions-list/.test(b)), other = loc.find(b => /^~ \^\/stealth-api\/rh\/relay\/\(stats/.test(b));
+    ok("1107 I-2 /relay/sanctions-list has its own location without hide_header / no-store, so the relayer's 5-minute cache header reaches the browser; the other GETs still hide it",
+      sl && !/proxy_hide_header|no-store/.test(sl.replace(/#.*$/gm, "")) && other && !/sanctions-list/.test(other.split("\n")[0]) && /proxy_hide_header Cache-Control/.test(other)); }
+
+  // 1107 I-3: the watchdog tracks the log's inode: a rotated file that has regrown PAST the old offset is read from its start
+  { const dir = fs.mkdtempSync(path.join(os.tmpdir(), "stw-")), lg = path.join(dir, "r.log");
+    const py = `import sys,json,os,importlib.util
+spec=importlib.util.spec_from_file_location('w',sys.argv[1]); m=importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+lg=sys.argv[2]; c={'name':'base','idx':'http://127.0.0.1:1','rel':'http://127.0.0.1:1','log':lg,'min_eth':0.0}; st={'alerts':{},'log_pos':{}}
+A=lambda i:'2026-10-29T10:00:00.000Z ALERT relayer balance low: %d ETH\\n'%i
+def run(): return sorted(k for k in m.check_chain(c,st) if ':log-' in k)
+open(lg,'w').write('x'*10+'\\n'); r0=run()
+open(lg,'a').write(A(1)); r1=run()
+os.rename(lg,lg+'.1'); open(lg,'w').write(A(2)+A(3)+A(4)+A(5)+'y\\n'); r2=run()
+print(json.dumps([r0,r1,r2]))`;
+    const o = spawnSync("python3", ["-B", "-c", py, path.join(HERE, "stealth_watch.py"), lg], { encoding: "utf8" });
+    let r = null; try { r = JSON.parse(o.stdout); } catch {}
+    ok("1107 I-3 watchdog: first run reads nothing, a new ALERT is seen, and after a rotation the regrown file (larger than the old offset) is still read from its start", r && r[0].length === 0 && r[1].length === 1 && r[2].length === 1, (o.stdout + o.stderr).slice(0, 300));
+    fs.rmSync(dir, { recursive: true, force: true }); }
 
   // ===================================================================================== C) UI pay amount
   sect("C) UI pay amount: 'you pay 10' = 10 leaves the wallet");

@@ -119,9 +119,12 @@ def check_chain(c, st):
     # relayer log: new ALERT / reverted lines since last run
     if c["log"] and os.path.exists(c["log"]):
         try:
-            size = os.path.getsize(c["log"]); pos = st["log_pos"].get(c["log"])
+            stt = os.stat(c["log"]); size = stt.st_size; pos = st["log_pos"].get(c["log"])
+            inos = st.setdefault("log_ino", {}); ino = inos.get(c["log"])
             if pos is None: pos = size                       # first run: start from now
             elif pos > size: pos = 0                          # audit 1102 I-4: rotated: read the new file from its start
+            elif ino is not None and ino != stt.st_ino: pos = 0   # audit 1107 I-3: a different file (rotation) that has already regrown past the old offset
+            inos[c["log"]] = stt.st_ino
             with open(c["log"], "rb") as f:
                 f.seek(pos); raw = f.read(256 * 1024)
                 nl = raw.rfind(b"\n")                              # audit 1102 I-4: only whole lines; a partial last line is read next run
