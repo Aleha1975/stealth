@@ -361,7 +361,11 @@ for (const [name, tk] of [["no txKnown available", undefined], ["txKnown cannot 
   w.outPermille = 495; const ok2 = await H.runHop(mkCtx(w, s));
   ok("M6 ... and resumes fine once the rate is acceptable again", ok2.step === "DONE" && w.broadcasts === 1);
   const w2 = makeWorld(), s2 = H.memStore(); off = 0; w2.outPermille = 450; const hi = await H.startHop(mkCtx(w2, s2, { maxLoss: 0.2 }));
-  ok("M6 the cap is configurable (ctx.maxLoss)", hi.step === "DONE"); }
+  ok("M6 the cap is configurable (ctx.maxLoss)", hi.step === "DONE");
+  const w3 = makeWorld(), s3 = H.memStore(); off = 0; w3.outPermille = 450; let asked = 0, seen = null; const ap = await H.startHop(mkCtx(w3, s3, { confirmLoss: async q => { asked++; seen = q; return true; } }));
+  ok("loss above the cap, user approves: the transfer finishes and the approval carries across the parts", ap.step === "DONE" && asked === 1 && seen.loss > seen.cap);
+  const w4 = makeWorld(), s4 = H.memStore(); off = 0; w4.outPermille = 450; const no = await H.startHop(mkCtx(w4, s4, { confirmLoss: async () => false }));
+  ok("loss above the cap, user declines: Halt before any ZEC is sent", no.step === "QUOTE_OUT" && /would lose/.test(no.err) && w4.broadcasts === 0); }
 { const w = makeWorld(), s = H.memStore(); off = 0; w.mutQuote = (q, isIn) => { if (isIn) q.minAmountOut = String(BigInt(q.amountOut) / 2n); }; const st = await H.startHop(mkCtx(w, s));
   ok("M6 in-leg quote with a 50% slippage floor is refused before anything is signed", st.step === "QUOTE_IN" && /slippage/.test(st.err) && w.relays === 0); }
 { const w = makeWorld(), s = H.memStore(); off = 0; w.mutQuote = (q, isIn) => { if (!isIn) q.deadline = new Date(Date.now() + 30_000).toISOString(); }; const st = await H.startHop(mkCtx(w, s));

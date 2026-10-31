@@ -520,8 +520,12 @@ export async function runHop(ctx) {
       const paid = (partsOn() ? st.parts : []).filter(x => x.status === "SUCCESS").reduce((a, x) => a + Number(x.quote.amountOut), 0);
       const left = (partsOn() ? st.parts.filter((x, i) => i > (st.partIdx || 0)).reduce((a, x) => a + BigInt(x.amount), 0n) : 0n) + amount;
       const loss = st.rebuilt ? 0 : projectedLoss({ amountIn: st.amount, inDec: ctx.chain.token.decimals, outDec: ctx.dest.token.decimals, paidOut: paid, rate: Number(info.amountOut) / Number(amount), zatsLeft: left }), cap = ctx.maxLoss == null ? MAX_LOSS : ctx.maxLoss;
-      if (!st.rebuilt && loss > cap) throw new Halt("the quote would lose " + (loss * 100).toFixed(1) + "% of the amount in total, above the " + (cap * 100).toFixed(1) + "% limit; nothing was sent, the ZEC stays shielded. Resume later or raise the limit");
       const rate = Number(info.amountOut) / Number(amount);
+      if (!st.rebuilt && loss > cap && !(st.quoteRate > 0 && rate >= st.quoteRate * (1 - QUOTE_TOL))) {      // small transfers can never pass the cap (fixed Zcash costs), and the ZEC is already shielded: the user sees the real loss and decides, instead of a dead end. The approval is a RATE, as for a rebuilt record
+        const over = "the quote would lose " + (loss * 100).toFixed(1) + "% of the amount in total, above the " + (cap * 100).toFixed(1) + "% limit; nothing was sent, the ZEC stays shielded";
+        if (typeof ctx.confirmLoss !== "function" || !(await ctx.confirmLoss({ loss, cap, amount, zatsLeft: left, amountOut: BigInt(info.amountOut), rate, recipient: st.recipient }))) throw new Halt(over + ". Press Continue transfer to see a new quote, or Return money");
+        st.quoteRate = rate; await save();
+      }
       if (st.rebuilt && !(st.quoteRate > 0 && rate >= st.quoteRate * (1 - QUOTE_TOL))) {      // 1133 L-5: nothing bounds a bad quote of a rebuilt record (the original amount is unknown), so the user sees it against what was found and confirms before any payout. 1136 F-3b: the approval is a RATE; a later quote (after an expiry or refund) that is worse by more than QUOTE_TOL asks again
         if (typeof ctx.confirmQuote !== "function") throw new Halt("this rebuilt transfer needs your confirmation of the quote, and this page cannot ask for it; nothing was sent, the ZEC stays shielded");
         if (!(await ctx.confirmQuote({ zecFound: BigInt(st.zecFound || 0), amount, zatsLeft: left, amountOut: BigInt(info.amountOut), recipient: st.recipient }))) throw new Halt("the quote was not confirmed; nothing was sent, the ZEC stays shielded. Resume to see a new quote");
