@@ -1,7 +1,7 @@
 /* Progress card of the private transfer (DOM only via createElement/textContent). Pure view of a hop record: no network, no keys.
    h = { st (hop state, see zec-hop.js), msg (last progress text), running (this tab is driving it) } */
 import { CHAINS } from "./chains.js";
-import { remainingMs, STEPS, STEP_MIN, partsLabel, modeOf } from "./zec-hop.js";
+import { remainingMs, STEPS, STEP_MIN, partsLabel, modeOf, partState } from "./zec-hop.js";
 
 export const STEP_UI = [   // one entry per zec-hop.js STEPS item, in order
   { name: "Preparing", line: "Preparing the swap", wait: "a few seconds" },
@@ -13,6 +13,8 @@ export const STEP_UI = [   // one entry per zec-hop.js STEPS item, in order
   { name: "Sending to recipient", line: "Sending to the recipient", wait: "~" + Math.round(STEP_MIN.SEND_OUT) + " min" },
 ];
 const STEP_ORDER = ["QUOTE_IN", "DEPOSIT_IN", "WAIT_T", "SHIELD", "DELAY", "QUOTE_OUT", "SEND_OUT"];
+export const SWAP_NOTE = "NEAR Intents is processing the swap (normal, can take up to about 15 min).";      // shown while the last payouts are in their swaps instead of "No update for N s"
+const stepKey = st => st.step === "WAIT_SWAPS" ? "SEND_OUT" : st.step;      // WAIT_SWAPS (everything sent, swaps still open) is the tail of the last step
 /** raw 1Click status -> friendly word (the raw name never reaches the screen) */
 export const friendly = s => ({ SUCCESS: "done", REFUNDED: "refunded", FAILED: "failed" })[s] || "in progress";
 const short = a => a ? a.slice(0, 6) + "…" + a.slice(-4) : "";
@@ -27,11 +29,15 @@ export const resetLeft = () => { LEFT.clear(); PCT.clear(); };
  *  and the mixing delay's own timer while the machine is alive). It never advances on elapsed time alone: a step that has not finished stays below its end, and a stuck hop stays where it is. Weights are the typical step times.
  *  The three payout steps are shared by the payout parts: part j of k contributes j/k of them done before it starts. 1..99 until done; it never goes down within a run. */
 export function realProgress(st, sub = 0) {
-  const i = Math.max(0, STEPS.indexOf(st.step)), w = k => STEP_MIN[k], di = STEPS.indexOf("DELAY"), parts = Array.isArray(st.parts) ? st.parts.length : 0, pIdx = st.partIdx || 0;
+  const i = Math.max(0, STEPS.indexOf(stepKey(st))), w = k => STEP_MIN[k], di = STEPS.indexOf("DELAY"), parts = Array.isArray(st.parts) ? st.parts.length : 0, pIdx = st.partIdx || 0;
   const pre = STEPS.slice(0, di).reduce((a, k) => a + w(k), 0), pay = STEPS.slice(di).reduce((a, k) => a + w(k), 0), total = pre + pay, f = Math.min(0.95, Math.max(0, sub));
   let done;
-  if (i < di) done = STEPS.slice(0, i).reduce((a, k) => a + w(k), 0) + f * w(st.step);
-  else { const k = Math.max(1, parts), inPart = STEPS.slice(di, i).reduce((a, x) => a + w(x), 0) + f * w(st.step); done = pre + pay * (Math.min(pIdx, k - 1) + inPart / pay) / k; }
+  if (i < di) done = STEPS.slice(0, i).reduce((a, k) => a + w(k), 0) + f * w(stepKey(st));
+  else {
+    const k = Math.max(1, parts); let inPart = STEPS.slice(di, i).reduce((a, x) => a + w(x), 0) + f * w(stepKey(st)), at = Math.min(pIdx, k - 1);
+    if (st.step === "WAIT_SWAPS") { const fin = (st.parts || []).filter(p => p && p.status === "SUCCESS").length; at = k - 1; inPart = pay - w("SEND_OUT") * (1 - Math.min(0.95, fin / k)); }      // all sent: the last share fills as the swaps end
+    done = pre + pay * (at + inPart / pay) / k;
+  }
   return Math.min(99, Math.max(1, Math.floor(100 * done / total)));
 }
 /** sub-progress 0..1 inside the current step, only from facts: "(n/T)" in the last message of the confirmation wait; the delay's elapsed share of its own scheduled length while the machine is alive */
@@ -58,10 +64,25 @@ export const oneLine = e => String(e || "").split("\n")[0].replace(/https?:\/\/\
 export const subStep = m => { m = String(m || "").trim(); return !m || /: [A-Z_]+$/.test(m) || /^Private transfer/.test(m) ? "" : m.replace(/…$/, ""); };
 const el = (tag, cls, text) => { const e = document.createElement(tag); if (cls) e.className = cls; if (text != null) e.textContent = text; return e; };
 
+/** One row per payout part once at least one has been started: what each part is doing and what it pays (the quoted amount while its swap runs, the delivered one when it has arrived). */
+export function partRows(st, dtok) {
+  const P = Array.isArray(st.parts) ? st.parts : []; if (P.length < 2 || !P.some(p => p && (p.tx || p.status))) return [];
+  const cur = st.partIdx || 0, a = p => p.quote && p.quote.amountOut ? "≈ " + amt(p.quote.amountOut, dtok.decimals) + " " + dtok.symbol : "";
+  return P.map((p, i) => {
+    const s = partState(p), tag = "Payout " + (i + 1);
+    if (s === "paid") return { state: "delivered", text: tag + ": delivered " + a(p) };
+    if (s === "open") return { state: "swap", text: tag + ": sent, in swap" + (a(p) ? " · " + a(p) + " expected" : "") };
+    if (s === "refund") return { state: "refunded", text: tag + ": the swap was refunded, sending again" };
+    if (s === "failed") return { state: "failed", text: tag + ": failed" };
+    const busy = i === cur && ["QUOTE_OUT", "SEND_OUT"].includes(st.step) || i === cur && p.status === "REFUNDED" && ["WAIT_T", "SHIELD", "DELAY"].includes(st.step);
+    return { state: busy ? "sending" : "waiting", text: tag + (busy ? ": sending" : ": waiting") };
+  });
+}
+
 /** Everything the card says, as plain data (testable). */
 export function hopView(h, now = Date.now()) {
   const st = h.st, src = CHAINS[st.chain] || {}, dst = CHAINS[st.dest] || src, tok = (src.token || { symbol: "", decimals: 6 }), dtok = dst.token || tok;
-  const idx = Math.max(0, STEP_ORDER.indexOf(st.step)), ui0 = STEP_UI[idx], pl = partsLabel(st), inParts = pl && idx >= STEP_ORDER.indexOf("DELAY");    // "payout 2 of 3" on the three payout steps
+  const idx = Math.max(0, STEP_ORDER.indexOf(stepKey(st))), waitSw = st.step === "WAIT_SWAPS", ui0 = waitSw ? { ...STEP_UI[idx], name: "Waiting for the payouts to arrive", line: "Waiting for the swaps to deliver", wait: "usually a few minutes" } : STEP_UI[idx], pl = partsLabel(st), inParts = pl && idx >= STEP_ORDER.indexOf("DELAY") && !waitSw;    // "payout 2 of 3" on the three payout steps
   const m = st.mode ? modeOf(st.mode) : null, delayWait = m ? (m.totalMax >= 60 ? "random, spread over " + m.totalMin / 60 + "–" + m.totalMax / 60 + " h" : m.totalMin + "–" + m.totalMax + " min, random") : "2–10 min, random";
   const ui = { ...ui0, name: ui0.name + (inParts ? " · " + pl : ""), line: ui0.line + (inParts ? " (" + pl + ")" : ""), wait: st.step === "DELAY" ? delayWait : ui0.wait };
   const v = { idx, total: STEP_UI.length, stepName: ui.name, amountLine: st.rebuilt ? (Number(st.zecFound || 0) / 1e8) + " ZEC (found on the chain)" + (st.recipient ? " → " + short(st.recipient) : "") : amt(st.amount, tok.decimals) + " " + tok.symbol + " → " + short(st.recipient),
@@ -71,6 +92,7 @@ export function hopView(h, now = Date.now()) {
     v.paid = "Already sent to the recipient: ≈ " + amt(okParts.reduce((a, p) => a + Number(p.quote.amountOut), 0), dtok.decimals) + " " + dtok.symbol + " (" + okParts.map(p => "≈ " + amt(p.quote.amountOut, dtok.decimals)).join(" + ") + ", " + okParts.length + " of " + st.parts.length + " payouts)";
     if (st.recipient && dst.explorer) v.paidLink = { text: "Recipient " + short(st.recipient) + " on " + (dst.explorerName || "the explorer"), href: dst.explorer + "/address/" + st.recipient };
   }
+  const rows = partRows(st, dtok); if (rows.length && st.step !== "DONE" && st.step !== "FAILED_IN") v.parts = rows;
   if (st.step === "DONE") {
     const got = st.outTotal ? amt(st.outTotal, dtok.decimals) : st.outQuote ? amt(st.outQuote.amountOut, dtok.decimals) : amt(st.amount, tok.decimals), p = st.payoutTx;
     v.kind = "done"; v.pct = 100; v.title = "Sent privately: " + got + " " + dtok.symbol + " to " + short(st.recipient); v.amountLine = ""; v.idx = v.total;
@@ -88,11 +110,12 @@ export function hopView(h, now = Date.now()) {
   } else if (h.running) {
     const hk = (st.stealth || "") + "#" + (st.n || 0), lm = shownLeft(hk, st.step, remainingMs(st, now), now); v.left = fmtLeft(lm); v.pct = shownPct(hk, st, subProgress(h, now), now);
     const m = /: ([A-Z_]+)$/.exec(h.msg || ""), left = st.step === "DELAY" && st.delayUntil ? Math.max(0, Math.ceil((st.delayUntil - now) / 1000)) : null;
-    const state = m && (st.step === "DEPOSIT_IN" || st.step === "SEND_OUT") ? friendly(m[1]) : null;
+    const state = m && (st.step === "DEPOSIT_IN" || st.step === "SEND_OUT" || waitSw) ? friendly(m[1]) : null;
     const sub = subStep(h.msg), age = h.beatAt ? now - h.beatAt : 0;       // the live sub-step ("Waiting for Zcash confirmations (7/10)") replaces the generic step line
     v.what = sub || ui.line + (state ? " · " + state : "");
     v.line = v.what + " · " + (left != null ? fmtElapsed(left * 1000) + " left" : ui.wait);
-    if (age > STALE_MS) v.note = "No update for " + Math.round(age / 1000) + " s" + (h.hidden ? ": this tab is in the background, so the browser slows it down. Bring it to the front and keep the screen on." : ". Still trying; if this stays, press Continue transfer after it pauses.");
+    if (waitSw && age <= 3 * STALE_MS) v.note = SWAP_NOTE;      // a payout swap normally takes minutes without any news: say so instead of "No update for N s" (the machine's own heartbeat is every few seconds, so a real silence of 90 s still shows the warning)
+    else if (age > STALE_MS) v.note = "No update for " + Math.round(age / 1000) + " s" + (h.hidden ? ": this tab is in the background, so the browser slows it down. Bring it to the front and keep the screen on." : ". Still trying; if this stays, press Continue transfer after it pauses.");
     else if (h.hidden) v.note = "This tab is in the background: updates may be slow. Keep it in front and the screen on.";
   } else {
     const early = idx < STEPS.indexOf("WAIT_T");               // nothing has left the stealth address yet / no ZEC exists yet
@@ -120,6 +143,7 @@ export function hopCard(h, cb = {}, now = Date.now()) {
   if (v.note) card.appendChild(el("div", "note hop-stale", v.note));
   if (v.body) card.appendChild(el("div", "hop-line", v.body));
   if (v.link) { const a = el("a", "hop-link", v.link.text); a.href = v.link.href; a.target = "_blank"; a.rel = "noopener noreferrer"; card.appendChild(a); }
+  if (v.parts) { const ul = el("div", "hop-parts"); for (const r of v.parts) ul.appendChild(el("div", "note hop-part hop-part-" + r.state, r.text)); card.appendChild(ul); }
   if (v.paid) card.appendChild(el("div", "hop-line hop-paid", v.paid));
   if (v.paidLink) { const a = el("a", "hop-link hop-paidlink", v.paidLink.text); a.href = v.paidLink.href; a.target = "_blank"; a.rel = "noopener noreferrer"; card.appendChild(a); }
   if (h.running) card.appendChild(el("div", "note hop-foot", "Keep this tab open · running for " + v.elapsed + " in this session"));

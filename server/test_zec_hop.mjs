@@ -64,6 +64,8 @@ function makeWorld(o = {}) {
     if (u.includes("/v0/status")) {
       const a = decodeURIComponent(u.split("depositAddress=")[1]), s = w.swaps[a]; if (!s) return J(404, { message: "not found" });
       if (!s.paid) return J(200, { status: "PENDING_DEPOSIT" });
+      if (!s.isIn && w.statusDown && w.statusDown(a)) return J(500, { message: "down" });      // 31.10 test hooks: a status outage, and a swap that is still running
+      if (!s.isIn && w.hold && w.hold(s, a)) { (w.holdSeen ||= new Set()).add(a); return J(200, { status: "PROCESSING" }); }
       const fin = s.isIn ? w.inOutcome : (w.outOutcomes[Math.min(w.outsDone || 0, w.outOutcomes.length - 1)]);
       if (!s.shown) { s.shown = true; if (s.isIn) { if (fin === "SUCCESS") w.tBal[s.body.recipient] = (w.tBal[s.body.recipient] || 0n) + s.out; else w.stealthBal += s.amt; } else { w.outsDone = (w.outsDone || 0) + 1; if (fin === "SUCCESS") w.delivered = (w.delivered || 0n) + s.out; else w.tBal[s.body.refundTo] = (w.tBal[s.body.refundTo] || 0n) + s.amt - 5000n; } }
       return J(200, { status: fin });
@@ -80,16 +82,16 @@ function makeWorld(o = {}) {
   };
   w.Zjs = {
     WebWallet: class {
-      constructor(net, url, a, b, db) { this.url = url; this.d = db ? JSON.parse(Buffer.from(db).toString()) : { accts: [], addr: {} }; if (url !== ZC.lightwalletd) throw new Error("wrong lightwalletd " + url); }
+      constructor(net, url, a, b, db) { w.built = (w.built || 0) + 1; this.url = url; this.d = db ? JSON.parse(Buffer.from(db).toString()) : { accts: [], addr: {} }; if (url !== ZC.lightwalletd) throw new Error("wrong lightwalletd " + url); }
       async get_latest_block() { if (w.off0 == null) w.off0 = off; return BigInt(3_500_000 + Math.floor((off - w.off0) / 75000)); }   /* ~75 s per block, driven by the virtual clock */ async sync() {} async db_to_bytes() { return new Uint8Array(Buffer.from(JSON.stringify(this.d))); }
       async create_account(name, m, i, bd) { if (bd !== 3_499_990) throw new Error("birthday " + bd); w.created++; const id = this.d.accts.length + 1; this.d.accts.push(id); this.d.addr[id] = tOf(m.slice(0, 20) + i); return id; }
       async get_current_address_transparent(id) { return this.d.addr[id]; }
       async get_wallet_summary() { return { account_balances: this.d.accts.map(id => [id, { unshielded_balance: Number(w.tBal[this.d.addr[id]] || 0n), orchard_balance: Number(w.oBal[this.d.addr[id]] || 0n), pending_change: Number(w.pend[this.d.addr[id]] || 0n), pending_spendable: 0 }]) }; }
       async pczt_shield(id) { return { id, a: this.d.addr[id] }; } async pczt_prove(p) { return p; }
-      async pczt_send(p) { w.shieldCalls++; if (w.shieldCalls <= w.shieldFails) throw new Error("Error when shielding: Change(InsufficientFunds { available: Zatoshis(0), required: Zatoshis(10000) })"); w.shieldHeights.push(3_500_000 + Math.floor((off - (w.off0 ?? off)) / 75000)); w.sig++; const v = w.tBal[p.a]; w.tBal[p.a] = 0n; w.pend[p.a] = v - 15000n; w.pendLater = (w.pendLater || []).concat([[p.a, v - 15000n]]); }
+      async pczt_send(p) { (w.events ||= []).push("shield"); w.shieldCalls++; if (w.shieldCalls <= w.shieldFails) throw new Error("Error when shielding: Change(InsufficientFunds { available: Zatoshis(0), required: Zatoshis(10000) })"); w.shieldHeights.push(3_500_000 + Math.floor((off - (w.off0 ?? off)) / 75000)); w.sig++; const v = w.tBal[p.a]; w.tBal[p.a] = 0n; w.pend[p.a] = v - 15000n; w.pendLater = (w.pendLater || []).concat([[p.a, v - 15000n]]); }
       async propose_transfer(id, to, v) { const a = this.d.addr[id]; if ((w.oBal[a] || 0n) < v + 15000n) throw new Error("insufficient"); return { a, to, v }; }
       async create_proposed_transactions(p, m, i) { if (m.split(" ").length !== 24 || tOf(m.slice(0, 20) + i) !== p.a) throw new Error("wrong key"); w.pr = p; return Uint8Array.from({ length: 32 }, (_, k) => k + 1); }
-      async send_authorized_transactions(raw) { w.broadcasts++; if (raw.length !== 32) throw new Error("bad txids"); w.oBal[w.pr.a] -= w.pr.v + 15000n; w.swaps[w.pr.to].paid = true; }
+      async send_authorized_transactions(raw) { (w.events ||= []).push("send"); (w.bo ||= []).push(off); w.broadcasts++; if (raw.length !== 32) throw new Error("bad txids"); w.oBal[w.pr.a] -= w.pr.v + 15000n; w.swaps[w.pr.to].paid = true; }
     },
     pczt_sign: async (net, p, usk, fp) => { if (!(usk.seed.length === 64 && fp.seed.length === 64)) throw new Error("bad key material"); return p; },
     UnifiedSpendingKey: class { constructor(n, seed, i) { this.seed = seed; this.i = i; } }, SeedFingerprint: class { constructor(seed) { this.seed = seed; } },
@@ -610,7 +612,8 @@ const tAddrOf = async (n, a, i = 0) => ZRm.deriveT(await H.mnemonicSeed(await H.
   ok("1129 F-4 ... but never after a shield of ours went out (shieldDone): then it keeps waiting for the shielded balance and Halts honestly", st5.step === "SHIELD" && /taking too long/.test(st5.err) && /Continue|Return/.test(st5.err), st5.step + " " + st5.err); }
 { // E: F-2 honest text, F-3 ETA, I-2 dust, I-3 preview
   const src = fs.readFileSync(path.join(WEB, "app.js"), "utf8");
-  ok("1129 F-2 the max route note no longer promises random times for both payouts", /one after the other/.test(src) && !/paid out in 2 parts at random times/.test(src));
+  ok("1129 F-2 the max route note no longer promises random times for both payouts", /a few minutes apart/.test(src) && !/paid out in 2 parts at random times/.test(src));
+  ok("31.10 the max route note says the second payout does NOT wait for the first swap, and no longer says 'one after the other' or 'as soon as the first has been sent'", /not when the first swap has finished/.test(src) && !/one after the other/.test(src.slice(src.indexOf("const ROUTE_NOTE"), src.indexOf("function setRoutes"))) && !/as soon as the first has been sent/.test(src));
   ok("31.10 the max route label stays within the owner's limit of 40 min", H.etaRangeMin("max")[1] <= 40);
   ok("1129 I-2 dust below the fee floor does not count as ZEC held; a real amount does", !H.holdsZec([{ transparent: 3000n, orchard: 5000n }]) && H.holdsZec([{ transparent: 0n, orchard: H.HOLD_DUST }]) && H.HOLD_DUST === 10_000n);
   const zec = 600_000n; ok("1129 I-3 preview out-amount reserves one fee per payout part (max = 2 parts)", H.previewOut(zec) === H.outAmount(zec - H.SHIELD_FEE) - 20000n && H.previewOut(zec, "fast") === H.outAmount(zec - H.SHIELD_FEE) - 20000n && H.previewOut(zec, "private") < H.previewOut(zec)); }
@@ -811,6 +814,128 @@ const tAddrOf = async (n, a, i = 0) => ZRm.deriveT(await H.mnemonicSeed(await H.
       ok("1136 F-4 after a lost wallet is returned (or found empty) it is forgotten and looked for again, so the next wallet of the address gets its own card; no record is hidden", /lostForget\(h\.lost\); checkLost\(\)/.test(srcA) && /lostSay\(h\.lost, t, false\); lostForget\(h\.lost\); step\(t\)/.test(rz) && /const t = "Nothing is listed/.test(rz) && !/hideHop\(HM, h\)[^\n]*h\.lost/.test(srcA));
     }
   }
+}
+// ---------- 31.10: payout swaps are not waited for one by one ----------
+{
+  let unh = 0; process.on("unhandledRejection", () => unh++);
+  const MN = 60_000, MX = (w, s, o = {}) => mkCtx(w, s, { mode: "max", rand: mulberry(11), ...o }), crashAfter = (w, n) => async ms => { if (w.broadcasts >= n) throw new Error("crash"); off += ms; };
+  const PS = async s => (await latest(s)).st.parts, stat = async s => (await PS(s)).map(p => p.status).join();
+  // pure: part states, next step (also for the sequential shape)
+  { const mk = (o = {}) => ({ amount: "1", tries: 0, refundAcct: 3, ...o });
+    ok("31.10 partState: unsent / open (AWAITING, or an old record with a tx and no status) / paid / refund (tx still set) / unsent again after a refund was handled / failed",
+      H.partState(mk()) === "unsent" && H.partState(mk({ tx: "a" })) === "open" && H.partState(mk({ tx: "a", status: H.AWAIT })) === "open" && H.partState(mk({ status: "SUCCESS", tx: "a" })) === "paid" && H.partState(mk({ status: "REFUNDED", tx: "a" })) === "refund"
+      && H.partState(mk({ status: "REFUNDED" })) === "unsent" && H.partState(mk({ status: "FAILED", tx: "a" })) === "failed");
+    const st = o => ({ parts: o.map(mk) }), n = H.nextStep;
+    ok("31.10 nextStep: unsent first, refund retry only when everything is sent, WAIT_SWAPS while a swap is open, DONE when all paid",
+      n(st([{ status: H.AWAIT, tx: "a" }, {}])).step === "DELAY" && n(st([{ status: H.AWAIT, tx: "a" }, {}])).partIdx === 1
+      && n(st([{ status: "REFUNDED", tx: "a" }, {}])).step === "DELAY" && n(st([{ status: "REFUNDED", tx: "a" }, { status: H.AWAIT, tx: "b" }])).step === "WAIT_T" && n(st([{ status: "REFUNDED", tx: "a" }, { status: H.AWAIT, tx: "b" }])).attempt === 3
+      && n(st([{ status: H.AWAIT, tx: "a" }, { status: H.AWAIT, tx: "b" }])).step === "WAIT_SWAPS" && n(st([{ status: "SUCCESS", tx: "a" }, { status: H.AWAIT, tx: "b" }])).step === "WAIT_SWAPS" && n(st([{ status: "SUCCESS", tx: "a" }, { status: "SUCCESS", tx: "b" }])).step === "DONE");
+    ok("31.10 nextStep: a failed part (or a refund with no tries left) stops sending; FAILED once no swap is open, WAIT_SWAPS while one is",
+      n(st([{ status: "FAILED", tx: "a" }, {}])).step === "FAILED" && n(st([{ status: "FAILED", tx: "a" }, {}])).result === "FAILED" && n(st([{ status: "FAILED", tx: "a" }, { status: H.AWAIT, tx: "b" }])).step === "WAIT_SWAPS"
+      && n(st([{ status: "REFUNDED", tx: "a", tries: 1 }, { status: "SUCCESS", tx: "b" }])).step === "FAILED" && n(st([{ status: "REFUNDED", tx: "a", refundAcct: null }, {}])).step === "FAILED");
+    ok("31.10 openParts / step number / remainingMs / progressText know WAIT_SWAPS", H.openParts({ parts: [{ status: "SUCCESS", tx: "a" }, { status: H.AWAIT, tx: "b" }, { tx: "c" }] }).join() === "1,2" && H.openParts({}).length === 0
+      && /step 7\/7/.test(H.progressText({ step: "WAIT_SWAPS", parts: [{}, {}] })) && H.remainingMs({ step: "WAIT_SWAPS", mode: "max", partIdx: 1, parts: [{}, {}], stepAt: 1e9 }, 1e9) > 0 && H.remainingMs({ step: "WAIT_SWAPS", mode: "max", partIdx: 1, parts: [{}, {}], stepAt: 1e9 }, 1e9) <= 8 * MN); }
+  // A: the gap between the two sends is about a block, the swap of part 1 is still running when part 2 goes out, the hop ends only when both swaps ended
+  { const w = makeWorld(), s = H.memStore(); off = 0; w.hold = () => off < w.bo[0] + 13 * MN; const msgs = []; let snap = null;
+    patchSend(w, async (orig) => { if (w.broadcasts === 1) snap = await stat(s); return orig(); });
+    const st = await H.startHop(MX(w, s, { onProgress: (x, m) => msgs.push([Date.now(), m]) })), P = await PS(s), rec = await latest(s);
+    ok("31.10 A: DONE with both swaps SUCCESS, two sends, one relay, two payout quotes", st.step === "DONE" && !st.err && P.every(p => p.status === "SUCCESS") && w.broadcasts === 2 && w.relays === 1 && outQuotes(w).length === 2, st.err || st.step);
+    ok("31.10 A: the second ZEC send does not wait for the first swap (gap < 7 min while that swap took 13 min)", w.bo[1] - w.bo[0] < 7 * MN, Math.round((w.bo[1] - w.bo[0]) / 1000) + " s");
+    ok("31.10 A: when part 2 was sent, part 1 was saved as awaiting, part 2 not yet", snap === H.AWAIT + ",", snap);
+    ok("31.10 A: DONE only after the held swap ended (not before 13 min after the first send)", off >= w.bo[0] + 13 * MN && rec.st.doneAt && rec.st.payoutTxs !== undefined && rec.st.outTotal === P.reduce((x, p) => x + BigInt(p.quote.amountOut), 0n).toString());
+    const wsMsgs = msgs.filter(([, m]) => /NEAR Intents is processing the swap/.test(m)), gaps = wsMsgs.slice(1).map(([t], i) => t - wsMsgs[i][0]);
+    ok("31.10 A: a heartbeat every few seconds while the swap is processed (card never reads 'No update')", wsMsgs.length > 50 && Math.max(...gaps) <= 10_000, wsMsgs.length + " beats, max gap " + Math.max(...gaps)); }
+  // B: reload at every point: the swap status of each part is persisted; resume follows open parts and carries on with unsent ones; a part is never sent twice
+  for (const n of [1, 2]) {
+    const w = makeWorld(), s = H.memStore(); off = 0; w.hold = () => !w.rel;
+    const a = await H.startHop(MX(w, s, { sleep: crashAfter(w, n) })), P1 = await PS(s);
+    ok("31.10 B" + n + ": tab closed after " + n + " send(s): part 1 awaiting" + (n === 2 ? ", part 2 awaiting, at WAIT_SWAPS" : ", part 2 not sent, at its delay"), a.err === "crash" && P1[0].status === H.AWAIT && (n === 2 ? P1[1].status === H.AWAIT && a.step === "WAIT_SWAPS" : a.partIdx === 1 && !P1[1].tx && P1[1].status == null && a.step === "DELAY"), a.step + " " + a.err + " " + P1.map(p => p.status));
+    w.rel = true; const built = w.built, b = await H.runHop(MX(w, s)), P2 = await PS(s);
+    ok("31.10 B" + n + ": resume (new ctx) follows the open swap, sends what is unsent, DONE; every part sent exactly once", b.step === "DONE" && !b.err && P2.every(p => p.status === "SUCCESS") && w.broadcasts === 2 && w.relays === 1 && outQuotes(w).length === 2, b.step + " " + b.err);
+    if (n === 2) ok("31.10 B2: following swaps after the reload never touches the wallet (no wallet object was even built)", w.built === built, built + " -> " + w.built); }
+  // C: records saved by the sequential build still resume
+  { const mkOld = async fn => { const w = makeWorld(), s = H.memStore(); off = 0; w.hold = () => !w.rel; await H.startHop(MX(w, s, { sleep: crashAfter(w, 1) })); const rec = await latest(s); fn(rec.st); await s.put(STEALTH + "#0", rec); w.rel = true; return { w, s }; };
+    { const { w, s } = await mkOld(st => { st.parts[0].status = null; delete st.parts[0].sentAt; st.step = "SEND_OUT"; st.partIdx = 0; delete st.delayUntil; });      // old: part 1 sent, its poll was running, part 2 not started
+      const b = await H.runHop(MX(w, s));
+      ok("31.10 C1: old record 'part 1 sent, polling' (tx, no status): followed, part 2 sent once, DONE, part 1 not sent again", b.step === "DONE" && !b.err && (await stat(s)) === "SUCCESS,SUCCESS" && w.broadcasts === 2 && outQuotes(w).length === 2, b.step + " " + b.err); }
+    { const { w, s } = await mkOld(st => { st.parts[0].status = "SUCCESS"; st.parts[0].payoutTx = { hash: "0x1", url: "" }; });      // old: part 1 delivered, part 2 next
+      const b = await H.runHop(MX(w, s));
+      ok("31.10 C2: old record 'part 1 SUCCESS, part 2 next': DONE", b.step === "DONE" && (await stat(s)) === "SUCCESS,SUCCESS" && w.broadcasts === 2); }
+    { const { w, s } = await mkOld(st => {}); w.rel = false;      // new record, tab closed at the delay of part 2, swap 1 still running: nothing is lost, and the card shows part 1 as 'in swap'
+      const C = await import("../web/hop-card.js"); C.resetLeft(); const rec = await latest(s), v = C.hopView({ st: rec.st, running: false, msg: "" }, Date.now());
+      ok("31.10 C3: a paused card shows each part (part 1 in swap, part 2 waiting)", v.parts && /Payout 1: sent, in swap/.test(v.parts[0].text) && /Payout 2: waiting/.test(v.parts[1].text) && v.kind === "warn", JSON.stringify(v.parts)); } }
+  // D: save-before-broadcast and the expiry guards on part 2 while part 1's swap is open
+  { const prep = async () => { const w = makeWorld(), s = H.memStore(); off = 0; w.hold = () => !w.rel; await H.startHop(MX(w, s, { sleep: crashAfter(w, 1) })); const a = await H.runHop(MX(w, s, { stopAt: "SEND_OUT" })), rec = await latest(s); return { w, s, a, rec }; };
+    { const { w, s, a, rec } = await prep(); ok("31.10 D0: part 2 reached SEND_OUT with a quote while part 1's swap is open", a.step === "SEND_OUT" && a.partIdx === 1 && rec.st.parts[1].quote && !rec.st.parts[1].tx && rec.st.parts[0].status === H.AWAIT);
+      rec.st.parts[1].raw = rawHex; rec.st.parts[1].expiry = 5; await s.put(STEALTH + "#0", rec);
+      const b = await H.runHop(MX(w, s, { stopAt: "WAIT_SWAPS", txKnown: async () => true })), P = await PS(s);
+      ok("31.10 D1: part 2's signed tx is past its expiry but the network knows it: NOT redone, followed (no second broadcast, no second quote)", b.step === "WAIT_SWAPS" && w.broadcasts === 1 && outQuotes(w).length === 2 && P[1].tx === txidHex && P[1].status === H.AWAIT, b.step + " " + b.err); }
+    { const { w, s, rec } = await prep(); rec.st.parts[1].raw = rawHex; rec.st.parts[1].expiry = 5; await s.put(STEALTH + "#0", rec); w.rel = true;
+      const b = await H.runHop(MX(w, s, { txKnown: async () => false })), P = await PS(s);
+      ok("31.10 D2: part 2's tx expired and provably not out: re-quoted once, sent once, both swaps SUCCESS", b.step === "DONE" && outQuotes(w).length === 3 && w.broadcasts === 2 && P.every(p => p.status === "SUCCESS"), b.step + " " + b.err);
+      const w3 = makeWorld(), s3 = H.memStore(); off = 0; w3.hold = () => !w3.rel; await H.startHop(MX(w3, s3, { sleep: crashAfter(w3, 1) })); await H.runHop(MX(w3, s3, { stopAt: "SEND_OUT" })); const r3 = await latest(s3); r3.st.parts[1].raw = rawHex; r3.st.parts[1].expiry = 5; await s3.put(STEALTH + "#0", r3);
+      const c = await H.runHop(MX(w3, s3, { txKnown: async () => { throw new Error("cannot tell"); } }));
+      ok("31.10 D3: cannot tell whether part 2's tx went out: Halt, nothing new sent, part 1 still tracked as awaiting", c.halted === true && /cannot tell/.test(c.err) && w3.broadcasts === 1 && (await stat(s3)).startsWith(H.AWAIT)); } }
+  // E: refunds
+  for (const [name, hold] of [["part 1's swap ends REFUNDED while part 2 is still unsent", null], ["part 1's swap is still running when part 2 is sent and ends REFUNDED afterwards", w => () => w.broadcasts < 2]]) {
+    const w = makeWorld({ outOutcomes: ["REFUNDED", "SUCCESS", "SUCCESS"] }), s = H.memStore(); off = 0; if (hold) w.hold = hold(w);
+    const st = await H.startHop(MX(w, s)), P = await PS(s), o = outQuotes(w);
+    ok("31.10 E: " + name + ": part 2 is sent first, then the refund is shielded again and re-sent (events shield,send,send,shield,send)", st.step === "DONE" && w.events.join() === "shield,send,send,shield,send" && P[0].tries === 1 && P.every(p => p.status === "SUCCESS") && w.broadcasts === 3 && w.sig === 2, w.events.join() + " " + st.step + " " + st.err);
+    ok("31.10 E: refund accounts are fresh and distinct", new Set([...o.map(q => q.refundTo), (await latest(s)).st.tIn]).size === o.length + 1 && o.length === 3); }
+  { const w = makeWorld({ outOutcomes: ["REFUNDED", "SUCCESS", "REFUNDED"] }), s = H.memStore(); off = 0; const st = await H.startHop(MX(w, s)), P = await PS(s);
+    ok("31.10 E3: part 1 refunded twice: FAILED (as today), part 2 stayed tracked and delivered, text names the paid part", st.step === "FAILED" && st.result === "REFUNDED" && P[1].status === "SUCCESS" && w.broadcasts === 3 && /1 of 2 payouts were already made/.test(H.recoveryText(st)) && /hop wallet/.test(H.recoveryText(st)), st.step + " " + st.err); }
+  { const w = makeWorld({ outOutcomes: ["FAILED", "SUCCESS"] }), s = H.memStore(); off = 0; w.hold = () => w.broadcasts < 2; const st = await H.startHop(MX(w, s)), P = await PS(s);
+    ok("31.10 E4: part 1 FAILED while part 2 was already sent: waits for part 2's swap, then FAILED naming it paid", st.step === "FAILED" && st.result === "FAILED" && P[1].status === "SUCCESS" && P[0].status === "FAILED" && w.broadcasts === 2 && /1 of 2 payouts/.test(H.recoveryText(st)), st.step + " " + st.err); }
+  { const w = makeWorld({ outOutcomes: ["FAILED"] }), s = H.memStore(); off = 0; const st = await H.startHop(MX(w, s)), P = await PS(s);
+    ok("31.10 E5: part 1 FAILED before part 2 started: part 2 is NOT sent (as in the sequential build), FAILED", st.step === "FAILED" && st.result === "FAILED" && w.broadcasts === 1 && !P[1].tx && !P[1].quote, st.step + " " + st.err + " " + w.broadcasts); }
+  // F: loss approval with the earlier swap unfinished
+  { const w = makeWorld(), s = H.memStore(); off = 0; w.hold = () => off < w.bo[0] + 13 * MN; let asked = 0;
+    const st = await H.startHop(MX(w, s, { maxLoss: 0, approvedLoss: 0.016, confirmLoss: async () => { asked++; return true; } })), rec = await latest(s);
+    ok("31.10 F: part 2's projected loss counts part 1 at its quoted amountOut although its swap is open (without it the loss would read ~50% and Halt)", st.step === "DONE" && asked === 0 && rec.st.parts.every(p => p.status === "SUCCESS"), st.step + " " + st.err);
+    const P = rec.st.parts, loss2 = H.projectedLoss({ amountIn: rec.st.amount, inDec: 6, outDec: 6, paidOut: Number(P[0].quote.amountOut), rate: Number(P[1].quote.amountOut) / Number(P[1].quote.amountIn), zatsLeft: BigInt(P[1].quote.amountIn) }), lossOld = H.projectedLoss({ amountIn: rec.st.amount, inDec: 6, outDec: 6, paidOut: 0, rate: Number(P[1].quote.amountOut) / Number(P[1].quote.amountIn), zatsLeft: BigInt(P[1].quote.amountIn) });
+    ok("31.10 F: the figures: counted loss is small, the overstated one (open part ignored) is above 40%", loss2 < 0.03 && lossOld > 0.4, loss2 + " vs " + lossOld); }
+  { const w = makeWorld(), s = H.memStore(); off = 0; w.hold = () => off < w.bo[0] + 13 * MN; w.mutQuote = (q, isIn, b) => { if (!isIn && w.quotes.filter(x => !x.dry && x.originAsset === ZC.assetId).length === 2) { q.amountOut = (BigInt(q.amountOut) * 3n / 10n).toString(); q.minAmountOut = (BigInt(q.amountOut) * 99n / 100n).toString(); } };
+    const st = await H.startHop(MX(w, s, { maxLoss: 0.05, approvedLoss: 0.01 }));
+    ok("31.10 F2: a bad quote for part 2 is still caught (Halt before sending, loss above the cap, timer-driven run never asks)", st.halted === true && /would lose|Quote above/.test(st.err) && w.broadcasts === 1 && st.step === "QUOTE_OUT" && (await stat(s)).startsWith(H.AWAIT), st.step + " " + st.err); }
+  // G: poll trouble
+  { const w = makeWorld(), s = H.memStore(); off = 0; w.hold = () => off < w.bo[0] + 13 * MN; w.statusDown = () => { w.dn = (w.dn || 0) + 1; return w.dn % 3 !== 0; }; const st = await H.startHop(MX(w, s)), P = await PS(s);
+    ok("31.10 G1: status errors on two of three polls never abort the hop; it ends DONE with a terminal status for every part", st.step === "DONE" && !st.err && P.every(p => p.status === "SUCCESS"), st.step + " " + st.err); }
+  { const w = makeWorld(), s = H.memStore(); off = 0; w.statusDown = () => !w.up; const st = await H.startHop(MX(w, s)), P = await PS(s);
+    ok("31.10 G2: NEAR Intents unreachable for good: Halt after 90 min of following, parts still awaiting", st.halted === true && /90 min/.test(st.err) && P.every(p => p.status === H.AWAIT) && w.broadcasts === 2 && st.step === "WAIT_SWAPS", st.step + " " + st.err);
+    const before = off; w.up = true; const b = await H.runHop(MX(w, s)); ok("31.10 G2: Continue after the outage follows them to DONE without re-sending", b.step === "DONE" && w.broadcasts === 2 && off - before < 5 * MN, b.step + " " + b.err); }
+  { const w = makeWorld(), s = H.memStore(); off = 0; w.hold = () => !w.rel; const st = await H.startHop(MX(w, s));
+    ok("31.10 G3: a swap that never ends: Halt after 90 min with its deposit address", st.halted === true && /90 min/.test(st.err) && /deposit address/.test(st.err), st.err);
+    w.rel = true; const b = await H.runHop(MX(w, s)); ok("31.10 G3: Continue finishes once it ends", b.step === "DONE"); }
+  // H: nothing runs after the end
+  { const w = makeWorld(), s = H.memStore(); off = 0; const f0 = w.fetch; w.fetch = async (u, i) => { if (String(u).includes("/v0/status")) w.sc = (w.sc || 0) + 1; return f0(u, i); };
+    const st = await H.startHop(MX(w, s)); const c = w.sc; await new Promise(r => setTimeout(r, 40)); await new Promise(r => setImmediate(r));
+    ok("31.10 H: nothing keeps polling after the run ended (no timers, no background task)", st.step === "DONE" && w.sc === c); }
+  { const w = makeWorld(), s = H.memStore(); off = 0; w.hold = () => !w.rel; await H.startHop(MX(w, s, { sleep: crashAfter(w, 1) }));
+    const st = await H.runHop(MX(w, s, { stopAt: "SEND_OUT" }));
+    ok("31.10 H2: a stop before part 2's send keeps part 1's swap tracked", st.step === "SEND_OUT" && (await stat(s)).startsWith(H.AWAIT)); }
+  // I: Return / lost-record finder see a hop with an open swap as a hop with a record
+  { const w = makeWorld(), s = H.memStore(); off = 0; w.hold = () => !w.rel; await H.startHop(MX(w, s, { sleep: crashAfter(w, 2) }));
+    const f = await H.findLostFunds({ store: s, stealth: STEALTH, priv: PRIV, words, getUtxos: async () => { throw new Error("must not be asked"); }, priorHops: 1, gapMs: 0 });
+    ok("31.10 I: findLostFunds leaves a hop with an open swap alone (its record is the owner)", f.skipped === "record");
+    const src = fs.readFileSync(path.join(WEB, "app.js"), "utf8");
+    ok("31.10 I: Return and the card's hide step never hide or empty-count a record with an open swap (openParts guard in returnZec and hideHop)", (src.match(/HM\.openParts\(/g) || []).length >= 2 && /A payout swap is still open/.test(src)); }
+  // J: the card
+  { const C = await import("../web/hop-card.js"), now = 900_000_000, M = 60_000; C.resetLeft();
+    const mk = (step, o = {}, st = {}) => ({ st: { step, chain: "rh", dest: "base", amount: "10000000", recipient: A, stealth: STEALTH, startedAt: now - 20 * M, stepAt: now - M, mode: "max", partIdx: 1, parts: [{ status: "SUCCESS", tx: "a", quote: { amountOut: "4040448" } }, { status: H.AWAIT, tx: "b", quote: { amountOut: "4374658" } }], ...st }, running: true, msg: "Waiting for Payout 2 of 2 to be delivered · NEAR Intents is processing the swap · 1:05", beatAt: now - 5000, ...o });
+    const v = C.hopView(mk("WAIT_SWAPS"), now);
+    ok("31.10 J1: WAIT_SWAPS is a running card (not done), step 7 of 7, rows: delivered / in swap with paid amounts", v.kind === "run" && v.idx === 6 && v.pct < 100 && v.parts[0].state === "delivered" && /delivered ≈ 4\.04/.test(v.parts[0].text) && v.parts[1].state === "swap" && /≈ 4\.37 .* expected/.test(v.parts[1].text) && /≈ 4\.04/.test(v.paid), JSON.stringify(v.parts) + v.pct);
+    ok("31.10 J2: a normal wait says NEAR Intents is processing the swap (normal, up to about 15 min) instead of 'No update'", /NEAR Intents is processing the swap \(normal, can take up to about 15 min\)/.test(v.note) && !/No update/.test(v.note));
+    C.resetLeft(); const v2 = C.hopView(mk("WAIT_SWAPS", { beatAt: now - 200_000 }), now); ok("31.10 J3: after 200 s of real silence the card does warn", /No update for 200 s/.test(v2.note));
+    C.resetLeft(); const rows = st => C.hopView(mk("QUOTE_OUT", {}, st), now).parts.map(r => r.state).join();
+    ok("31.10 J4: part rows while part 2 is being quoted: part 1 in swap/delivered, part 2 sending", rows({ parts: [{ status: H.AWAIT, tx: "a", quote: { amountOut: "1" } }, { status: null }] }) === "swap,sending" && rows({ parts: [{ status: "SUCCESS", tx: "a", quote: { amountOut: "1" } }, { status: null }] }) === "delivered,sending");
+    C.resetLeft(); const aw = { status: H.AWAIT, tx: "a", quote: { amountOut: "1" } }, su = { status: "SUCCESS", tx: "a", quote: { amountOut: "1" } };
+    const seq = [mk("SEND_OUT", {}, { partIdx: 0, parts: [{ status: null, quote: {} }, { status: null }] }), mk("DELAY", {}, { partIdx: 1, parts: [aw, { status: null }] }), mk("QUOTE_OUT", {}, { partIdx: 1, parts: [aw, { status: null }] }),
+      mk("SEND_OUT", {}, { partIdx: 1, parts: [aw, { status: null }] }), mk("WAIT_SWAPS", {}, { parts: [aw, { ...aw }] }), mk("WAIT_SWAPS", {}, { parts: [su, { ...aw }] })].map(h => C.hopView(h, now).pct);
+    ok("31.10 J5: progress never goes backward along the whole payout sequence and stays below 100 until DONE", seq.every((x, i) => i === 0 || x >= seq[i - 1]) && seq.every(x => x < 100), seq.join());
+    C.resetLeft(); const d = C.hopView(mk("DONE", { running: false }, { doneAt: now, outTotal: "8415106" }), now); ok("31.10 J6: DONE shows 100% only on the DONE step", d.kind === "done" && d.pct === 100);
+    const real = [C.realProgress({ step: "SEND_OUT", parts: [{}, {}], partIdx: 0 }), C.realProgress({ step: "DELAY", parts: [{}, {}], partIdx: 1 }), C.realProgress({ step: "WAIT_SWAPS", parts: [{}, {}], partIdx: 1 }), C.realProgress({ step: "WAIT_SWAPS", parts: [{ status: "SUCCESS" }, { status: "SUCCESS" }], partIdx: 1 })];
+    ok("31.10 J7: realProgress is monotone along send, next delay, wait for swaps and caps at 99", real.every((x, i) => i === 0 || x >= real[i - 1]) && real[3] <= 99, real.join()); }
+  ok("31.10 no unhandled rejection in any of the runs above", unh === 0, String(unh));
 }
 Date.now = realNow;
 console.log(fails ? fails + " FAILED" : "all passed"); process.exit(fails ? 1 : 0);

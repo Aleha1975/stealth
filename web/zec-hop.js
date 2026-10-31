@@ -21,8 +21,10 @@ export const ETA_MIN = Math.round(Object.values(STEP_MIN).reduce((a, b) => a + b
 /** Payout modes (audit H-1): the shielded balance is paid out in k parts of random size, each with its own random delay, quote and deposit.
  *  Limit (1105 L-7): the split defeats a match on ONE amount only. The parts sum to the in-leg amount minus known fees, all go to the same recipient, and the pipeline latency is
  *  near-constant, so an observer who can see both legs can still match on sum and time window, especially with few concurrent users.
- *  max = 2 parts planned at 2..6 min after the shield (owner 31.10; was 5..12). 1129 F-2: the parts run strictly one after the other (a send takes ~8 min plus the wallet sync before its quote), so in practice the second payout
- *  follows the first as soon as that one has ended: the planned time of part 2 only matters when it is later than that. The screen says so (ROUTE_NOTE); the gap between the payouts is not randomised by the plan.
+ *  max = 2 parts planned at 2..6 min after the shield (owner 31.10; was 5..12). Payout parts are SENT one after the other but their swaps are NOT waited for (31.10 change; before it the second payout started only when the first swap
+ *  had ended, which added ~13 min in a real run): after a part's ZEC transaction is broadcast and submitted to 1Click it is marked awaiting and the machine moves on to the next part at once. The next part's quote waits for the first part's
+ *  shielded change to confirm (1 block), so the gap between the two payouts is about one block, or the planned time of part 2 when that is later; it is not a swap duration and the plan does not randomise it beyond that.
+ *  Every part's swap is followed on its own (swapTick between steps, WAIT_SWAPS at the end) and the hop is DONE only when every part's swap is SUCCESS. The screen says so (ROUTE_NOTE).
  *  measured: the label shown for max. Three mainnet runs took 23:09, 25:57 and 36:07 (31.10), and most of the spread is the wait for the first payout's change, which the step constants cannot predict.
  *  fast / private are the OLD modes (up to 47 / 60 min): no longer offered, kept so that a saved hop of those modes resumes with its own plan. totalMin/totalMax: minutes from "shielded" to the LAST part's send time. */
 export const MODES = { max: { kMin: 2, kMax: 2, totalMin: 2, totalMax: 6, firstMax: 2, measured: [25, 40] }, fast: { kMin: 1, kMax: 2, totalMin: 3, totalMax: 10 }, private: { kMin: 2, kMax: 3, totalMin: 8, totalMax: 15 } };
@@ -47,9 +49,9 @@ export const etaLabel = mode => { const [a, b] = etaRangeMin(mode), h = x => (x 
 /** Time left for an unfinished hop, in ms: rest of the current step (min 1 min) + typical time of the later steps. DELAY uses its exact end; with payout parts the parts are simulated one after the other
  *  (each waits for its own time, then needs a quote and a send). Never below 1 min while unfinished, 0 once finished. */
 export function remainingMs(st, now = Date.now()) {
-  const i = STEPS.indexOf(st.step); if (i < 0) return 0;
+  const i = STEPS.indexOf(st.step === "WAIT_SWAPS" ? "SEND_OUT" : st.step); if (i < 0) return 0;
   const sm = k => STEP_MIN[k] * MIN, send = sm("QUOTE_OUT") + sm("SEND_OUT"), di = STEPS.indexOf("DELAY"), parts = Array.isArray(st.parts) ? st.parts : null;
-  const cur = st.step === "DELAY" && st.delayUntil ? Math.max(0, st.delayUntil - now) : Math.max(MIN, sm(st.step) - (now - (st.stepAt || now)));
+  const stepK = STEPS[i], cur = st.step === "DELAY" && st.delayUntil ? Math.max(0, st.delayUntil - now) : Math.max(MIN, sm(stepK) - (now - (st.stepAt || now)));
   if (!parts) {
     const m = st.mode ? modeOf(st.mode) : null, dl = m ? (payoutMin(m, m.kMin, m.totalMin) + payoutMin(m, m.kMax, m.totalMax)) / 2 * MIN - send : sm("DELAY");   // plan not made yet: typical delay of the mode
     return Math.max(MIN, cur + STEPS.slice(i + 1).reduce((a, k) => a + (k === "DELAY" ? dl : sm(k)), 0));
@@ -57,6 +59,7 @@ export function remainingMs(st, now = Date.now()) {
   let t = now, j = st.partIdx || 0;
   if (i < di) { t += cur + STEPS.slice(i + 1, di).reduce((a, k) => a + sm(k), 0) + sm("DELAY") + send; j++; }      // a refunded part is shielded again, waits a short delay and is sent
   else if (st.step === "DELAY") { t = Math.max(t, (parts[j] || {}).at || t) + send; j++; }
+  else if (st.step === "WAIT_SWAPS") { t += cur; j = parts.length; }      // everything is sent: only the swaps are left
   else { t += cur + (st.step === "QUOTE_OUT" ? sm("SEND_OUT") : 0); j++; }
   for (; j < parts.length; j++) t = Math.max(t, parts[j].at || t) + send;
   return Math.max(MIN, t - now);
@@ -123,23 +126,42 @@ export const afterIn = status => (status === "SUCCESS" ? { step: "WAIT_T" } : { 
 export const afterOut = (st, status) => status === "SUCCESS" ? { step: "DONE" }
   : status === "REFUNDED" && st.attempt + 1 < MAX_OUT ? { step: "WAIT_T", attempt: st.attempt + 1, tSeenHeight: null, tSeenAt: null, outQuote: null, outRaw: null, outTx: null }   // ZEC came back to account attempt+1's t-address: shield and send again
   : { step: "FAILED", result: status };
-/** After the payout part st.partIdx ended with `status`: next part, DONE, shield the refund again (it came back to the part's refund account) or FAILED. */
-export function afterPart(st, status) {
-  const i = st.partIdx || 0, p = st.parts[i];
-  if (status === "SUCCESS") return i + 1 < st.parts.length ? { step: "DELAY", partIdx: i + 1, delayUntil: st.parts[i + 1].at } : { step: "DONE" };
-  if (status === "REFUNDED" && (p.tries || 0) + 1 < PART_TRIES && p.refundAcct != null) return { step: "WAIT_T", attempt: p.refundAcct, tSeenHeight: null, tSeenAt: null };
-  return { step: "FAILED", result: status };
+/** The state of one payout part, from its own persisted fields (a record saved by the sequential build reads the same way):
+ *  paid = swap SUCCESS; open = ZEC sent, swap not ended (status "AWAITING", or an old record with a tx and no status); refund = swap REFUNDED and not handled yet (tx still set);
+ *  failed = any other end; unsent = no ZEC sent yet (also a refunded part whose retry has started: its tx was cleared). */
+export const AWAIT = "AWAITING";
+export function partState(p) {
+  const s = p.status;
+  if (s === "SUCCESS") return "paid";
+  if (s === AWAIT) return "open";
+  if (s === "REFUNDED") return p.tx ? "refund" : "unsent";
+  if (s) return "failed";
+  return p.tx ? "open" : "unsent";
 }
+export const openParts = st => (Array.isArray(st.parts) ? st.parts : []).map((p, i) => partState(p) === "open" ? i : -1).filter(i => i >= 0);
+const canRetry = p => (p.tries || 0) + 1 < PART_TRIES && p.refundAcct != null;
+/** Where the machine goes when it has nothing more to do for the part it just sent (or when a swap has ended while it waits). A failed part stops further sending (as before) and the hop ends FAILED once no swap is open any more.
+ *  Otherwise: the next unsent part (its quote waits for the shielded change); only when everything is sent, a refunded part is shielded again and re-sent (so a refund never competes with a send for the wallet); then WAIT_SWAPS; then DONE. */
+/** A part that ended for good without paying: FAILED, or REFUNDED with no retry left. -1 = none. */
+export const failedPart = st => st.parts.findIndex(p => { const x = partState(p); return x === "failed" || (x === "refund" && !canRetry(p)); });
+export function nextStep(st) {
+  const P = st.parts, S = P.map(partState), bad = failedPart(st), open = S.includes("open");
+  if (bad >= 0) return open ? { step: "WAIT_SWAPS" } : { step: "FAILED", result: P[bad].status };
+  const un = S.indexOf("unsent"); if (un >= 0) return { step: "DELAY", partIdx: un, delayUntil: P[un].at };
+  const rf = S.indexOf("refund"); if (rf >= 0) return { step: "WAIT_T", partIdx: rf, attempt: P[rf].refundAcct, tSeenHeight: null, tSeenAt: null };
+  return open ? { step: "WAIT_SWAPS" } : { step: "DONE" };
+}
+const stepNo = st => STEPS.indexOf(st.step === "WAIT_SWAPS" ? "SEND_OUT" : st.step) + 1;      // WAIT_SWAPS is the tail of the last step
 export const partsLabel = st => Array.isArray(st.parts) && st.parts.length > 1 ? "payout " + ((st.partIdx || 0) + 1) + " of " + st.parts.length : "";
 export const etaText = st => st.mode ? etaLabel(st.mode) : ETA_MIN + " min";
 export const progressText = st => DONE_STEPS.has(st.step) ? (st.step === "DONE" ? "Private transfer done" : "Private transfer stopped")
-  : "Private transfer: step " + (STEPS.indexOf(st.step) + 1) + "/" + STEPS.length + (partsLabel(st) ? " (" + partsLabel(st) + ")" : "") + " · keep this tab open · ~" + etaText(st);
+  : "Private transfer: step " + stepNo(st) + "/" + STEPS.length + (partsLabel(st) ? " (" + partsLabel(st) + ")" : "") + " · keep this tab open · ~" + etaText(st);
 export function recoveryText(st) {
   if (st.step === "DONE") return "Done.";
   if (st.step === "FAILED_IN") return "The first swap ended as " + st.result + ". The money is back on the stealth address (minus the refund fee).";
   if (st.step === "FAILED") { const n = Array.isArray(st.parts) ? st.parts.filter(p => p.status === "SUCCESS").length : 0;
     return "The last swap ended as " + st.result + (st.outQuote ? " (deposit address " + st.outQuote.depositAddress + ")" : "") + (n ? ". " + n + " of " + st.parts.length + " payouts were already made" : "") + ". Any ZEC left is in the hop wallet, which you can rebuild from this payment's key."; }
-  return (st.err ? st.err + ". " : "") + "Nothing is lost: press Resume to continue from step " + (STEPS.indexOf(st.step) + 1) + "/" + STEPS.length + ".";
+  return (st.err ? st.err + ". " : "") + "Nothing is lost: press Resume to continue from step " + stepNo(st) + "/" + STEPS.length + ".";
 }
 export async function retry(fn, { tries = 4, base = 2000, sleep = sleepMs } = {}) {
   for (let i = 1; ; i++) try { return await fn(); } catch (e) { if (e instanceof Halt || i >= tries) throw e; await sleep(base * 3 ** (i - 1)); }
@@ -328,7 +350,7 @@ let zjsP; export const sharedZjs = () => zjsP ||= loadZjs().catch(e => { zjsP = 
  *          waitReceipt(hash)->{ok}, balance()->BigInt, randomNonce(), authUsed(authorizer,nonce)->bool, txKnown(txid)->bool, countPriorHops(stealth)->n, onProgress(st,msg) }
  *  Returns the state. st.err set = halted (resume = call runHop again); DONE_STEPS = finished. */
 export async function runHop(ctx) {
-  const { store, sleep = sleepMs, base = PW.ONECLICK } = ctx, found = await findHop(store, ctx.stealth);
+  const { store, sleep: rawSleep = sleepMs, base = PW.ONECLICK } = ctx, found = await findHop(store, ctx.stealth), runAt = Date.now();
   if (!found) throw new Error("no private transfer to resume"); const { key, rec } = found, st = rec.st;
   const rawFetch = ctx.fetchFn || fetch, iso = f => (u, init = {}) => f(u, { ...init, credentials: "omit", referrerPolicy: "no-referrer", cache: "no-store" });   // M-5: no cookies / referrer to 1Click
   const fIn = iso(rawFetch), fOut = iso(ctx.fetchFnOut || rawFetch), fetchFn = rawFetch;                  // fOut may be a different network path (proxy) than fIn
@@ -381,6 +403,29 @@ export async function runHop(ctx) {
   const until = async (what, ms, fn, every = 10000) => { const t0 = Date.now(); for (;;) { if (await fn()) return; if (Date.now() - t0 > ms) throw new Halt(what + " is taking too long"); say("Waiting for " + what + "… " + Math.round((Date.now() - t0) / 1000) + " s"); await sleep(every); } };
   const status = async (a, f) => { const r = await f(base + "/v0/status?depositAddress=" + encodeURIComponent(a), { cache: "no-store", signal: timeoutSignal(30000) }).catch(() => null); return r && r.ok ? (await r.json().catch(() => ({}))).status || PENDING : PENDING; };
   const poll = async (a, label, ms, f) => { try { return await PW.pollStatus({ base, depositAddress: a, fetchFn: f, sleep, intervalMs: 4000, timeoutMs: ms, onUpdate: s => say(label + ": " + s.status) }); } catch (e) { throw new Halt(e.message); } };
+  // ---- payout swaps are followed apart from the sending (31.10). swapTick only asks 1Click (never the wallet), never throws, and only ever changes the status of a part whose ZEC is already sent, so it cannot clash with
+  // the part the machine is working on. It runs between steps (main loop), inside every wait (the `sleep` handlers use) and in WAIT_SWAPS. There is no timer or background task: when the run ends nothing is left running.
+  const SWAP_TICK_MS = ctx.swapTickMs ?? 15000, swapErrs = new Map(), swapSeen = new Map(); let tickAt = 0;
+  const partTag = i => "Payout " + (i + 1) + " of " + st.parts.length;
+  const swapTick = async (force = false, announce = false) => {
+    if (!Array.isArray(st.parts) || st.dry) return;
+    const now = Date.now(); if (!force && now - tickAt < SWAP_TICK_MS) return; tickAt = now;
+    let changed = false;
+    for (const i of openParts(st)) {
+      const p = st.parts[i]; if (!p.quote || !p.quote.depositAddress) continue;
+      let j = null;
+      try { const r = await fOut(base + "/v0/status?depositAddress=" + encodeURIComponent(p.quote.depositAddress), { cache: "no-store", signal: timeoutSignal(30000) }); j = r && r.ok ? await r.json().catch(() => null) : null; } catch { j = null; }
+      if (!j || typeof j.status !== "string") { swapErrs.set(i, (swapErrs.get(i) || 0) + 1); continue; }      // a failed look is "no news", the swap is looked at again; nothing aborts
+      swapErrs.set(i, 0);
+      if (announce && swapSeen.get(i) !== j.status) { swapSeen.set(i, j.status); say(partTag(i) + ": swap " + j.status); }
+      if (PW.TERMINAL.has(j.status)) {
+        const t = (((j.swapDetails || {}).destinationChainTxHashes) || [])[0];
+        p.status = j.status; if (t && t.hash) p.payoutTx = { hash: String(t.hash), url: String(t.explorerUrl || "") }; changed = true;
+      }
+    }
+    if (changed) { try { await save(); } catch {} }
+  };
+  const sleep = async ms => { await rawSleep(ms); await swapTick(); };
   const txidOf = raw => hex(unhex(raw).slice(0, 32).reverse()).slice(2);
   const known = async raw => { try { return ctx.txKnown ? await ctx.txKnown(txidOf(raw)) : undefined; } catch { return undefined; } };      // true / false / undefined = cannot tell
   const relay = async () => {
@@ -394,6 +439,18 @@ export async function runHop(ctx) {
       throw new Halt("the relayer says this authorization was already used, but the chain does not confirm it; nothing new was signed. Press Continue to check again");
     }
     throw new Error(d.error || "relayer error");
+  };
+  const fmtMS = ms => { const x = Math.max(0, Math.floor(ms / 1000)); return Math.floor(x / 60) + ":" + String(x % 60).padStart(2, "0"); };
+  /** The step after a payout part was sent or a swap ended (see nextStep). A refunded part restarts its retry here (own refund account, fresh quote); DONE records the totals; FAILED names the result. */
+  const advance = async () => {
+    const a = nextStep(st);
+    if (a.step === "WAIT_T") { const q = st.parts[a.partIdx]; q.tries = (q.tries || 0) + 1; q.quote = null; q.raw = null; q.tx = null; q.expiry = null; q.sentAt = null; }
+    if (a.step === "DONE") {
+      const ok = st.parts.filter(x => x.status === "SUCCESS");
+      a.doneAt = Date.now(); a.payoutTxs = ok.map(x => x.payoutTx).filter(Boolean); if (a.payoutTxs[0]) a.payoutTx = a.payoutTxs[0];
+      a.outTotal = ok.reduce((s, x) => s + BigInt(x.quote.amountOut), 0n).toString();
+    }
+    return go(a.step, a);
   };
   const H = {
     async QUOTE_IN() {
@@ -513,6 +570,9 @@ export async function runHop(ctx) {
     },
     async QUOTE_OUT() {
       const p = P();
+      if (partsOn() && !p.tx && !p.raw) {                          // a part has ended for good while this one was waiting: nothing new is sent (as in the sequential build), the open swaps are followed to their end
+        const f = failedPart(st); if (f >= 0 && f !== (st.partIdx || 0)) return openParts(st).length ? go("WAIT_SWAPS") : go("FAILED", { result: st.parts[f].status });
+      }
       if (p.quote && (p.raw || Date.now() < p.quote.deadlineMs - 120_000)) return go("SEND_OUT");
       if (st.waitExpiry) { await until("the earlier unsent Zcash transaction to expire", 70 * 60_000, async () => (await tip()) > st.waitExpiry); st.waitExpiry = null; await save(); }
       const reserve = BigInt(p.reserve || st.reserve);
@@ -523,8 +583,10 @@ export async function runHop(ctx) {
       if (partsOn() && p.refundAcct == null) { p.refundAcct = await allocAcct(); await save(); }            // a fresh hop t-address per part and attempt: the refund address is never reused
       const refundT = await taddr(partsOn() ? p.refundAcct : st.attempt + 1), req = reqOut({ dest: ctx.dest, amount, recipient: st.recipient, refundT, rand: ctx.rand });
       const info = quoteInfoOf(await PW.requestQuote({ base, fetchFn: fOut, okDeposit: isT, req }), req);
-      const paid = (partsOn() ? st.parts : []).filter(x => x.status === "SUCCESS").reduce((a, x) => a + Number(x.quote.amountOut), 0);
-      const left = (partsOn() ? st.parts.filter((x, i) => i > (st.partIdx || 0)).reduce((a, x) => a + BigInt(x.amount), 0n) : 0n) + amount;
+      // 31.10: a part whose swap has not ended yet counts at its quoted amountOut (paid or open), so the loss is not overstated; a part refunded and not re-sent yet, or not sent yet, is ZEC still to send
+      const cur = st.partIdx || 0, others = partsOn() ? st.parts.map((x, i) => [x, i]).filter(([, i]) => i !== cur) : [];
+      const paid = others.filter(([x]) => ["paid", "open"].includes(partState(x)) && x.quote).reduce((a, [x]) => a + Number(x.quote.amountOut), 0);
+      const left = others.filter(([x]) => ["unsent", "refund"].includes(partState(x))).reduce((a, [x]) => a + BigInt(x.amount), 0n) + amount;
       const loss = st.rebuilt ? 0 : projectedLoss({ amountIn: st.amount, inDec: ctx.chain.token.decimals, outDec: ctx.dest.token.decimals, paidOut: paid, rate: Number(info.amountOut) / Number(amount), zatsLeft: left }), cap = ctx.maxLoss == null ? MAX_LOSS : ctx.maxLoss;
       const rate = Number(info.amountOut) / Number(amount);
       // 1138 L-3 / C2 / I-1: pressing "Confirm private transfer" on the preview IS the approval of the preview's total cost (st.approvedLoss). Over the cap, a quote passes silently while its
@@ -546,7 +608,7 @@ export async function runHop(ctx) {
       p.quote = info; p.tx = null; p.raw = null; p.expiry = null; await go("SEND_OUT");
     },
     async SEND_OUT() {
-      const p = P(), oq = p.quote;
+      const p = P(), oq = p.quote, s0 = partsOn() ? partState(p) : null;
       if (!p.tx && (await status(oq.depositAddress, fOut)) === PENDING) {        // 1Click has not seen the ZEC yet
         const w = await wallet(), stale = Date.now() > oq.deadlineMs - 60_000;
         let send = true;
@@ -577,24 +639,38 @@ export async function runHop(ctx) {
             else throw new Halt("the broadcast failed and the network could not say whether the transaction is known (" + String((e && e.message) || e) + ")");
           }
         }
-        p.tx = txidOf(p.raw); await save();
+        p.tx = txidOf(p.raw); if (partsOn()) { p.status = AWAIT; p.sentAt = Date.now(); }      // tx and "awaiting" are saved together: a record never shows a sent part as unsent or as refunded
+        await save();
         await PW.submitDeposit({ base, txHash: p.tx, depositAddress: oq.depositAddress, fetchFn: fOut }).catch(() => {});
       }
-      const fin = await poll(oq.depositAddress, (partsLabel(st) ? partsLabel(st).replace(/^./, c => c.toUpperCase()) + ": swap" : "Swap") + " from ZEC", 90 * 60_000, fOut);
-      const t = (((fin.swapDetails || {}).destinationChainTxHashes) || [])[0], pay = t && t.hash ? { hash: String(t.hash), url: String(t.explorerUrl || "") } : null;
-      if (!partsOn()) { const a = afterOut(st, fin.status); if (a.step === "DONE") { if (pay) a.payoutTx = pay; a.doneAt = Date.now(); } return go(a.step, a); }
-      p.status = fin.status; if (pay) p.payoutTx = pay;
-      const a = afterPart(st, fin.status);
-      if (fin.status === "REFUNDED" && a.step === "WAIT_T") { p.tries = (p.tries || 0) + 1; p.quote = null; p.raw = null; p.tx = null; p.expiry = null; }
-      if (a.step === "DONE") {
-        const ok = st.parts.filter(x => x.status === "SUCCESS");
-        a.doneAt = Date.now(); a.payoutTxs = ok.map(x => x.payoutTx).filter(Boolean); if (a.payoutTxs[0]) a.payoutTx = a.payoutTxs[0];
-        a.outTotal = ok.reduce((s, x) => s + BigInt(x.quote.amountOut), 0n).toString();
+      if (!partsOn()) {                                                          // an old (v1) record: one out-leg, followed to its end here as before
+        const fin = await poll(oq.depositAddress, "Swap from ZEC", 90 * 60_000, fOut);
+        const t = (((fin.swapDetails || {}).destinationChainTxHashes) || [])[0], pay = t && t.hash ? { hash: String(t.hash), url: String(t.explorerUrl || "") } : null;
+        const a = afterOut(st, fin.status); if (a.step === "DONE") { if (pay) a.payoutTx = pay; a.doneAt = Date.now(); } return go(a.step, a);
       }
-      await go(a.step, a);
+      // 31.10: the ZEC is sent and submitted: mark the swap awaiting and move on without waiting for it. An old record (tx saved, no status) lands here too and is simply followed from now on.
+      if (!p.tx && p.raw) p.tx = txidOf(p.raw);
+      if (s0 === "unsent" || s0 === "open") { p.status = AWAIT; p.sentAt = p.sentAt || Date.now(); }
+      await advance();
+    },
+    async WAIT_SWAPS() {                                           // everything is sent: follow every open swap to its end; a REFUNDED one goes back through the retry path (nextStep)
+      const t0 = Date.now();
+      for (;;) {
+        await swapTick(true, true);
+        const o = openParts(st); if (!o.length || (nextStep(st).step !== "WAIT_SWAPS")) return advance();
+        for (const i of o) {
+          const p = st.parts[i]; if (!p.quote || !p.quote.depositAddress) throw new Halt(partTag(i) + ": no deposit address is saved, so its swap cannot be followed here");
+          if (!p.sentAt) { p.sentAt = Date.now(); await save(); }
+          if (Date.now() - Math.max(p.sentAt, runAt) > 90 * 60_000) throw new Halt(partTag(i) + ": the swap has not finished after 90 min; check it later with deposit address " + p.quote.depositAddress + ". Press Continue to follow it again");
+        }
+        const i = o[0], errs = swapErrs.get(i) || 0, since = fmtMS(Date.now() - Math.max(st.parts[i].sentAt || t0, runAt));
+        say(errs >= 3 ? "Problem: cannot reach NEAR Intents · retrying · " + partTag(i) : "Waiting for " + partTag(i) + " to be delivered · NEAR Intents is processing the swap · " + since);      // a heartbeat on every round: the card never reads "no update" during a normal swap
+        await rawSleep(4000);
+      }
     },
   };
   for (st.err = null, st.halted = false; !DONE_STEPS.has(st.step) && st.step !== ctx.stopAt;) {
+    await swapTick();      // swaps of parts already sent are followed between steps (and a resume looks at once: the first call is never throttled)
     if (st.dry && !["QUOTE_IN", "DEPOSIT_IN"].includes(st.step)) { st.err = "dry run stops here"; break; }
     try { await retry(() => H[st.step](), { sleep }); } catch (e) { st.err = e.message || String(e); st.halted = e instanceof Halt; break; }   // halted = a deliberate stop (checks); otherwise a transient failure the app may retry
   }

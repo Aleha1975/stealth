@@ -363,6 +363,7 @@ async function returnZec(h, card) {
     step("Checking the shielded balance…");
     const r = await HM.findHop(HM.idbStore(), h.f.stealth), left = await HM.hopSummary(await hopCtx(HM, h.f, h.hit, null), r && r.rec);
     if (HM.holdsZec(left)) throw new Error("ZEC is still in the shielded pool. Press Continue transfer.");
+    if (HM.openParts((r && r.rec.st) || h.st || {}).length) throw new Error("A payout swap is still open (its ZEC has left the hop wallet and NEAR Intents has not finished it). Press Continue transfer to follow it; nothing is hidden or removed.");      // 31.10: payouts are no longer waited for one by one, so an empty wallet can mean "sent, swap open"
     const v = await noteEmptyFor(HM, h, true);
     if (v.hide) { await hideHop(HM, h); step("Nothing left here, confirmed by repeated checks. Removed."); return; }
     step("The server says there is nothing here (" + ((v.obs && v.obs.count) || 1) + "/" + ZR.EMPTY_N + " checks, spread over at least 30 minutes). Not removed: rechecking. Press Return money again later."); return;
@@ -431,7 +432,9 @@ async function noteEmptyFor(HM, h, empty) {
 // a finished or returned transfer leaves no card behind (the record stays in IndexedDB, flagged)
 async function hideHop(HM, h) {
   const store = HM.idbStore();
-  await underHopLock(h.f.stealth, async () => { const r = await HM.findHop(store, h.f.stealth); if (r) { r.rec.st = { ...r.rec.st, step: "FAILED", result: "RETURNED", hidden: true, earlierFunds: false }; await store.put(r.key, r.rec); } });
+  let keep = false;      // 31.10: a record with a payout swap still open is never hidden (it would stop being followed)
+  await underHopLock(h.f.stealth, async () => { const r = await HM.findHop(store, h.f.stealth); if (r && HM.openParts(r.rec.st).length) { keep = true; return; } if (r) { r.rec.st = { ...r.rec.st, step: "FAILED", result: "RETURNED", hidden: true, earlierFunds: false }; await store.put(r.key, r.rec); } });
+  if (keep) return;
   hops.delete(h.f.stealth.toLowerCase()); renderHops(); render();
 }
 setInterval(() => { const r = [...hops.values()].filter(h => h.running); if (!r.length && $("pay-hint").textContent.startsWith("●")) say("pay-hint", ""); if (r.length) { renderHops(); const v = hopView(r[0]); if (v.kind === "run" && v.what && $("pay-hint").textContent.startsWith("●")) say("pay-hint", statusLine(v), "ok"); } }, 1000);
@@ -476,7 +479,7 @@ function openWithdraw(i) {
 const ROUTE_NOTE = {
   std: "Gasless, straight from the stealth address to the recipient. Anyone can see that link on-chain.",
   fast: "No Zcash: NEAR Intents swaps the money in 1–2 parts at random times. The link is broken by the swap, not by cryptography: someone who sees both sides and matches amounts and times can still connect them.",
-  max: "Through the Zcash shielded pool and back, paid out in 2 parts, one after the other (the second follows as soon as the first has been sent, so the gap between them is not random). Keep this tab open; it can be resumed if you close it.",
+  max: "Through the Zcash shielded pool and back, paid out in 2 parts a few minutes apart: the second is sent about one block after the first (as soon as its change has confirmed, or at its planned time if that is later), not when the first swap has finished, so the gap between them is short and not random. Both swaps then finish on their own. Keep this tab open; it can be resumed if you close it.",
 };
 function setRoutes(HM) {
   const sel = $("wd-route"), prev = sel.value, priv = !$("wd-priv-wrap").hidden; sel.textContent = "";
