@@ -280,6 +280,7 @@ export async function startHop(ctx) {
   let chainN = 0; if (ctx.countPriorHops) { try { chainN = await ctx.countPriorHops(ctx.stealth); } catch (e) { throw new Error("could not read this address's earlier hops from the chain (" + e.message + "); nothing was started"); }
     if (!Number.isInteger(chainN) || chainN < 0) throw new Error("bad hop count from the chain"); }
   const n = Math.max(local, chainN), st = newState({ ...ctx, n });
+  if (Number.isFinite(ctx.approvedLoss) && ctx.approvedLoss >= 0 && ctx.approvedLoss < 1) st.approvedLoss = ctx.approvedLoss;      // 1138 L-3: the preview's total cost the user accepted by pressing Confirm
   await ctx.store.put(ctx.stealth.toLowerCase() + "#" + n, { st, db: null });
   return runHop(ctx);
 }
@@ -521,10 +522,16 @@ export async function runHop(ctx) {
       const left = (partsOn() ? st.parts.filter((x, i) => i > (st.partIdx || 0)).reduce((a, x) => a + BigInt(x.amount), 0n) : 0n) + amount;
       const loss = st.rebuilt ? 0 : projectedLoss({ amountIn: st.amount, inDec: ctx.chain.token.decimals, outDec: ctx.dest.token.decimals, paidOut: paid, rate: Number(info.amountOut) / Number(amount), zatsLeft: left }), cap = ctx.maxLoss == null ? MAX_LOSS : ctx.maxLoss;
       const rate = Number(info.amountOut) / Number(amount);
-      if (!st.rebuilt && loss > cap && !(st.quoteRate > 0 && rate >= st.quoteRate * (1 - QUOTE_TOL))) {      // small transfers can never pass the cap (fixed Zcash costs), and the ZEC is already shielded: the user sees the real loss and decides, instead of a dead end. The approval is a RATE, as for a rebuilt record
-        const over = "the quote would lose " + (loss * 100).toFixed(1) + "% of the amount in total, above the " + (cap * 100).toFixed(1) + "% limit; nothing was sent, the ZEC stays shielded";
-        if (typeof ctx.confirmLoss !== "function" || !(await ctx.confirmLoss({ loss, cap, amount, zatsLeft: left, amountOut: BigInt(info.amountOut), rate, recipient: st.recipient }))) throw new Halt(over + ". Press Continue transfer to see a new quote, or Return money");
-        st.quoteRate = rate; await save();
+      // 1138 L-3 / C2 / I-1: pressing "Confirm private transfer" on the preview IS the approval of the preview's total cost (st.approvedLoss). Over the cap, a quote passes silently while its
+      // projected loss stays within that approved figure + QUOTE_TOL. Beyond it: a run the user just started by clicking (ctx.interactive) shows the dialog; a timer-driven run (a DELAY that ended,
+      // an auto-retry) never opens a modal, it halts. A record with no approvedLoss (older build) follows the same rule, with its stored quoteRate as the only silent pass.
+      const approved = Number.isFinite(st.approvedLoss) ? st.approvedLoss : null;
+      const silentOk = approved !== null ? loss <= approved + QUOTE_TOL : (st.quoteRate > 0 && rate >= st.quoteRate * (1 - QUOTE_TOL));
+      if (!st.rebuilt && loss > cap && !silentOk) {
+        const over = "the quote would lose " + (loss * 100).toFixed(1) + "% of the amount in total, above the " + (cap * 100).toFixed(1) + "% limit" + (approved !== null ? " and above the " + (approved * 100).toFixed(1) + "% you approved" : "") + "; nothing was sent, the ZEC stays shielded";
+        if (!ctx.interactive || typeof ctx.confirmLoss !== "function") throw new Halt("Quote above what you approved: press Continue transfer to review it (" + over + ")");
+        if (!(await ctx.confirmLoss({ loss, cap, approved, amount, zatsLeft: left, amountOut: BigInt(info.amountOut), rate, recipient: st.recipient, destSymbol: ctx.dest.token.symbol, destDecimals: ctx.dest.token.decimals }))) throw new Halt(over + ". Press Continue transfer to see a new quote, or Return money");
+        st.quoteRate = rate; st.approvedLoss = loss; await save();
       }
       if (st.rebuilt && !(st.quoteRate > 0 && rate >= st.quoteRate * (1 - QUOTE_TOL))) {      // 1133 L-5: nothing bounds a bad quote of a rebuilt record (the original amount is unknown), so the user sees it against what was found and confirms before any payout. 1136 F-3b: the approval is a RATE; a later quote (after an expiry or refund) that is worse by more than QUOTE_TOL asks again
         if (typeof ctx.confirmQuote !== "function") throw new Halt("this rebuilt transfer needs your confirmation of the quote, and this page cannot ask for it; nothing was sent, the ZEC stays shielded");

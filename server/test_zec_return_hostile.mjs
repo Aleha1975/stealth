@@ -109,6 +109,23 @@ ok("r2 L-1 tipWithinClock: anchor block, +1 day, and a tip 1 day ahead of the cl
   ok("r2 L-2 abort of SendTransaction is resolved by the lookup (known -> sent; unknown -> error that names the abort)", (await R.sendAndConfirm("https://lw", RAW, node({ sendThrows: true, get: got(RAW) }), TX, noSleep)) === TX && await rejects(R.sendAndConfirm("https://lw", RAW, node({ sendThrows: true }), TX, noSleep), /aborted/));
   ok("r2 L-2 network rejection is final and never looked up", await rejects(R.sendAndConfirm("https://lw", RAW, node({ send: cat(fr(0, cat(vf(1, 18), ld(2, enc("bad-txns")))), OKT), get: got(RAW) }), TX, noSleep), /Rejected by network/)); }
 
+// 1138 L-1: a TYPED definite flag, never the message text
+{ const RAW = Uint8Array.of(5, 0, 0, 128, 1, 2, 3), noSleep = { sleep: async () => {}, tries: 3 }, rej = (code, m) => cat(fr(0, cat(vf(1, code), ld(2, enc(m)))), OKT);
+  const flag = async (bytes) => R.broadcast("https://lw", RAW, mk(bytes), TX).then(() => "sent", e => e.definite);
+  const node = ({ send, get = null }) => async (u, i) => { if (/SendTransaction$/.test(u)) return resp(send); if (/GetTransaction$/.test(u)) return get ? resp(get) : resp(trailer("grpc-status: 5\r\ngrpc-message: not found\r\n")); throw new Error("unexpected " + u); };
+  const got = bytes => cat(fr(0, ld(1, bytes)), OKT), neg = n => (1n << 64n) - BigInt(-n);
+  ok("1138 L-1 a rejection (-26 style, bad-txns) is definite", (await flag(rej(26, "bad-txns"))) === true);
+  ok("1138 L-1 errorCode -27 (already in chain, sent as 64-bit two's complement) is NOT definite", (await flag(rej(neg(-27), "x"))) === false);
+  ok("1138 L-1 'txn-already-in-mempool' under an ordinary code is NOT definite", (await flag(rej(18, "txn-already-in-mempool"))) === false && (await flag(rej(18, "txn-already-known"))) === false);
+  ok("1138 L-1 'different txid' (a success reply that echoed another id) carries no definite flag", (await R.broadcast("https://lw", RAW, mk(okMsg("b1".repeat(32))), TX).then(() => "sent", e => e.definite)) !== true);
+  ok("1138 L-1 sendAndConfirm: an already-in-mempool rejection is resolved by the lookup (our bytes known = sent)", (await R.sendAndConfirm("https://lw", RAW, node({ send: rej(18, "txn-already-in-mempool"), get: got(RAW) }), TX, noSleep)) === TX);
+  const e1 = await R.sendAndConfirm("https://lw", RAW, node({ send: rej(18, "bad-txns") }), TX, noSleep).catch(e => e);
+  ok("1138 L-1 sendAndConfirm: a definite rejection keeps the flag", e1.definite === true && /Rejected by network/.test(e1.message));
+  const e2 = await R.sendAndConfirm("https://lw", RAW, node({ send: rej(18, "txn-already-in-mempool") }), TX, noSleep).catch(e => e);
+  ok("1138 L-1 sendAndConfirm: the final unknown-outcome error never carries it, even when it quotes a server's 'Rejected by network ... different txid' text", e2.definite !== true && /NOT confirmed/.test(e2.message));
+  const e3 = await R.sendAndConfirm("https://lw", RAW, node({ send: okMsg("b1".repeat(32)) }), TX, noSleep).catch(e => e);
+  ok("1138 L-1 sendAndConfirm: 'different txid' is an unknown outcome (lookup, then NOT confirmed), not definite", e3.definite !== true && /NOT confirmed/.test(e3.message)); }
+
 // L-3 / 1103 M-1 flood: the cap counts entries worth spending (>= 5001 zat); dust never pushes the real deposit out of view
 { const ent = (i, v = 6000 + i, h = 3_600_000) => ld(1, U({ txid: ld(1, Uint8Array.from({ length: 32 }, (_, k) => k === 0 ? i & 255 : k === 1 ? i >> 8 : 7)), value: vf(4, v), height: vf(5, h) }));
   const big = (n, v) => cat(...Array.from({ length: n }, (_, i) => ent(i, v === undefined ? undefined : v + i)));

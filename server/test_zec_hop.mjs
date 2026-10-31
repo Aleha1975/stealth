@@ -362,10 +362,26 @@ for (const [name, tk] of [["no txKnown available", undefined], ["txKnown cannot 
   ok("M6 ... and resumes fine once the rate is acceptable again", ok2.step === "DONE" && w.broadcasts === 1);
   const w2 = makeWorld(), s2 = H.memStore(); off = 0; w2.outPermille = 450; const hi = await H.startHop(mkCtx(w2, s2, { maxLoss: 0.2 }));
   ok("M6 the cap is configurable (ctx.maxLoss)", hi.step === "DONE");
-  const w3 = makeWorld(), s3 = H.memStore(); off = 0; w3.outPermille = 450; let asked = 0, seen = null; const ap = await H.startHop(mkCtx(w3, s3, { confirmLoss: async q => { asked++; seen = q; return true; } }));
+  const w3 = makeWorld(), s3 = H.memStore(); off = 0; w3.outPermille = 450; let asked = 0, seen = null; const ap = await H.startHop(mkCtx(w3, s3, { interactive: true, confirmLoss: async q => { asked++; seen = q; return true; } }));
   ok("loss above the cap, user approves: the transfer finishes and the approval carries across the parts", ap.step === "DONE" && asked === 1 && seen.loss > seen.cap);
-  const w4 = makeWorld(), s4 = H.memStore(); off = 0; w4.outPermille = 450; const no = await H.startHop(mkCtx(w4, s4, { confirmLoss: async () => false }));
+  const w4 = makeWorld(), s4 = H.memStore(); off = 0; w4.outPermille = 450; const no = await H.startHop(mkCtx(w4, s4, { interactive: true, confirmLoss: async () => false }));
   ok("loss above the cap, user declines: Halt before any ZEC is sent", no.step === "QUOTE_OUT" && /would lose/.test(no.err) && w4.broadcasts === 0); }
+{ // 1138 L-3 / C2 / I-1: the preview's cost is the approval; the dialog only on a run the user just clicked
+  const mk = () => { const w = makeWorld(), s = H.memStore(); off = 0; w.outPermille = 450; return { w, s }; };
+  let a1 = mk(), asked1 = 0; const r1 = await H.startHop(mkCtx(a1.w, a1.s, { approvedLoss: 0.13, confirmLoss: async () => { asked1++; return true; } }));
+  ok("1138 C2 the quote is within the approved loss + tolerance: passes silently, no dialog, even on a timer-driven run", r1.step === "DONE" && asked1 === 0 && Math.abs(r1.approvedLoss - 0.13) < 1e-9, r1.step + " " + r1.err);
+  let a2 = mk(), asked2 = 0; const r2 = await H.startHop(mkCtx(a2.w, a2.s, { approvedLoss: 0.01, confirmLoss: async () => { asked2++; return true; } }));
+  ok("1138 L-3 beyond the approved loss on a timer-driven run: Halt 'press Continue transfer', NO dialog, nothing sent", r2.step === "QUOTE_OUT" && r2.halted === true && /Quote above what you approved: press Continue transfer to review it/.test(r2.err) && asked2 === 0 && a2.w.broadcasts === 0, r2.err);
+  let seen2 = null; const r2b = await H.runHop(mkCtx(a2.w, a2.s, { interactive: true, confirmLoss: async q => { asked2++; seen2 = q; return true; } }));
+  const rec2 = (await latest(a2.s)).st;
+  ok("1138 L-3 ... the Continue click (interactive) shows the dialog once, with the payout token; the approval stores quoteRate AND approvedLoss", r2b.step === "DONE" && asked2 === 1 && seen2.destSymbol === base.token.symbol && seen2.destDecimals === base.token.decimals && Math.abs(seen2.approved - 0.01) < 1e-9 && rec2.approvedLoss > 0.1 && rec2.quoteRate > 0, r2b.step + " " + r2b.err);
+  let a3 = mk(), asked3 = 0; const r3 = await H.startHop(mkCtx(a3.w, a3.s, { approvedLoss: 0.01, interactive: true, confirmLoss: async () => { asked3++; return false; } }));
+  ok("1138 L-3 a declined dialog halts, nothing sent, approvedLoss stays the preview's", r3.step === "QUOTE_OUT" && asked3 === 1 && a3.w.broadcasts === 0 && (await latest(a3.s)).st.approvedLoss === 0.01);
+  let a4 = mk(), asked4 = 0; const r4 = await H.startHop(mkCtx(a4.w, a4.s, { confirmLoss: async () => { asked4++; return true; } }));
+  ok("1138 L-3 an old record / start without approvedLoss follows the same rule: timer-driven halts, no dialog", r4.step === "QUOTE_OUT" && r4.halted === true && asked4 === 0 && !(await latest(a4.s)).st.approvedLoss);
+  let a5 = mk(), asked5 = 0; const r5 = await H.startHop(mkCtx(a5.w, a5.s, { approvedLoss: 0.05, confirmLoss: async () => { asked5++; return true; } }));
+  ok("1138 I-1 approved at 5%: a quote at ~11% (beyond approved + QUOTE_TOL) is not passed silently", r5.step === "QUOTE_OUT" && r5.halted === true && asked5 === 0 && a5.w.broadcasts === 0);
+}
 { const w = makeWorld(), s = H.memStore(); off = 0; w.mutQuote = (q, isIn) => { if (isIn) q.minAmountOut = String(BigInt(q.amountOut) / 2n); }; const st = await H.startHop(mkCtx(w, s));
   ok("M6 in-leg quote with a 50% slippage floor is refused before anything is signed", st.step === "QUOTE_IN" && /slippage/.test(st.err) && w.relays === 0); }
 { const w = makeWorld(), s = H.memStore(); off = 0; w.mutQuote = (q, isIn) => { if (!isIn) q.deadline = new Date(Date.now() + 30_000).toISOString(); }; const st = await H.startHop(mkCtx(w, s));
@@ -718,9 +734,9 @@ const tAddrOf = async (n, a, i = 0) => ZRm.deriveT(await H.mnemonicSeed(await H.
     const rg = H.lostRange(3, [1]); ok("1133 L-2 lostRange: unknown count -> LOST_N, local records excluded, negative / fractional counts are not trusted", JSON.stringify(H.lostRange(null, []).ns) === "[0,1,2,3]" && JSON.stringify(rg.ns) === "[0,2]" && rg.maxLocal === 1 && H.lostRange(-5, []).ns.length === 4 && H.lostRange(2.5, []).ns.length === 4);
   }
   { // L-3
-    const srcA = fs.readFileSync(path.join(WEB, "app.js"), "utf8"), rz = srcA.slice(srcA.indexOf("async function returnZec"), srcA.indexOf("async function finishSweep")), i0 = rz.indexOf("underHopLock(h.f.stealth"), i1 = rz.indexOf("ZR.sendAndConfirm"), i2 = rz.indexOf("if (!saved)");
-    ok("1133 L-3 returnZec records the intent AND broadcasts inside one hop lock, bounded by a timeout, with no second underHopLock inside it", i0 > 0 && i0 < i1 && i1 < i2 && /withTimeout\(ZR\.sendAndConfirm/.test(rz) && (rz.slice(i0, i2).match(/underHopLock/g) || []).length === 1);
-    ok("1133 L-3 ...and the polling of the swap (finishSweep) stays outside the lock", rz.indexOf("await finishSweep(HM, h, step, intent)") > i2);
+    const srcA = fs.readFileSync(path.join(WEB, "app.js"), "utf8"), rz = srcA.slice(srcA.indexOf("async function returnZec"), srcA.indexOf("async function finishSweep")), zrS = fs.readFileSync(path.join(WEB, "zec-return.js"), "utf8"), rs = zrS.slice(zrS.indexOf("export async function runSweep"), zrS.indexOf("export async function settleIntent")), i0 = rs.indexOf("await d.lock("), i1 = rs.indexOf("await send()"), i2 = rs.indexOf('if (saved === "busy")');
+    ok("1133 L-3 returnZec records the intent AND broadcasts inside one hop lock (runSweep), bounded by a timeout, with no second lock inside it", i0 > 0 && i0 < rs.indexOf("d.set(intent)") && rs.indexOf("d.set(intent)") < i1 && i1 < i2 && /withTimeout\(ZR\.sendAndConfirm/.test(rz) && (rz.match(/underHopLock/g) || []).length === 1 && (rs.slice(i0 + 12, i2).match(/d\.lock/g) || []).length === 0);
+    ok("1133 L-3 ...and the polling of the swap (finishSweep) stays outside the lock", rz.indexOf("await finishSweep(HM, h, step, r.follow") > rz.indexOf("ZR.runSweep") && !/finishSweep/.test(rs));
   }
   { // L-4
     const f = (account, index) => ({ n: 0, account, index, value: 1n, height: 1, latest: 1 });
@@ -772,8 +788,8 @@ const tAddrOf = async (n, a, i = 0) => ZRm.deriveT(await H.mnemonicSeed(await H.
     { // F-3a
       const age = H.outputAge([{ height: 3_500_100 }, { height: 3_500_300 }]), pend = H.outputAge([{ height: 3_500_100 }, { height: 0 }]);
       ok("1136 F-3a outputAge: oldest / newest of confirmed outputs; any unconfirmed output -> latest 0 and pending", age.height === 3_500_100 && age.latest === 3_500_300 && !age.pending && pend.latest === 0 && pend.pending && pend.height === 3_500_100);
-      const rz = srcA.slice(srcA.indexOf("async function returnZec"), srcA.indexOf("async function finishSweep")), i1 = rz.indexOf("HM.lostYoung([HM.outputAge(utxos)], tip)");
-      ok("1136 F-3a returnZec applies the age rule to the freshly queried set it is about to sweep (only for a record-less lost wallet), failing closed on an unknown tip, before the quote and the intent", i1 > 0 && /if \(h\.lost\)/.test(rz.slice(i1 - 330, i1)) && i1 < rz.indexOf("Getting a quote") && i1 < rz.indexOf("sweepIntents.set(h, intent)") && /let tip = null; try \{ tip = await ZR\.getTip/.test(rz.slice(i1 - 330, i1)));
+      const rz = srcA.slice(srcA.indexOf("async function returnZec"), srcA.indexOf("async function finishSweep")), i1 = rz.indexOf("HM.lostYoung([HM.outputAge(utxos)], tip)"), zrS2 = fs.readFileSync(path.join(WEB, "zec-return.js"), "utf8"), rs2 = zrS2.slice(zrS2.indexOf("export async function runSweep"));
+      ok("1136 F-3a returnZec applies the age rule to the freshly queried set it is about to sweep (only for a record-less lost wallet), failing closed on an unknown tip, before the quote and the intent", i1 > 0 && /if \(!h\.lost\) return false/.test(rz.slice(i1 - 330, i1)) && i1 < rz.indexOf("Getting a quote") && rs2.indexOf("d.midCheck()") > 0 && rs2.indexOf("d.midCheck()") < rs2.indexOf("d.quote()") && rs2.indexOf("d.quote()") < rs2.indexOf("d.set(intent)") && /let tip = null; try \{ tip = await ZR\.getTip/.test(rz.slice(i1 - 330, i1)));
     }
     { // F-3b
       const mkW = () => { const w = makeWorld(); off = 0; w.tBal[tOf(mn.slice(0, 20) + 0)] = 10_000_000n; return w; };

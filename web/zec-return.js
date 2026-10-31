@@ -263,6 +263,12 @@ export async function getUtxos(base, addr, fetchFn) {
   list.truncated = more;
   return list;
 }
+/** 1138 L-1: is a non-zero SendTransaction errorCode a DEFINITE refusal (the node did not take the transaction)? The "already known" answers are not: the transaction IS (or was) on the network.
+ *  Excluded: code -27 (zcashd RPC_TRANSACTION_ALREADY_IN_CHAIN) and any message saying already-in-mempool / already-in-chain / already-known ("txn-already-in-mempool", "txn-already-known",
+ *  "transaction already in block chain"). I could not verify these codes against zcashd or lightwalletd sources in this repo (no copy here); they are from zcashd's rpc/protocol.h and main.cpp as I know them,
+ *  so the text test is the second net. Everything else (-26 rejected, -22 deserialize, ...) is a refusal. An untrusted server can still lie either way: this only types what the reply says. */
+export const isDefiniteRefusal = (code, msg) => code !== 0n && BigInt.asIntN(32, code) !== -27n &&      // an int32 field: a negative code arrives as its 64-bit two's complement
+   !/already[\s-]*(in|known|exist)|txn-already|duplicate/i.test(String(msg || ""));
 /** Send a raw tx. Succeeds only on a well-formed reply with errorCode 0 whose returned txid equals `expectTxid` (display hex, the locally computed one). */
 export async function broadcast(base, raw, fetchFn, expectTxid) {
   if (!/^[0-9a-f]{64}$/i.test(expectTxid || "")) throw new Error("broadcast needs the locally computed txid");
@@ -270,7 +276,7 @@ export async function broadcast(base, raw, fetchFn, expectTxid) {
   const c = res.find(([no]) => no === 1), m = res.find(([no]) => no === 2);
   if (c && typeof c[1] !== "bigint" || m && !(m[1] instanceof Uint8Array)) throw new Error("lightwalletd: malformed broadcast reply");
   const code = c ? c[1] : 0n, msg = m ? new TextDecoder().decode(m[1]) : "";
-  if (code !== 0n) throw new Error("Rejected by network: " + msg.slice(0, 300));
+  if (code !== 0n) { const e = new Error("Rejected by network: " + msg.slice(0, 300)); e.definite = isDefiniteRefusal(code, msg); throw e; }
   const got = msg.trim().replace(/^"|"$/g, "").toLowerCase();
   if (got !== expectTxid.toLowerCase()) throw new Error("lightwalletd confirmed a different txid than ours (" + got.slice(0, 80) + "); not treating it as sent");
   return got;
@@ -296,7 +302,7 @@ export async function txKnown(base, txid, fetchFn) {
 export async function sendAndConfirm(base, raw, fetchFn, expectTxid, { sleep = ms => new Promise(r => setTimeout(r, ms)), tries = 4, everyMs = 1500 } = {}) {
   let sendErr = null;
   try { await broadcast(base, raw, fetchFn, expectTxid); }
-  catch (e) { if (/^Rejected by network|different txid/.test(String(e && e.message))) throw e; sendErr = e; }
+  catch (e) { if (e && e.definite === true) throw e; sendErr = e; }      // 1138 L-1: a typed flag, never the message text ("different txid" and a server's free text are an UNKNOWN outcome)
   let lastErr = null;
   for (let i = 0; i < tries; i++) {
     try {
@@ -317,4 +323,48 @@ export function noteEmpty(prev, empty, now = Date.now()) {
   if (!prev || !(prev.first <= now) || !(prev.count >= 1)) return { obs: { first: now, last: now, count: 1 }, hide: false };
   const obs = now - prev.last >= EMPTY_GAP_MS ? { first: prev.first, last: now, count: prev.count + 1 } : { first: prev.first, last: prev.last, count: prev.count };
   return { obs, hide: obs.count >= EMPTY_N && obs.last - obs.first >= EMPTY_SPAN_MS };
+}
+
+// ---- 1138 M-1: the sweep intent protocol, injectable (app.js passes localStorage + the Web Lock; tests pass fakes)
+const live = c => !!c && !c.ended && !c.notSent;
+/** The pre-check of an earlier unended intent, whatever its age. -> "follow" (its tx is known: settle it by following the swap) | "expire" (provably dead: past its expiry) ; throws when it cannot tell or may still be mined. */
+export async function resolvePrevIntent(prev, { txKnownFn, tipFn, now = Date.now() }) {
+  let on = null; try { on = await txKnownFn(prev.txid); } catch {}
+  if (on === true) return "follow";
+  if (on !== false) throw new Error("Cannot tell whether your earlier return transaction (" + prev.txid.slice(0, 12) + "…) went out. Not sending another yet: press Return money again in a minute.");
+  const tipNow = await tipFn(), until = Number.isInteger(prev.expiry) ? prev.expiry : null;      // "not known" is one server's answer: the old tx may be mined until its expiry height has passed
+  if (until === null ? now - (prev.at || 0) < 3600_000 : tipNow <= until) throw new Error("Your earlier return transaction (" + prev.txid.slice(0, 12) + "…) is not on the network yet but may still be mined (it stays valid for about 50 minutes). Not sending another yet: press Return money again later.");
+  return "expire";
+}
+/** One press of Return after the UTXOs were found. deps: prevOf(), prevOk(p), get(), set(v)->bool, lock(fn) (undefined = unavailable), txKnownFn, tipFn, midCheck() (truthy = stop), quote() -> { intent, send() }, now().
+ *  -> { follow: intent } | { intent } | { stopped: true }. Refuses "busy" ONLY if an intent appeared that is neither ours nor the one the pre-check evaluated. */
+export async function runSweep(d) {
+  const now = d.now || Date.now; const prev = await d.prevOf(); let expire = null;
+  if (d.prevOk(prev) && !prev.ended) {
+    const v = await resolvePrevIntent(prev, { txKnownFn: d.txKnownFn, tipFn: d.tipFn, now: now() });
+    if (v === "follow") return { follow: prev };
+    expire = prev;
+  }
+  if (await d.midCheck()) return { stopped: true };
+  const { intent, send } = await d.quote();
+  const saved = await d.lock(async () => {
+    const c0 = d.get();
+    if (expire && live(c0) && c0.txid === expire.txid) d.set({ ...c0, ended: "EXPIRED", endedAt: now() });      // provably dead: ended under the lock, never blocks the new sweep
+    const cur = d.get();
+    if (d.prevOk(cur) && live(cur) && cur.txid !== intent.txid && !(expire && cur.txid === expire.txid)) return "busy";
+    if (!d.set(intent)) return false;      // recorded BEFORE broadcasting
+    try { await send(); } catch (e) { if (e && e.definite === true) d.set({ ...intent, ended: "NOT_SENT", notSent: true, endedAt: now() }); throw e; }      // only a DEFINITE refusal un-tracks it
+    return true; });
+  if (saved === "busy") throw new Error("Another return for this wallet is already in progress (another tab?). Nothing was sent; press Return money again in a minute.");
+  if (!saved) throw new Error("Could not record the return before sending it (the transfer may be running in another tab). Nothing was sent; try again in a minute.");
+  return { intent };
+}
+/** Settle an intent at the end of its swap. The lock may be unavailable (the hop machine holds it): retry, bounded; false = still not settled (the caller says so). */
+export async function settleIntent({ lock, get, set, sw, status, tries = 6, everyMs = 5000, sleep = ms => new Promise(r => setTimeout(r, ms)), now = Date.now }) {
+  for (let i = 0; i < tries; i++) {
+    let r; try { r = await lock(async () => { const cur = get(); if (cur && cur.txid !== sw.txid) return "other"; return set({ ...sw, ended: status, endedAt: now() }) ? "done" : "failed"; }); } catch {}
+    if (r === "done" || r === "other") return true;
+    if (i < tries - 1) await sleep(everyMs);
+  }
+  return false;
 }

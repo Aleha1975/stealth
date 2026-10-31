@@ -216,8 +216,8 @@ const autoTries = new Map(), hops = new Map(), TERMINAL = ["DONE", "FAILED_IN", 
 const activeHop = f => { const h = hops.get(f.stealth.toLowerCase()); return h && !TERMINAL.includes(h.st.step) ? h : null; };
 function renderHops() {
   const box = $("hop-resume"); box.textContent = "";
-  for (const [k, h] of hops) box.appendChild(hopCard(h, { onContinue: b => { b.disabled = true; runHop(h.f, h.hit, null).catch(e => say("pay-hint", e.message || String(e), "bad")); },
-    onFunds: b => { b.disabled = true; runHop(h.f, h.hit, null).catch(e => say("pay-hint", e.message || String(e), "bad")); }, onDismiss: () => { hops.delete(k); renderHops(); },
+  for (const [k, h] of hops) box.appendChild(hopCard(h, { onContinue: b => { b.disabled = true; runHop(h.f, h.hit, null, { interactive: true }).catch(e => say("pay-hint", e.message || String(e), "bad")); },
+    onFunds: b => { b.disabled = true; runHop(h.f, h.hit, null, { interactive: true }).catch(e => say("pay-hint", e.message || String(e), "bad")); }, onDismiss: () => { hops.delete(k); renderHops(); },
     onReturn: (b, card) => { b.disabled = true; returnZec(h, card).catch(e => { b.disabled = false; say("pay-hint", e.message || String(e), "bad"); }); } }));
   for (const [k, l] of lost) if (!hops.has(k)) box.appendChild(lostCard(k, l));
   for (const [k, d] of lostDone) { const c = el("div", "hop " + (d.ok ? "ok" : "warn")), b = el("button", "btn ghost", "Dismiss"); b.type = "button"; b.addEventListener("click", () => { lostDone.delete(k); renderHops(); }); c.appendChild(el("div", "hop-line", d.text)); const a = el("div", "row hop-act"); a.appendChild(b); c.appendChild(a); box.appendChild(c); }      // the result of a Return on a lost wallet outlives its card and every redraw
@@ -330,7 +330,7 @@ async function lostContinue(k, l, to, line) {
   else { account = HM.lostContinueAcct(l.found); if (account == null) throw new Error("The ZEC is on several accounts: press Return money first, it sweeps all of them."); zats = l.found.reduce((s, x) => s + x.value, 0n); const hs = l.found.map(x => x.height).filter(x => x > 0); birthday = (hs.length ? Math.min(...hs) : (await ZR.getTip(ZC.lightwalletd)) - 5000) - 10; }
   const r = await HM.adoptLostHop(ctx, { n: l.n, account, birthday, zats, recipient: to, chain: C, dest: C });
   if (!r.created) throw NOT_ADOPTED(r);      // 1133 L-1: never run on another record's recipient
-  lost.delete(k); renderHops(); render(); await runHop(l.f, l.hit, null);
+  lost.delete(k); renderHops(); render(); await runHop(l.f, l.hit, null, { interactive: true });
 }
 // 1105 L-4: every writer of a hop record outside the machine takes the machine's own Web Lock (non-blocking). If the hop is running (or another writer is) the write is skipped, never interleaved.
 const underHopLock = (stealth, fn) => navigator.locks ? navigator.locks.request("zec-hop:" + stealth.toLowerCase(), { ifAvailable: true }, l => l ? fn() : undefined) : fn();
@@ -368,46 +368,32 @@ async function returnZec(h, card) {
   }
   if (!h.lost) noteEmptyFor(HM, h, false).catch(() => {});
   const total = utxos.reduce((s, u) => s + u.value, 0n), amount = total - ZR.sweepFee(utxos.length);
-  { // 1103 L-1: an earlier press recorded its sweep BEFORE broadcasting. If that transaction is on the network, carry on with it instead of building a conflicting second one.
-    const prev = await prevOf();
-    if (prevOk(prev) && !prev.ended && Date.now() - (prev.at || 0) < 6 * 3600_000) {
-      let on = null; try { on = await ZR.txKnown(ZC.lightwalletd, prev.txid); } catch {}
-      if (on === true) return await finishSweep(HM, h, step, { txid: prev.txid, deposit: prev.deposit, amountOut: prev.amountOut });
-      if (on === undefined || on === null) throw new Error("Cannot tell whether your earlier return transaction (" + prev.txid.slice(0, 12) + "…) went out. Not sending another yet: press Return money again in a minute.");
-      // 1110 L-2: "not known" is only an answer of one server. The earlier transaction may still be mined until its expiry height has passed: no second sweep before that
-      const tipNow = await ZR.getTip(ZC.lightwalletd), until = Number.isInteger(prev.expiry) ? prev.expiry : null;
-      if (until === null ? Date.now() - (prev.at || 0) < 3600_000 : tipNow <= until) throw new Error("Your earlier return transaction (" + prev.txid.slice(0, 12) + "…) is not on the network yet but may still be mined (it stays valid for about 50 minutes). Not sending another yet: press Return money again later.");
-    }
-  }
-  if (h.lost) {      // 1136 F-3a: the age rule applies to the very outputs about to be swept (fresh query), not to the card's snapshot
-    let tip = null; try { tip = await ZR.getTip(ZC.lightwalletd); } catch {}
-    if (HM.lostYoung([HM.outputAge(utxos)], tip)) { step("This may still be running on another device: its ZEC is too recent to touch. Try again in about 2 hours."); return; }
-  }
-  step("Getting a quote…");
-  const j = await PW.requestQuote({ req: HM.reqOut({ dest: C, amount, recipient: acct, refundT: key.addr }), okDeposit: a => /^t1[1-9A-HJ-NP-Za-km-z]{33}$/.test(a || "") });
-  step("Sending " + (Number(amount) / 1e8) + " ZEC…");
-  const sw = ZR.buildSweep({ utxos, key, to: j.quote.depositAddress, tip: await ZR.getTip(ZC.lightwalletd) });
-  if (sw.amount !== BigInt(j.quote.amountIn)) throw new Error("amount mismatch; refusing");
-  const intent = { txid: sw.txid, deposit: j.quote.depositAddress, amountOut: j.quote.amountOut, at: Date.now(), expiry: sw.expiry };
-  // 1133 L-3: the hop lock is held from recording the intent through the broadcast, so a resume (Halt / auto-retry) cannot shield the same outputs meanwhile. Nothing inside takes the lock again; the broadcast is bounded by its own request timeouts plus 5 min
-  const saved = await underHopLock(h.f.stealth, async () => {
-    const cur = sweepIntents.get(h);      // 1137 M-1: re-read under the lock: another tab / stale card may have recorded and sent its own sweep while this one waited for the quote
-    if (prevOk(cur) && !cur.ended && !cur.notSent && cur.txid !== intent.txid) return "busy";
-    if (!sweepIntents.set(h, intent)) return false;      // recorded BEFORE broadcasting
-    try { await HM.withTimeout(ZR.sendAndConfirm(ZC.lightwalletd, sw.raw, undefined, sw.txid), 5 * 60_000, "Zcash broadcast"); }
-    catch (e) { if (/^Rejected by network|different txid/.test(String((e && e.message) || ""))) sweepIntents.set(h, { ...intent, ended: "NOT_SENT", notSent: true, endedAt: Date.now() }); throw e; }      // only a DEFINITE refusal un-tracks it; an unknown outcome stays a live intent
-    return true; });        // 1100 L-2: the node must hand our exact bytes back before this counts as sent
-  if (saved === "busy") throw new Error("Another return for this wallet is already in progress (another tab?). Nothing was sent; press Return money again in a minute.");
-  if (!saved) throw new Error("Could not record the return before sending it (the transfer may be running in another tab). Nothing was sent; try again in a minute.");
-  await finishSweep(HM, h, step, intent);
+  // 1138 M-1: the whole protocol (earlier unended intent of ANY age is followed or ended as EXPIRED; "busy" only for an intent the pre-check did not see) lives in zec-return.js runSweep
+  const r = await ZR.runSweep({ prevOf, prevOk, get: () => sweepIntents.get(h), set: v => sweepIntents.set(h, v), lock: fn => underHopLock(h.f.stealth, fn),
+    txKnownFn: id => ZR.txKnown(ZC.lightwalletd, id), tipFn: () => ZR.getTip(ZC.lightwalletd),
+    midCheck: async () => {
+      if (!h.lost) return false;      // 1136 F-3a: the age rule applies to the very outputs about to be swept (fresh query), not to the card's snapshot
+      let tip = null; try { tip = await ZR.getTip(ZC.lightwalletd); } catch {}
+      if (HM.lostYoung([HM.outputAge(utxos)], tip)) { step("This may still be running on another device: its ZEC is too recent to touch. Try again in about 2 hours."); return true; }
+      return false; },
+    quote: async () => {
+      step("Getting a quote…");
+      const j = await PW.requestQuote({ req: HM.reqOut({ dest: C, amount, recipient: acct, refundT: key.addr }), okDeposit: a => /^t1[1-9A-HJ-NP-Za-km-z]{33}$/.test(a || "") });
+      step("Sending " + (Number(amount) / 1e8) + " ZEC…");
+      const sw = ZR.buildSweep({ utxos, key, to: j.quote.depositAddress, tip: await ZR.getTip(ZC.lightwalletd) });
+      if (sw.amount !== BigInt(j.quote.amountIn)) throw new Error("amount mismatch; refusing");
+      // 1133 L-3: the hop lock is held from recording the intent through the broadcast; the broadcast is bounded by its own request timeouts plus 5 min. 1100 L-2: the node must hand our exact bytes back before this counts as sent
+      return { intent: { txid: sw.txid, deposit: j.quote.depositAddress, amountOut: j.quote.amountOut, at: Date.now(), expiry: sw.expiry }, send: () => HM.withTimeout(ZR.sendAndConfirm(ZC.lightwalletd, sw.raw, undefined, sw.txid), 5 * 60_000, "Zcash broadcast") }; } });
+  if (r.stopped) return;
+  await finishSweep(HM, h, step, r.follow ? { txid: r.follow.txid, deposit: r.follow.deposit, amountOut: r.follow.amountOut } : r.intent);
 }
 async function finishSweep(HM, h, step, sw) {
   let note = ""; await PW.submitDeposit({ txHash: sw.txid, depositAddress: sw.deposit }).catch(e => { note = " (could not notify NEAR Intents: " + ((e && e.message) || e) + ")"; });
   if (note) step("Sent" + note);
   const fin = await PW.pollStatus({ depositAddress: sw.deposit, timeoutMs: 60 * 60_000, intervalMs: 10_000, onUpdate: s => step("Returning · " + s.status.toLowerCase().replace(/_/g, " ") + " · usually 10–20 min" + note) });
-  await underHopLock(h.f.stealth, async () => { const cur = sweepIntents.get(h); if (!cur || cur.txid === sw.txid) sweepIntents.set(h, { ...sw, ended: fin.status, endedAt: Date.now() }); }).catch(() => {});      // 1137 L-1 / 1110 L-1: every end settles the intent (SUCCESS too, so a later Return round sweeps instead of replaying "Done")
+  const settled = await (await import("./zec-return.js")).settleIntent({ lock: fn => underHopLock(h.f.stealth, fn), get: () => sweepIntents.get(h), set: v => sweepIntents.set(h, v), sw, status: fin.status });      // 1137 L-1 / 1110 L-1: every end settles the intent (SUCCESS too); 1138 M-1: retried while the hop machine holds the lock, never skipped silently
   const sh = h.lost && lost.get(h.lost) && lost.get(h.lost).shielded;      // 1137 L-2: a shielded finding is dropped with the card, so the Done text says it may remain
-  const doneText = fin.status === "SUCCESS" ? "Done: ≈ " + (Number(sw.amountOut) / 1e6).toFixed(2) + " " + SYM + " sent to your wallet." + (sh ? " Shielded ZEC was found on this wallet earlier and may remain: press Check shielded balance." : "") : "Swap ended as " + fin.status + ". The ZEC is back on the hop address; press Return money again.";
+  const doneText = (fin.status === "SUCCESS" ? "Done: ≈ " + (Number(sw.amountOut) / 1e6).toFixed(2) + " " + SYM + " sent to your wallet." + (sh ? " Shielded ZEC was found on this wallet earlier and may remain: press Check shielded balance." : "") : "Swap ended as " + fin.status + ". The ZEC is back on the hop address; press Return money again.") + (settled ? "" : " (Could not mark this return as finished in this browser: if ZEC is still listed, press Return money again.)");
   step(doneText); if (h.lost) { lostSay(h.lost, doneText, fin.status === "SUCCESS"); renderHops(); }      // kept on its own card: the lost card is redrawn or removed below
   if (fin.status === "SUCCESS" && h.lost) { lostForget(h.lost); checkLost().catch(() => {}); }      // a lost wallet has no card to keep: it is looked for again, and any other wallet of this address shows up with its own Return
   else if (fin.status === "SUCCESS") {      // 1122 L-3: the transparent return worked, but the card goes away only when the hop wallet holds nothing at all (shielded ZEC included); a failed check keeps the card
@@ -513,7 +499,8 @@ const walletRpc = async (_u, init) => { const { method, params } = JSON.parse(in
 const chainRpc = async (u, init, allowWallet = false) => { try { const r = await fetch(u, { ...init, signal: init.signal || timeoutSignal() }); if (r.ok) { const j = await r.clone().json().catch(() => null); if (j && j.result !== undefined) return r; } } catch {} if (allowWallet) return walletRpc(u, init); throw new Error("the chain RPC did not answer"); };
 // 1133 L-5: a rebuilt transfer has no original amount to check a quote against, so the user sees what was found, what is sent and what comes out, and confirms
 const confirmRebuiltQuote = q => confirm("Found on the transfer wallet: " + zecText(q.zecFound) + " ZEC.\nThis payout sends " + zecText(q.amount) + " ZEC" + (q.zatsLeft > q.amount ? " (of " + zecText(q.zatsLeft) + " ZEC still to send)" : "") + " and pays out about " + fmtTok(q.amountOut) + " " + SYM + " (≈ " + (Number(q.amountOut) / TUNIT / (Number(q.amount) / 1e8)).toFixed(2) + " " + SYM + " per ZEC) to " + q.recipient + ".\nThe network fee and swap fee are inside that figure. Pay out at this quote?");
-const confirmHopLoss = q => { const total = Number(q.amountOut) * Number(q.zatsLeft) / Number(q.amount); return confirm("This quote is worse than the " + (q.cap * 100).toFixed(0) + "% limit: the whole transfer would lose about " + (q.loss * 100).toFixed(1) + "%.\nStill to send: " + zecText(q.zatsLeft) + " ZEC, paying out about " + fmtTok(BigInt(Math.floor(total))) + " " + SYM + " to " + q.recipient + ".\nThe fees on a small transfer are mostly fixed. Pay out at this quote? Cancel keeps the ZEC shielded."); };
+const confirmHopLoss = q => { const dec = Number.isInteger(q.destDecimals) ? q.destDecimals : TOK.decimals, sym = q.destSymbol || SYM, f = v => (Number(v) / 10 ** dec).toFixed(2), total = Number(q.amountOut) * Number(q.zatsLeft) / Number(q.amount);      // 1138 L-2: the PAYOUT token, not the connected chain's
+  return confirm("This quote is worse than the " + (q.cap * 100).toFixed(1) + "% limit: the whole transfer would lose about " + (q.loss * 100).toFixed(1) + "%" + (q.approved != null ? " (you approved about " + (q.approved * 100).toFixed(1) + "% on the preview)" : "") + ".\nStill to send: " + zecText(q.zatsLeft) + " ZEC. This payout: about " + f(q.amountOut) + " " + sym + " to " + q.recipient + "; about " + f(BigInt(Math.floor(total))) + " " + sym + " in total if later payouts get this rate (an estimate).\nThe fees on a small transfer are mostly fixed. Pay out at this quote? Cancel keeps the ZEC shielded."); };
 const hopCtx = async (HM, f, hit, o) => ({ getUtxos: HM.makeGetUtxos(), authUsed: HM.makeAuthUsed(C, chainRpc), countPriorHops: HM.makeCountPriorHops(C, chainRpc), txKnown: HM.makeTxKnown(), store: HM.idbStore(), stealth: f.stealth, priv: hit.stealthPriv, chain: C, api: API, words: await HM.loadWords(), loadZjs: HM.sharedZjs, waitReceipt, randomNonce: randomBytes32,
   confirmQuote: q => confirmRebuiltQuote(q), confirmLoss: q => confirmHopLoss(q), balance: async () => (await getBalances(rpcBatch, USDC, [f.stealth])).get(f.stealth.toLowerCase()).usdc, onProgress: (s, m) => hopProgress(f, s, m), ...o });
 const rpcOne = async (method, params) => { const r = await chainRpc(C.rpc, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ jsonrpc: "2.0", id: 1, method, params }) }); const j = await r.json(); if (j.error) throw new Error(j.error.message || "rpc error"); return j.result; };
@@ -531,9 +518,9 @@ function hopProgress(f, s, m) {
   renderHops();
 }
 /** start (o = { recipient, amount, dest }) or resume (o = null) the hop of one found payment; one tab at a time per address */
-async function runHop(f, hit, o) {
+async function runHop(f, hit, o, opts = {}) {
   const k = f.stealth.toLowerCase(); if ((hops.get(k) || {}).running) return;
-  const HM = await hopMod(), ctx = await hopCtx(HM, f, hit, o || {}), key = "zec-hop:" + k;
+  const HM = await hopMod(), ctx = await hopCtx(HM, f, hit, { ...(o || {}), interactive: !!o || opts.interactive === true }), key = "zec-hop:" + k;      // 1138 L-3: interactive = the user just clicked (Confirm / Continue); a timer-driven run never opens a dialog
   let h;
   if (o) h = { f, hit, running: true, msg: "", st: { step: "QUOTE_IN", chain: C.key, dest: o.dest.key, amount: o.amount.toString(), recipient: o.recipient, startedAt: Date.now() } };
   else { const r = await HM.findHop(ctx.store, f.stealth); if (!r) throw new Error("nothing to resume"); if (r.rec.st.chain !== C.key) throw new Error("This transfer belongs to " + (CHAINS[r.rec.st.chain] || {}).name + ": open the app on that chain to resume it."); ctx.chain = CHAINS[r.rec.st.chain]; ctx.dest = CHAINS[r.rec.st.dest]; h = { f, hit, running: true, msg: "", st: r.rec.st }; }
@@ -575,12 +562,13 @@ async function privateWithdraw(to, value, hit) {
     c2.appendChild(el("span", "note", "Fee")); c2.appendChild(el("span", "big", "≈ " + (Number(fee) / TUNIT).toFixed(2) + " (" + pct + "%)"));
     const c3 = el("div"); c3.appendChild(el("span", "note", "Takes about")); c3.appendChild(el("span", "big", HM.etaLabel(mode)));
     qt.appendChild(c1); qt.appendChild(c2); qt.appendChild(c3); box.appendChild(qt); feeNote(box, value); box.appendChild(el("div", "note", "Takes about " + HM.etaLabel(mode) + " · keep this tab open (it can be resumed if you close it)"));
-    if (Number(fee) / Number(value) > HM.MAX_LOSS) box.appendChild(el("div", "note", "Zcash fees are mostly fixed, so this route is expensive on small amounts. It costs less from about 50 " + TOK.symbol + "; Private fast is cheaper below that. You will be asked to confirm before the payout."));
-    box.hidden = false; pv = { key }; $("btn-wd").textContent = "Confirm private transfer";
+    box.appendChild(el("div", "note", "Pressing Confirm private transfer accepts this total cost (about " + pct + "% Fee, " + (Number(out) / 10 ** dest.token.decimals).toFixed(2) + " " + dest.token.symbol + " out). The payouts are checked against it; the real rate can differ a little, and if a payout quote ends up clearly worse you are asked to review it in this tab."));
+    if (Number(fee) / Number(value) > HM.MAX_LOSS) box.appendChild(el("div", "note", "Zcash fees are mostly fixed, so this route is expensive on small amounts. It is usually cheaper from a few tens of " + TOK.symbol + "; Private fast is usually cheaper below that."));
+    box.hidden = false; pv = { key, loss: Number(fee) / Number(value) }; $("btn-wd").textContent = "Confirm private transfer";
     say("pay-hint", "Check the quote, then confirm.", "warn"); return;
   }
   $("btn-wd").disabled = true; $("withdraw").hidden = true;
-  try { await runHop(wd, hit, { recipient: to, amount: value, dest, mode }); } finally { $("btn-wd").disabled = false; pvReset(); }
+  try { await runHop(wd, hit, { recipient: to, amount: value, dest, mode, approvedLoss: pv.loss }); } finally { $("btn-wd").disabled = false; pvReset(); }
 }
 
 // ---- route "private, fast": NEAR Intents only (web/private-withdraw.js runFast). The record (no recipient in it) is kept in localStorage while a part is open, so a closed tab can still follow the swaps.

@@ -145,7 +145,7 @@ const PRIV = new Uint8Array(32).fill(9), ACC = addressFromPriv(PRIV), A2 = "0x" 
   t("1101 I-2: key derivation and scan are single-flight; a scan works on its own list and keys", /\$\("btn-keys"\)\.addEventListener\("click", once\(/.test(src) && /\$\("btn-scan"\)\.addEventListener\("click", once\(/.test(src) && /const K = keys, mine = \[\]/.test(src) && /if \(keys !== K\) return;/.test(src));
   t("1101 L-1/L-2: the withdraw receipt must carry the request's nonce; a confirmation timeout says 'do not send again' and arms a pending guard", /hasAuthUsed\(x, \{ token: USDC, authorizer: w\.stealth, nonce \}\)/.test(src) && /not confirmed yet \(tx/.test(src) && /pendingWd\.set/.test(src) && /AUTH_USED_TOPIC, "0x" \+ padAddr\(w\.stealth\), nonce/.test(src));
   t("1105 L-4: every hop-record writer outside the machine takes the machine's Web Lock", (src.match(/underHopLock\(/g) || []).length >= 5);
-  t("1103 L-1: the sweep is recorded BEFORE it is broadcast, and an earlier one that is on the network is resumed, not rebuilt", src.indexOf("const intent =") > 0 && src.indexOf("const intent =") < src.indexOf("sweepIntents.set(h, intent)") && src.indexOf("sweepIntents.set(h, intent)") < src.indexOf("ZR.sendAndConfirm(ZC.lightwalletd") && /ZR\.txKnown\(ZC\.lightwalletd, prev\.txid\)/.test(src));
+  t("1103 L-1: the sweep is recorded BEFORE it is broadcast (runSweep), and an earlier one that is on the network is resumed, not rebuilt", (() => { const z = fs.readFileSync(new URL("../web/zec-return.js", import.meta.url), "utf8"), r = z.slice(z.indexOf("export async function runSweep")); return r.indexOf("d.set(intent)") > 0 && r.indexOf("d.set(intent)") < r.indexOf("await send()") && /resolvePrevIntent/.test(r) && /follow/.test(r) && /sendAndConfirm\(ZC\.lightwalletd/.test(src); })());
   t("1103 M-1: a dust-only or too-long list is never an 'empty' observation", /unspendable = true/.test(src) && src.indexOf("unspendable) {") < src.indexOf("noteEmptyFor(HM, h, true)"));
   t("statuses still tick every second", /setInterval\(\(\) => \{ const r = \[\.\.\.hops\.values\(\)\]\.filter\(h => h\.running\);[^]*?\}, 1000\);/.test(src)); }
 
@@ -189,13 +189,13 @@ const PRIV = new Uint8Array(32).fill(9), ACC = addressFromPriv(PRIV), A2 = "0x" 
   t("1109 I-7: the CSP keeps blob: and says why", /script-src 'self' blob:/.test(html) && /I-7: script-src\/worker-src blob: is deliberate/.test(html));
   // 1110 L-1 / L-2 (returnZec lives in app.js: checked on its text, like the other sweep guards)
   const rz = src.slice(src.indexOf("async function returnZec"), src.indexOf("async function staleV1"));
-  t("1110 L-1: an unresolved sweep intent is followed in the empty branch BEFORE any empty observation, and an ended one only pauses it", rz.indexOf("const sp = await prevOf()") > 0 && rz.indexOf("const sp = await prevOf()") < rz.indexOf("noteEmptyFor(HM, h, true)") && /if \(!sp\.ended\) return await finishSweep/.test(rz) && /ended: fin\.status/.test(rz));
-  t("1110 L-2: no second sweep before the first one's expiry height has passed (the intent stores it)", /expiry: sw\.expiry/.test(rz) && /tipNow <= until/.test(rz) && /!prev\.ended/.test(rz));
+  t("1110 L-1: an unresolved sweep intent is followed in the empty branch BEFORE any empty observation, and an ended one only pauses it", rz.indexOf("const sp = await prevOf()") > 0 && rz.indexOf("const sp = await prevOf()") < rz.indexOf("noteEmptyFor(HM, h, true)") && /if \(!sp\.ended\) return await finishSweep/.test(rz) && /status: fin\.status/.test(src));
+  t("1110 L-2: no second sweep before the first one's expiry height has passed (the intent stores it)", /expiry: sw\.expiry/.test(rz) && /tipNow <= until/.test(fs.readFileSync(new URL("../web/zec-return.js", import.meta.url), "utf8")) && /!prev\.ended|!c\.ended|!d\.prevOk\(prev\)|prevOk\(prev\) && !prev\.ended/.test(fs.readFileSync(new URL("../web/zec-return.js", import.meta.url), "utf8")));
   // 1137 M-1 / L-1 / L-2
   const lk = rz.slice(rz.indexOf("const saved = await underHopLock"), rz.indexOf("if (!saved)")), fs_ = src.slice(src.indexOf("async function finishSweep"), src.indexOf("async function staleV1"));
-  t("1137 M-1: inside the lock the intent is re-read and a different unended one refuses, before set() and the broadcast", lk.indexOf("sweepIntents.get(h)") > 0 && lk.indexOf("sweepIntents.get(h)") < lk.indexOf("sweepIntents.set(h, intent)") && /cur\.txid !== intent\.txid\) return "busy"/.test(lk) && /saved === "busy"/.test(rz));
-  t("1137 M-1: only a definite refusal marks the stored intent not-sent; an unknown outcome stays live; a not-sent intent is not followed", /catch \(e\) \{ if \(\/\^Rejected by network\|different txid\/\.test/.test(lk) && /notSent: true/.test(lk) && /prevOk\(sp\) && !sp\.notSent/.test(rz) && !/notSent: true[^\n]*\n[^\n]*else/.test(lk) && /throw e; \}/.test(lk));
-  t("1137 L-1: every end (SUCCESS too) settles the intent with ended + endedAt, before the Done text; an ended SUCCESS is not reported as a refund on its way", fs_.indexOf("ended: fin.status, endedAt") > 0 && fs_.indexOf("ended: fin.status, endedAt") < fs_.indexOf('"Done: ') && /sp\.ended !== "SUCCESS" && Date\.now\(\) - \(sp\.endedAt/.test(rz));
+  t("1138 M-1: runSweep re-reads the intent inside the lock; only a different intent the pre-check did not see refuses; no 6 h gate", (() => { const z = fs.readFileSync(new URL("../web/zec-return.js", import.meta.url), "utf8"); return /d\.get\(\)/.test(z) && /cur\.txid !== intent\.txid && !\(expire && cur\.txid === expire\.txid\)\) return "busy"/.test(z) && !/6 \* 3600_000/.test(rz) && !/6 \* 3600_000/.test(z) && /saved === "busy"/.test(z); })());
+  t("1138 L-1: only e.definite === true marks the intent not-sent (no message regex at either call site); a not-sent intent is not followed", (() => { const z = fs.readFileSync(new URL("../web/zec-return.js", import.meta.url), "utf8"); return /e\.definite === true\) d\.set\(\{ \.\.\.intent, ended: "NOT_SENT", notSent: true/.test(z) && /if \(e && e\.definite === true\) throw e/.test(z) && !/Rejected by network\|different txid/.test(z + src) && /prevOk\(sp\) && !sp\.notSent/.test(rz); })());
+  t("1137 L-1: every end (SUCCESS too) settles the intent (settleIntent: ended + endedAt) before the Done text; an ended SUCCESS is not reported as a refund on its way", fs_.indexOf("settleIntent({") > 0 && fs_.indexOf("settleIntent({") < fs_.indexOf('"Done: ') && /status: fin\.status/.test(fs_) && /ended: status, endedAt/.test(fs.readFileSync(new URL("../web/zec-return.js", import.meta.url), "utf8")) && /sp\.ended !== "SUCCESS" && Date\.now\(\) - \(sp\.endedAt/.test(rz));
   t("1137 L-2: a lost wallet's found shielded value is read before the card is forgotten and said in the Done text", /const sh = h\.lost && lost\.get\(h\.lost\) && lost\.get\(h\.lost\)\.shielded;/.test(fs_) && fs_.indexOf("const sh =") < fs_.indexOf("lostForget(h.lost)") && /\(sh \? " Shielded ZEC[^"]*may remain/.test(fs_)); }
 
 // ---- round 5 (audit 1121): pendingWd memory fallback, lost-answer retry, honest busy text
@@ -355,7 +355,7 @@ const PRIV = new Uint8Array(32).fill(9), ACC = addressFromPriv(PRIV), A2 = "0x" 
   t("1135 L-4: resumeFast without an account keeps the record (no note, no delete) and follows it again when setAcct gets one; a withdraw's notes belong to the account that started it; Abandon needs an account", /if \(!acct\) \{ extra\.push\(text\); fastDeferred = true; continue; \}/.test(rf) && /fastDeferred\) \{ fastDeferred = false; resumeFast\(\)/.test(app) && /const owner = acct/.test(fw) && !/, acct\)/.test(fw) && /if \(!acct\) \{ say\("pay-hint", "Connect your wallet first/.test(app));
 }
 { const app = fs.readFileSync(new URL("../web/app.js", import.meta.url), "utf8");
-  t("the private route preview warns when the fee is above the loss cap, and the confirmation comes before the payout", /Number\(fee\) \/ Number\(value\) > HM\.MAX_LOSS/.test(app) && /Private fast is cheaper below that/.test(app)); }
+  t("the private route preview: pressing Confirm is the approval (approvedLoss passed to the hop), the text says so and promises neither a confirmation nor a fixed amount", /approvedLoss: pv\.loss/.test(app) && /pv = \{ key, loss: Number\(fee\) \/ Number\(value\) \}/.test(app) && /Pressing Confirm private transfer accepts this total cost/.test(app) && /Number\(fee\) \/ Number\(value\) > HM\.MAX_LOSS/.test(app) && !/about 50 /.test(app) && !/You will be asked to confirm before the payout/.test(app) && /usually cheaper from a few tens/.test(app) && /interactive: true/.test(app)); }
 { const app = fs.readFileSync(new URL("../web/app.js", import.meta.url), "utf8"), blk = app.slice(app.indexOf("// LOSTDONE-BEGIN"), app.indexOf("// LOSTDONE-END")), L = new Function(blk + "; return { lostDone, lostSay };")();
   const fin = app.slice(app.indexOf("async function finishSweep"), app.indexOf("// A transfer from the first version"));
   L.lostSay("0xabc", "Done: \u2248 5.69 USDG sent to your wallet.", true);
@@ -364,4 +364,54 @@ const PRIV = new Uint8Array(32).fill(9), ACC = addressFromPriv(PRIV), A2 = "0x" 
   t("lost Return: every renderHops draws the kept results with a Dismiss that removes only that one; the box stays visible for them", /for \(const \[k, d\] of lostDone\)[^\n]*lostDone\.delete\(k\)/.test(app) && /box\.hidden = !hops\.size && !lost\.size && !lostDone\.size/.test(app));
   t("lost Return: only the user's Scan clears the results (not checkLost / the background rescan after a Return)", /async function scan\(\) \{[^\n]*\n[^\n]*\n\s*if \(lostDone\.size\) \{ lostDone\.clear\(\)/.test(app) && (app.match(/lostDone\.clear\(\)/g) || []).length === 1);
 }
+
+// ---- 1138 M-1 behavioural: the sweep intent protocol (zec-return.js runSweep / settleIntent) against fake storage, lock and node
+{ const ZRm = await import("../web/zec-return.js"), TXA = "a".repeat(64), TXB = "b".repeat(64), TXC = "c".repeat(64), DEP = "t1" + "3".repeat(33), H6 = 6 * 3600_000 + 60_000;
+  const prevOk = p => p && /^[0-9a-f]{64}$/i.test(p.txid || "") && /^t1[1-9A-HJ-NP-Za-km-z]{33}$/.test(p.deposit || "");
+  const world = (init, o = {}) => { const w = { cur: init, sent: [], sets: [], locked: false, ...o };
+    w.d = { prevOf: async () => w.cur, prevOk, get: () => w.cur, set: v => { if (w.setFails) return false; w.cur = v; w.sets.push(v); return true; }, lock: async fn => w.locked ? undefined : fn(),
+      txKnownFn: async () => { if (w.known instanceof Error) throw w.known; return w.known; }, tipFn: async () => w.tip ?? 3_600_000, midCheck: async () => false, now: () => w.now ?? Date.now(),
+      quote: async () => { if (w.during) w.cur = w.during; return { intent: { txid: TXB, deposit: DEP, amountOut: "1", at: Date.now(), expiry: 3_600_040 }, send: async () => { w.sent.push(TXB); if (w.sendErr) throw w.sendErr; } }; } };
+    return w; };
+  const X = (extra = {}) => ({ txid: TXA, deposit: DEP, amountOut: "1", at: Date.now() - 2 * 3600_000, expiry: 3_600_000, ...extra });
+  { const w = world(X(), { known: false, tip: 3_600_500 }); const r = await ZRm.runSweep(w.d);
+    t("1138 M-1: unended intent X, past its expiry, tx unknown, Return pressed -> a NEW sweep is broadcast (X ended EXPIRED under the lock)", w.sent.length === 1 && r.intent.txid === TXB && w.sets[0].ended === "EXPIRED" && w.sets[0].txid === TXA && w.cur.txid === TXB && !w.cur.ended); }
+  { const w = world(X({ at: Date.now() - H6 }), { known: false, tip: 3_600_500 }); await ZRm.runSweep(w.d);
+    t("1138 M-1: the same with an intent older than 6 h (no age gate): swept anew", w.sent.length === 1 && w.sets[0].ended === "EXPIRED"); }
+  { const w = world(X({ at: Date.now() - H6 }), { known: true }); const r = await ZRm.runSweep(w.d);
+    t("1138 M-1: tab-closed REFUNDED case older than 6 h: its tx is known -> followed (finishSweep settles it), nothing new is sent yet", r.follow && r.follow.txid === TXA && w.sent.length === 0);
+    const ok = await ZRm.settleIntent({ lock: w.d.lock, get: w.d.get, set: w.d.set, sw: r.follow, status: "REFUNDED", sleep: async () => {} });
+    const r2 = await ZRm.runSweep({ ...w.d, quote: w.d.quote });
+    t("1138 M-1: ... after the settle (ended REFUNDED) the next Return sweeps instead of refusing", ok && w.cur.txid === TXB && r2.intent && w.sent.length === 1 && !w.cur.ended); }
+  { const w = world(X(), { known: false, tip: 3_600_500, during: { txid: TXC, deposit: DEP, amountOut: "1", at: Date.now(), expiry: 1 } }); let err = null; await ZRm.runSweep(w.d).catch(e => { err = e; });
+    t("1138 M-1: a DIFFERENT intent that appeared during the quote wait still refuses 'busy', nothing sent", err && /already in progress/.test(err.message) && w.sent.length === 0 && w.cur.txid === TXC); }
+  { const w = world(X({ expiry: 3_600_000 }), { known: false, tip: 3_599_000 }); let err = null; await ZRm.runSweep(w.d).catch(e => { err = e; });
+    t("1138 M-1: before the expiry height a not-known tx may still be mined: no second sweep", err && /may still be mined/.test(err.message) && w.sent.length === 0); }
+  { const w = world(X(), { known: new Error("down") }); let err = null; await ZRm.runSweep(w.d).catch(e => { err = e; });
+    t("1138 M-1: the node cannot answer -> no second sweep, press again", err && /Cannot tell/.test(err.message) && w.sent.length === 0); }
+  { const w = world(null, { sendErr: Object.assign(new Error("Rejected by network: bad"), { definite: true }) }); let err = null; await ZRm.runSweep(w.d).catch(e => { err = e; });
+    t("1138 L-1: a definite refusal marks the intent NOT_SENT; the error still propagates", err && w.cur.notSent === true && w.cur.ended === "NOT_SENT"); }
+  { const w = world(null, { sendErr: new Error("Rejected by network: txn-already-in-mempool different txid") }); let err = null; await ZRm.runSweep(w.d).catch(e => { err = e; });
+    t("1138 L-1: an unknown outcome (no typed flag, whatever its text says) leaves the intent LIVE", err && !w.cur.ended && !w.cur.notSent && w.cur.txid === TXB); }
+  { const w = world(null, { setFails: true }); let err = null; await ZRm.runSweep(w.d).catch(e => { err = e; });
+    t("1138 M-1: if the intent cannot be recorded nothing is sent", err && /Could not record/.test(err.message) && w.sent.length === 0); }
+  { const w = world(X({ at: Date.now() - 3 * 3600_000 }), { known: false, tip: 3_600_500, setFails: true }); let err = null; await ZRm.runSweep(w.d).catch(e => { err = e; });
+    t("1138 M-1: even if the EXPIRED write fails the pre-check's own intent never blocks (nothing sent only because recording failed)", err && /Could not record/.test(err.message) && !/already in progress/.test(err.message)); }
+  { // settleIntent: the lock is held by the hop machine for a while -> retried, not skipped
+    let n = 0, cur = { txid: TXA }; const sets = [];
+    const lock = async fn => (++n <= 3 ? undefined : fn()), get = () => cur, set = v => { cur = v; sets.push(v); return true; };
+    const ok = await ZRm.settleIntent({ lock, get, set, sw: { txid: TXA, deposit: DEP }, status: "SUCCESS", sleep: async () => {}, now: () => 7 });
+    t("1138 M-1: the settle write is retried while the lock is unavailable and then lands", ok === true && n === 4 && cur.ended === "SUCCESS" && cur.endedAt === 7);
+    n = -100; const never = await ZRm.settleIntent({ lock: async () => undefined, get, set, sw: { txid: TXA }, status: "SUCCESS", tries: 3, sleep: async () => {} });
+    t("1138 M-1: ... bounded: a lock that never frees returns false (the caller says so), no hang", never === false);
+    cur = { txid: TXC }; const other = await ZRm.settleIntent({ lock: async fn => fn(), get, set, sw: { txid: TXA }, status: "SUCCESS", sleep: async () => {} });
+    t("1138 M-1: another sweep's intent is never overwritten by a settle", other === true && cur.txid === TXC && !cur.ended);
+    t("1138 M-1: a failed storage write is retried too", await (async () => { let k = 0; return ZRm.settleIntent({ lock: async fn => fn(), get: () => ({ txid: TXA }), set: () => ++k > 1, sw: { txid: TXA }, status: "SUCCESS", sleep: async () => {} }); })()); } }
+// 1138 L-2: the loss dialog, evaluated from app.js's own text with stubs
+{ const app = fs.readFileSync(new URL("../web/app.js", import.meta.url), "utf8"), a = app.indexOf("const confirmHopLoss"), src = app.slice(a, app.indexOf("\n", app.indexOf("Cancel keeps the ZEC shielded", a)) + 1);
+  let shown = ""; const f = new Function("confirm", "TOK", "SYM", "zecText", src + "; return confirmHopLoss;")(m => { shown = m; return true; }, { decimals: 6 }, "USDG", v => String(v));
+  f({ cap: 0.025, loss: 0.113, approved: 0.1, amount: 10_000_000n, zatsLeft: 20_000_000n, amountOut: 4_000_000n, recipient: "0xabc", destSymbol: "USDC", destDecimals: 6 });
+  t("1138 L-2: the dialog names the PAYOUT token (not the connected chain's), says the total is an estimate, shows the cap as 2.5% and the approved preview figure", /USDC/.test(shown) && !/USDG/.test(shown) && /about 8\.00 USDC in total if later payouts get this rate \(an estimate\)/.test(shown) && /2\.5% limit/.test(shown) && /you approved about 10\.0%/.test(shown));
+  f({ cap: 0.03, loss: 0.2, amount: 10_000_000n, zatsLeft: 10_000_000n, amountOut: 1_000_000_000_000_000_000n, recipient: "0xabc", destSymbol: "WETH", destDecimals: 18 });
+  t("1138 L-2: decimals of the payout token are used (18-decimal token)", /about 1\.00 WETH/.test(shown)); }
 console.log(fail ? "FAILED " + fail : "all passed"); process.exit(fail ? 1 : 0);
