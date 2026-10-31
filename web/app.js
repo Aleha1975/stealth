@@ -356,7 +356,8 @@ async function returnZec(h, card) {
     const sp = await prevOf();
     if (prevOk(sp) && !sp.notSent) {
       if (!sp.ended) return await finishSweep(HM, h, step, { txid: sp.txid, deposit: sp.deposit, amountOut: sp.amountOut });
-      if (sp.ended !== "SUCCESS" && Date.now() - (sp.endedAt || 0) < 3600_000) { step("The swap ended as " + sp.ended + ". The refund is on its way back to the hop address: press Return money again in a few minutes."); return; }
+      if (sp.ended === "UNTRACKED" && Date.now() - (sp.endedAt || 0) < 24 * 3600_000) { step("Earlier return: NEAR Intents could not report on it. Deposit address to check: " + sp.deposit + ". Nothing is listed here now; if ZEC reappears, press Return money again."); return; }
+      if (sp.ended !== "SUCCESS" && sp.ended !== "UNTRACKED" && Date.now() - (sp.endedAt || 0) < 3600_000) { step("The swap ended as " + sp.ended + ". The refund is on its way back to the hop address: press Return money again in a few minutes."); return; }
     }
     if (h.lost) { const t = "Nothing is listed on the transparent addresses now (moved already, or the server is behind). Scan checks again; the shielded balance has its own button."; lostSay(h.lost, t, false); lostForget(h.lost); step(t); renderHops(); return; }      // no record to count empty observations in: the card just goes, and is found again if the ZEC is still there
     step("Checking the shielded balance…");
@@ -390,10 +391,12 @@ async function returnZec(h, card) {
 async function finishSweep(HM, h, step, sw) {
   let note = ""; await PW.submitDeposit({ txHash: sw.txid, depositAddress: sw.deposit }).catch(e => { note = " (could not notify NEAR Intents: " + ((e && e.message) || e) + ")"; });
   if (note) step("Sent" + note);
-  const fin = await PW.pollStatus({ depositAddress: sw.deposit, timeoutMs: 60 * 60_000, intervalMs: 10_000, onUpdate: s => step("Returning · " + s.status.toLowerCase().replace(/_/g, " ") + " · usually 10–20 min" + note) });
-  const settled = await (await import("./zec-return.js")).settleIntent({ lock: fn => underHopLock(h.f.stealth, fn), get: () => sweepIntents.get(h), set: v => sweepIntents.set(h, v), sw, status: fin.status });      // 1137 L-1 / 1110 L-1: every end settles the intent (SUCCESS too); 1138 M-1: retried while the hop machine holds the lock, never skipped silently
+  const ZR = await import("./zec-return.js"), { zcash: ZC } = await import("./chains.js");
+  const fin = await ZR.followSweep({ poll: () => PW.pollStatus({ depositAddress: sw.deposit, timeoutMs: 60 * 60_000, intervalMs: 10_000, onUpdate: s => step("Returning · " + s.status.toLowerCase().replace(/_/g, " ") + " · usually 10–20 min" + note) }),      // 1139 M-1: a persistent status outage with the tx known settles as UNTRACKED
+    txKnownFn: () => ZR.txKnown(ZC.lightwalletd, sw.txid), settle: status => ZR.settleIntent({ lock: fn => underHopLock(h.f.stealth, fn), get: () => sweepIntents.get(h), set: v => sweepIntents.set(h, v), sw, status }) });
+  const settled = fin.settled;      // 1137 L-1 / 1110 L-1: every end settles the intent (SUCCESS too); 1138 M-1: retried while the hop machine holds the lock, never skipped silently
   const sh = h.lost && lost.get(h.lost) && lost.get(h.lost).shielded;      // 1137 L-2: a shielded finding is dropped with the card, so the Done text says it may remain
-  const doneText = (fin.status === "SUCCESS" ? "Done: ≈ " + (Number(sw.amountOut) / 1e6).toFixed(2) + " " + SYM + " sent to your wallet." + (sh ? " Shielded ZEC was found on this wallet earlier and may remain: press Check shielded balance." : "") : "Swap ended as " + fin.status + ". The ZEC is back on the hop address; press Return money again.") + (settled ? "" : " (Could not mark this return as finished in this browser: if ZEC is still listed, press Return money again.)");
+  const doneText = (fin.status === "SUCCESS" ? "Done: ≈ " + (Number(sw.amountOut) / 1e6).toFixed(2) + " " + SYM + " sent to your wallet." + (sh ? " Shielded ZEC was found on this wallet earlier and may remain: press Check shielded balance." : "") : fin.untracked ? "NEAR Intents stopped reporting on this swap. Your transaction is on the Zcash network. Check the swap with deposit address " + sw.deposit + "; if the ZEC comes back to this hop address, press Return money again." : "Swap ended as " + fin.status + ". The ZEC is back on the hop address; press Return money again.") + (settled ? "" : " (Could not mark this return as finished in this browser: if ZEC is still listed, press Return money again.)");
   step(doneText); if (h.lost) { lostSay(h.lost, doneText, fin.status === "SUCCESS"); renderHops(); }      // kept on its own card: the lost card is redrawn or removed below
   if (fin.status === "SUCCESS" && h.lost) { lostForget(h.lost); checkLost().catch(() => {}); }      // a lost wallet has no card to keep: it is looked for again, and any other wallet of this address shows up with its own Return
   else if (fin.status === "SUCCESS") {      // 1122 L-3: the transparent return worked, but the card goes away only when the hop wallet holds nothing at all (shielded ZEC included); a failed check keeps the card
@@ -556,15 +559,15 @@ async function privateWithdraw(to, value, hit) {
     const q1 = await PW.requestQuote({ base: PW.ONECLICK, req: HM.reqIn({ chain: C, amount: value, tAddr: HM.DRY_T, stealth: wd.stealth, dry: true }) }), zec = BigInt(q1.quote.amountOut);
     if (!HM.okSize(zec)) throw new Error("Too small for the private route. Try a larger amount.");
     const q2 = await PW.requestQuote({ base: PW.ONECLICK, req: HM.reqOut({ dest, amount: HM.previewOut(zec, mode), recipient: to, refundT: HM.DRY_T, dry: true }) });
-    const out = BigInt(q2.quote.amountOut), fee = value - out, box = $("wd-quote"); box.textContent = "";
-    const pct = (Number(fee) / Number(value) * 100).toFixed(1), qt = el("div", "qt"), c1 = el("div"), c2 = el("div");
+    const out = BigInt(q2.quote.amountOut), loss = HM.previewLoss({ value, out, inDec: TOK.decimals, outDec: dest.token.decimals }), fee = loss * Number(value), box = $("wd-quote"); box.textContent = "";      // 1139 I-1: same basis as the machine's projectedLoss (decimals of source and destination differ)
+    const pct = (loss * 100).toFixed(1), qt = el("div", "qt"), c1 = el("div"), c2 = el("div");
     c1.appendChild(el("span", "note", "Recipient gets")); c1.appendChild(el("span", "big", "≈ " + (Number(out) / 10 ** dest.token.decimals).toFixed(2) + " " + dest.token.symbol));
-    c2.appendChild(el("span", "note", "Fee")); c2.appendChild(el("span", "big", "≈ " + (Number(fee) / TUNIT).toFixed(2) + " (" + pct + "%)"));
+    c2.appendChild(el("span", "note", "Fee")); c2.appendChild(el("span", "big", "≈ " + (fee / TUNIT).toFixed(2) + " (" + pct + "%)"));
     const c3 = el("div"); c3.appendChild(el("span", "note", "Takes about")); c3.appendChild(el("span", "big", HM.etaLabel(mode)));
     qt.appendChild(c1); qt.appendChild(c2); qt.appendChild(c3); box.appendChild(qt); feeNote(box, value); box.appendChild(el("div", "note", "Takes about " + HM.etaLabel(mode) + " · keep this tab open (it can be resumed if you close it)"));
     box.appendChild(el("div", "note", "Pressing Confirm private transfer accepts this total cost (about " + pct + "% Fee, " + (Number(out) / 10 ** dest.token.decimals).toFixed(2) + " " + dest.token.symbol + " out). The payouts are checked against it; the real rate can differ a little, and if a payout quote ends up clearly worse you are asked to review it in this tab."));
-    if (Number(fee) / Number(value) > HM.MAX_LOSS) box.appendChild(el("div", "note", "Zcash fees are mostly fixed, so this route is expensive on small amounts. It is usually cheaper from a few tens of " + TOK.symbol + "; Private fast is usually cheaper below that."));
-    box.hidden = false; pv = { key, loss: Number(fee) / Number(value) }; $("btn-wd").textContent = "Confirm private transfer";
+    if (loss > HM.MAX_LOSS) box.appendChild(el("div", "note", "Zcash fees are mostly fixed, so this route is expensive on small amounts. It is usually cheaper from a few tens of " + TOK.symbol + "; Private fast is usually cheaper below that."));
+    box.hidden = false; pv = { key, loss }; $("btn-wd").textContent = "Confirm private transfer";
     say("pay-hint", "Check the quote, then confirm.", "warn"); return;
   }
   $("btn-wd").disabled = true; $("withdraw").hidden = true;

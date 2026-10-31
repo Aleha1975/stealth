@@ -267,8 +267,8 @@ export async function getUtxos(base, addr, fetchFn) {
  *  Excluded: code -27 (zcashd RPC_TRANSACTION_ALREADY_IN_CHAIN) and any message saying already-in-mempool / already-in-chain / already-known ("txn-already-in-mempool", "txn-already-known",
  *  "transaction already in block chain"). I could not verify these codes against zcashd or lightwalletd sources in this repo (no copy here); they are from zcashd's rpc/protocol.h and main.cpp as I know them,
  *  so the text test is the second net. Everything else (-26 rejected, -22 deserialize, ...) is a refusal. An untrusted server can still lie either way: this only types what the reply says. */
-export const isDefiniteRefusal = (code, msg) => code !== 0n && BigInt.asIntN(32, code) !== -27n &&      // an int32 field: a negative code arrives as its 64-bit two's complement
-   !/already[\s-]*(in|known|exist)|txn-already|duplicate/i.test(String(msg || ""));
+export const isDefiniteRefusal = (code, msg) => code !== 0n && ![-27n, -25n].includes(BigInt.asIntN(32, code)) &&      // an int32 field: a negative code arrives as its 64-bit two's complement. 1139 L-2: -25 (missing inputs) is unknown too: a mined tx re-sent after its inputs were spent answers like that
+   !/already[\s-]*(in|known|exist)|txn-already|duplicate|missing[\s-]*(or[\s-]*spent|inputs)/i.test(String(msg || ""));
 /** Send a raw tx. Succeeds only on a well-formed reply with errorCode 0 whose returned txid equals `expectTxid` (display hex, the locally computed one). */
 export async function broadcast(base, raw, fetchFn, expectTxid) {
   if (!/^[0-9a-f]{64}$/i.test(expectTxid || "")) throw new Error("broadcast needs the locally computed txid");
@@ -326,6 +326,7 @@ export function noteEmpty(prev, empty, now = Date.now()) {
 }
 
 // ---- 1138 M-1: the sweep intent protocol, injectable (app.js passes localStorage + the Web Lock; tests pass fakes)
+export const EXPIRY_MARGIN_BLOCKS = 5;      // 1139 I-2: blocks beyond a sweep's expiry height before it counts as dead (the tip comes from the same single server that said "not known")
 const live = c => !!c && !c.ended && !c.notSent;
 /** The pre-check of an earlier unended intent, whatever its age. -> "follow" (its tx is known: settle it by following the swap) | "expire" (provably dead: past its expiry) ; throws when it cannot tell or may still be mined. */
 export async function resolvePrevIntent(prev, { txKnownFn, tipFn, now = Date.now() }) {
@@ -333,7 +334,7 @@ export async function resolvePrevIntent(prev, { txKnownFn, tipFn, now = Date.now
   if (on === true) return "follow";
   if (on !== false) throw new Error("Cannot tell whether your earlier return transaction (" + prev.txid.slice(0, 12) + "…) went out. Not sending another yet: press Return money again in a minute.");
   const tipNow = await tipFn(), until = Number.isInteger(prev.expiry) ? prev.expiry : null;      // "not known" is one server's answer: the old tx may be mined until its expiry height has passed
-  if (until === null ? now - (prev.at || 0) < 3600_000 : tipNow <= until) throw new Error("Your earlier return transaction (" + prev.txid.slice(0, 12) + "…) is not on the network yet but may still be mined (it stays valid for about 50 minutes). Not sending another yet: press Return money again later.");
+  if (until === null ? now - (prev.at || 0) < 3600_000 : tipNow <= until + EXPIRY_MARGIN_BLOCKS) throw new Error("Your earlier return transaction (" + prev.txid.slice(0, 12) + "…) is not on the network yet but may still be mined (it stays valid for about 50 minutes). Not sending another yet: press Return money again later.");
   return "expire";
 }
 /** One press of Return after the UTXOs were found. deps: prevOf(), prevOk(p), get(), set(v)->bool, lock(fn) (undefined = unavailable), txKnownFn, tipFn, midCheck() (truthy = stop), quote() -> { intent, send() }, now().
@@ -353,7 +354,12 @@ export async function runSweep(d) {
     const cur = d.get();
     if (d.prevOk(cur) && live(cur) && cur.txid !== intent.txid && !(expire && cur.txid === expire.txid)) return "busy";
     if (!d.set(intent)) return false;      // recorded BEFORE broadcasting
-    try { await send(); } catch (e) { if (e && e.definite === true) d.set({ ...intent, ended: "NOT_SENT", notSent: true, endedAt: now() }); throw e; }      // only a DEFINITE refusal un-tracks it
+    try { await send(); } catch (e) {
+      if (e && e.definite === true) {      // 1139 L-2: a refusal is written as NOT_SENT only after the node is asked and clearly does not know the tx; known or unreadable = leave the intent live (the next press resolves it)
+        let known = null; try { known = await d.txKnownFn(intent.txid); } catch {}
+        if (known === false) d.set({ ...intent, ended: "NOT_SENT", notSent: true, endedAt: now() });
+      }
+      throw e; }
     return true; });
   if (saved === "busy") throw new Error("Another return for this wallet is already in progress (another tab?). Nothing was sent; press Return money again in a minute.");
   if (!saved) throw new Error("Could not record the return before sending it (the transfer may be running in another tab). Nothing was sent; try again in a minute.");
@@ -367,4 +373,20 @@ export async function settleIntent({ lock, get, set, sw, status, tries = 6, ever
     if (i < tries - 1) await sleep(everyMs);
   }
   return false;
+}
+
+/** 1139 M-1: follow a swap to its end. pollStatus (not changed) throws after >10 straight errors (~2 min) or when the swap is still running at its timeout. Only the first kind, repeated `rounds` times
+ *  `gapMs` apart AND with the sweep tx still known to the node, settles the intent as "UNTRACKED" (1Click cannot report on it; the money is with the swap or refunded to the hop address): the next Return then
+ *  sweeps any UTXO that reappears. A "still not finished" timeout, an unreadable node or a tx the node no longer knows is rethrown and settles nothing. deps: poll(), settle(status)->bool, txKnownFn(), sleep.
+ *  -> { status, settled, untracked? } */
+export async function followSweep({ poll, settle, txKnownFn, rounds = 3, gapMs = 120_000, sleep = ms => new Promise(r => setTimeout(r, ms)) }) {
+  let last = null;
+  for (let i = 0; i < rounds; i++) {
+    try { const fin = await poll(); return { status: fin.status, settled: await settle(fin.status) }; }
+    catch (e) { last = e; if (/^still not finished/i.test(String((e && e.message) || ""))) throw e; }      // the swap is still running: not a status outage
+    if (i < rounds - 1) await sleep(gapMs);
+  }
+  let known = null; try { known = await txKnownFn(); } catch {}
+  if (known !== true) throw last;
+  return { status: "UNTRACKED", untracked: true, settled: await settle("UNTRACKED") };
 }

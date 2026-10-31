@@ -362,8 +362,10 @@ for (const [name, tk] of [["no txKnown available", undefined], ["txKnown cannot 
   ok("M6 ... and resumes fine once the rate is acceptable again", ok2.step === "DONE" && w.broadcasts === 1);
   const w2 = makeWorld(), s2 = H.memStore(); off = 0; w2.outPermille = 450; const hi = await H.startHop(mkCtx(w2, s2, { maxLoss: 0.2 }));
   ok("M6 the cap is configurable (ctx.maxLoss)", hi.step === "DONE");
-  const w3 = makeWorld(), s3 = H.memStore(); off = 0; w3.outPermille = 450; let asked = 0, seen = null; const ap = await H.startHop(mkCtx(w3, s3, { interactive: true, confirmLoss: async q => { asked++; seen = q; return true; } }));
-  ok("loss above the cap, user approves: the transfer finishes and the approval carries across the parts", ap.step === "DONE" && asked === 1 && seen.loss > seen.cap);
+  const w3 = makeWorld(), s3 = H.memStore(); off = 0; w3.outPermille = 450; let asked = 0, seen = null; const ap0 = await H.startHop(mkCtx(w3, s3, { interactive: true, confirmLoss: async q => { asked++; seen = q; return true; } }));
+  ok("1139 L-1 a click-started run that waited through DELAY never opens the dialog: it halts at QUOTE_OUT", ap0.step === "QUOTE_OUT" && ap0.halted === true && asked === 0 && w3.broadcasts === 0, ap0.step + " " + ap0.err);
+  const ap = await H.runHop(mkCtx(w3, s3, { interactive: true, confirmLoss: async q => { asked++; seen = q; return true; } }));      // Continue while QUOTE_OUT is the current step: no DELAY, may prompt
+  ok("loss above the cap, user approves (Continue at QUOTE_OUT): the transfer finishes and the approval carries across the parts", ap.step === "DONE" && asked === 1 && seen.loss > seen.cap, ap.step + " " + ap.err);
   const w4 = makeWorld(), s4 = H.memStore(); off = 0; w4.outPermille = 450; const no = await H.startHop(mkCtx(w4, s4, { interactive: true, confirmLoss: async () => false }));
   ok("loss above the cap, user declines: Halt before any ZEC is sent", no.step === "QUOTE_OUT" && /would lose/.test(no.err) && w4.broadcasts === 0); }
 { // 1138 L-3 / C2 / I-1: the preview's cost is the approval; the dialog only on a run the user just clicked
@@ -375,7 +377,8 @@ for (const [name, tk] of [["no txKnown available", undefined], ["txKnown cannot 
   let seen2 = null; const r2b = await H.runHop(mkCtx(a2.w, a2.s, { interactive: true, confirmLoss: async q => { asked2++; seen2 = q; return true; } }));
   const rec2 = (await latest(a2.s)).st;
   ok("1138 L-3 ... the Continue click (interactive) shows the dialog once, with the payout token; the approval stores quoteRate AND approvedLoss", r2b.step === "DONE" && asked2 === 1 && seen2.destSymbol === base.token.symbol && seen2.destDecimals === base.token.decimals && Math.abs(seen2.approved - 0.01) < 1e-9 && rec2.approvedLoss > 0.1 && rec2.quoteRate > 0, r2b.step + " " + r2b.err);
-  let a3 = mk(), asked3 = 0; const r3 = await H.startHop(mkCtx(a3.w, a3.s, { approvedLoss: 0.01, interactive: true, confirmLoss: async () => { asked3++; return false; } }));
+  let a3 = mk(), asked3 = 0; await H.startHop(mkCtx(a3.w, a3.s, { approvedLoss: 0.01, interactive: true, confirmLoss: async () => { asked3++; return false; } }));
+  const r3 = await H.runHop(mkCtx(a3.w, a3.s, { interactive: true, confirmLoss: async () => { asked3++; return false; } }));
   ok("1138 L-3 a declined dialog halts, nothing sent, approvedLoss stays the preview's", r3.step === "QUOTE_OUT" && asked3 === 1 && a3.w.broadcasts === 0 && (await latest(a3.s)).st.approvedLoss === 0.01);
   let a4 = mk(), asked4 = 0; const r4 = await H.startHop(mkCtx(a4.w, a4.s, { confirmLoss: async () => { asked4++; return true; } }));
   ok("1138 L-3 an old record / start without approvedLoss follows the same rule: timer-driven halts, no dialog", r4.step === "QUOTE_OUT" && r4.halted === true && asked4 === 0 && !(await latest(a4.s)).st.approvedLoss);

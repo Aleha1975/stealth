@@ -209,6 +209,9 @@ export function projectedLoss({ amountIn, inDec, outDec, paidOut, rate, zatsLeft
   const out = (Number(paidOut) + rate * Number(zatsLeft)) / 10 ** outDec, inn = Number(amountIn) / 10 ** inDec; return 1 - out / inn;
 }
 
+/** 1139 I-1: the preview's total cost (what Confirm approves), on the SAME basis as the machine's projectedLoss: value in, `out` paid out (own decimals), nothing paid yet and no rate left to apply. */
+export const previewLoss = ({ value, out, inDec, outDec }) => projectedLoss({ amountIn: value, inDec, outDec, paidOut: out, rate: 0, zatsLeft: 0 });
+
 // ---------------------------------------------------------------- chain reads (M-1, M-4) and lightwalletd (M-2); all injectable in ctx
 // Public RPCs (and wallets in front of them) answer 429 / "client error" under load: retry with backoff before giving up.
 export let RPC_RETRY = { tries: 4, base: 1500 };
@@ -501,6 +504,7 @@ export async function runHop(ctx) {
       } else await go("DELAY", { delayUntil: Date.now() + delayMs(ctx.rand) });         // state of the old code: one out-leg
     },
     async DELAY() {
+      ctx.interactive = false;      // 1139 L-1: the user is not at the screen during the wait; only a quote fetched right after the click (or a Continue that starts at QUOTE_OUT) may open the dialog
       const at = () => partsOn() ? P().at : st.delayUntil, lbl = partsLabel(st);
       if (partsOn()) st.delayUntil = P().at;
       while (Date.now() < at()) { const left = at() - Date.now(); say((lbl ? lbl + ": waiting " : "Waiting ") + Math.ceil(left / 1000) + " s to break the timing link…"); await sleep(Math.min(left > 120_000 ? 10000 : 5000, left)); }
@@ -524,7 +528,7 @@ export async function runHop(ctx) {
       const rate = Number(info.amountOut) / Number(amount);
       // 1138 L-3 / C2 / I-1: pressing "Confirm private transfer" on the preview IS the approval of the preview's total cost (st.approvedLoss). Over the cap, a quote passes silently while its
       // projected loss stays within that approved figure + QUOTE_TOL. Beyond it: a run the user just started by clicking (ctx.interactive) shows the dialog; a timer-driven run (a DELAY that ended,
-      // an auto-retry) never opens a modal, it halts. A record with no approvedLoss (older build) follows the same rule, with its stored quoteRate as the only silent pass.
+      // an auto-retry) never opens a modal, it halts. DELAY clears ctx.interactive, so a click-started run that waited through a DELAY halts too. A record with no approvedLoss (older build) follows the same rule, with its stored quoteRate as the only silent pass.
       const approved = Number.isFinite(st.approvedLoss) ? st.approvedLoss : null;
       const silentOk = approved !== null ? loss <= approved + QUOTE_TOL : (st.quoteRate > 0 && rate >= st.quoteRate * (1 - QUOTE_TOL));
       if (!st.rebuilt && loss > cap && !silentOk) {
