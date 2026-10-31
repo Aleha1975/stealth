@@ -531,7 +531,7 @@ async function runHop(f, hit, o) {
   let h;
   if (o) h = { f, hit, running: true, msg: "", st: { step: "QUOTE_IN", chain: C.key, dest: o.dest.key, amount: o.amount.toString(), recipient: o.recipient, startedAt: Date.now() } };
   else { const r = await HM.findHop(ctx.store, f.stealth); if (!r) throw new Error("nothing to resume"); if (r.rec.st.chain !== C.key) throw new Error("This transfer belongs to " + (CHAINS[r.rec.st.chain] || {}).name + ": open the app on that chain to resume it."); ctx.chain = CHAINS[r.rec.st.chain]; ctx.dest = CHAINS[r.rec.st.dest]; h = { f, hit, running: true, msg: "", st: r.rec.st }; }
-  h.beatAt = Date.now(); hops.set(k, h); say("pay-hint", ""); renderHops(); render();
+  h.beatAt = h.sessionAt = Date.now(); hops.set(k, h); say("pay-hint", ""); renderHops(); render();
   const lock = await holdScreen();                                // a locked phone screen or a sleeping display freezes the tab and with it the transfer
   const run = () => (o ? HM.startHop(ctx) : HM.runHop(ctx));
   let st;

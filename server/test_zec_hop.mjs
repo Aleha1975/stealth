@@ -612,6 +612,18 @@ const tAddrOf = async (n, a, i = 0) => ZRm.deriveT(await H.mnemonicSeed(await H.
   const dl = C.hopView(mk("DELAY", { st: { delayUntil: now + 5 * M, stepAt: now - 5 * M } }), now).pct; C.resetLeft(); const dlStale = C.hopView(mk("DELAY", { beatAt: now - 5 * 60_000, st: { delayUntil: now + 5 * M, stepAt: now - 5 * M } }), now).pct; C.resetLeft();
   ok("progress: the delay's own timer counts only while the machine is alive (a silent tab does not creep forward)", dl > dlStale);
   const stuck = C.hopView(mk("SHIELD", { beatAt: now - 200_000 }), now); ok("progress: 'No update for N s' is kept for a silent run", /No update for 200 s/.test(stuck.note)); C.resetLeft(); }
+{ // 31.10 card: paid parts shown with explorer link; elapsed = this session, hours formatted
+  const C = await import("../web/hop-card.js"), now = 500_000_000, M = 60_000, H36 = 36 * 3600_000;
+  const mk = (o = {}, st = {}) => ({ st: { step: "DELAY", chain: "rh", dest: "base", amount: "10000000", recipient: A, stealth: STEALTH, startedAt: now - H36 - 5 * M, stepAt: now - 3 * M, partIdx: 1, parts: [{ status: "SUCCESS", quote: { amountOut: "4040448" } }, { status: null, at: now + M }], ...st }, running: true, msg: "", beatAt: now, ...o });
+  C.resetLeft(); const v = C.hopView(mk({ sessionAt: now - 7 * M }), now);
+  ok("card 31.10: a paid part shows its approximate amount and the recipient's explorer link", /≈ 4\.04 USDC|≈ 4\.04 /.test(v.paid) && /1 of 2/.test(v.paid) && v.paidLink && v.paidLink.href === "https://basescan.org/address/" + A, v.paid + " | " + JSON.stringify(v.paidLink));
+  ok("card 31.10: elapsed of a running session counts from the session start, not across a 36 h pause", v.elapsed === "7:00", v.elapsed);
+  C.resetLeft(); const v2 = C.hopView(mk({}), now); ok("card 31.10: without a session start it falls back to the step start (3 min), not the hop start", v2.elapsed === "3:00", v2.elapsed);
+  ok("card 31.10: fmtElapsed formats hours", C.fmtElapsed(36 * 3600_000 + 5 * M) === "36 h 05 min" && C.fmtElapsed(59 * M + 59_000) === "59:59" && C.fmtElapsed(65 * M) === "1 h 05 min");
+  C.resetLeft(); const v3 = C.hopView(mk({ running: false }, { step: "DONE", doneAt: now, outTotal: "8415106", parts: [{ status: "SUCCESS", quote: { amountOut: "4040448" } }, { status: "SUCCESS", quote: { amountOut: "4374658" } }] }), now);
+  ok("card 31.10: a finished hop links the recipient and states total time includes the pause", v3.paidLink && v3.paidLink.href.endsWith("/address/" + A) && /36 h/.test(v3.line) && /pause/.test(v3.line), v3.line);
+  C.resetLeft(); const v4 = C.hopView(mk({}, { parts: [{ status: null }, { status: null }] }), now); ok("card 31.10: no paid parts, no paid line", v4.paid === "" && v4.paidLink === null);
+  C.resetLeft(); }
 { // G: lost-record recovery
   const FOUND = 123_456n, W = {}; let calls = 0;
   const a02 = await tAddrOf(0, 2), a1 = await tAddrOf(1, 0), a40 = await tAddrOf(0, 4, 0);

@@ -17,7 +17,7 @@ const STEP_ORDER = ["QUOTE_IN", "DEPOSIT_IN", "WAIT_T", "SHIELD", "DELAY", "QUOT
 export const friendly = s => ({ SUCCESS: "done", REFUNDED: "refunded", FAILED: "failed" })[s] || "in progress";
 const short = a => a ? a.slice(0, 6) + "…" + a.slice(-4) : "";
 const amt = (v, dec) => (Number(v) / 10 ** dec).toFixed(2);
-export const fmtElapsed = ms => { const s = Math.max(0, Math.floor(ms / 1000)), m = Math.floor(s / 60); return m + ":" + String(s % 60).padStart(2, "0"); };
+export const fmtElapsed = ms => { const s = Math.max(0, Math.floor(ms / 1000)), m = Math.floor(s / 60); if (m >= 60) { const h = Math.floor(m / 60); return h + " h " + String(m % 60).padStart(2, "0") + " min"; } return m + ":" + String(s % 60).padStart(2, "0"); };   // under an hour m:ss, from an hour on "H h MM min"
 /** "27 min left" / "4:05 left" */
 export const fmtLeft = ms => ms >= 600_000 ? "≈ " + Math.ceil(ms / 60_000) + " min left" : fmtElapsed(Math.max(60_000, ms)) + " left";
 const LEFT = new Map();   // hop -> last shown remainder; keeps the countdown from jumping up (never +1 min between ticks, except when the step changes)
@@ -65,11 +65,17 @@ export function hopView(h, now = Date.now()) {
   const m = st.mode ? modeOf(st.mode) : null, delayWait = m ? (m.totalMax >= 60 ? "random, spread over " + m.totalMin / 60 + "–" + m.totalMax / 60 + " h" : m.totalMin + "–" + m.totalMax + " min, random") : "2–10 min, random";
   const ui = { ...ui0, name: ui0.name + (inParts ? " · " + pl : ""), line: ui0.line + (inParts ? " (" + pl + ")" : ""), wait: st.step === "DELAY" ? delayWait : ui0.wait };
   const v = { idx, total: STEP_UI.length, stepName: ui.name, amountLine: st.rebuilt ? (Number(st.zecFound || 0) / 1e8) + " ZEC (found on the chain)" + (st.recipient ? " → " + short(st.recipient) : "") : amt(st.amount, tok.decimals) + " " + tok.symbol + " → " + short(st.recipient),
-    left: "", pct: 0, what: "", elapsed: st.startedAt ? fmtElapsed((st.doneAt || now) - st.startedAt) : "", kind: "run", title: "Private transfer in progress", line: "", note: "", body: "", detail: "", action: null, link: null };
+    left: "", pct: 0, what: "", elapsed: st.doneAt && st.startedAt ? fmtElapsed(st.doneAt - st.startedAt) : (h.sessionAt || st.stepAt || st.startedAt) ? fmtElapsed(now - (h.sessionAt || st.stepAt || st.startedAt)) : "", paid: "", paidLink: null, kind: "run", title: "Private transfer in progress", line: "", note: "", body: "", detail: "", action: null, link: null };
+  const okParts = (Array.isArray(st.parts) ? st.parts : []).filter(p => p && p.status === "SUCCESS" && p.quote && p.quote.amountOut);      // payout parts that already arrived
+  if (okParts.length && st.step !== "DONE" && st.step !== "FAILED_IN") {
+    v.paid = "Already sent to the recipient: ≈ " + amt(okParts.reduce((a, p) => a + Number(p.quote.amountOut), 0), dtok.decimals) + " " + dtok.symbol + " (" + okParts.map(p => "≈ " + amt(p.quote.amountOut, dtok.decimals)).join(" + ") + ", " + okParts.length + " of " + st.parts.length + " payouts)";
+    if (st.recipient && dst.explorer) v.paidLink = { text: "Recipient " + short(st.recipient) + " on " + (dst.explorerName || "the explorer"), href: dst.explorer + "/address/" + st.recipient };
+  }
   if (st.step === "DONE") {
     const got = st.outTotal ? amt(st.outTotal, dtok.decimals) : st.outQuote ? amt(st.outQuote.amountOut, dtok.decimals) : amt(st.amount, tok.decimals), p = st.payoutTx;
     v.kind = "done"; v.pct = 100; v.title = "Sent privately: " + got + " " + dtok.symbol + " to " + short(st.recipient); v.amountLine = ""; v.idx = v.total;
-    v.line = "Total time " + v.elapsed + " (min:sec).";
+    v.line = "Total time " + v.elapsed + " (including any pause).";
+    if (st.recipient && dst.explorer) v.paidLink = { text: "Recipient " + short(st.recipient) + " on " + (dst.explorerName || "the explorer"), href: dst.explorer + "/address/" + st.recipient };
     if (p && p.hash) v.link = { text: "Payout tx " + p.hash.slice(0, 10) + "…", href: /^https:\/\//.test(p.url || "") ? p.url : (dst.explorer || "") + "/tx/" + p.hash };
   } else if (st.step === "FAILED_IN") {
     v.kind = "warn"; v.title = "Swap refunded"; v.body = "Your " + amt(st.amount, tok.decimals) + " " + tok.symbol + " should be back on the stealth address (minus a small refund fee): check the balance. Nothing was sent.";
@@ -114,7 +120,9 @@ export function hopCard(h, cb = {}, now = Date.now()) {
   if (v.note) card.appendChild(el("div", "note hop-stale", v.note));
   if (v.body) card.appendChild(el("div", "hop-line", v.body));
   if (v.link) { const a = el("a", "hop-link", v.link.text); a.href = v.link.href; a.target = "_blank"; a.rel = "noopener noreferrer"; card.appendChild(a); }
-  if (h.running) card.appendChild(el("div", "note hop-foot", "Keep this tab open · " + v.elapsed + " elapsed"));
+  if (v.paid) card.appendChild(el("div", "hop-line hop-paid", v.paid));
+  if (v.paidLink) { const a = el("a", "hop-link hop-paidlink", v.paidLink.text); a.href = v.paidLink.href; a.target = "_blank"; a.rel = "noopener noreferrer"; card.appendChild(a); }
+  if (h.running) card.appendChild(el("div", "note hop-foot", "Keep this tab open · running for " + v.elapsed + " in this session"));
   if (v.detail) { const d = el("details", "hop-det"); d.appendChild(el("summary", null, "details")); d.appendChild(el("div", "note", v.detail)); card.appendChild(d); }
   const acts = el("div", "row hop-act");
   const btn = (txt, cls, fn) => { const b = el("button", "btn " + cls, txt); b.type = "button"; b.addEventListener("click", () => fn(b)); acts.appendChild(b); };
