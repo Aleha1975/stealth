@@ -207,8 +207,8 @@ const patchSend = (w, fn) => { const orig = w.Zjs.WebWallet.prototype.send_autho
     if (q.length < 2 || q.length > 3 || q[q.length - 1].at < 8 * 60_000 || q[q.length - 1].at > 15 * 60_000 || !asc(q) || q[0].at < 60_000) privOk = false; }
   let maxOk = true;
   for (let sd = 1; sd <= 300; sd++) { const m = H.planParts({ orchard: 50_000_000n, rand: mulberry(sd + 77), now: 0 }); const asc = m.every((x, i) => i === 0 || x.at > m[i - 1].at);
-    if (m.length !== 2 || m[1].at < 5 * 60_000 || m[1].at > 12 * 60_000 || m[0].at > 6 * 60_000 || !asc) maxOk = false; }
-  ok("owner 30.10 max mode (the default): exactly 2 payouts, last send 5..12 min, first within 6 min, ascending", maxOk && H.DEFAULT_MODE === "max" && H.newState({ stealth: STEALTH, chain: rh, dest: base, recipient: A, amount: 1n }).mode === "max");
+    if (m.length !== 2 || m[1].at < 2 * 60_000 || m[1].at > 6 * 60_000 || m[0].at > 2 * 60_000 || !asc) maxOk = false; }
+  ok("owner 31.10 max mode (the default): exactly 2 payouts, last send 2..6 min, first within 2 min, ascending", maxOk && H.DEFAULT_MODE === "max" && H.newState({ stealth: STEALTH, chain: rh, dest: base, recipient: A, amount: 1n }).mode === "max");
   ok("max ETA is computed from the constants (measured sync time included, 30.10): 30-40 min; old modes still readable", (e => e[0] >= 30 && e[1] <= 40 && e[0] <= e[1])(H.etaRangeMin("max")) && H.modeOf("fast").kMax === 2 && H.modeOf("private").kMax === 3 && H.MODES.max.kMax === 2 && H.accountsFor("private") === 7);
   ok("H1 modes: fast = 1..2 parts, last send 3..10 min; private = 2..3 parts, last send 8..15 min, ascending own times", fastOk && privOk);
   ok("H1 plan: parts get distinct fields (own delay, no quote yet)", (p => new Set(p.map(x => x.at)).size === p.length && p.every(x => x.quote === null && x.refundAcct === null))(H.planParts({ orchard: 50_000_000n, mode: "private", rand: mulberry(7), now: 0 }))); }
@@ -239,7 +239,7 @@ const patchSend = (w, fn) => { const orig = w.Zjs.WebWallet.prototype.send_autho
     && H.remainingMs({ step: "DELAY", mode: "private", partIdx: 0, parts, delayUntil: now - 1, stepAt: now }, now) === 7200_000 + send);
   ok("H1 ETA: private plan not made yet is longer than fast and within 1 h; legacy state unchanged", H.remainingMs({ step: "QUOTE_IN", mode: "private", stepAt: now }, now) > H.remainingMs({ step: "QUOTE_IN", mode: "fast", stepAt: now }, now) && H.remainingMs({ step: "QUOTE_IN", mode: "private", stepAt: now }, now) <= 60 * M && H.remainingMs({ step: "QUOTE_IN", mode: "fast", stepAt: now }, now) < 50 * M
     && Math.abs(H.remainingMs({ step: "QUOTE_IN", stepAt: now }, now) - (M + (Object.values(S).reduce((a, b) => a + b, 0) - S.QUOTE_IN * 1) * M)) < 1);
-  ok("H1 labels: ETA text per mode, progress text with 'payout 2 of 3'", H.etaLabel("max") === "31–35 min" && H.etaLabel("fast") === "23–34 min" && H.etaLabel("private") === "33–42 min"
+  ok("H1 labels: ETA text per mode, progress text with 'payout 2 of 3'", H.etaLabel("max") === "30–31 min" && H.etaLabel("fast") === "23–34 min" && H.etaLabel("private") === "33–42 min"
     && /\(payout 2 of 3\)/.test(H.progressText({ step: "DELAY", mode: "private", partIdx: 1, parts: [{}, {}, {}] })) && H.progressText({ step: "WAIT_T" }) === "Private transfer: step 3/7 · keep this tab open · ~" + H.ETA_MIN + " min");
   const C = await import("../web/hop-card.js"); C.resetLeft();
   const v = C.hopView({ running: true, msg: "", st: { step: "SEND_OUT", chain: "rh", dest: "base", amount: "5000000", recipient: A, stealth: STEALTH, startedAt: now - 3600_000, stepAt: now, mode: "private", partIdx: 1, parts: [{}, { at: now }, { at: now + 1 }] } }, now);
