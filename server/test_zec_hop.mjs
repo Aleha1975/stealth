@@ -935,6 +935,13 @@ const tAddrOf = async (n, a, i = 0) => ZRm.deriveT(await H.mnemonicSeed(await H.
     C.resetLeft(); const d = C.hopView(mk("DONE", { running: false }, { doneAt: now, outTotal: "8415106" }), now); ok("31.10 J6: DONE shows 100% only on the DONE step", d.kind === "done" && d.pct === 100);
     const real = [C.realProgress({ step: "SEND_OUT", parts: [{}, {}], partIdx: 0 }), C.realProgress({ step: "DELAY", parts: [{}, {}], partIdx: 1 }), C.realProgress({ step: "WAIT_SWAPS", parts: [{}, {}], partIdx: 1 }), C.realProgress({ step: "WAIT_SWAPS", parts: [{ status: "SUCCESS" }, { status: "SUCCESS" }], partIdx: 1 })];
     ok("31.10 J7: realProgress is monotone along send, next delay, wait for swaps and caps at 99", real.every((x, i) => i === 0 || x >= real[i - 1]) && real[3] <= 99, real.join()); }
+  { const C = await import("../web/hop-card.js"), q = n => ({ amountOut: String(n) }), tx = h => ({ hash: h, url: "https://x/tx/" + h }), base = { step: "DONE", stealth: "0x1", n: 0, chain: "rh", dest: "rh", recipient: "0xD364DB3bf6b681D5aBD23E809D8BbfB26872a500", amount: "9940000", outTotal: "8759715", startedAt: 1000, doneAt: 1000 + 2403000 };
+    const v2 = C.hopView({ st: { ...base, payoutTx: tx("0xaaaaaaaaaaaa"), parts: [{ status: "SUCCESS", quote: q(3255853), payoutTx: tx("0xaaaaaaaaaaaa") }, { status: "SUCCESS", quote: q(5503862), payoutTx: tx("0xbbbbbbbbbbbb") }] } }, Date.now());
+    ok("31.10 K1: the finished card shows sent, received, cost and one row per payout with its own tx", /^Sent 9\.94 USDG · received 8\.76 USDG · cost 1\.18 USDG \(11\.9%\)$/.test(v2.sum) && v2.payouts.length === 2 && /^Payout 2: /.test(v2.payouts[1].text) && v2.payouts[1].href.endsWith("0xbbbbbbbbbbbb") && !v2.link, JSON.stringify(v2));
+    const v1 = C.hopView({ st: { ...base, payoutTx: tx("0xcccccccccccc"), parts: [{ status: "SUCCESS", quote: q(8759715), payoutTx: tx("0xcccccccccccc") }] } }, Date.now());
+    ok("31.10 K2: one payout keeps the single tx link", v1.payouts.length === 1 && v1.link && /0xcccccccc/.test(v1.link.text), JSON.stringify(v1));
+    const v0 = C.hopView({ st: { ...base, rebuilt: true } }, Date.now());
+    ok("31.10 K3: a transfer rebuilt from the chain states no cost", !v0.sum, JSON.stringify(v0)); }
   ok("31.10 no unhandled rejection in any of the runs above", unh === 0, String(unh));
 }
 Date.now = realNow;

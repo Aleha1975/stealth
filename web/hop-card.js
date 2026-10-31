@@ -96,9 +96,13 @@ export function hopView(h, now = Date.now()) {
   if (st.step === "DONE") {
     const got = st.outTotal ? amt(st.outTotal, dtok.decimals) : st.outQuote ? amt(st.outQuote.amountOut, dtok.decimals) : amt(st.amount, tok.decimals), p = st.payoutTx;
     v.kind = "done"; v.pct = 100; v.title = "Sent privately: " + got + " " + dtok.symbol + " to " + short(st.recipient); v.amountLine = ""; v.idx = v.total;
+    const outN = Number(st.outTotal || (st.outQuote && st.outQuote.amountOut) || 0) / 10 ** dtok.decimals, inN = Number(st.amount || 0) / 10 ** tok.decimals;
+    if (outN && inN && !st.rebuilt) v.sum = "Sent " + amt(st.amount, tok.decimals) + " " + tok.symbol + " · received " + got + " " + dtok.symbol + " · cost " + (inN - outN).toFixed(2) + " " + dtok.symbol + " (" + ((inN - outN) / inN * 100).toFixed(1) + "%)";
     v.line = "Total time " + v.elapsed + " (including any pause).";
+    const txUrl = x => /^https:\/\//.test(x.url || "") ? x.url : (dst.explorer || "") + "/tx/" + x.hash;
+    v.payouts = (Array.isArray(st.parts) ? st.parts : []).filter(x => x && x.status === "SUCCESS" && x.quote && x.payoutTx && x.payoutTx.hash).map((x, i) => ({ text: "Payout " + (i + 1) + ": " + amt(x.quote.amountOut, dtok.decimals) + " " + dtok.symbol + " · tx " + x.payoutTx.hash.slice(0, 10) + "…", href: txUrl(x.payoutTx) }));
     if (st.recipient && dst.explorer) v.paidLink = { text: "Recipient " + short(st.recipient) + " on " + (dst.explorerName || "the explorer"), href: dst.explorer + "/address/" + st.recipient };
-    if (p && p.hash) v.link = { text: "Payout tx " + p.hash.slice(0, 10) + "…", href: /^https:\/\//.test(p.url || "") ? p.url : (dst.explorer || "") + "/tx/" + p.hash };
+    if (p && p.hash && v.payouts.length < 2) v.link = { text: "Payout tx " + p.hash.slice(0, 10) + "…", href: txUrl(p) };
   } else if (st.step === "FAILED_IN") {
     v.kind = "warn"; v.title = "Swap refunded"; v.body = "Your " + amt(st.amount, tok.decimals) + " " + tok.symbol + " should be back on the stealth address (minus a small refund fee): check the balance. Nothing was sent.";
     v.detail = "First swap ended as " + (st.result || "unknown") + "." + (st.inDeposit ? " Deposit address " + st.inDeposit + (st.txIn ? ", transaction " + st.txIn : "") + "." : "");
@@ -139,7 +143,9 @@ export function hopCard(h, cb = {}, now = Date.now()) {
     card.appendChild(bar);
     if (v.kind !== "done") card.appendChild(el("div", "hop-step", "Step " + (v.idx + 1) + " of " + v.total + " · " + v.stepName));
   }
+  if (v.sum) card.appendChild(el("div", "hop-line", v.sum));
   if (v.line) card.appendChild(el("div", "hop-line", v.line));
+  if (v.payouts && v.payouts.length > 1) for (const r of v.payouts) { const a = el("a", "hop-link hop-payout", r.text); a.href = r.href; a.target = "_blank"; a.rel = "noopener noreferrer"; card.appendChild(a); }
   if (v.note) card.appendChild(el("div", "note hop-stale", v.note));
   if (v.body) card.appendChild(el("div", "hop-line", v.body));
   if (v.link) { const a = el("a", "hop-link", v.link.text); a.href = v.link.href; a.target = "_blank"; a.rel = "noopener noreferrer"; card.appendChild(a); }
