@@ -356,4 +356,12 @@ const PRIV = new Uint8Array(32).fill(9), ACC = addressFromPriv(PRIV), A2 = "0x" 
 }
 { const app = fs.readFileSync(new URL("../web/app.js", import.meta.url), "utf8");
   t("the private route preview warns when the fee is above the loss cap, and the confirmation comes before the payout", /Number\(fee\) \/ Number\(value\) > HM\.MAX_LOSS/.test(app) && /Private fast is cheaper below that/.test(app)); }
+{ const app = fs.readFileSync(new URL("../web/app.js", import.meta.url), "utf8"), blk = app.slice(app.indexOf("// LOSTDONE-BEGIN"), app.indexOf("// LOSTDONE-END")), L = new Function(blk + "; return { lostDone, lostSay };")();
+  const fin = app.slice(app.indexOf("async function finishSweep"), app.indexOf("// A transfer from the first version"));
+  L.lostSay("0xabc", "Done: \u2248 5.69 USDG sent to your wallet.", true);
+  t("lost Return: the result is kept in lostDone under the address, apart from the lost card (lostForget does not touch it)", L.lostDone.get("0xabc").text.startsWith("Done: \u2248 5.69") && L.lostDone.get("0xabc").ok === true && !/lostDone/.test(app.slice(app.indexOf("const lostForget"), app.indexOf("const zecText"))));
+  t("lost Return: finishSweep stores the final text (SUCCESS or a non-SUCCESS swap status) BEFORE the card is forgotten and the rescan runs", fin.indexOf("lostSay(h.lost, doneText") > 0 && fin.indexOf("lostSay(h.lost, doneText") < fin.indexOf("lostForget(h.lost)") && /Swap ended as " \+ fin\.status/.test(fin));
+  t("lost Return: every renderHops draws the kept results with a Dismiss that removes only that one; the box stays visible for them", /for \(const \[k, d\] of lostDone\)[^\n]*lostDone\.delete\(k\)/.test(app) && /box\.hidden = !hops\.size && !lost\.size && !lostDone\.size/.test(app));
+  t("lost Return: only the user's Scan clears the results (not checkLost / the background rescan after a Return)", /async function scan\(\) \{[^\n]*\n[^\n]*\n\s*if \(lostDone\.size\) \{ lostDone\.clear\(\)/.test(app) && (app.match(/lostDone\.clear\(\)/g) || []).length === 1);
+}
 console.log(fail ? "FAILED " + fail : "all passed"); process.exit(fail ? 1 : 0);

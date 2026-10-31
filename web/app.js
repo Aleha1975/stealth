@@ -152,6 +152,7 @@ const pendingWd = { _m() { let s = {}; try { s = JSON.parse(localStorage.getItem
 const spent = new Map();   // stealth -> { left, until }
 async function scan() {
   if (!keys) { say("pay-hint", "Derive your keys first (Receive tab).", "bad"); return; }
+  if (lostDone.size) { lostDone.clear(); renderHops(); }      // a new Scan retires the old results
   const head = await api("/head");
   if (head.lag != null && head.lag > 50) say("pay-hint", "Index is " + head.lag + " blocks behind the chain; very recent payments may not show yet.", "warn");
   else say("pay-hint", "Reading announcements on " + C.name + "…");
@@ -219,7 +220,8 @@ function renderHops() {
     onFunds: b => { b.disabled = true; runHop(h.f, h.hit, null).catch(e => say("pay-hint", e.message || String(e), "bad")); }, onDismiss: () => { hops.delete(k); renderHops(); },
     onReturn: (b, card) => { b.disabled = true; returnZec(h, card).catch(e => { b.disabled = false; say("pay-hint", e.message || String(e), "bad"); }); } }));
   for (const [k, l] of lost) if (!hops.has(k)) box.appendChild(lostCard(k, l));
-  box.hidden = !hops.size && !lost.size;
+  for (const [k, d] of lostDone) { const c = el("div", "hop " + (d.ok ? "ok" : "warn")), b = el("button", "btn ghost", "Dismiss"); b.type = "button"; b.addEventListener("click", () => { lostDone.delete(k); renderHops(); }); c.appendChild(el("div", "hop-line", d.text)); const a = el("div", "row hop-act"); a.appendChild(b); c.appendChild(a); box.appendChild(c); }      // the result of a Return on a lost wallet outlives its card and every redraw
+  box.hidden = !hops.size && !lost.size && !lostDone.size;
 }
 // ---- 1130 G: a private transfer whose record this browser lost (cleared storage, another device). The hop seed is a function of the stealth key, so after Scan the hop t-addresses of a payment that now holds nothing
 // (and has no local record) are asked for UTXOs: one cheap call each, no wallet sync, rate limited. A finding becomes a card with Return money / Continue; shielded ZEC needs a wallet sync, so it has its own button.
@@ -227,6 +229,9 @@ const lost = new Map(), lostBusy = { v: false }, LOST_CHECK_KEY = "stealth-lost-
 const lostSeen = { read() { try { const o = JSON.parse(localStorage.getItem(LOST_CHECK_KEY) || "{}"); return o && typeof o === "object" ? o : {}; } catch { return {}; } },
   fresh(k) { return Date.now() - (Number(this.read()[k]) || 0) < LOST_RECHECK_MS; }, unmark(k) { const o = this.read(); delete o[k]; try { localStorage.setItem(LOST_CHECK_KEY, JSON.stringify(o)); } catch {} }, mark(k) { const o = this.read(); o[k] = Date.now(); const ks = Object.keys(o); if (ks.length > 500) for (const x of ks.slice(0, ks.length - 500)) delete o[x]; try { localStorage.setItem(LOST_CHECK_KEY, JSON.stringify(o)); } catch {} } };
 const lostNone = new Map();      // payments checked on the chain with nothing found -> the range looked at; they get the explicit "Check shielded balance" button
+// LOSTDONE-BEGIN: the final line of a Return money on a lost wallet (k = stealth address). The card it was written on goes with lostForget and every rescan, so it is kept here until Dismiss or the next Scan
+const lostDone = new Map(), lostSay = (k, text, ok) => { lostDone.set(k, { text, ok: !!ok }); };
+// LOSTDONE-END
 const lostForget = k => { lost.delete(k); lostNone.delete(k); lostSeen.unmark(k); };
 const zecText = z => (Number(z) / 1e8).toFixed(8).replace(/0+$/, "").replace(/\.$/, "");
 // 1136 F-2: the range of hop wallets looked at is always said (1-based), with what was NOT looked at when the cap cut it
@@ -353,7 +358,7 @@ async function returnZec(h, card) {
       if (!sp.ended) return await finishSweep(HM, h, step, { txid: sp.txid, deposit: sp.deposit, amountOut: sp.amountOut });
       if (sp.ended !== "SUCCESS" && Date.now() - (sp.endedAt || 0) < 3600_000) { step("The swap ended as " + sp.ended + ". The refund is on its way back to the hop address: press Return money again in a few minutes."); return; }
     }
-    if (h.lost) { lostForget(h.lost); step("Nothing is listed on the transparent addresses now (moved already, or the server is behind). Scan checks again; the shielded balance has its own button."); return; }      // no record to count empty observations in: the card just goes, and is found again if the ZEC is still there
+    if (h.lost) { const t = "Nothing is listed on the transparent addresses now (moved already, or the server is behind). Scan checks again; the shielded balance has its own button."; lostSay(h.lost, t, false); lostForget(h.lost); step(t); renderHops(); return; }      // no record to count empty observations in: the card just goes, and is found again if the ZEC is still there
     step("Checking the shielded balance…");
     const r = await HM.findHop(HM.idbStore(), h.f.stealth), left = await HM.hopSummary(await hopCtx(HM, h.f, h.hit, null), r && r.rec);
     if (HM.holdsZec(left)) throw new Error("ZEC is still in the shielded pool. Press Continue transfer.");
@@ -402,7 +407,8 @@ async function finishSweep(HM, h, step, sw) {
   const fin = await PW.pollStatus({ depositAddress: sw.deposit, timeoutMs: 60 * 60_000, intervalMs: 10_000, onUpdate: s => step("Returning · " + s.status.toLowerCase().replace(/_/g, " ") + " · usually 10–20 min" + note) });
   await underHopLock(h.f.stealth, async () => { const cur = sweepIntents.get(h); if (!cur || cur.txid === sw.txid) sweepIntents.set(h, { ...sw, ended: fin.status, endedAt: Date.now() }); }).catch(() => {});      // 1137 L-1 / 1110 L-1: every end settles the intent (SUCCESS too, so a later Return round sweeps instead of replaying "Done")
   const sh = h.lost && lost.get(h.lost) && lost.get(h.lost).shielded;      // 1137 L-2: a shielded finding is dropped with the card, so the Done text says it may remain
-  step(fin.status === "SUCCESS" ? "Done: ≈ " + (Number(sw.amountOut) / 1e6).toFixed(2) + " " + SYM + " sent to your wallet." + (sh ? " Shielded ZEC was found on this wallet earlier and may remain: press Check shielded balance." : "") : "Swap ended as " + fin.status + ". The ZEC is back on the hop address; press Return money again.");
+  const doneText = fin.status === "SUCCESS" ? "Done: ≈ " + (Number(sw.amountOut) / 1e6).toFixed(2) + " " + SYM + " sent to your wallet." + (sh ? " Shielded ZEC was found on this wallet earlier and may remain: press Check shielded balance." : "") : "Swap ended as " + fin.status + ". The ZEC is back on the hop address; press Return money again.";
+  step(doneText); if (h.lost) { lostSay(h.lost, doneText, fin.status === "SUCCESS"); renderHops(); }      // kept on its own card: the lost card is redrawn or removed below
   if (fin.status === "SUCCESS" && h.lost) { lostForget(h.lost); checkLost().catch(() => {}); }      // a lost wallet has no card to keep: it is looked for again, and any other wallet of this address shows up with its own Return
   else if (fin.status === "SUCCESS") {      // 1122 L-3: the transparent return worked, but the card goes away only when the hop wallet holds nothing at all (shielded ZEC included); a failed check keeps the card
     let left = null; try { const r = await HM.findHop(HM.idbStore(), h.f.stealth); left = await HM.hopSummary(await hopCtx(HM, h.f, h.hit, null), r && r.rec); } catch {}
