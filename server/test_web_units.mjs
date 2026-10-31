@@ -354,4 +354,6 @@ const PRIV = new Uint8Array(32).fill(9), ACC = addressFromPriv(PRIV), A2 = "0x" 
   const rf = app.slice(app.indexOf("async function resumeFast"), app.indexOf("// ---- unfinished hops")), fw = app.slice(app.indexOf("async function fastWithdraw"), app.indexOf("async function resumeFast"));
   t("1135 L-4: resumeFast without an account keeps the record (no note, no delete) and follows it again when setAcct gets one; a withdraw's notes belong to the account that started it; Abandon needs an account", /if \(!acct\) \{ extra\.push\(text\); fastDeferred = true; continue; \}/.test(rf) && /fastDeferred\) \{ fastDeferred = false; resumeFast\(\)/.test(app) && /const owner = acct/.test(fw) && !/, acct\)/.test(fw) && /if \(!acct\) \{ say\("pay-hint", "Connect your wallet first/.test(app));
 }
+{ const app = fs.readFileSync(new URL("../web/app.js", import.meta.url), "utf8");
+  t("the private route preview warns when the fee is above the loss cap, and the confirmation comes before the payout", /Number\(fee\) \/ Number\(value\) > HM\.MAX_LOSS/.test(app) && /Private fast is cheaper below that/.test(app)); }
 console.log(fail ? "FAILED " + fail : "all passed"); process.exit(fail ? 1 : 0);
