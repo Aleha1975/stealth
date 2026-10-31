@@ -209,7 +209,7 @@ const patchSend = (w, fn) => { const orig = w.Zjs.WebWallet.prototype.send_autho
   for (let sd = 1; sd <= 300; sd++) { const m = H.planParts({ orchard: 50_000_000n, rand: mulberry(sd + 77), now: 0 }); const asc = m.every((x, i) => i === 0 || x.at > m[i - 1].at);
     if (m.length !== 2 || m[1].at < 2 * 60_000 || m[1].at > 6 * 60_000 || m[0].at > 2 * 60_000 || !asc) maxOk = false; }
   ok("owner 31.10 max mode (the default): exactly 2 payouts, last send 2..6 min, first within 2 min, ascending", maxOk && H.DEFAULT_MODE === "max" && H.newState({ stealth: STEALTH, chain: rh, dest: base, recipient: A, amount: 1n }).mode === "max");
-  ok("max ETA is computed from the constants (measured sync time included, 30.10): 30-40 min; old modes still readable", (e => e[0] >= 30 && e[1] <= 40 && e[0] <= e[1])(H.etaRangeMin("max")) && H.modeOf("fast").kMax === 2 && H.modeOf("private").kMax === 3 && H.MODES.max.kMax === 2 && H.accountsFor("private") === 7);
+  ok("max ETA is the measured range of the mainnet runs (31.10), within the owner's 40 min; old modes still readable", (e => e[0] === 25 && e[1] === 40)(H.etaRangeMin("max")) && H.modeOf("fast").kMax === 2 && H.modeOf("private").kMax === 3 && H.MODES.max.kMax === 2 && H.accountsFor("private") === 7);
   ok("H1 modes: fast = 1..2 parts, last send 3..10 min; private = 2..3 parts, last send 8..15 min, ascending own times", fastOk && privOk);
   ok("H1 plan: parts get distinct fields (own delay, no quote yet)", (p => new Set(p.map(x => x.at)).size === p.length && p.every(x => x.quote === null && x.refundAcct === null))(H.planParts({ orchard: 50_000_000n, mode: "private", rand: mulberry(7), now: 0 }))); }
 { const w = makeWorld(), s = H.memStore(); off = 0; const msgs = [], t0 = Date.now(); const st = await H.startHop(mkCtx(w, s, { mode: "private", rand: mulberry(42), onProgress: (x, m) => msgs.push(m) })); const rec = await latest(s), P = rec.st.parts, o = outQuotes(w);
@@ -239,7 +239,7 @@ const patchSend = (w, fn) => { const orig = w.Zjs.WebWallet.prototype.send_autho
     && H.remainingMs({ step: "DELAY", mode: "private", partIdx: 0, parts, delayUntil: now - 1, stepAt: now }, now) === 7200_000 + send);
   ok("H1 ETA: private plan not made yet is longer than fast and within 1 h; legacy state unchanged", H.remainingMs({ step: "QUOTE_IN", mode: "private", stepAt: now }, now) > H.remainingMs({ step: "QUOTE_IN", mode: "fast", stepAt: now }, now) && H.remainingMs({ step: "QUOTE_IN", mode: "private", stepAt: now }, now) <= 60 * M && H.remainingMs({ step: "QUOTE_IN", mode: "fast", stepAt: now }, now) < 50 * M
     && Math.abs(H.remainingMs({ step: "QUOTE_IN", stepAt: now }, now) - (M + (Object.values(S).reduce((a, b) => a + b, 0) - S.QUOTE_IN * 1) * M)) < 1);
-  ok("H1 labels: ETA text per mode, progress text with 'payout 2 of 3'", H.etaLabel("max") === "30–31 min" && H.etaLabel("fast") === "23–34 min" && H.etaLabel("private") === "33–42 min"
+  ok("H1 labels: ETA text per mode, progress text with 'payout 2 of 3'", H.etaLabel("max") === "25–40 min" && H.etaLabel("fast") === "23–34 min" && H.etaLabel("private") === "33–42 min"
     && /\(payout 2 of 3\)/.test(H.progressText({ step: "DELAY", mode: "private", partIdx: 1, parts: [{}, {}, {}] })) && H.progressText({ step: "WAIT_T" }) === "Private transfer: step 3/7 · keep this tab open · ~" + H.ETA_MIN + " min");
   const C = await import("../web/hop-card.js"); C.resetLeft();
   const v = C.hopView({ running: true, msg: "", st: { step: "SEND_OUT", chain: "rh", dest: "base", amount: "5000000", recipient: A, stealth: STEALTH, startedAt: now - 3600_000, stepAt: now, mode: "private", partIdx: 1, parts: [{}, { at: now }, { at: now + 1 }] } }, now);
@@ -611,7 +611,7 @@ const tAddrOf = async (n, a, i = 0) => ZRm.deriveT(await H.mnemonicSeed(await H.
 { // E: F-2 honest text, F-3 ETA, I-2 dust, I-3 preview
   const src = fs.readFileSync(path.join(WEB, "app.js"), "utf8");
   ok("1129 F-2 the max route note no longer promises random times for both payouts", /one after the other/.test(src) && !/paid out in 2 parts at random times/.test(src));
-  ok("30.10 ETA from the measured sync time (SYNC_MIN 0.1): the max route is 30-40 min, the owner's limit", H.etaRangeMin("max")[0] >= 30 && H.etaRangeMin("max")[1] <= 40);
+  ok("31.10 the max route label stays within the owner's limit of 40 min", H.etaRangeMin("max")[1] <= 40);
   ok("1129 I-2 dust below the fee floor does not count as ZEC held; a real amount does", !H.holdsZec([{ transparent: 3000n, orchard: 5000n }]) && H.holdsZec([{ transparent: 0n, orchard: H.HOLD_DUST }]) && H.HOLD_DUST === 10_000n);
   const zec = 600_000n; ok("1129 I-3 preview out-amount reserves one fee per payout part (max = 2 parts)", H.previewOut(zec) === H.outAmount(zec - H.SHIELD_FEE) - 20000n && H.previewOut(zec, "fast") === H.outAmount(zec - H.SHIELD_FEE) - 20000n && H.previewOut(zec, "private") < H.previewOut(zec)); }
 { // fewer syncs: QUOTE_OUT and the plan reuse the balance just read

@@ -23,8 +23,9 @@ export const ETA_MIN = Math.round(Object.values(STEP_MIN).reduce((a, b) => a + b
  *  near-constant, so an observer who can see both legs can still match on sum and time window, especially with few concurrent users.
  *  max = 2 parts planned at 2..6 min after the shield (owner 31.10; was 5..12). 1129 F-2: the parts run strictly one after the other (a send takes ~8 min plus the wallet sync before its quote), so in practice the second payout
  *  follows the first as soon as that one has ended: the planned time of part 2 only matters when it is later than that. The screen says so (ROUTE_NOTE); the gap between the payouts is not randomised by the plan.
+ *  measured: the label shown for max. Three mainnet runs took 23:09, 25:57 and 36:07 (31.10), and most of the spread is the wait for the first payout's change, which the step constants cannot predict.
  *  fast / private are the OLD modes (up to 47 / 60 min): no longer offered, kept so that a saved hop of those modes resumes with its own plan. totalMin/totalMax: minutes from "shielded" to the LAST part's send time. */
-export const MODES = { max: { kMin: 2, kMax: 2, totalMin: 2, totalMax: 6, firstMax: 2 }, fast: { kMin: 1, kMax: 2, totalMin: 3, totalMax: 10 }, private: { kMin: 2, kMax: 3, totalMin: 8, totalMax: 15 } };
+export const MODES = { max: { kMin: 2, kMax: 2, totalMin: 2, totalMax: 6, firstMax: 2, measured: [25, 40] }, fast: { kMin: 1, kMax: 2, totalMin: 3, totalMax: 10 }, private: { kMin: 2, kMax: 3, totalMin: 8, totalMax: 15 } };
 export const DEFAULT_MODE = "max";
 export const modeOf = m => MODES[m] || MODES[DEFAULT_MODE];
 export const accountsFor = mode => 1 + modeOf(mode).kMax * PART_TRIES;            // account 0 holds the shielded funds, every part attempt gets a fresh refund account
@@ -41,7 +42,7 @@ const payoutMin = (m, k, total) => { const send = STEP_MIN.QUOTE_OUT + STEP_MIN.
 /** 1129 I-3: what the preview asks the out-leg quote about: the shielded ZEC minus the shield fee and one fee reserve PER payout part (max mode pays kMax parts, each keeps its own reserve). */
 export const previewOut = (zec, mode = DEFAULT_MODE) => outAmount(zec - SHIELD_FEE - RESERVE * BigInt(modeOf(mode).kMax - 1));
 /** [low, high] minutes for the whole private transfer of a mode (steps before the delay + payout of kMin parts over totalMin / of kMax parts over totalMax). */
-export const etaRangeMin = mode => { const m = modeOf(mode); return [Math.round(BASE_MIN + payoutMin(m, m.kMin, m.totalMin)), Math.round(BASE_MIN + payoutMin(m, m.kMax, m.totalMax))]; };
+export const etaRangeMin = mode => { const m = modeOf(mode); if (m.measured) return m.measured; return [Math.round(BASE_MIN + payoutMin(m, m.kMin, m.totalMin)), Math.round(BASE_MIN + payoutMin(m, m.kMax, m.totalMax))]; };
 export const etaLabel = mode => { const [a, b] = etaRangeMin(mode), h = x => (x / 60).toFixed(1).replace(/\.0$/, ""); return b < 120 ? a + "–" + b + " min" : a < 120 ? a + " min–" + h(b) + " h" : h(a) + "–" + h(b) + " h"; };
 /** Time left for an unfinished hop, in ms: rest of the current step (min 1 min) + typical time of the later steps. DELAY uses its exact end; with payout parts the parts are simulated one after the other
  *  (each waits for its own time, then needs a quote and a send). Never below 1 min while unfinished, 0 once finished. */
