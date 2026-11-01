@@ -952,6 +952,11 @@ const tAddrOf = async (n, a, i = 0) => ZRm.deriveT(await H.mnemonicSeed(await H.
     ok("1145 L-3: underpriced, full pool and a lagging balance do not give the saved bytes up; a fee refusal does", bad("replacement transaction underpriced") && bad("txpool is full") && bad("insufficient funds for gas") && !bad("max fee per gas less than block base fee"));
     const v = C.hopView({ st: { step: "SHIELD", stealth: "0x2", n: 0, chain: "rh", dest: "rh", recipient: "0xD364DB3bf6b681D5aBD23E809D8BbfB26872a500", amount: "1000000", startedAt: 1, stepAt: 1, err: "stop", halted: true }, running: false }, Date.now());
     ok("1145 L-1: the paused card keeps its progress", v.pct > 0, String(v.pct)); }
+  { const E = await import("../web/eth-send.js"), r = (bal, gp = 1000n) => async m => m === "eth_getBalance" ? "0x" + bal.toString(16) : m === "eth_getTransactionCount" ? "0x0" : m === "eth_estimateGas" ? "0x5208" : "0x" + gp.toString(16);
+    const priv = "0x" + "11".repeat(32), go = (bal, value, gp) => E.prepareSend(r(bal, gp), { priv, chainId: 4663, from: "0x" + "22".repeat(20), to: "0x" + "33".repeat(20), value }), fee = 26250n * 2000n, v = 10n ** 15n;
+    const full = await go(v + fee, v), cut = await go(v + fee - 1n, v), least = await go(v + 26250n * 1000n, v);
+    let short = null; try { await go(v + 26250n * 1000n - 1n, v); } catch (e) { short = e; }
+    ok("01.11 live: a fixed amount with slightly less room than the worst-case fee is still signed; the margin gives way down to the node's price, and below it the send is refused", String(full.gasPrice) === "2000" && String(cut.gasPrice) === "1999" && String(least.gasPrice) === "1000" && short && short.short === true, [full.gasPrice, cut.gasPrice, least.gasPrice].join()); }
   ok("31.10 no unhandled rejection in any of the runs above", unh === 0, String(unh));
 }
 

@@ -44,8 +44,10 @@ export async function sendableAll(rpc, { from, to, balance }) {
 export async function prepareSend(rpc, { priv, chainId, from, to, value }) {
   if (!(BigInt(value) > 0n)) throw new Error("bad amount");
   const [bal, cnt, p] = await Promise.all([rpc("eth_getBalance", [from, "latest"]), rpc("eth_getTransactionCount", [from, "latest"]), planFee(rpc, { from, to, value })]);
-  if (big(bal, "balance") < BigInt(value) + p.fee) throw Object.assign(new Error("not enough ETH on this address for the amount plus the network fee (about " + p.fee + " wei). Nothing was sent. Send a little less."), { short: true });
-  return signLegacyTx({ priv, chainId, nonce: big(cnt, "nonce"), gasPrice: p.gasPrice, gasLimit: p.gasLimit, to, value });
+  // live run 01.11: a fixed deposit amount was sized against a fee read a minute earlier, the worst case had moved by a little, and the whole transfer was refused. The 2x margin gives way first: the price falls as far as the node's own current price
+  const room = big(bal, "balance") - BigInt(value), price = room >= p.fee ? p.gasPrice : room > 0n ? room / p.gasLimit : 0n;
+  if (price * PRICE_X < p.gasPrice) throw Object.assign(new Error("not enough ETH on this address for the amount plus the network fee (about " + p.fee + " wei). Nothing was sent. Send a little less."), { short: true });
+  return signLegacyTx({ priv, chainId, nonce: big(cnt, "nonce"), gasPrice: price, gasLimit: p.gasLimit, to, value });
 }
 const KNOWN = /already known|known transaction|already imported|AlreadyKnown|already in (the )?(mempool|pool)/i;
 /** eth_sendRawTransaction of the SAME saved bytes. "already known" counts as sent. Any other RPC error rethrown with e.rpc = true (the node refused it: nothing was accepted); a network failure has no e.rpc (outcome unknown). */
