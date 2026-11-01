@@ -954,9 +954,12 @@ const tAddrOf = async (n, a, i = 0) => ZRm.deriveT(await H.mnemonicSeed(await H.
     ok("1145 L-1: the paused card keeps its progress", v.pct > 0, String(v.pct)); }
   { const E = await import("../web/eth-send.js"), r = (bal, gp = 1000n) => async m => m === "eth_getBalance" ? "0x" + bal.toString(16) : m === "eth_getTransactionCount" ? "0x0" : m === "eth_estimateGas" ? "0x5208" : "0x" + gp.toString(16);
     const priv = "0x" + "11".repeat(32), go = (bal, value, gp) => E.prepareSend(r(bal, gp), { priv, chainId: 4663, from: "0x" + "22".repeat(20), to: "0x" + "33".repeat(20), value }), fee = 26250n * 2000n, v = 10n ** 15n;
-    const full = await go(v + fee, v), cut = await go(v + fee - 1n, v), least = await go(v + 26250n * 1000n, v);
-    let short = null; try { await go(v + 26250n * 1000n - 1n, v); } catch (e) { short = e; }
-    ok("01.11 live: a fixed amount with slightly less room than the worst-case fee is still signed; the margin gives way down to the node's price, and below it the send is refused", String(full.gasPrice) === "2000" && String(cut.gasPrice) === "1999" && String(least.gasPrice) === "1000" && short && short.short === true, [full.gasPrice, cut.gasPrice, least.gasPrice].join()); }
+    const full = await go(v + fee, v), cut = await go(v + fee - 1n, v), least = await go(v + 26250n * 1250n, v);      // 1149 M-2: the floor is node price x GAS_LIMIT_PCT / 100 (1250), not the node price itself
+    let short = null; try { await go(v + 26250n * 1250n - 1n, v); } catch (e) { short = e; }
+    let atNode = null; try { await go(v + 26250n * 1000n, v); } catch (e) { atNode = e; }
+    let noCut = null; try { await E.prepareSend(r(v + fee - 1n), { priv, chainId: 4663, from: "0x" + "22".repeat(20), to: "0x" + "33".repeat(20), value: v }, { noCut: true }); } catch (e) { noCut = e; }
+    ok("1149 M-2 invariant: a cut price never goes below node price x 125 / 100 (a price at the node's own price is refused), and the standard route (noCut) keeps the old refusal for any shortfall", atNode && atNode.short === true && noCut && noCut.short === true && String((await E.prepareSend(r(v + fee), { priv, chainId: 4663, from: "0x" + "22".repeat(20), to: "0x" + "33".repeat(20), value: v }, { noCut: true })).gasPrice) === "2000");
+    ok("01.11 live: a fixed amount with slightly less room than the worst-case fee is still signed; the margin gives way down to 125 % of the node's price, and below it the send is refused", String(full.gasPrice) === "2000" && String(cut.gasPrice) === "1999" && String(least.gasPrice) === "1250" && short && short.short === true, [full.gasPrice, cut.gasPrice, least.gasPrice].join()); }
   { const C = await import("../web/hop-card.js"), v = C.hopView({ st: { step: "DONE", stealth: "0x1", chain: "rh", dest: "rh", recipient: "0xD364DB3bf6b681D5aBD23E809D8BbfB26872a500", amount: "5950000", outTotal: "4747842", startedAt: 1, doneAt: 2, parts: [{ status: "SUCCESS", quote: { amountOut: "2293000" }, outActual: "2288000", payoutTx: { hash: "0xaaaaaaaaaaaa" } }, { status: "SUCCESS", quote: { amountOut: "2466000" }, payoutTx: { hash: "0xbbbbbbbbbbbb" } }] } }, Date.now());
     ok("01.11 live: the finished card uses the delivered amount of a payout, and the quote only when 1Click gave none", /^Payout 1: 2\.29 USDG/.test(v.payouts[0].text) && /^Payout 2: 2\.47 USDG/.test(v.payouts[1].text) && /received 4\.75 USDG/.test(v.sum), JSON.stringify([v.sum, v.payouts])); }
   ok("31.10 no unhandled rejection in any of the runs above", unh === 0, String(unh));
@@ -1129,6 +1132,7 @@ const tAddrOf = async (n, a, i = 0) => ZRm.deriveT(await H.mnemonicSeed(await H.
   { const { w, c } = mkEth(), s = H.memStore(); off = 0; c.set(SE, 10n ** 18n); c.bump(SE);
     const st = await H.startHop(ectx(w, c, s, { stopAt: "DEPOSIT_IN" })); const x = await H.findHop(s, SE);
     const ghost = { quote: { ...x.rec.st.inQuote, depositAddress: "0x" + "ab".repeat(20) }, tx: { ...x.rec.st.ethTx || { raw: "0x", hash: "0x" + "11".repeat(32), to: "0x", value: "0", gasLimit: "1", gasPrice: "1" }, nonce: "0", hash: "0x" + "22".repeat(32) }, bal: String(10n ** 18n) };
+    w.swaps[ghost.quote.depositAddress] = { isIn: true, paid: false, body: {}, amt: 0n, out: 0n, shown: false };      // 1149: the fixture's earlier quote is known to the fake 1Click (an unknown address answers 404, which the ETH path now reads as unreadable and holds on)
     x.rec.st.prevIn = [ghost, { ...ghost, tx: { ...ghost.tx, hash: "0x" + "33".repeat(32) } }]; x.rec.st.ethTx = null; x.rec.st.step = "DEPOSIT_IN"; await s.put(x.key, x.rec);
     const st2 = await H.runHop(ectx(w, c, s)), r2 = await rec(s);
     ok("1146 I-2: two earlier entries at nonce 0 while the chain is at nonce 1 (nothing left the address): both are dead and are forgotten together, the hop completes with one deposit", st2.step === "DONE" && w.ethDeposits === 1 && r2.st.prevIn === null, st2.step + " " + st2.err + " " + st.step); }
@@ -1170,6 +1174,22 @@ const tAddrOf = async (n, a, i = 0) => ZRm.deriveT(await H.mnemonicSeed(await H.
     ok("hop card: a record without an asset still reads 5.00 USDG", /5\.00 USDG/.test(v.amountLine)); }
   { const v = Cd.hopView({ st: { step: "DEPOSIT_IN", stealth: "0x1", chain: "rh", dest: "rh", asset: "ETH", recipient: A, amount: ETHV.toString(), startedAt: 1, ethTx: { hash: "0x1" } }, running: false }, Date.now());
     ok("hop card: an ETH transfer paused after signing says the deposit may be on its way (not 'your money has not moved')", /0\.03 ETH/.test(v.amountLine) && /may already be on its way/.test(v.body), v.body); }
+  // --- 1149 invariants. I1: on the ETH paths an unreadable 1Click answer is never "nothing seen": the hop holds, nothing is signed; the stablecoin hop reads it as it always did. I2: one rule for "did money leave" (leftSince). I3: a cut price keeps the headroom. I4: a delivered amount outside the slippage cap of the quote is ignored.
+  for (const down of ["500", "throw", "nostatus"]) {
+    const { w, c } = mkEth(), s = H.memStore(); off = 0; let fail = 1; const f0 = w.fetch;
+    w.fetch = async (u, init) => { if (String(u).includes("/v0/status") && fail > 0) { fail--; if (down === "throw") throw new Error("network down"); return down === "500" ? { ok: false, status: 500, json: async () => ({}) } : { ok: true, status: 200, json: async () => ({}) }; } return f0(u, init); };
+    const a = await H.startHop(ectx(w, c, s, { fetchFn: w.fetch })), ra = await rec(s);
+    ok("1149 M-1 (" + down + "): an unreadable 1Click answer on the ETH deposit holds the hop: nothing signed, nothing broadcast, the message says why", a.halted !== false && /could not read NEAR Intents/.test(a.err || "") && c.sends.length === 0 && !ra.st.ethTx, a.step + " " + a.err);
+    const b = await H.runHop(ectx(w, c, s, { fetchFn: w.fetch }));
+    ok("1149 M-1 (" + down + "): the next pass, with a readable answer, does the deposit once", b.step === "DONE" && c.sends.length === 1 && w.ethDeposits === 1, b.step + " " + b.err); }
+  { const w = makeWorld({}), s = H.memStore(); off = 0; let fail = 1; const f0 = w.fetch;
+    w.fetch = async (u, init) => { if (String(u).includes("/v0/status") && fail > 0) { fail--; return { ok: false, status: 500, json: async () => ({}) }; } return f0(u, init); };
+    const st = await H.startHop(mkCtx(w, s, { fetchFn: w.fetch }));
+    ok("1149 M-1: the USDG hop is unchanged: an unreadable status answer still reads as 'not seen yet' and the hop goes on (one relay)", st.step === "DONE" && w.relays === 1, st.step + " " + st.err + " relays " + w.relays); }
+  { const lf = E.leftSince, bal = v => async () => v, bad = async () => { throw new Error("rpc"); };
+    ok("1149 invariant: money 'left' unless a fresh number proves it stayed (unreadable balance, no baseline, a fall by the amount all count as left)", (await lf(bal(100n), "100", 30n)).left === false && (await lf(bal(100n), "130", 30n)).left === true && (await lf(bad, "130", 30n)).left === true && (await lf(bal(100n), null, 30n)).left === true && (await lf(bad, "130", 30n)).now === null && (await lf(bal(5n), "130", 30n)).now === "5"); }
+  { const ok1 = (g, q) => H.deliveredOk(g, { amountOut: q });
+    ok("1149 I-1: a delivered amount counts only within the slippage cap of the quote; digits only, no zero, a wrong unit or a missing quote falls back to the quote", ok1("2288000", "2293000") && ok1("2293000", "2293000") && !ok1("2288000000000000000", "2293000") && !ok1("0", "2293000") && !ok1("12x", "2293000") && !ok1("1", "2293000") && !H.deliveredOk("5", null) && ok1("2224210", "2293000") && !ok1("2224209", "2293000")); }
 }
 Date.now = realNow;
 console.log(fails ? fails + " FAILED" : "all passed"); process.exit(fails ? 1 : 0);

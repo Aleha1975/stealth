@@ -8,7 +8,7 @@ import { keccak, signDigest, unhex, hex } from "./stealth-crypto.js";
 import { postRelay } from "./relay-post.js";
 import { timeoutSignal } from "./chain-read.js";
 import { privateFee, appFeesOf, assetOf, fmtUnits } from "./chains.js";
-import { sendSettled, mayHaveLeft } from "./eth-send.js";
+import { sendSettled, leftSince } from "./eth-send.js";
 
 export const ONECLICK = "https://1click.chaindefuser.com";
 export const NEAR_RPCS = ["https://rpc.mainnet.near.org", "https://free.rpc.fastnear.com"];   // read-only: current_salt of intents.near
@@ -234,6 +234,7 @@ async function runPartEth(ctx, q, amount, say, fetchFn, sleep) {
   const E = ctx.eth, A = assetOf(ctx.from, "ETH"), fm = v => fmtUnits(v, A.decimals, 6), short = h => h.slice(0, 12) + "…";
   say("Quote: send " + fm(q.amountIn) + " " + A.symbol + ", receive " + fm(q.amountOut) + " " + A.symbol + ", ~" + q.timeEstimate + " s. Signing the transfer…");
   let bal = null; if (E.balance) { try { bal = String(await E.balance()); } catch {} }      // 1146 L-4: what the address held before this signing; a resume compares a "dead" verdict with it
+  if (E.balance && bal === null) throw new Error("could not read the balance of the stealth address; nothing was signed. Try again.");      // 1149 L-3: without a baseline a later "dead" could not be checked (the hop refuses the same way)
   const tx = await E.prepare({ to: q.depositAddress, value: amount });      // throws before anything is signed when the balance cannot cover the amount plus the network fee
   const validBefore = Math.floor(Date.now() / 1000) + 3600;      // the caller's double-send guard window, the same as for an EIP-3009 authorization
   if (ctx.onSigned) ctx.onSigned({ depositAddress: q.depositAddress, amount, validBefore, ethTx: tx, ethBal: bal });
@@ -287,8 +288,8 @@ export async function runFast(ctx, rec, save = () => {}, { resume = false } = {}
         const st1 = await statusOf({ base: ctx.base, depositAddress: p.depositAddress, fetchFn: ctx.fetchFn });
         if (st1 !== null && st1 !== PENDING_DEPOSIT) { p.state = "DEPOSITED"; p.txHash = p.ethTx.hash; save(rec); await submitDeposit({ base: ctx.base, txHash: p.txHash, depositAddress: p.depositAddress, fetchFn: ctx.fetchFn }).catch(() => {}); }      // 1Click has the deposit: follow it
         else {
-          let now = null; if (ctx.ethBalance) { try { now = String(await ctx.ethBalance(rec)); } catch {} }
-          p.state = st1 === PENDING_DEPOSIT && !mayHaveLeft(p.ethBal, now, p.amount) ? "NOT_SENT" : "UNKNOWN"; save(rec); continue;      // UNKNOWN keeps the guard: the explorer and the deposit address say which
+          const { left } = await leftSince(() => ctx.ethBalance(rec), p.ethBal, p.amount);
+          p.state = st1 === PENDING_DEPOSIT && !left ? "NOT_SENT" : "UNKNOWN"; save(rec); continue;      // UNKNOWN keeps the guard: the explorer and the deposit address say which
         }
       }
       else { p.state = seen === "failed" ? "NOT_SENT" : "UNKNOWN"; save(rec); continue; }      // reverted: nothing moved. 1145 M-1: "unsent" stays UNKNOWN: a single node not knowing it, with no tab running, does not prove a broadcast already on its way cannot land

@@ -32,21 +32,23 @@ export const GAS_LIMIT_PCT = 125n, PRICE_X = 2n;
 /** Gas limit, price and the worst-case fee of sending `value` wei from `from` to `to`. */
 export async function planFee(rpc, { from, to, value }) {
   const [est, gp] = await Promise.all([rpc("eth_estimateGas", [{ from, to, value: hx(value) }]), rpc("eth_gasPrice", [])]);
-  const gasLimit = big(est, "gas estimate") * GAS_LIMIT_PCT / 100n, gasPrice = big(gp, "gas price") * PRICE_X;
+  const gasLimit = big(est, "gas estimate") * GAS_LIMIT_PCT / 100n, nodePrice = big(gp, "gas price"), gasPrice = nodePrice * PRICE_X;
   if (gasLimit <= 0n || gasPrice <= 0n) throw new Error("the RPC gave no usable gas figures");
-  return { gasLimit, gasPrice, fee: gasLimit * gasPrice };
+  return { gasLimit, gasPrice, nodePrice, fee: gasLimit * gasPrice };
 }
 /** What can be sent from `balance` when the user asks for "all": the balance minus the worst-case fee (estimated against `to`, with 1 wei as the value). null when the balance does not even cover the fee. */
 export async function sendableAll(rpc, { from, to, balance }) {
   const p = await planFee(rpc, { from, to, value: 1n }); return balance > p.fee ? { value: balance - p.fee, fee: p.fee } : null;
 }
-/** Reads the nonce, plans the fee against the REAL destination, checks the balance covers value + fee, signs. Sends nothing. Throws before signing when the balance is short. */
-export async function prepareSend(rpc, { priv, chainId, from, to, value }) {
+/** Reads the nonce, plans the fee against the REAL destination, checks the balance covers value + fee, signs. Sends nothing. Throws before signing when the balance is short.
+ *  `noCut`: the amount is the user's to change (the standard route), so the price is never cut below the full worst case: the old refusal ("send a little less") stays. Without it (an amount fixed by a quote: the hop and the fast route) the price may be cut, see below. */
+export async function prepareSend(rpc, { priv, chainId, from, to, value }, { noCut = false } = {}) {
   if (!(BigInt(value) > 0n)) throw new Error("bad amount");
   const [bal, cnt, p] = await Promise.all([rpc("eth_getBalance", [from, "latest"]), rpc("eth_getTransactionCount", [from, "latest"]), planFee(rpc, { from, to, value })]);
-  // live run 01.11: a fixed deposit amount was sized against a fee read a minute earlier, the worst case had moved by a little, and the whole transfer was refused. The 2x margin gives way first: the price falls as far as the node's own current price
-  const room = big(bal, "balance") - BigInt(value), price = room >= p.fee ? p.gasPrice : room > 0n ? room / p.gasLimit : 0n;
-  if (price * PRICE_X < p.gasPrice) throw Object.assign(new Error("not enough ETH on this address for the amount plus the network fee (about " + p.fee + " wei). Nothing was sent. Send a little less."), { short: true });
+  // live run 01.11: a fixed deposit amount was sized against a fee read a minute earlier, the worst case had moved by a little, and the whole transfer was refused. The 2x margin gives way first, but only down to the same headroom the gas limit gets (GAS_LIMIT_PCT, 1149 M-2):
+  // a price at the node's own current price would stay pending after the next base-fee rise, and a replacement needs a higher price than the little ETH left can pay, which would lock the address.
+  const room = big(bal, "balance") - BigInt(value), floor = (p.nodePrice * GAS_LIMIT_PCT + 99n) / 100n, price = room >= p.fee ? p.gasPrice : noCut ? 0n : room > 0n ? room / p.gasLimit : 0n;
+  if (price < floor) throw Object.assign(new Error("not enough ETH on this address for the amount plus the network fee (about " + p.fee + " wei). Nothing was sent. Send a little less."), { short: true });
   return signLegacyTx({ priv, chainId, nonce: big(cnt, "nonce"), gasPrice: price, gasLimit: p.gasLimit, to, value });
 }
 const KNOWN = /already known|known transaction|already imported|AlreadyKnown|already in (the )?(mempool|pool)/i;
@@ -79,6 +81,8 @@ export const refused = e => { const m = String((e && e.message) || ""); return !
 export const definiteRefusal = e => refused(e) && !mayStillLand(e);
 /** 1146 L-4: did the money possibly leave the address? `before` is the balance when the transfer was signed, `now` a fresh read, `value` the amount. Unknown on either side counts as "possibly left" (nothing is believed without a number). */
 export const mayHaveLeft = (before, now, value) => before == null || now == null || BigInt(before) - BigInt(now) >= BigInt(value);
+/** 1149: the ONE reading of "did the money leave", for every route (hop, fast resume, standard guard). `balance()` is a fresh read, taken after the verdict that raised the question. -> { left, now }: `now` is the string read or null when it could not be read; `left` is true unless the balance proves the amount stayed. */
+export const leftSince = async (balance, before, value) => { let now = null; try { now = String(await balance()); } catch {} return { left: mayHaveLeft(before, now, value), now }; };
 /** May the SAME bytes simply be sent again? A network failure (no answer) or a rate-limit body. Any other answer is either a refusal or needs txStatus first. */
 export const resendable = e => !(e && e.rpc === true) || RATE_LIMIT.test(String(e.message || ""));
 /** 1144 M-1: the broadcast of the SAME saved bytes, up to `tries` times, and what it proves. { send(), status(), sleep(ms) } -> { outcome, error? }:

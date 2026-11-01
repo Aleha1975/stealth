@@ -758,9 +758,9 @@ const ETH_WD_KEY = "stealth-eth-wd", ethWdRec = { all() { try { const o = JSON.p
 const ethArmedUntil = r => (Math.floor((Number(r.at) || 0) / 1000) + 3600 + 60) * 1000;
 async function ethResolve() {
   const m = ethWdRec.all(); let any = false;
-  for (const k of Object.keys(m)) { const r = m[k]; if (!r || !found.some(f => f.stealth.toLowerCase() === k)) continue; let st = null, now = null; try { st = await ETH.txStatus(ethRpc, { from: k, hash: r.hash, nonce: r.nonce }); } catch {}
-    if (st === "dead") { try { now = String(BigInt(await ethRpc("eth_getBalance", [k, "latest"]))); } catch {} }      // 1146 L-4: a lagging node counts the nonce before it serves the receipt: "dead" releases the guard only when a fresh balance shows the amount did not leave (or the guard's window has run out)
-    if (st === "mined" || st === "failed" || (st === "unsent" && Date.now() > ethArmedUntil(r)) || (st === "dead" && (Date.now() > ethArmedUntil(r) || !ETH.mayHaveLeft(r.bal, now, r.value)))) { pendingWd.delete(k); ethWdRec.del(k); any = true; } }
+  for (const k of Object.keys(m)) { const r = m[k]; if (!r || !found.some(f => f.stealth.toLowerCase() === k)) continue; let st = null, left = true; try { st = await ETH.txStatus(ethRpc, { from: k, hash: r.hash, nonce: r.nonce }); } catch {}
+    if (st === "dead") left = (await ETH.leftSince(async () => BigInt(await ethRpc("eth_getBalance", [k, "latest"])), r.bal, r.value)).left;      // 1146 L-4 / 1149: the one reading of "did it leave" (eth-send.js): a lagging node counts the nonce before it serves the receipt: "dead" releases the guard only when a fresh balance shows the amount did not leave (or the guard's window has run out)
+    if (st === "mined" || st === "failed" || (st === "unsent" && Date.now() > ethArmedUntil(r)) || (st === "dead" && (Date.now() > ethArmedUntil(r) || !left))) { pendingWd.delete(k); ethWdRec.del(k); any = true; } }
   return any;
 }
 async function ethFeeOf(stealth, to) {
@@ -784,8 +784,9 @@ async function ethWithdraw(to) {
 async function ethStandard(to, value, hit, all) {
   const w = wd, k = w.stealth.toLowerCase(), sleep = ms => new Promise(r => setTimeout(r, ms));
   say("pay-hint", "Signing the " + NAT + " transfer…");
-  const tx = await ETH.prepareSend(ethRpc, { priv: hit.stealthPriv, chainId: C.chainId, from: w.stealth, to, value });      // reads nonce + gas, checks amount + fee fit the balance; nothing is sent
-  const armedAt = Date.now(); pendingWd.set(k, ethArmedUntil({ at: armedAt })); ethWdRec.put(k, { hash: tx.hash, nonce: tx.nonce, at: armedAt, bal: String(all), value: String(value) });      // armed and recorded BEFORE the bytes leave; cleared only by a confirmed outcome
+  let fresh; try { fresh = BigInt(await ethRpc("eth_getBalance", [w.stealth, "latest"])); } catch { throw new Error("Could not read the balance of this address; nothing was signed. Try again."); }      // 1149 L-1: the guard's baseline is read now, not the balance of the last Scan
+  const tx = await ETH.prepareSend(ethRpc, { priv: hit.stealthPriv, chainId: C.chainId, from: w.stealth, to, value }, { noCut: true });      // reads nonce + gas, checks amount + fee fit the balance; nothing is sent. 1149 M-2: the standard route keeps the full price margin or refuses (the user can send less)
+  const armedAt = Date.now(); pendingWd.set(k, ethArmedUntil({ at: armedAt })); ethWdRec.put(k, { hash: tx.hash, nonce: tx.nonce, at: armedAt, bal: String(fresh), value: String(value) });      // armed and recorded BEFORE the bytes leave; cleared only by a confirmed outcome
   say("pay-hint", "Sending from the stealth address (it pays its own network fee)…");
   const sr = await ETH.sendSettled({ send: () => ETH.sendRaw(ethRpc, tx), status: () => ETH.txStatus(ethRpc, { from: w.stealth, hash: tx.hash, nonce: tx.nonce }), sleep });      // 1144 M-1: "refused" is only believed when no earlier attempt ended unclear (the resend of a mined transaction is answered "nonce too low")
   const why = sr.error && (sr.error.message || sr.error);

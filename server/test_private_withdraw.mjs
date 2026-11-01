@@ -302,6 +302,9 @@ async function fastUnit() {
       ok("ETH fast: the chain got exactly the amount at the quote's deposit address, nothing else moved but gas", tx.to === dest && tx.value === AMT && c.balOf(dest) === AMT && c.balOf(SE) === 10n ** 18n - AMT - 21000n * c.gasPrice * 2n);
       ok("ETH fast: the saved record keeps the hash and nonce (to follow the transfer after a reload) but neither the raw bytes nor the recipient", /"ethTx":\{"hash":"0x[0-9a-f]{64}","nonce":"0"\}/.test(w.saves.find(x => x.includes("ethTx"))) && !w.saves.some(x => x.includes(atSigned.p.slice(8, 40)) || x.includes("cd".repeat(20)) || x.includes('"raw"')));
       ok("ETH fast: the summary names ETH", PW.fastSummary(r, v => E && (Number(v) / 1e18).toString(), "ETH")[0].includes("ETH")); }
+    { const w = world(), c = mkc(), r = erec(); let signed = 0, err = null; const e0 = api(c);
+      try { await PW.runFast(ectx(w, c, { eth: { ...e0, balance: async () => { throw new Error("rpc down"); } }, onSigned: () => signed++ }), r, () => {}); } catch (e) { err = e; }
+      ok("1149 L-3: the fast route refuses to sign when the balance baseline cannot be read: nothing signed, nothing broadcast, nothing recorded as signed", err && /could not read the balance/.test(err.message) && signed === 0 && c.sends.length === 0 && c.nonceOf(SE) === 0, err && err.message); }
     { const w = world(), c = mkc(), r = erec(); let calls = 0; c.refuse = "max fee per gas less than block base fee"; let refused = 0, err = null;
       try { await PW.runFast(ectx(w, c, { onRefused: () => refused++ }), r, () => {}); } catch (e) { err = e; }
       ok("ETH fast: the node refuses the transaction (fee below its floor) -> definite: part NOT_SENT, the guard hook onRefused fired, e.refused", r.parts[0].state === "NOT_SENT" && refused === 1 && err && err.refused === true && /refused the deposit transaction; nothing was sent/.test(err.message) && c.nonceOf(SE) === 0); }

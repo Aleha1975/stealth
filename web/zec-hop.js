@@ -209,6 +209,8 @@ export function planParts({ orchard, reserve = RESERVE, mode = DEFAULT_MODE, ran
 }
 
 // ---------------------------------------------------------------- quote validation (M-6)
+/** 1149 I-1: the delivered amount 1Click reports counts only within the slippage cap of the quote (SLIP_CAP_BPS, the same bound quoteInfoOf holds the quote's own minimum to) on either side: a wrong unit or an odd answer then falls back to the quote on the card and in the total. Display only. */
+export const deliveredOk = (got, quote) => { if (!/^[0-9]+$/.test(String(got)) || got === "0" || !quote || !/^[0-9]+$/.test(String(quote.amountOut))) return false; const g = BigInt(got), q = BigInt(quote.amountOut); return (g > q ? g - q : q - g) * 10000n <= q * BigInt(SLIP_CAP_BPS); };
 export const MAX_LOSS = 0.03, SLIP_CAP_BPS = 300, QUOTE_MIN_LEFT_MS = 5 * MIN, QUOTE_MAX_LEFT_MS = 2 * 3600_000, TX_EXPIRY_DELTA = 40, QUOTE_TOL = 0.02;   // TX_EXPIRY_DELTA: blocks a Zcash wallet transaction stays valid (ZIP-203 default); QUOTE_TOL: a re-quote of a rebuilt hop may be this much worse than the rate the user approved (2x the 1% slippage every quote already allows) before the user is asked again
 /** Checks a 1Click quote against the request and economic sanity; returns the fields we keep. Throws Halt (never retried) with nothing sent. */
 export function quoteInfoOf(j, req, { now = Date.now(), minLeft = QUOTE_MIN_LEFT_MS, maxLeft = QUOTE_MAX_LEFT_MS, slipBps = SLIP_CAP_BPS } = {}) {
@@ -406,7 +408,11 @@ export async function runHop(ctx) {
   const utxoOf = async a => { if (!ctx.getUtxos) return undefined; try { const u = (await ctx.getUtxos(a)).filter(x => x.height > 0); return { sum: u.reduce((s, x) => s + BigInt(x.value), 0n), height: u.reduce((m, x) => Math.max(m, x.height), 0) }; } catch { return undefined; } };   // undefined = cannot tell
   const allocAcct = async () => { const a = st.nextAcct || MAX_OUT + 1; if (a >= st.accts.length) throw new Halt("no fresh hop account left for a refund address; nothing was sent"); st.nextAcct = a + 1; await save(); return a; };
   const until = async (what, ms, fn, every = 10000) => { const t0 = Date.now(); for (;;) { if (await fn()) return; if (Date.now() - t0 > ms) throw new Halt(what + " is taking too long"); say("Waiting for " + what + "… " + Math.round((Date.now() - t0) / 1000) + " s"); await sleep(every); } };
-  const status = async (a, f) => { const r = await f(base + "/v0/status?depositAddress=" + encodeURIComponent(a), { cache: "no-store", signal: timeoutSignal(30000) }).catch(() => null); return r && r.ok ? (await r.json().catch(() => ({}))).status || PENDING : PENDING; };
+  // ONE look at 1Click's status of a deposit address. null = the answer could not be read (network, rate limit, 5xx, no status in the body).
+  const look = async (a, f) => { const r = await f(base + "/v0/status?depositAddress=" + encodeURIComponent(a), { cache: "no-store", signal: timeoutSignal(30000) }).catch(() => null); const j = r && r.ok ? await r.json().catch(() => null) : null; return j && typeof j.status === "string" && j.status ? j.status : null; };
+  const status = async (a, f) => (await look(a, f)) || PENDING;      // USDG / USDC: an unreadable answer reads as "nothing seen yet", as it always did
+  // 1149 M-1: the ETH paths never read an unreadable answer as "nothing seen" (that would let a second deposit be signed during an outage): they hold. true = 1Click has seen the deposit address.
+  const seenBy1Click = async a => { const s = await look(a, fIn); if (s === null) throw new Halt("could not read NEAR Intents' answer about the deposit address " + a + "; nothing new was signed. Press Continue to check again"); return s !== PENDING; };
   const poll = async (a, label, ms, f) => { try { return await PW.pollStatus({ base, depositAddress: a, fetchFn: f, sleep, intervalMs: 4000, timeoutMs: ms, onUpdate: s => say(label + ": " + s.status) }); } catch (e) { throw new Halt(e.message); } };
   // ---- payout swaps are followed apart from the sending (31.10). swapTick only asks 1Click (never the wallet), never throws, and only ever changes the status of a part whose ZEC is already sent, so it cannot clash with
   // the part the machine is working on. It runs between steps (main loop), inside every wait (the `sleep` handlers use) and in WAIT_SWAPS. There is no timer or background task: when the run ends nothing is left running.
@@ -425,7 +431,7 @@ export async function runHop(ctx) {
       if (announce && swapSeen.get(i) !== j.status) { swapSeen.set(i, j.status); say(partTag(i) + ": swap " + j.status); }
       if (PW.TERMINAL.has(j.status)) {
         const t = (((j.swapDetails || {}).destinationChainTxHashes) || [])[0];
-        p.status = j.status; p.endAt = Date.now(); const got = String((j.swapDetails || {}).amountOut ?? ""); if (/^[0-9]+$/.test(got) && got !== "0") p.outActual = got;      // live run 01.11: the delivered amount differed from the quote by 0.012 USDG; the card states what arrived
+        p.status = j.status; p.endAt = Date.now(); const got = String((j.swapDetails || {}).amountOut ?? ""); if (deliveredOk(got, p.quote)) p.outActual = got;      // live run 01.11: the delivered amount differed from the quote by 0.012 USDG; the card states what arrived
         if (t && t.hash) p.payoutTx = { hash: String(t.hash), url: String(t.explorerUrl || "") }; changed = true;
       }
     }
@@ -469,7 +475,7 @@ export async function runHop(ctx) {
   /** An earlier (dropped) deposit that DID happen: 1Click has seen its address, or its transaction is mined / known to the node. The hop returns to that quote and follows that deposit (its ZEC comes to the same hop wallet). */
   const resumePrev = async () => {
     for (const pv of prevOf()) {
-      const seen = (await status(pv.quote.depositAddress, fIn)) !== PENDING; let on = null; try { on = await ctx.eth.status(pv.tx); } catch {}
+      const seen = await seenBy1Click(pv.quote.depositAddress); let on = null; try { on = await ctx.eth.status(pv.tx); } catch {}
       if (seen || on === "mined" || on === "pending") {
         say("An earlier ETH deposit did reach the network; following it instead of a new one…");
         await go("DEPOSIT_IN", { prevIn: prevOf().filter(x => x !== pv), inQuote: pv.quote, ethTx: pv.tx, ethBal: pv.bal, txIn: null, ethRefused: false }); return true;
@@ -478,11 +484,11 @@ export async function runHop(ctx) {
     return false;
   };
   /** 1146 L-1, L-2, I-3: the nonce of an earlier deposit `x` (its bytes, quote and the balance before it was signed) was used by some transaction and 1Click has not shown that deposit. Did the money leave? Judged on a balance read NOW, after the "dead" verdict (a read taken before it can predate the landing).
-   *  Nothing is believed without a number: an unreadable balance, a missing baseline and a fall by the amount all hold the hop (a Halt that names when it ends). The hold ends with the quote: after its deadline 1Click no longer swaps that deposit (it refunds it to the stealth address), so the hop goes on and the earlier bytes stay in prevIn,
-   *  where a later pass still looks at them. -> undefined when the balance shows the money stayed, "late" when the hold ran out */
+   *  Nothing is believed without a number: an unreadable balance, a missing baseline and a fall by the amount all hold the hop (a Halt that names when it ends). The hold ends with the quote: after its deadline 1Click no longer swaps that deposit (it refunds it to the stealth address), so the hop goes on and the earlier bytes stay in prevIn.
+   *  1149 L-2, the honest limit: prevIn is looked at again only until the new deposit is mined (it is cleared then). A "late" earlier deposit that is indexed after that is NOT looked at again; 1Click refunds a deposit it did not swap to the stealth address, and the Scan shows that balance. -> undefined when the balance shows the money stayed, "late" when the hold ran out */
   const leftOrWait = async (x, deadlineMs) => {
-    let now = null; try { now = String(await ctx.eth.balance()); } catch {}
-    if (!ETH.mayHaveLeft(x.bal, now, x.quote.amountIn)) return undefined;
+    const { left, now } = await ETH.leftSince(ctx.eth.balance, x.bal, x.quote.amountIn);
+    if (!left) return undefined;
     if (Date.now() > deadlineMs) return "late";
     const end = "; this hold ends with that deposit's quote, in " + fmtMS(deadlineMs - Date.now()) + ". Press Continue to check again";
     if (now === null) throw new Halt("could not read the balance to tell whether the earlier ETH deposit landed; nothing new was signed" + end);
@@ -490,7 +496,7 @@ export async function runHop(ctx) {
     throw new Halt("the nonce of the earlier ETH deposit was used and the balance fell by its amount, so it probably landed (deposit address " + x.quote.depositAddress + "); the node does not show it yet; nothing new was signed" + end);
   };
   const depositEth = async q => {
-    if ((await status(q.depositAddress, fIn)) !== PENDING) return false;      // 1Click already has the deposit
+    if (await seenBy1Click(q.depositAddress)) return false;      // 1Click already has the deposit
     const E = ctx.eth; if (!E) throw new Halt("this page cannot send ETH from the stealth address; nothing was sent");
     if (!st.ethTx && prevOf().length && await resumePrev()) return true;
     if (!st.ethTx) {
@@ -515,7 +521,7 @@ export async function runHop(ctx) {
       const s0 = await E.status(st.ethTx);
       if (s0 === "dead") {
         if (await resumePrev()) return true;      // the nonce may have been used by a dropped earlier deposit of ours
-        const seenNow = (await status(q.depositAddress, fIn)) !== PENDING; if (seenNow) return false;      // 1144 L-2: a lagging node can count the nonce before it serves the receipt, and 1Click may have seen the deposit meanwhile
+        if (await seenBy1Click(q.depositAddress)) return false;      // 1144 L-2: a lagging node can count the nonce before it serves the receipt, and 1Click may have seen the deposit meanwhile
         if (E.balance) await leftOrWait({ bal: st.ethBal, quote: q }, q.deadlineMs);      // the balance fell by the deposit amount since signing: money left the address, so it is not "never mined" (1146 L-2: until the quote ends)
         await dropEth("The earlier ETH deposit can never be mined (its nonce was used by another transaction); starting again with a new quote…"); return true;
       }
@@ -533,7 +539,7 @@ export async function runHop(ctx) {
     let got; try { got = await ctx.waitReceipt(st.txIn, rc => rc.ok && String(rc.hash).toLowerCase() === st.ethTx.hash.toLowerCase()); }      // the hash binds the nonce, the destination and the amount of THIS transaction
     catch (e) { st.txIn = null; await save(); throw e; }      // 1144 L-1: not mined in time: the next pass asks the chain again (and re-sends the SAME bytes if they were dropped); st.ethTx stays
     if (!got.ok) { st.txIn = null; if (!got.unexpected) { st.ethTx = null; st.ethBal = null; } await save(); throw new Halt(got.unexpected ? "the receipt does not belong to the ETH deposit we signed; nothing was recorded as sent. Press Continue to check again" : "the ETH deposit transaction reverted; nothing moved. Press Continue to try again"); }
-    st.prevIn = null; await save();      // this deposit is mined: every dropped one has this nonce or a lower one, so none can land
+    st.prevIn = null; await save();      // this deposit is mined: every dropped one has this nonce or a lower one, so none can land (1149 L-2: a "late" one is no longer looked at; see leftOrWait)
     await PW.submitDeposit({ base, txHash: st.txIn, depositAddress: q.depositAddress, fetchFn: fIn }).catch(() => {});
     return false;
   };
