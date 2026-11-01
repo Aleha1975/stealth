@@ -104,7 +104,7 @@ export function hopView(h, now = Date.now()) {
     const mark = at => at && st.startedAt ? fmtElapsed(at - st.startedAt) : "", P = Array.isArray(st.parts) ? st.parts : [];
     if (P.length > 1 && P.every(x => x && x.sentAt && x.endAt)) v.timing = (st.shieldedAt ? "Shielded at " + mark(st.shieldedAt) + " · " : "") + P.map((x, i) => "payout " + (i + 1) + " sent at " + mark(x.sentAt) + ", arrived at " + mark(x.endAt)).join(" · ");
     const txUrl = x => /^https:\/\//.test(x.url || "") ? x.url : (dst.explorer || "") + "/tx/" + x.hash;
-    v.payouts = (Array.isArray(st.parts) ? st.parts : []).filter(x => x && x.status === "SUCCESS" && x.quote && x.payoutTx && x.payoutTx.hash).map((x, i) => ({ text: "Payout " + (i + 1) + ": " + amt(x.quote.amountOut, dtok.decimals) + " " + dtok.symbol + " · tx " + x.payoutTx.hash.slice(0, 10) + "…", href: txUrl(x.payoutTx) }));
+    v.payouts = (Array.isArray(st.parts) ? st.parts : []).filter(x => x && x.status === "SUCCESS" && x.quote && x.payoutTx && x.payoutTx.hash).map((x, i) => ({ text: "Payout " + (i + 1) + ": " + amt(x.outActual || x.quote.amountOut, dtok.decimals) + " " + dtok.symbol + " · tx " + x.payoutTx.hash.slice(0, 10) + "…", href: txUrl(x.payoutTx) }));
     if (st.recipient && dst.explorer) v.paidLink = { text: "Recipient " + short(st.recipient) + " on " + (dst.explorerName || "the explorer"), href: dst.explorer + "/address/" + st.recipient };
     if (p && p.hash && v.payouts.length < 2) v.link = { text: "Payout tx " + p.hash.slice(0, 10) + "…", href: txUrl(p) };
   } else if (st.step === "FAILED_IN") {

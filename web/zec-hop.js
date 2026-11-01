@@ -425,7 +425,8 @@ export async function runHop(ctx) {
       if (announce && swapSeen.get(i) !== j.status) { swapSeen.set(i, j.status); say(partTag(i) + ": swap " + j.status); }
       if (PW.TERMINAL.has(j.status)) {
         const t = (((j.swapDetails || {}).destinationChainTxHashes) || [])[0];
-        p.status = j.status; p.endAt = Date.now(); if (t && t.hash) p.payoutTx = { hash: String(t.hash), url: String(t.explorerUrl || "") }; changed = true;
+        p.status = j.status; p.endAt = Date.now(); const got = String((j.swapDetails || {}).amountOut ?? ""); if (/^[0-9]+$/.test(got) && got !== "0") p.outActual = got;      // live run 01.11: the delivered amount differed from the quote by 0.012 USDG; the card states what arrived
+        if (t && t.hash) p.payoutTx = { hash: String(t.hash), url: String(t.explorerUrl || "") }; changed = true;
       }
     }
     if (changed) { try { await save(); } catch {} }
@@ -453,7 +454,7 @@ export async function runHop(ctx) {
     if (a.step === "DONE") {
       const ok = st.parts.filter(x => x.status === "SUCCESS");
       a.doneAt = Date.now(); a.payoutTxs = ok.map(x => x.payoutTx).filter(Boolean); if (a.payoutTxs[0]) a.payoutTx = a.payoutTxs[0];
-      a.outTotal = ok.reduce((s, x) => s + BigInt(x.quote.amountOut), 0n).toString();
+      a.outTotal = ok.reduce((s, x) => s + BigInt(x.outActual || x.quote.amountOut), 0n).toString();
     }
     return go(a.step, a);
   };

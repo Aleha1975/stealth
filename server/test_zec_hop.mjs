@@ -957,6 +957,8 @@ const tAddrOf = async (n, a, i = 0) => ZRm.deriveT(await H.mnemonicSeed(await H.
     const full = await go(v + fee, v), cut = await go(v + fee - 1n, v), least = await go(v + 26250n * 1000n, v);
     let short = null; try { await go(v + 26250n * 1000n - 1n, v); } catch (e) { short = e; }
     ok("01.11 live: a fixed amount with slightly less room than the worst-case fee is still signed; the margin gives way down to the node's price, and below it the send is refused", String(full.gasPrice) === "2000" && String(cut.gasPrice) === "1999" && String(least.gasPrice) === "1000" && short && short.short === true, [full.gasPrice, cut.gasPrice, least.gasPrice].join()); }
+  { const C = await import("../web/hop-card.js"), v = C.hopView({ st: { step: "DONE", stealth: "0x1", chain: "rh", dest: "rh", recipient: "0xD364DB3bf6b681D5aBD23E809D8BbfB26872a500", amount: "5950000", outTotal: "4747842", startedAt: 1, doneAt: 2, parts: [{ status: "SUCCESS", quote: { amountOut: "2293000" }, outActual: "2288000", payoutTx: { hash: "0xaaaaaaaaaaaa" } }, { status: "SUCCESS", quote: { amountOut: "2466000" }, payoutTx: { hash: "0xbbbbbbbbbbbb" } }] } }, Date.now());
+    ok("01.11 live: the finished card uses the delivered amount of a payout, and the quote only when 1Click gave none", /^Payout 1: 2\.29 USDG/.test(v.payouts[0].text) && /^Payout 2: 2\.47 USDG/.test(v.payouts[1].text) && /received 4\.75 USDG/.test(v.sum), JSON.stringify([v.sum, v.payouts])); }
   ok("31.10 no unhandled rejection in any of the runs above", unh === 0, String(unh));
 }
 
