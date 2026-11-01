@@ -68,10 +68,17 @@ export async function txStatus(rpc, { from, hash, nonce }, { sleep = ms => new P
   await sleep(recheckMs); const b = await look(); return b;
 }
 const NONCE_USED = /nonce too low|nonce is too low|nonce has already been used/i, RATE_LIMIT = /rate.?limit|too many requests|\b429\b/i;
-/** Is this RPC error a definite refusal (the node answered and did not accept the transaction)? Not when the words say the nonce is used (the transaction may have been mined after all: a resend after a lost answer gets exactly that), not a hash mismatch (the node took SOMETHING), not a rate-limit body (said nothing about the transaction). Those need txStatus. */
-/** 1145 L-3: a refusal that does not prove the saved bytes are out of play (the node holds another tx at this nonce, its pool is full, or it lags on the balance): they are kept rather than replaced. */
-export const mayStillLand = e => /underpriced|pool is full|insufficient funds/i.test(String((e && e.message) || ""));
-export const refused = e => !!(e && e.rpc === true && !e.mismatch && !KNOWN.test(String(e.message || "")) && !NONCE_USED.test(String(e.message || "")) && !RATE_LIMIT.test(String(e.message || "")));
+/** 1145 L-3 / 1146 L-3, L-5: an answer that does not prove the saved bytes are out of play: the node holds ANOTHER transaction at this nonce (it may be our own earlier one), its pool is full, it lags on the balance, or the answer is the shape of a proxy / timeout / duplicate that says nothing about what the sequencer took. The bytes are kept rather than replaced, and the fast and standard routes do not call such an answer "nothing was sent". */
+const LANDS = /replacement (transaction )?underpriced|pool is full|insufficient ?funds|existing tx with same hash|FeeTooLowToCompete|upfront cost exceeds|deadline exceeded|timed? ?out/i;
+export const mayStillLand = e => LANDS.test(String((e && e.message) || ""));
+/** The answers that prove the node would never take these bytes (a fee below its floor, an invalid or oversized transaction). Anything else is not believed to be a refusal (1146 L-3). A plain "transaction underpriced" is a fee refusal; "replacement transaction underpriced" is not. */
+const INVALID = /max fee per gas less than block base fee|intrinsic gas too low|invalid sender|invalid chain id|exceeds block gas limit|gas limit reached|oversized data|tx fee .*exceeds|transaction underpriced/i;
+/** Is this RPC error a refusal (the node answered and did not accept the transaction)? Not when the words say the nonce is used (the transaction may have been mined after all: a resend after a lost answer gets exactly that), not a hash mismatch (the node took SOMETHING), not a rate-limit body (said nothing about the transaction), and, 1146 L-3, only an answer of a known wording: an unrecognised text is not a refusal. Those need txStatus. A refusal that mayStillLand is still no proof that nothing moved. */
+export const refused = e => { const m = String((e && e.message) || ""); return !!(e && e.rpc === true && !e.mismatch && !KNOWN.test(m) && !NONCE_USED.test(m) && !RATE_LIMIT.test(m) && (mayStillLand(e) || INVALID.test(m))); };
+/** A refusal that proves nothing was accepted (refused, and not one that mayStillLand). */
+export const definiteRefusal = e => refused(e) && !mayStillLand(e);
+/** 1146 L-4: did the money possibly leave the address? `before` is the balance when the transfer was signed, `now` a fresh read, `value` the amount. Unknown on either side counts as "possibly left" (nothing is believed without a number). */
+export const mayHaveLeft = (before, now, value) => before == null || now == null || BigInt(before) - BigInt(now) >= BigInt(value);
 /** May the SAME bytes simply be sent again? A network failure (no answer) or a rate-limit body. Any other answer is either a refusal or needs txStatus first. */
 export const resendable = e => !(e && e.rpc === true) || RATE_LIMIT.test(String(e.message || ""));
 /** 1144 M-1: the broadcast of the SAME saved bytes, up to `tries` times, and what it proves. { send(), status(), sleep(ms) } -> { outcome, error? }:
@@ -82,13 +89,13 @@ export async function sendSettled({ send, status, sleep }, tries = 3) {
   for (let i = 0; ; i++) {
     try { await send(); return { outcome: "sent" }; }
     catch (e) {
-      if (refused(e) && !unknown) return { outcome: "refused", error: e };
+      if (definiteRefusal(e) && !unknown) return { outcome: "refused", error: e };      // 1146 L-3: a refusal that mayStillLand goes to txStatus like any unclear answer
       unknown = true;
       if (resendable(e) && i < tries - 1) { await sleep(2000 * 3 ** i); continue; }      // a network failure or a rate limit: the SAME bytes again
       let st = null; try { st = await status(); } catch {}
       if (st === "mined" || st === "pending") return { outcome: "sent", status: st };
       if (st === "failed") return { outcome: "failed", error: e };
-      if (st === "unsent" && refused(e)) return { outcome: "refused", error: e };      // the node does not know it and its nonce is still free
+      if (st === "unsent" && definiteRefusal(e)) return { outcome: "refused", error: e };      // the node does not know it and its nonce is still free
       return { outcome: "unknown", error: e };      // incl. "dead": its nonce is used, by this transaction or another; the explorer says which
     }
   }

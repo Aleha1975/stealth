@@ -287,10 +287,11 @@ async function fastUnit() {
   { const { makeEthChain } = await import("./fake_eth_chain.mjs"), E = await import("../web/eth-send.js"), CR = await import("../web/chain-read.js"), { privateKeyToAccount } = await import("viem/accounts");
     const PR = "0x" + "45".repeat(32), SE = privateKeyToAccount(PR).address.toLowerCase(), AMT = 30_000_000_000_000_000n, nos = async () => {};
     const mkc = () => { const c = makeEthChain(); c.set(SE, 10n ** 18n); return c; };
-    const api = (c, o = {}) => ({ prepare: ({ to, value }) => E.prepareSend(c.rpc, { priv: PR, chainId: 4663, from: SE, to, value }), send: o.send || (tx => E.sendRaw(c.rpc, tx)), status: tx => E.txStatus(c.rpc, { from: SE, hash: tx.hash, nonce: tx.nonce }, { sleep: nos }) });
+    const api = (c, o = {}) => ({ prepare: ({ to, value }) => E.prepareSend(c.rpc, { priv: PR, chainId: 4663, from: SE, to, value }), send: o.send || (tx => E.sendRaw(c.rpc, tx)), status: tx => E.txStatus(c.rpc, { from: SE, hash: tx.hash, nonce: tx.nonce }, { sleep: nos }), balance: async () => c.balOf(SE) });      // 1146 L-4: the balance before signing is the baseline of a later "dead"
     const ectx = (w, c, o = {}) => ({ ...mk(w), from: CHAINS.rh, to: CHAINS.rh, asset: "ETH", priv: PR, stealth: SE, eth: api(c), waitReceipt: (h, expect) => CR.waitFinal(c.rpc, h, { expect: expect || (x => x.ok && x.hash === c.lastHash), sleep: nos, tries: 4, everyMs: 0 }), ...o });
     const erec = (n = 1) => ({ v: 1, stealth: SE, chain: "rh", dest: "rh", asset: "ETH", parts: Array.from({ length: n }, () => ({ amount: AMT.toString(), delayMs: 0, state: "PLANNED", depositAddress: null, txHash: null })) });
     const wc = (c, hash) => (c.lastHash = hash, true);
+    const pendF = f => async (u, i) => String(u).includes("/v0/status") ? { ok: true, status: 200, json: async () => ({ status: "PENDING_DEPOSIT" }) } : f(u, i);      // 1Click: nothing deposited at that address
     { const w = world(), c = mkc(), r = erec(), hooks = []; let atSigned = null;
       const ctx = ectx(w, c, { waitReceipt: (h, expect) => CR.waitFinal(c.rpc, h, { expect, sleep: nos, tries: 4, everyMs: 0 }), onSigned: i => { atSigned = { sends: c.sends.length, p: JSON.stringify(i.ethTx) }; hooks.push("signed"); }, onDeposited: () => hooks.push("dep") });
       await PW.runFast(ctx, r, x => w.saves.push(JSON.stringify(x)));
@@ -301,9 +302,9 @@ async function fastUnit() {
       ok("ETH fast: the chain got exactly the amount at the quote's deposit address, nothing else moved but gas", tx.to === dest && tx.value === AMT && c.balOf(dest) === AMT && c.balOf(SE) === 10n ** 18n - AMT - 21000n * c.gasPrice * 2n);
       ok("ETH fast: the saved record keeps the hash and nonce (to follow the transfer after a reload) but neither the raw bytes nor the recipient", /"ethTx":\{"hash":"0x[0-9a-f]{64}","nonce":"0"\}/.test(w.saves.find(x => x.includes("ethTx"))) && !w.saves.some(x => x.includes(atSigned.p.slice(8, 40)) || x.includes("cd".repeat(20)) || x.includes('"raw"')));
       ok("ETH fast: the summary names ETH", PW.fastSummary(r, v => E && (Number(v) / 1e18).toString(), "ETH")[0].includes("ETH")); }
-    { const w = world(), c = mkc(), r = erec(); let calls = 0; c.refuse = "insufficient funds for gas * price + value"; let refused = 0, err = null;
+    { const w = world(), c = mkc(), r = erec(); let calls = 0; c.refuse = "max fee per gas less than block base fee"; let refused = 0, err = null;
       try { await PW.runFast(ectx(w, c, { onRefused: () => refused++ }), r, () => {}); } catch (e) { err = e; }
-      ok("ETH fast: the node refuses the transaction -> definite: part NOT_SENT, the guard hook onRefused fired, e.refused", r.parts[0].state === "NOT_SENT" && refused === 1 && err && err.refused === true && /refused the deposit transaction; nothing was sent/.test(err.message) && c.nonceOf(SE) === 0); }
+      ok("ETH fast: the node refuses the transaction (fee below its floor) -> definite: part NOT_SENT, the guard hook onRefused fired, e.refused", r.parts[0].state === "NOT_SENT" && refused === 1 && err && err.refused === true && /refused the deposit transaction; nothing was sent/.test(err.message) && c.nonceOf(SE) === 0); }
     { const w = world(), c = mkc(), r = erec(); c.set(SE, AMT + 5000n); let signed = 0, err = null;
       try { await PW.runFast(ectx(w, c, { onSigned: () => signed++ }), r, () => {}); } catch (e) { err = e; }
       ok("ETH fast: amount + fee does not fit the balance -> refused BEFORE signing: part NOT_SENT, onSigned never fired, nothing sent", r.parts[0].state === "NOT_SENT" && signed === 0 && c.sends.length === 0 && /Nothing was sent/.test(err.message)); }
@@ -333,11 +334,11 @@ async function fastUnit() {
       let x = await mk1(); ok("1144 M-1 standard route: lost answer + resend 'nonce too low' + status mined -> outcome sent (guard cleared only by the receipt later), one tx on chain, nothing signed again", x.out.outcome === "sent" && x.c.mined.size === 1 && x.c.sends.length === 2 && x.c.sends[0] === x.c.sends[1]);
       x = await mk1({ status: async () => { throw new Error("status down"); } }); ok("... status unreadable -> outcome unknown (the caller keeps the guard and never says 'Nothing was sent')", x.out.outcome === "unknown" && x.c.mined.size === 1);
       x = await mk1({ status: async () => "dead" }); ok("... status dead (a lagging node) -> unknown, the guard stays", x.out.outcome === "unknown");
-      const c2 = mkc(); c2.refuse = "insufficient funds for gas * price + value"; const tx2 = await E.prepareSend(c2.rpc, { priv: PR, chainId: 4663, from: SE, to: "0x" + "d1".repeat(20), value: AMT });
+      const c2 = mkc(); c2.refuse = "max fee per gas less than block base fee"; const tx2 = await E.prepareSend(c2.rpc, { priv: PR, chainId: 4663, from: SE, to: "0x" + "d1".repeat(20), value: AMT });
       const o2 = await E.sendSettled({ send: () => E.sendRaw(c2.rpc, tx2), status: () => E.txStatus(c2.rpc, { from: SE, hash: tx2.hash, nonce: tx2.nonce }, { sleep: nos }), sleep: nos });
       ok("a refusal on the FIRST answer is still a definite refusal (outcome refused, one send, nothing on chain)", o2.outcome === "refused" && c2.sends.length === 1 && c2.mined.size === 0);
       const c3 = mkc(); let n3 = 0; const tx3 = await E.prepareSend(c3.rpc, { priv: PR, chainId: 4663, from: SE, to: "0x" + "d1".repeat(20), value: AMT });
-      const o3 = await E.sendSettled({ send: async () => { n3++; throw n3 === 1 ? new Error("network down") : Object.assign(new Error("insufficient funds"), { rpc: true }); }, status: () => E.txStatus(c3.rpc, { from: SE, hash: tx3.hash, nonce: tx3.nonce }, { sleep: nos }), sleep: nos });
+      const o3 = await E.sendSettled({ send: async () => { n3++; throw n3 === 1 ? new Error("network down") : Object.assign(new Error("max fee per gas less than block base fee"), { rpc: true }); }, status: () => E.txStatus(c3.rpc, { from: SE, hash: tx3.hash, nonce: tx3.nonce }, { sleep: nos }), sleep: nos });
       ok("a refusal AFTER an unclear attempt is believed when the chain says unsent (nonce free, hash unknown) -> refused", o3.outcome === "refused" && n3 === 2);
       const o4 = await (async () => { let k = 0; return E.sendSettled({ send: async () => { k++; throw k === 1 ? new Error("network down") : Object.assign(new Error("insufficient funds"), { rpc: true }); }, status: async () => { throw new Error("down"); }, sleep: nos }); })();
       ok("... (that last pair) a refusal after an unclear attempt with the chain unreadable -> unknown, never refused", o4.outcome === "unknown"); }
@@ -350,6 +351,31 @@ async function fastUnit() {
       ok("1145 M-1: a node not knowing the tx is no proof: even with no tab running the part stays UNKNOWN, never NOT_SENT", r.parts[0].state === "UNKNOWN" && c.sends.length === 0);
       const r2 = erec(); r2.parts[0].state = "SIGNED"; r2.parts[0].depositAddress = "0x" + "e2".repeat(20); r2.parts[0].ethTx = { hash: "0x" + "ab".repeat(32), nonce: "0" };
       await PW.runFast({ ...base, ethStatus: async () => "pending" }, r2, () => {}, { resume: true }); ok("... a pending transaction is still UNKNOWN even then", r2.parts[0].state === "UNKNOWN"); }
+    // ---- 1146 L-3: a refusal that may still land is not "nothing was sent" on the fast and standard routes
+    for (const text of ["replacement transaction underpriced", "txpool is full", "insufficient funds for gas * price + value", "context deadline exceeded", "weird proxy failure 502"]) {
+      const w = world(), c = mkc(), r = erec(); c.refuse = text; let refused = 0, err = null;
+      try { await PW.runFast(ectx(w, c, { onRefused: () => refused++ }), r, () => {}); } catch (e) { err = e; }
+      ok("1146 L-3 fast route: '" + text + "' is not a definite refusal: part stays SIGNED, guard hook not fired, no 'nothing was sent'", r.parts[0].state === "SIGNED" && refused === 0 && err && !err.refused && !/nothing was sent/i.test(err.message) && err.message.includes("tx 0x"), String(err && err.message));
+      const c2 = mkc(); c2.refuse = text; const tx = await E.prepareSend(c2.rpc, { priv: PR, chainId: 4663, from: SE, to: "0x" + "d1".repeat(20), value: AMT });
+      const o = await E.sendSettled({ send: () => E.sendRaw(c2.rpc, tx), status: () => E.txStatus(c2.rpc, { from: SE, hash: tx.hash, nonce: tx.nonce }, { sleep: nos }), sleep: nos });
+      ok("1146 L-3 standard route (sendSettled with the page's send/status): '" + text + "' -> unknown (the guard stays), even though the node does not know the hash", o.outcome === "unknown" && c2.sends.length === 1, o.outcome); }
+    { const text = "transaction underpriced", c2 = mkc(); c2.refuse = text; const tx = await E.prepareSend(c2.rpc, { priv: PR, chainId: 4663, from: SE, to: "0x" + "d1".repeat(20), value: AMT });
+      const o = await E.sendSettled({ send: () => E.sendRaw(c2.rpc, tx), status: () => E.txStatus(c2.rpc, { from: SE, hash: tx.hash, nonce: tx.nonce }, { sleep: nos }), sleep: nos });
+      ok("1146 L-5: a plain 'transaction underpriced' is a fee refusal (definite, nothing sent) on the routes", o.outcome === "refused"); }
+    // ---- 1146 L-4: "dead" on a fast resume is not proof that nothing moved
+    { const mkLanded = async () => { const w = world(), c = mkc(), r = erec(); let tx = null;
+        await PW.runFast(ectx(w, c, { eth: api(c, { send: async () => { throw new Error("died before the broadcast"); } }), onSigned: i => { tx = i.ethTx; } }), r, () => {}).catch(() => {});
+        await E.sendRaw(c.rpc, tx); c.hideReceipt = true; c.hideTx = true; return { w, c, r, tx }; };      // mined, but this node serves neither receipt nor transaction while its nonce count is already up
+      const resume = (c, r, over = {}) => { const x = world(); return PW.runFast({ base: "http://1click", fetchFn: pendF(x.fetchFn), sleep: async () => {}, pollMs: 1, ethStatus: (rc, tx) => E.txStatus(c.rpc, { from: rc.stealth, hash: tx.hash, nonce: tx.nonce }, { sleep: nos }), ethBalance: async () => c.balOf(SE), ...over }, r, () => {}, { resume: true }).then(() => x); };
+      let m = await mkLanded(); ok("1146 L-4 baseline: the part records the balance from before its signing, outside ethTx", /^\d+$/.test(m.r.parts[0].ethBal) && !("bal" in m.r.parts[0].ethTx));
+      let x = await resume(m.c, m.r); ok("1146 L-4: lagging node says 'dead', 1Click shows nothing yet, the balance FELL by the amount -> UNKNOWN (guard kept), never NOT_SENT; nothing submitted", m.r.parts[0].state === "UNKNOWN" && x.submits.length === 0, m.r.parts[0].state);
+      m = await mkLanded(); const w2 = world(); const f2 = async (a, i) => String(a).includes("/v0/status") ? { ok: true, status: 200, json: async () => ({ status: "SUCCESS" }) } : w2.fetchFn(a, i);
+      await PW.runFast({ base: "http://1click", fetchFn: f2, sleep: async () => {}, pollMs: 1, ethStatus: (rc, tx) => E.txStatus(m.c.rpc, { from: rc.stealth, hash: tx.hash, nonce: tx.nonce }, { sleep: nos }), ethBalance: async () => m.c.balOf(SE) }, m.r, () => {}, { resume: true });
+      ok("1146 L-4: 'dead' but 1Click already has the deposit -> the part is followed (DEPOSITED, 1Click told, swap polled to SUCCESS), not NOT_SENT", m.r.parts[0].state === "SUCCESS" && w2.submits.length === 1 && w2.submits[0].txHash === m.tx.hash, m.r.parts[0].state);
+      m = await mkLanded(); x = await resume(m.c, m.r, { ethBalance: undefined }); ok("1146 L-4: no balance reader on the resume -> UNKNOWN (nothing is believed without a number)", m.r.parts[0].state === "UNKNOWN");
+      m = await mkLanded(); m.r.parts[0].ethBal = null; m.c.set(SE, 10n ** 18n); x = await resume(m.c, m.r); ok("1146 L-4: a record without a baseline balance -> UNKNOWN", m.r.parts[0].state === "UNKNOWN");
+      m = await mkLanded(); x = await resume(m.c, m.r, { fetchFn: async () => { throw new Error("1Click down"); } }); ok("1146 L-4: 1Click unreadable -> UNKNOWN", m.r.parts[0].state === "UNKNOWN");
+      m = await mkLanded(); x = await resume(m.c, m.r, { ethBalance: async () => { throw new Error("rpc down"); } }); ok("1146 L-4: balance unreadable -> UNKNOWN", m.r.parts[0].state === "UNKNOWN"); }
     { const w = world(), c = mkc(), r = erec(); let hash = null;
       await PW.runFast(ectx(w, c, { eth: api(c, { send: async tx => { await E.sendRaw(c.rpc, tx); throw new Error("tab died here"); } }), waitReceipt: async () => { throw new Error("tab died here"); }, onSigned: i => { hash = i.ethTx.hash; } }), r, () => {}).catch(() => {});
       ok("tab dies after the broadcast: the record is SIGNED with the hash", r.parts[0].state === "SIGNED" && r.parts[0].ethTx.hash === hash);
@@ -360,7 +386,7 @@ async function fastUnit() {
       const w = world(), c = mkc(), r = erec(); let hash = null, sent = false;
       await PW.runFast(ectx(w, c, { eth: api(c, { send: async tx => { sent = true; throw new Error("died before the broadcast"); } }), onSigned: i => { hash = i.ethTx.hash; } }), r, () => {}).catch(() => {});
       if (name.startsWith("reverted")) { c.revertNext = true; const raw = (await E.prepareSend(c.rpc, { priv: PR, chainId: 4663, from: SE, to: "0x" + "d1".repeat(20), value: 1n })); r.parts[0].ethTx = { hash: raw.hash, nonce: raw.nonce }; await E.sendRaw(c.rpc, raw); } else c.bump(SE);
-      await PW.runFast({ base: "http://1click", fetchFn: world().fetchFn, sleep: async () => {}, ethStatus: (rc, tx) => E.txStatus(c.rpc, { from: rc.stealth, hash: tx.hash, nonce: tx.nonce }, { sleep: nos }) }, r, () => {}, { resume: true });
+      await PW.runFast({ base: "http://1click", fetchFn: pendF(world().fetchFn), sleep: async () => {}, ethStatus: (rc, tx) => E.txStatus(c.rpc, { from: rc.stealth, hash: tx.hash, nonce: tx.nonce }, { sleep: nos }), ethBalance: async () => c.balOf(SE) }, r, () => {}, { resume: true });      // 1146 L-4: "dead" now also needs 1Click to show no deposit (pendF) and a balance that did not fall (ethBalance)
       ok("ETH fast resume: " + name + " -> " + want + " (the money did not move), not UNKNOWN", r.parts[0].state === want && PW.fastDone(r), r.parts[0].state); }
     { const w = world(), c = mkc(), r = erec(); let err = null; c.revertNext = true;
       try { await PW.runFast(ectx(w, c, { waitReceipt: (h, expect) => CR.waitFinal(c.rpc, h, { expect, sleep: nos, tries: 4, everyMs: 0 }), onRefused: () => {} }), r, () => {}); } catch (e) { err = e; }

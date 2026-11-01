@@ -8,7 +8,7 @@ import { keccak, signDigest, unhex, hex } from "./stealth-crypto.js";
 import { postRelay } from "./relay-post.js";
 import { timeoutSignal } from "./chain-read.js";
 import { privateFee, appFeesOf, assetOf, fmtUnits } from "./chains.js";
-import { sendSettled } from "./eth-send.js";
+import { sendSettled, mayHaveLeft } from "./eth-send.js";
 
 export const ONECLICK = "https://1click.chaindefuser.com";
 export const NEAR_RPCS = ["https://rpc.mainnet.near.org", "https://free.rpc.fastnear.com"];   // read-only: current_salt of intents.near
@@ -131,6 +131,11 @@ export function summarizeQuote(j, inDec = 6, outDec = 6) {
 export async function submitDeposit({ base = ONECLICK, txHash, depositAddress, fetchFn = fetch }) {
   return call(fetchFn, base + "/v0/deposit/submit", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ txHash, depositAddress }) });
 }
+/** 1146 L-4: one look at GET /v0/status. -> the status string, or null when it cannot be read (an unreadable answer is never "nothing seen"). */
+export async function statusOf({ base = ONECLICK, depositAddress, fetchFn = fetch }) {
+  try { const j = await call(fetchFn, base + "/v0/status?depositAddress=" + encodeURIComponent(depositAddress), { cache: "no-store" }); return typeof j.status === "string" ? j.status : null; } catch { return null; }
+}
+export const PENDING_DEPOSIT = "PENDING_DEPOSIT";
 /** Polls GET /v0/status until SUCCESS / REFUNDED / FAILED. onUpdate(statusJson) on every change. Transient errors are retried. */
 export async function pollStatus({ base = ONECLICK, depositAddress, fetchFn = fetch, sleep = ms => new Promise(r => setTimeout(r, ms)), intervalMs = 3000, timeoutMs = 20 * 60_000, onUpdate = () => {} }) {
   const t0 = Date.now(); let last = null, errs = 0;
@@ -228,9 +233,10 @@ export async function runPart(ctx, amount, delayMs) {
 async function runPartEth(ctx, q, amount, say, fetchFn, sleep) {
   const E = ctx.eth, A = assetOf(ctx.from, "ETH"), fm = v => fmtUnits(v, A.decimals, 6), short = h => h.slice(0, 12) + "…";
   say("Quote: send " + fm(q.amountIn) + " " + A.symbol + ", receive " + fm(q.amountOut) + " " + A.symbol + ", ~" + q.timeEstimate + " s. Signing the transfer…");
+  let bal = null; if (E.balance) { try { bal = String(await E.balance()); } catch {} }      // 1146 L-4: what the address held before this signing; a resume compares a "dead" verdict with it
   const tx = await E.prepare({ to: q.depositAddress, value: amount });      // throws before anything is signed when the balance cannot cover the amount plus the network fee
   const validBefore = Math.floor(Date.now() / 1000) + 3600;      // the caller's double-send guard window, the same as for an EIP-3009 authorization
-  if (ctx.onSigned) ctx.onSigned({ depositAddress: q.depositAddress, amount, validBefore, ethTx: tx });
+  if (ctx.onSigned) ctx.onSigned({ depositAddress: q.depositAddress, amount, validBefore, ethTx: tx, ethBal: bal });
   say("Sending the " + A.symbol + " deposit from the stealth address (it pays its own network fee)…");
   const refuse = (m, e) => { const x = new Error(m + (e ? ": " + ((e && e.message) || e) : "")); x.refused = true; if (ctx.onRefused) ctx.onRefused(); return x; };
   const sr = await sendSettled({ send: () => E.send(tx), status: () => E.status(tx), sleep });      // 1144 M-1: "refused" is only believed when no earlier attempt ended unclear (the resend of a mined transaction is answered "nonce too low")
@@ -277,7 +283,15 @@ export async function runFast(ctx, rec, save = () => {}, { resume = false } = {}
     if (p.state === "SIGNED" && resume) {
       let seen = null; if (p.ethTx && ctx.ethStatus) { try { seen = await ctx.ethStatus(rec, p.ethTx); } catch { seen = null; } }      // ETH: the saved hash says what became of the transfer (nothing is ever re-sent on a resume)
       if (seen === "mined") { p.state = "DEPOSITED"; p.txHash = p.ethTx.hash; save(rec); await submitDeposit({ base: ctx.base, txHash: p.txHash, depositAddress: p.depositAddress, fetchFn: ctx.fetchFn }).catch(() => {}); }
-      else { p.state = seen === "failed" || seen === "dead" ? "NOT_SENT" : "UNKNOWN"; save(rec); continue; }      // reverted, or its nonce was used by another transaction: nothing moved. 1145 M-1: "unsent" stays UNKNOWN: a single node not knowing it, with no tab running, does not prove a broadcast already on its way cannot land
+      else if (seen === "dead") {      // 1146 L-4: its nonce is used, by it or by another transaction. A lagging node counts the nonce before it serves the receipt, so "dead" alone is no proof that nothing moved: 1Click must still show no deposit and the balance must not have fallen by the amount
+        const st1 = await statusOf({ base: ctx.base, depositAddress: p.depositAddress, fetchFn: ctx.fetchFn });
+        if (st1 !== null && st1 !== PENDING_DEPOSIT) { p.state = "DEPOSITED"; p.txHash = p.ethTx.hash; save(rec); await submitDeposit({ base: ctx.base, txHash: p.txHash, depositAddress: p.depositAddress, fetchFn: ctx.fetchFn }).catch(() => {}); }      // 1Click has the deposit: follow it
+        else {
+          let now = null; if (ctx.ethBalance) { try { now = String(await ctx.ethBalance(rec)); } catch {} }
+          p.state = st1 === PENDING_DEPOSIT && !mayHaveLeft(p.ethBal, now, p.amount) ? "NOT_SENT" : "UNKNOWN"; save(rec); continue;      // UNKNOWN keeps the guard: the explorer and the deposit address say which
+        }
+      }
+      else { p.state = seen === "failed" ? "NOT_SENT" : "UNKNOWN"; save(rec); continue; }      // reverted: nothing moved. 1145 M-1: "unsent" stays UNKNOWN: a single node not knowing it, with no tab running, does not prove a broadcast already on its way cannot land
     }
     if (p.state === "PLANNED" && resume) { p.state = "NOT_SENT"; save(rec); continue; }
     if (p.state === "DEPOSITED") {
@@ -288,7 +302,7 @@ export async function runFast(ctx, rec, save = () => {}, { resume = false } = {}
     }
     if (p.state !== "PLANNED") continue;
     const c = { ...ctx, onProgress: m => say(tag + m),
-      onSigned: info => { p.state = "SIGNED"; p.depositAddress = info.depositAddress; if (info.ethTx) p.ethTx = { hash: info.ethTx.hash, nonce: info.ethTx.nonce }; save(rec); if (ctx.onSigned) ctx.onSigned({ ...info, index: i }); },
+      onSigned: info => { p.state = "SIGNED"; p.depositAddress = info.depositAddress; if (info.ethTx) { p.ethTx = { hash: info.ethTx.hash, nonce: info.ethTx.nonce }; p.ethBal = info.ethBal == null ? null : String(info.ethBal); } save(rec); if (ctx.onSigned) ctx.onSigned({ ...info, index: i }); },
       onDeposited: info => { p.state = "DEPOSITED"; p.depositAddress = info.depositAddress; p.txHash = info.txHash; save(rec); if (ctx.onDeposited) ctx.onDeposited({ ...info, index: i }); } };
     try { const r = await runPart(c, BigInt(p.amount), p.delayMs); p.state = r.status; p.final = r.status; save(rec); }
     catch (e) { if (p.state === "PLANNED" || (p.state === "SIGNED" && e.refused)) p.state = "NOT_SENT"; else if (p.state === "DEPOSITED") { p.state = "STUCK"; p.stuckWhy = String((e && e.message) || e).slice(0, 160); }      // DEPOSITED + a throw = the 1Click poll gave up (1130 M-2)

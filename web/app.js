@@ -674,7 +674,7 @@ async function fastWithdraw(to, value, hit, asset = "TOKEN") {
     findTx: a => txOfLogs({ address: USDC, topics: [AUTH_USED_TOPIC, "0x" + padAddr(w.stealth), a.nonce], span: logSpanSince(a.validBefore) }, () => true), onRefused: () => pendingWd.delete(k),
     onSigned: info => { cur = info; pendingWd.set(k, (info.validBefore + 60) * 1000); },       // armed before the request leaves; cleared only when the deposit is confirmed
     waitReceipt: h => eth ? waitReceipt(h, x => x.ok && x.hash === cur.ethTx.hash.toLowerCase()) : waitReceipt(h, x => hasTransfer(x, { token: USDC, from: w.stealth, to: cur.depositAddress, value: cur.amount }) && hasAuthUsed(x, { token: USDC, authorizer: w.stealth, nonce: cur.auth.nonce }), true),      // ETH: the hash of the transaction we signed binds its nonce, destination and amount
-    onDeposited: info => { if (info.index === rec.parts.length - 1) pendingWd.delete(k); spent.set(spentKey(k, eth), { left: (spent.get(spentKey(k, eth)) || { left: (eth ? w.eth : w.usdc) ?? 0n }).left - BigInt(rec.parts[info.index].amount), until: Date.now() + 120_000, ...(eth ? { asset: "ETH" } : {}) }); render(); } };
+    onDeposited: info => { if (info.index === rec.parts.length - 1) pendingWd.delete(k); spent.set(spentKey(k, eth), { left: (l => l < 0n ? 0n : l)((spent.get(spentKey(k, eth)) || { left: (eth ? w.eth : w.usdc) ?? 0n }).left - BigInt(rec.parts[info.index].amount)), until: Date.now() + 120_000, ...(eth ? { asset: "ETH" } : {}) }); render(); } };
   try {
     const run = () => { fastClaim(rec); claimed = true; return PW.runFast(ctx, rec, save); };      // claimed inside the lock: a second tab is refused before it can write
     if (navigator.locks) await navigator.locks.request("fast-wd:" + k, { ifAvailable: true }, l => l ? run() : Promise.reject(new Error("A withdraw from this address is already running in another tab."))); else await run();
@@ -692,7 +692,7 @@ async function resumeFast() {
   for (const k of Object.keys(m)) {
     const rec = m[k]; if (!rec || !Array.isArray(rec.parts) || fastBusy.has(k)) continue;
     let ran = false;
-    const go = async () => { ran = true; fastBusy.add(k); try { await PW.runFast({ base: PW.ONECLICK, fetchFn: fetch, ethStatus: (r, tx) => ETH.txStatus(ethRpc, { from: r.stealth, hash: tx.hash, nonce: tx.nonce }), onProgress: t => { fastLive = "Earlier private withdraw: " + t; showFastBox(); } }, rec, r => { try { fastRecs.put(r); } catch {} }, { resume: true }); } finally { fastBusy.delete(k); fastLive = ""; } };
+    const go = async () => { ran = true; fastBusy.add(k); try { await PW.runFast({ base: PW.ONECLICK, fetchFn: fetch, ethStatus: (r, tx) => ETH.txStatus(ethRpc, { from: r.stealth, hash: tx.hash, nonce: tx.nonce }), ethBalance: async r => BigInt(await ethRpc("eth_getBalance", [r.stealth, "latest"])), onProgress: t => { fastLive = "Earlier private withdraw: " + t; showFastBox(); } }, rec, r => { try { fastRecs.put(r); } catch {} }, { resume: true }); } finally { fastBusy.delete(k); fastLive = ""; } };
     try { if (navigator.locks) await navigator.locks.request("fast-wd:" + k, { ifAvailable: true }, l => l ? go() : undefined); else await go(); } catch (e) { extra.push("Earlier private withdraw: " + (e.message || e)); continue; }
     if (!ran) continue;                                      // 1125 F-6: another tab holds the lock, so this record is a LIVE withdraw there, not an earlier one
     const chain = CHAINS[rec.chain] || C, un = unitsOf(chain, rec), sums = PW.fastSummary(rec, un.fmt, un.sym), text = "Earlier private withdraw (" + chain.name + "):\n" + sums.join("\n");
@@ -753,12 +753,14 @@ async function screenRecipient(to) {
 // with the fee is refused before anything is signed. The signed bytes are recorded (with the double-send guard) BEFORE they are broadcast; they are only ever re-sent as they are, and a nonce can be mined once, so nothing can be paid twice.
 const ETH_WD_KEY = "stealth-eth-wd", ethWdRec = { all() { try { const o = JSON.parse(localStorage.getItem(ETH_WD_KEY) || "{}"); return o && typeof o === "object" ? o : {}; } catch { return {}; } },
   put(k, v) { const o = this.all(); o[k] = v; try { localStorage.setItem(ETH_WD_KEY, JSON.stringify(o)); } catch {} }, del(k) { const o = this.all(); delete o[k]; try { localStorage.setItem(ETH_WD_KEY, JSON.stringify(o)); } catch {} } };
-// after a Scan: an earlier ETH withdrawal whose outcome is now known on chain (mined, reverted, or its nonce taken by another transaction) no longer needs its guard.
+// after a Scan: an earlier ETH withdrawal whose outcome is now known on chain (mined, reverted, or its nonce taken by another transaction while the balance did not fall by its amount) no longer needs its guard.
 // "unsent" (the node does not know it, its nonce is free) is cleared only once the guard's own window (the 1 h + 60 s armed in ethStandard) has passed: the record holds hash and nonce, not the bytes, so the only copy of them was in the tab that signed them and a send loop there ends within seconds
 const ethArmedUntil = r => (Math.floor((Number(r.at) || 0) / 1000) + 3600 + 60) * 1000;
 async function ethResolve() {
   const m = ethWdRec.all(); let any = false;
-  for (const k of Object.keys(m)) { const r = m[k]; if (!r || !found.some(f => f.stealth.toLowerCase() === k)) continue; let st = null; try { st = await ETH.txStatus(ethRpc, { from: k, hash: r.hash, nonce: r.nonce }); } catch {} if (st === "mined" || st === "failed" || st === "dead" || (st === "unsent" && Date.now() > ethArmedUntil(r))) { pendingWd.delete(k); ethWdRec.del(k); any = true; } }
+  for (const k of Object.keys(m)) { const r = m[k]; if (!r || !found.some(f => f.stealth.toLowerCase() === k)) continue; let st = null, now = null; try { st = await ETH.txStatus(ethRpc, { from: k, hash: r.hash, nonce: r.nonce }); } catch {}
+    if (st === "dead") { try { now = String(BigInt(await ethRpc("eth_getBalance", [k, "latest"]))); } catch {} }      // 1146 L-4: a lagging node counts the nonce before it serves the receipt: "dead" releases the guard only when a fresh balance shows the amount did not leave (or the guard's window has run out)
+    if (st === "mined" || st === "failed" || (st === "unsent" && Date.now() > ethArmedUntil(r)) || (st === "dead" && (Date.now() > ethArmedUntil(r) || !ETH.mayHaveLeft(r.bal, now, r.value)))) { pendingWd.delete(k); ethWdRec.del(k); any = true; } }
   return any;
 }
 async function ethFeeOf(stealth, to) {
@@ -783,7 +785,7 @@ async function ethStandard(to, value, hit, all) {
   const w = wd, k = w.stealth.toLowerCase(), sleep = ms => new Promise(r => setTimeout(r, ms));
   say("pay-hint", "Signing the " + NAT + " transfer…");
   const tx = await ETH.prepareSend(ethRpc, { priv: hit.stealthPriv, chainId: C.chainId, from: w.stealth, to, value });      // reads nonce + gas, checks amount + fee fit the balance; nothing is sent
-  const armedAt = Date.now(); pendingWd.set(k, ethArmedUntil({ at: armedAt })); ethWdRec.put(k, { hash: tx.hash, nonce: tx.nonce, at: armedAt });      // armed and recorded BEFORE the bytes leave; cleared only by a confirmed outcome
+  const armedAt = Date.now(); pendingWd.set(k, ethArmedUntil({ at: armedAt })); ethWdRec.put(k, { hash: tx.hash, nonce: tx.nonce, at: armedAt, bal: String(all), value: String(value) });      // armed and recorded BEFORE the bytes leave; cleared only by a confirmed outcome
   say("pay-hint", "Sending from the stealth address (it pays its own network fee)…");
   const sr = await ETH.sendSettled({ send: () => ETH.sendRaw(ethRpc, tx), status: () => ETH.txStatus(ethRpc, { from: w.stealth, hash: tx.hash, nonce: tx.nonce }), sleep });      // 1144 M-1: "refused" is only believed when no earlier attempt ended unclear (the resend of a mined transaction is answered "nonce too low")
   const why = sr.error && (sr.error.message || sr.error);

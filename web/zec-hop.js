@@ -476,6 +476,18 @@ export async function runHop(ctx) {
     }
     return false;
   };
+  /** 1146 L-1, L-2, I-3: the nonce of an earlier deposit `x` (its bytes, quote and the balance before it was signed) was used by some transaction and 1Click has not shown that deposit. Did the money leave? Judged on a balance read NOW, after the "dead" verdict (a read taken before it can predate the landing).
+   *  Nothing is believed without a number: an unreadable balance, a missing baseline and a fall by the amount all hold the hop (a Halt that names when it ends). The hold ends with the quote: after its deadline 1Click no longer swaps that deposit (it refunds it to the stealth address), so the hop goes on and the earlier bytes stay in prevIn,
+   *  where a later pass still looks at them. -> undefined when the balance shows the money stayed, "late" when the hold ran out */
+  const leftOrWait = async (x, deadlineMs) => {
+    let now = null; try { now = String(await ctx.eth.balance()); } catch {}
+    if (!ETH.mayHaveLeft(x.bal, now, x.quote.amountIn)) return undefined;
+    if (Date.now() > deadlineMs) return "late";
+    const end = "; this hold ends with that deposit's quote, in " + fmtMS(deadlineMs - Date.now()) + ". Press Continue to check again";
+    if (now === null) throw new Halt("could not read the balance to tell whether the earlier ETH deposit landed; nothing new was signed" + end);
+    if (x.bal == null) throw new Halt("the balance from before the earlier ETH deposit was not saved, so it cannot be told whether it landed (deposit address " + x.quote.depositAddress + "); nothing new was signed" + end);
+    throw new Halt("the nonce of the earlier ETH deposit was used and the balance fell by its amount, so it probably landed (deposit address " + x.quote.depositAddress + "); the node does not show it yet; nothing new was signed" + end);
+  };
   const depositEth = async q => {
     if ((await status(q.depositAddress, fIn)) !== PENDING) return false;      // 1Click already has the deposit
     const E = ctx.eth; if (!E) throw new Halt("this page cannot send ETH from the stealth address; nothing was sent");
@@ -483,16 +495,18 @@ export async function runHop(ctx) {
     if (!st.ethTx) {
       if (Date.now() > q.deadlineMs - 120_000) { await go("QUOTE_IN", { inQuote: null }); return true; }      // quote nearly expired and nothing signed: start over
       let bal = null; if (E.balance) { try { bal = String(await E.balance()); } catch {} }      // what the address held before this signing (1144 L-2: a later "dead" is compared with it)
+      if (E.balance && bal === null) throw new Halt("could not read the balance of the stealth address; nothing was signed. Press Continue to try again");      // 1146 I-3: without a baseline a later "dead" could not be checked
       let t; try { t = await E.prepare({ to: q.depositAddress, value: BigInt(q.amountIn) }); } catch (e) { throw e && e.short ? new Halt(e.message) : e; }
       const pv = prevOf()[prevOf().length - 1];
       if (pv && String(t.nonce) !== String(pv.tx.nonce)) {      // 1144 M-2: a replacement must take the nonce of the dropped bytes. A later nonce means the chain moved on: either those bytes landed in between, or the nonce was taken by another transaction
-        const o = await E.status(pv.tx).catch(() => null);
-        if (o === "dead" && await resumePrev()) return true;      // 1145 L-2: same checks as the dead path below before an earlier deposit is forgotten
-        if (o === "dead" && pv.bal != null && bal === null) throw new Halt("could not read the balance to tell whether the earlier ETH deposit landed; nothing new was signed. Press Continue to check again");
-        if (o === "dead" && pv.bal != null && BigInt(bal) + BigInt(pv.quote.amountIn) <= BigInt(pv.bal)) throw new Halt("the balance fell by the amount of an earlier ETH deposit, so it probably landed; nothing new was signed. Press Continue to check again");
-        if (o === "dead" || o === "failed") st.prevIn = prevOf().filter(x => x !== pv);      // can never be mined / reverted: the later nonce is safe (saved with t below)
-        else if (o === "mined" || o === "pending") { if (await resumePrev()) return true; throw new Halt("an earlier ETH deposit is on the network; following it. Press Continue"); }
-        else throw new Halt("the address's transaction count moved but the earlier ETH deposit cannot be told apart from another transaction; nothing new was signed. Press Continue to check again");
+        const old = prevOf().filter(x => String(x.tx.nonce) !== String(t.nonce)), sts = [];      // 1146 I-2: every earlier entry with a nonce below t's, not only the last
+        for (const x of old) sts.push(await E.status(x.tx).catch(() => null));
+        if (sts.some(o => o === "mined" || o === "pending")) { if (await resumePrev()) return true; throw new Halt("an earlier ETH deposit is on the network; following it. Press Continue"); }
+        if (sts.some(o => o !== "dead" && o !== "failed")) throw new Halt("the address's transaction count moved but the earlier ETH deposit cannot be told apart from another transaction; nothing new was signed. Press Continue to check again");
+        if (sts.includes("dead") && await resumePrev()) return true;      // 1145 L-2: same checks as the dead path below before an earlier deposit is forgotten
+        const late = [];
+        if (E.balance) for (let i = 0; i < old.length; i++) if (sts[i] === "dead" && await leftOrWait(old[i], old[i].quote.deadlineMs) === "late") late.push(old[i]);      // 1146 L-1: a fresh balance, read after the verdicts
+        st.prevIn = prevOf().filter(x => !old.includes(x) || late.includes(x));      // can never be mined / reverted: the later nonce is safe (saved with t below)
       }
       st.ethTx = t; st.ethBal = bal; await save();      // recorded BEFORE it can leave the device
     }
@@ -501,11 +515,7 @@ export async function runHop(ctx) {
       if (s0 === "dead") {
         if (await resumePrev()) return true;      // the nonce may have been used by a dropped earlier deposit of ours
         const seenNow = (await status(q.depositAddress, fIn)) !== PENDING; if (seenNow) return false;      // 1144 L-2: a lagging node can count the nonce before it serves the receipt, and 1Click may have seen the deposit meanwhile
-        if (E.balance && st.ethBal != null) {      // the balance fell by the deposit amount since signing: money left the address, so it is not "never mined"
-          let now = null; try { now = await E.balance(); } catch {}
-          if (now === null) throw new Halt("could not read the balance to tell whether the earlier ETH deposit landed; nothing new was signed. Press Continue to check again");
-          if (BigInt(st.ethBal) - now >= BigInt(q.amountIn)) throw new Halt("the nonce of the ETH deposit was used and the balance fell by its amount, so it probably landed (deposit address " + q.depositAddress + "); the node does not show it yet. Press Continue to check again");
-        }
+        if (E.balance) await leftOrWait({ bal: st.ethBal, quote: q }, q.deadlineMs);      // the balance fell by the deposit amount since signing: money left the address, so it is not "never mined" (1146 L-2: until the quote ends)
         await dropEth("The earlier ETH deposit can never be mined (its nonce was used by another transaction); starting again with a new quote…"); return true;
       }
       if (s0 === "failed") { st.ethTx = null; st.ethBal = null; await save(); throw new Halt("the ETH deposit transaction reverted; nothing moved. Press Continue to try again"); }
@@ -514,14 +524,15 @@ export async function runHop(ctx) {
           await dropEth(st.ethRefused ? "The network refused the saved ETH deposit; starting again with a new quote and a new transaction…" : "The saved ETH deposit was never sent and its quote is about to expire; starting again with a new quote…"); return true;
         }
         say("Sending the ETH deposit from the stealth address…");
-        try { await E.send(st.ethTx); } catch (e) { if (ETH.refused(e)) { st.ethRefused = !ETH.mayStillLand(e); await save(); throw new Halt("the network refused the ETH deposit (" + oneLineErr(e) + "); the signed transaction is kept. Press Continue to check again"); } throw e; }      // kept until the next pass asks the chain again: a refusal worded "nonce too low" is not a refusal (it was mined after all) and is never counted here
+        try { await E.send(st.ethTx); } catch (e) { if (ETH.refused(e)) { if (ETH.mayStillLand(e) && prevOf().length && await resumePrev()) return true; st.ethRefused = ETH.definiteRefusal(e); await save();      // 1146 L-5: "replacement underpriced" with an earlier deposit given up most likely means that deposit is pending in this node
+          throw new Halt("the network refused the ETH deposit (" + oneLineErr(e) + "); the signed transaction is kept. Press Continue to check again"); } throw e; }      // kept until the next pass asks the chain again: a refusal worded "nonce too low" is not a refusal (it was mined after all) and is never counted here
       }
       st.txIn = st.ethTx.hash; await save();
     }
     let got; try { got = await ctx.waitReceipt(st.txIn, rc => rc.ok && String(rc.hash).toLowerCase() === st.ethTx.hash.toLowerCase()); }      // the hash binds the nonce, the destination and the amount of THIS transaction
     catch (e) { st.txIn = null; await save(); throw e; }      // 1144 L-1: not mined in time: the next pass asks the chain again (and re-sends the SAME bytes if they were dropped); st.ethTx stays
     if (!got.ok) { st.txIn = null; if (!got.unexpected) { st.ethTx = null; st.ethBal = null; } await save(); throw new Halt(got.unexpected ? "the receipt does not belong to the ETH deposit we signed; nothing was recorded as sent. Press Continue to check again" : "the ETH deposit transaction reverted; nothing moved. Press Continue to try again"); }
-    st.prevIn = null; await save();      // this deposit is mined: any dropped one shared its nonce and can never land
+    st.prevIn = null; await save();      // this deposit is mined: every dropped one has this nonce or a lower one, so none can land
     await PW.submitDeposit({ base, txHash: st.txIn, depositAddress: q.depositAddress, fetchFn: fIn }).catch(() => {});
     return false;
   };
