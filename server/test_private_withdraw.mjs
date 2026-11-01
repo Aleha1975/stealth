@@ -97,7 +97,11 @@ async function walletRequest(P, method, params) {
       (P.signed = P.signed || []).push(td.primaryType);
       return P.account.signTypedData({ domain, types, primaryType: td.primaryType, message });
     }
-    case "eth_sendTransaction": throw new Error("test wallet: transactions are not expected in the gasless flow");
+    case "eth_sendTransaction": {
+      if (!P.allowTx) throw new Error("test wallet: transactions are not expected in the gasless flow");      // only the payer of an ETH payment sends a normal transaction (payETH), and only while allowTx is set
+      const t = params[0]; if (String(t.from).toLowerCase() !== P.account.address.toLowerCase()) throw new Error("tx for wrong account");
+      return createWalletClient({ account: P.account, chain: pubChain, transport: vhttp(RPC) }).sendTransaction({ to: t.to, data: t.data, value: t.value ? BigInt(t.value) : 0n });
+    }
     default: return rpc(method, params);
   }
 }
@@ -114,14 +118,14 @@ function startMock() {
       if (u.pathname === "/v0/quote" && req.method === "POST") {
         mock.quotes.push(body); const amt = BigInt(body.amount), out = amt * 997n / 1000n - 2400n;
         const q = { amountIn: body.amount, amountInFormatted: String(Number(amt) / 1e6), amountInUsd: "0", minAmountIn: body.amount, amountOut: out.toString(), amountOutFormatted: String(Number(out) / 1e6), amountOutUsd: "0", minAmountOut: (out * 99n / 100n).toString(), timeEstimate: 20, refundFee: "75000", withdrawFee: "2400" };
-        if (!body.dry) { const a = privateKeyToAccount(generatePrivateKey()).address; q.depositAddress = a; q.deadline = body.deadline; mock.deposits[a.toLowerCase()] = { amount: amt, state: "PENDING_DEPOSIT" }; }
+        if (!body.dry) { const a = privateKeyToAccount(generatePrivateKey()).address; q.depositAddress = a; q.deadline = body.deadline; mock.deposits[a.toLowerCase()] = { amount: amt, state: "PENDING_DEPOSIT", eth: body.originAsset === "nep141:hood.omft.near" }; }
         return send(200, { quote: q, quoteRequest: { ...body, depositMode: "SIMPLE" }, signature: "ed25519:mock", timestamp: new Date().toISOString(), correlationId: "mock" });
       }
       if (u.pathname === "/v0/deposit/submit" && req.method === "POST") {
         mock.submits.push(body); const d = mock.deposits[String(body.depositAddress).toLowerCase()];
         if (!d) return send(400, { message: "unknown deposit address" });
         const rc = await rpc("eth_getTransactionReceipt", [body.txHash]).catch(() => null);          // like 1Click: the deposit tx must exist and have paid the address
-        const bal = BigInt(await rpc("eth_call", [{ to: TOKEN, data: "0x70a08231" + body.depositAddress.slice(2).toLowerCase().padStart(64, "0") }, "latest"]));
+        const bal = d.eth ? BigInt(await rpc("eth_getBalance", [body.depositAddress, "latest"])) : BigInt(await rpc("eth_call", [{ to: TOKEN, data: "0x70a08231" + body.depositAddress.slice(2).toLowerCase().padStart(64, "0") }, "latest"]));      // an ETH deposit is a plain transfer: the address balance is the proof
         if (!rc || bal < d.amount) return send(400, { message: "deposit not found" });
         d.state = "KNOWN_DEPOSIT_TX"; return send(200, { status: d.state });
       }
@@ -279,6 +283,56 @@ async function fastUnit() {
     ok("1125 F-5: rc.unexpected -> 'does not contain the expected transfer', not 'reverted'; part stays SIGNED", /does not contain the expected transfer/.test(err) && !/reverted/.test(err) && r.parts[0].state === "SIGNED"); }
   // 1125 F-1 record gate
   ok("1125 F-1: fastOpenRec is true for PLANNED/SIGNED/DEPOSITED parts, false for finished or missing records", PW.fastOpenRec({ parts: [{ state: "SUCCESS" }, { state: "DEPOSITED" }] }) && PW.fastOpenRec({ parts: [{ state: "PLANNED" }] }) && !PW.fastOpenRec({ parts: [{ state: "UNKNOWN" }, { state: "NOT_SENT" }] }) && !PW.fastOpenRec(undefined) && !PW.fastOpenRec({}));
+  // ---- native ETH on the fast route: a plain transaction signed by the stealth key, no relayer. Fake chain (parses every raw transaction with viem), same 1Click stub.
+  { const { makeEthChain } = await import("./fake_eth_chain.mjs"), E = await import("../web/eth-send.js"), CR = await import("../web/chain-read.js"), { privateKeyToAccount } = await import("viem/accounts");
+    const PR = "0x" + "45".repeat(32), SE = privateKeyToAccount(PR).address.toLowerCase(), AMT = 30_000_000_000_000_000n, nos = async () => {};
+    const mkc = () => { const c = makeEthChain(); c.set(SE, 10n ** 18n); return c; };
+    const api = (c, o = {}) => ({ prepare: ({ to, value }) => E.prepareSend(c.rpc, { priv: PR, chainId: 4663, from: SE, to, value }), send: o.send || (tx => E.sendRaw(c.rpc, tx)), status: tx => E.txStatus(c.rpc, { from: SE, hash: tx.hash, nonce: tx.nonce }, { sleep: nos }) });
+    const ectx = (w, c, o = {}) => ({ ...mk(w), from: CHAINS.rh, to: CHAINS.rh, asset: "ETH", priv: PR, stealth: SE, eth: api(c), waitReceipt: (h, expect) => CR.waitFinal(c.rpc, h, { expect: expect || (x => x.ok && x.hash === c.lastHash), sleep: nos, tries: 4, everyMs: 0 }), ...o });
+    const erec = (n = 1) => ({ v: 1, stealth: SE, chain: "rh", dest: "rh", asset: "ETH", parts: Array.from({ length: n }, () => ({ amount: AMT.toString(), delayMs: 0, state: "PLANNED", depositAddress: null, txHash: null })) });
+    const wc = (c, hash) => (c.lastHash = hash, true);
+    { const w = world(), c = mkc(), r = erec(), hooks = []; let atSigned = null;
+      const ctx = ectx(w, c, { waitReceipt: (h, expect) => CR.waitFinal(c.rpc, h, { expect, sleep: nos, tries: 4, everyMs: 0 }), onSigned: i => { atSigned = { sends: c.sends.length, p: JSON.stringify(i.ethTx) }; hooks.push("signed"); }, onDeposited: () => hooks.push("dep") });
+      await PW.runFast(ctx, r, x => w.saves.push(JSON.stringify(x)));
+      ok("ETH fast: one part SUCCESS, NO relayer call, one real quote, one submit, ONE raw transaction from the stealth address", r.parts[0].state === "SUCCESS" && w.relays.length === 0 && w.quotes.length === 1 && w.submits.length === 1 && c.sends.length === 1 && c.nonceOf(SE) === 1);
+      ok("ETH fast: the quote is ETH <-> ETH on hood (assets from 1Click), refund to the stealth address, public", w.quotes[0].originAsset === "nep141:hood.omft.near" && w.quotes[0].destinationAsset === "nep141:hood.omft.near" && w.quotes[0].refundTo === SE && w.quotes[0].recipient === ctx.recipient && w.quotes[0].amount === AMT.toString());
+      ok("ETH fast: the signing hook fired BEFORE anything reached the chain (the caller saves + arms its guard first), then the deposit hook", atSigned.sends === 0 && hooks.join() === "signed,dep");
+      const dest = Object.values(w.polls).length && w.submits[0].depositAddress.toLowerCase(), tx = [...c.mined.values()][0];
+      ok("ETH fast: the chain got exactly the amount at the quote's deposit address, nothing else moved but gas", tx.to === dest && tx.value === AMT && c.balOf(dest) === AMT && c.balOf(SE) === 10n ** 18n - AMT - 21000n * c.gasPrice * 2n);
+      ok("ETH fast: the saved record keeps the hash and nonce (to follow the transfer after a reload) but neither the raw bytes nor the recipient", /"ethTx":\{"hash":"0x[0-9a-f]{64}","nonce":"0"\}/.test(w.saves.find(x => x.includes("ethTx"))) && !w.saves.some(x => x.includes(atSigned.p.slice(8, 40)) || x.includes("cd".repeat(20)) || x.includes('"raw"')));
+      ok("ETH fast: the summary names ETH", PW.fastSummary(r, v => E && (Number(v) / 1e18).toString(), "ETH")[0].includes("ETH")); }
+    { const w = world(), c = mkc(), r = erec(); let calls = 0; c.refuse = "insufficient funds for gas * price + value"; let refused = 0, err = null;
+      try { await PW.runFast(ectx(w, c, { onRefused: () => refused++ }), r, () => {}); } catch (e) { err = e; }
+      ok("ETH fast: the node refuses the transaction -> definite: part NOT_SENT, the guard hook onRefused fired, e.refused", r.parts[0].state === "NOT_SENT" && refused === 1 && err && err.refused === true && /refused the deposit transaction; nothing was sent/.test(err.message) && c.nonceOf(SE) === 0); }
+    { const w = world(), c = mkc(), r = erec(); c.set(SE, AMT + 5000n); let signed = 0, err = null;
+      try { await PW.runFast(ectx(w, c, { onSigned: () => signed++ }), r, () => {}); } catch (e) { err = e; }
+      ok("ETH fast: amount + fee does not fit the balance -> refused BEFORE signing: part NOT_SENT, onSigned never fired, nothing sent", r.parts[0].state === "NOT_SENT" && signed === 0 && c.sends.length === 0 && /Nothing was sent/.test(err.message)); }
+    { const w = world(), c = mkc(), r = erec(); c.dropAnswer = 1; const f0 = w.fetchFn; let n = 0;
+      await PW.runFast(ectx(w, c, { waitReceipt: (h, expect) => CR.waitFinal(c.rpc, h, { expect, sleep: nos, tries: 4, everyMs: 0 }) }), r, () => {});
+      ok("ETH fast: the answer of the broadcast is lost (network error) -> the SAME bytes go again, the chain says 'already known' = sent: one payment, SUCCESS", r.parts[0].state === "SUCCESS" && c.sends.length === 2 && c.sends[0] === c.sends[1] && c.nonceOf(SE) === 1 && c.balOf(c.mined.values().next().value.to) === AMT); }
+    { const w = world(), c = mkc(), r = erec(); let err = null;
+      const ctx = ectx(w, c, { eth: api(c, { send: async () => { throw new Error("network down"); } }) });
+      try { await PW.runFast(ctx, r, () => {}); } catch (e) { err = e; }
+      ok("ETH fast: the broadcast never gets through and the chain does not know it -> an error with the hash and deposit address, the part stays SIGNED (unknown), nothing was refused", /could not confirm that the ETH deposit was sent/.test(err.message) && err.message.includes("tx 0x") && r.parts[0].state === "SIGNED" && r.parts[0].ethTx && c.sends.length === 0);
+      const x = world(); await PW.runFast({ base: "http://1click", fetchFn: x.fetchFn, sleep: async () => {}, ethStatus: (rc, tx) => E.txStatus(c.rpc, { from: rc.stealth, hash: tx.hash, nonce: tx.nonce }, { sleep: nos }) }, r, () => {}, { resume: true });
+      ok("ETH fast resume of that SIGNED part: the chain does not know the hash and the nonce is free -> UNKNOWN (nothing is ever re-sent from a resume), no quote, no send", r.parts[0].state === "UNKNOWN" && c.sends.length === 0 && x.quotes.length === 0 && x.relays.length === 0); }
+    { const w = world(), c = mkc(), r = erec(); let hash = null;
+      await PW.runFast(ectx(w, c, { eth: api(c, { send: async tx => { await E.sendRaw(c.rpc, tx); throw new Error("tab died here"); } }), waitReceipt: async () => { throw new Error("tab died here"); }, onSigned: i => { hash = i.ethTx.hash; } }), r, () => {}).catch(() => {});
+      ok("tab dies after the broadcast: the record is SIGNED with the hash", r.parts[0].state === "SIGNED" && r.parts[0].ethTx.hash === hash);
+      const x = world(); x.fetchFn = ((f) => async (u, i) => String(u).includes("/v0/status") ? { ok: true, status: 200, json: async () => ({ status: "SUCCESS" }) } : f(u, i))(x.fetchFn);
+      await PW.runFast({ base: "http://1click", fetchFn: x.fetchFn, sleep: async () => {}, pollMs: 1, ethStatus: (rc, tx) => E.txStatus(c.rpc, { from: rc.stealth, hash: tx.hash, nonce: tx.nonce }, { sleep: nos }) }, r, () => {}, { resume: true });
+      ok("ETH fast resume: the saved hash is MINED -> the part is DEPOSITED, 1Click is told, the swap is followed to SUCCESS; nothing is quoted, signed or sent", r.parts[0].state === "SUCCESS" && x.submits.length === 1 && x.submits[0].txHash === hash && x.quotes.length === 0 && new Set(c.sends).size === 1 && c.nonceOf(SE) === 1); }      // the first run re-sent the same bytes once after the error ("already known"); the resume sent nothing
+    for (const [name, setup, want] of [["reverted on chain", c => { c.revertNext = true; }, "NOT_SENT"], ["its nonce was taken by another transaction", c => {}, "NOT_SENT"]]) {
+      const w = world(), c = mkc(), r = erec(); let hash = null, sent = false;
+      await PW.runFast(ectx(w, c, { eth: api(c, { send: async tx => { sent = true; throw new Error("died before the broadcast"); } }), onSigned: i => { hash = i.ethTx.hash; } }), r, () => {}).catch(() => {});
+      if (name.startsWith("reverted")) { c.revertNext = true; const raw = (await E.prepareSend(c.rpc, { priv: PR, chainId: 4663, from: SE, to: "0x" + "d1".repeat(20), value: 1n })); r.parts[0].ethTx = { hash: raw.hash, nonce: raw.nonce }; await E.sendRaw(c.rpc, raw); } else c.bump(SE);
+      await PW.runFast({ base: "http://1click", fetchFn: world().fetchFn, sleep: async () => {}, ethStatus: (rc, tx) => E.txStatus(c.rpc, { from: rc.stealth, hash: tx.hash, nonce: tx.nonce }, { sleep: nos }) }, r, () => {}, { resume: true });
+      ok("ETH fast resume: " + name + " -> " + want + " (the money did not move), not UNKNOWN", r.parts[0].state === want && PW.fastDone(r), r.parts[0].state); }
+    { const w = world(), c = mkc(), r = erec(); let err = null; c.revertNext = true;
+      try { await PW.runFast(ectx(w, c, { waitReceipt: (h, expect) => CR.waitFinal(c.rpc, h, { expect, sleep: nos, tries: 4, everyMs: 0 }), onRefused: () => {} }), r, () => {}); } catch (e) { err = e; }
+      ok("ETH fast: the deposit transaction reverts -> 'reverted; nothing moved', e.refused, the part is NOT_SENT (the value stayed)", r.parts[0].state === "NOT_SENT" && err && err.refused === true && /reverted/.test(err.message) && c.balOf(SE) > 10n ** 18n - 10n ** 15n); }
+    ok("a stablecoin runFast resume is as before: SIGNED -> UNKNOWN even when an ethStatus hook exists (no ethTx on the part)", await (async () => { const w = world(), r = rec(1); r.parts[0].state = "SIGNED"; r.parts[0].depositAddress = "0x" + "e2".repeat(20); await PW.runFast({ ...mk(w), ethStatus: async () => { throw new Error("must not be asked"); } }, r, () => {}, { resume: true }); return r.parts[0].state === "UNKNOWN"; })());
+  }
 }
 
 // ================= PART 1 (network): REAL dry quotes =================
@@ -426,6 +480,65 @@ try {
   const rt = await until(async () => { const t = await R.text("fast-resume"); return /was not sent/.test(t) ? t : null; }, "resume text", 30000, 300);
   ok("closed tab: the DEPOSITED part is followed to its end, the signed one is reported UNKNOWN with its deposit address, the never-started one NOT_SENT", /Part 1 of 3 .*was sent to the recipient/.test(rt) && /Part 2 of 3 .*deposit was not seen confirmed/.test(rt) && rt.includes("0x" + "ee".repeat(20)) && /Part 3 of 3 .*money is still on the stealth address/.test(rt), rt.replace(/\n/g, " | ").slice(0, 400));
   ok("closed tab: nothing was quoted, signed or relayed again; the record is gone once nothing is open", mock.quotes.length === qBeforeD && (await R.eval("!localStorage.getItem('stealth-fast-wd')")));
+
+  // ---- E. native ETH next to USDG: pay ETH (a normal payETH transaction from the payer's wallet), see it, withdraw it on the standard route (a plain transaction signed by the stealth key, no relayer)
+  const realQ0 = mock.quotes.filter(x => !x.dry).length, ETHA = "nep141:hood.omft.near", ethBal = a => rpc("eth_getBalance", [a, "latest"]).then(BigInt), stealthGas = () => rpc("eth_gasPrice").then(BigInt);
+  await rpc("anvil_setBalance", [payerA, toHex(10n ** 18n)]); Y.allowTx = true;
+  await Y.goto(SITE + "/stealth/app.html?chain=rh&to=" + encodeURIComponent(meta));
+  ok("pay: the token choice on Robinhood Chain is USDG / ETH", (await Y.eval("[...document.querySelectorAll('#token option')].map(o => o.value + '|' + o.textContent).join()")) === "TOKEN|USDG,NATIVE|ETH");
+  const payEth = async amt => {
+    await Y.goto(SITE + "/stealth/app.html?chain=rh&to=" + encodeURIComponent(meta)); await Y.eval("(() => { const s = document.getElementById('token'); s.value = 'NATIVE'; s.dispatchEvent(new Event('change', { bubbles: true })); return true; })()");
+    await Y.type("amount", amt); await until(async () => (await Y.eval("document.getElementById('amount-get').value")) === amt, "amounts linked", 5000, 100);
+    await Y.click("#btn-pay"); await until(async () => /^Paid\./.test(await Y.text("send-hint")) || /bad/.test(await Y.eval("document.getElementById('send-hint').className")), "ETH payer finished", 90000, 300);
+    ok("pay ETH " + amt + ": paid with one normal transaction from the wallet (payETH), receipt proven by Paid(stealth, ETH, exact amount)", /^Paid\./.test(await Y.text("send-hint")), (await Y.text("send-hint")).slice(0, 80)); };
+  const ethWei = x => BigInt(Math.round(Number(x) * 1e18));
+  await payEth("0.02"); await rpc("anvil_mine", ["0x4"]);
+  await R.goto(SITE + "/stealth/app.html?chain=rh"); await R.click("#btn-keys"); await until(async () => !(await R.eval("document.getElementById('recv-out').hidden")), "keys derived again", 15000, 150); await R.click('[data-pane="payments"]');      // section D reloaded the page: the keys are derived again
+  await until(async () => { return /, 3 are yours/.test(await scan()); }, "ETH payment visible to scan", 40000, 500);
+  const rows = await R.eval("[...document.querySelectorAll('#pay-list .pay')].map(r => r.textContent).join('\\n')");
+  ok("scan: the ETH payment is shown as 0.02 ETH with its real balance read by eth_getBalance (18 decimals), with a Withdraw ETH button; the USDG ones are listed as before", /0\.02 ETH/.test(rows) && /now holds 0\.02 ETH/.test(rows) && /Withdraw ETH/.test(rows), rows.replace(/\n/g, " | ").slice(0, 300));
+  const openEth = () => R.eval("[...document.querySelectorAll('#pay-list button')].find(b => /^Withdraw ETH/.test(b.textContent)).click(); true");
+  await openEth();
+  const ethFrom = await R.text("wd-from"), dest2 = privateKeyToAccount(generatePrivateKey()).address, w1 = walletTotal(R);
+  ok("withdraw ETH: the box says ETH, the route list offers Standard (pays its own fee) and Private fast, the destination list is Robinhood ETH, the button says Send ETH",
+    (await R.eval("[...document.querySelectorAll('.wd-sym')].map(e => e.textContent).join()")) === "ETH,ETH" && /pays its own network fee/.test(await R.eval("document.getElementById('wd-route').options[0].textContent")) && (await R.eval("[...document.querySelectorAll('#wd-route option')].map(o => o.value).join()")) === "std,fast" && /Robinhood Chain \(ETH\)/.test(await R.eval("document.getElementById('wd-dest').options[0].textContent")) && /Send ETH/.test(await R.text("btn-wd")) && /network fee is paid from this address/.test(await R.text("wd-gas-note")));
+  const balBefore = await ethBal(ethFrom), gp = await stealthGas(), listed = JSON.parse(fs.readFileSync(path.join(HERE, "sanctions/evm.json"), "utf8")).addresses[0], nonceS = await rpc("eth_getTransactionCount", [ethFrom, "latest"]);
+  await R.type("wd-to", listed); await R.click("#btn-wd"); await until(async () => await hintBad(), "ETH sanctions refusal", 15000, 100);
+  ok("standard ETH withdraw: a sanctioned recipient is refused by the page BEFORE anything is signed (ETH never touches the relayer, which screens USDG), nothing was sent", /sanctions list/.test(await R.text("pay-hint")) && (await rpc("eth_getTransactionCount", [ethFrom, "latest"])) === nonceS && (await ethBal(listed)) === 0n);
+  const netM = R.mark(); await R.type("wd-to", dest2); await R.click("#btn-wd");
+  await until(async () => { const h = await R.text("pay-hint"); if (await hintBad()) throw new Error("ETH std withdraw: " + h); return /^Done: /.test(h) || /Done: /.test(h); }, "ETH standard withdraw done", 90000, 300);
+  const gotE = await ethBal(dest2), left = await ethBal(ethFrom), hint = await R.text("pay-hint");
+  ok("standard ETH withdraw 'all': the recipient got the balance minus the kept-back network fee (nothing else), the stealth address paid its own gas and keeps only the unused margin", gotE > 0n && gotE < balBefore && balBefore - gotE < 10n ** 15n && left < 10n ** 15n && gotE + left < balBefore && hint.includes("Done: "), `got ${gotE} left ${left} before ${balBefore} gp ${gp}`);
+  ok("standard ETH withdraw: 0 wallet prompts (the stealth key signed in the page), no relayer call, no domain-separator read, no 1Click call", walletTotal(R) === w1 && !R.net.slice(netM).some(n => /\/relay(\/pay)?$/.test(n.url) && n.method === "POST") && mock.quotes.filter(x => !x.dry).length === realQ0);
+  ok("standard ETH withdraw: the double-send guard and the record are cleared by the confirmed receipt", await R.eval(`(() => { const k = ${JSON.stringify(ethFrom.toLowerCase())}, g = JSON.parse(localStorage.getItem('stealth-pending-wd') || '{}'), e = JSON.parse(localStorage.getItem('stealth-eth-wd') || '{}'); return !(k in g) && !(k in e); })()`));
+  await sleep(1500); await until(async () => /Done: /.test(await R.text("pay-hint")) || true, "x", 100, 50);
+  // an amount that does not fit with the fee is refused before anything is signed
+  await R.click('[data-pane="payments"]'); await payEth("0.03"); await rpc("anvil_mine", ["0x4"]);
+  await until(async () => /, 4 are yours/.test(await scan()), "second ETH payment visible", 40000, 500);
+  await R.eval("[...document.querySelectorAll('#pay-list .pay')].filter(r => /now holds 0\\.03 ETH/.test(r.textContent))[0].querySelector('button').click(); true");
+  const ethFrom2 = await R.text("wd-from"), nonce0 = await rpc("eth_getTransactionCount", [ethFrom2, "latest"]);
+  await R.type("wd-to", dest2); await R.type("wd-amt", "0.03"); await R.click("#btn-wd");
+  await until(async () => await hintBad(), "amount + fee refused", 15000, 100);
+  ok("withdraw ETH: the exact full balance as an amount (no room for the fee) is refused with both numbers, before anything is signed", /plus the network fee/.test(await R.text("pay-hint")) && (await rpc("eth_getTransactionCount", [ethFrom2, "latest"])) === nonce0);
+
+  // ---- F. ETH on the private-fast route (NEAR Intents mock): ETH in as a plain transaction to the quote's deposit address, ETH out
+  const qF = mock.quotes.length, subF = mock.submits.length;
+  await R.type("wd-amt", ""); await pickRoute("fast"); const destF = privateKeyToAccount(generatePrivateKey()).address;
+  await R.eval("(() => { const h = document.getElementById('pay-hint'); h.textContent = ''; h.className = 'hint'; return true; })()");
+  await R.type("wd-to", destF); await R.click("#btn-wd");
+  await until(async () => !(await R.eval("document.getElementById('wd-quote').hidden")), "ETH preview shown", 30000, 150);
+  const qtF = (await R.text("wd-quote")).replace(/\s+/g, " ");
+  ok("ETH fast preview: a dry quote ETH -> ETH on hood; it shows the ETH amount the recipient gets, the fee in ETH, the network fee of the deposit that is NOT included, and 'one part'", mock.quotes.length === qF + 1 && mock.quotes.at(-1).dry === true && mock.quotes.at(-1).originAsset === ETHA && mock.quotes.at(-1).destinationAsset === ETHA && /Recipient gets\s*≈ 0\.0\d+ ETH/.test(qtF) && /Fee\s*≈ 0\.000\d+ \(/.test(qtF) && /Not included: the network fee of the deposit transfer/.test(qtF) && /Sent in one part, after a random wait of up to 3 min/.test(qtF), qtF.slice(0, 400));
+  const balF = await ethBal(ethFrom2);
+  await R.eval("(() => { const q = [0], orig = Math.random.bind(Math); Math.random = () => q.length ? q.shift() : orig(); return true; })()");      // the random wait before the quote scripted to 0
+  await R.click("#btn-wd");
+  await until(async () => { const h = await R.text("pay-hint"); if (await hintBad()) throw new Error("ETH fast: " + h); return /^Done privately:/.test(h); }, "ETH fast withdraw done", 120000, 300)
+    .catch(async e => { console.log("  hint:", await R.text("pay-hint"), "| errors:", R.errors.join(";")); throw e; });
+  const rF = mock.quotes.filter(x => !x.dry).at(-1), depF = rF.originAsset === ETHA ? Object.keys(mock.deposits).at(-1) : null, hintF = await R.text("pay-hint");
+  ok("ETH fast: the real quote is ETH <-> ETH, refund to the stealth address, recipient as typed, one deposit", rF.originAsset === ETHA && rF.destinationAsset === ETHA && rF.refundTo.toLowerCase() === ethFrom2.toLowerCase() && rF.recipient.toLowerCase() === destF.toLowerCase() && mock.submits.length === subF + 1);
+  ok("ETH fast: the quote's deposit address received EXACTLY the quoted amount in ETH (a plain transfer from the stealth address), and the stealth address kept only dust", (await ethBal(depF)) === BigInt(rF.amount) && BigInt(rF.amount) < balF && balF - BigInt(rF.amount) < 10n ** 15n && (await ethBal(ethFrom2)) < 10n ** 15n);
+  ok("ETH fast: the answer says Done privately in ETH with 18-decimal text; 0 wallet prompts; the record and the guard are gone", /Done privately: 0\.0\d+ ETH sent through NEAR Intents/.test(hintF) && walletTotal(R) === w1 && await R.eval(`(() => { const k = ${JSON.stringify(ethFrom2.toLowerCase())}, g = JSON.parse(localStorage.getItem('stealth-pending-wd') || '{}'); return !(k in g) && localStorage.getItem('stealth-fast-wd:' + k) == null; })()`), hintF);
+  Y.allowTx = false;
 
   ok("no JS exceptions / console errors on either page", R.errors.length === 0 && Y.errors.length === 0 && R.console.length === 0 && Y.console.length === 0, [...R.errors, ...Y.errors, ...R.console, ...Y.console].join(" | ").slice(0, 300));
   console.log("wallet calls receiver:", JSON.stringify(R.counts), " payer:", JSON.stringify(Y.counts));

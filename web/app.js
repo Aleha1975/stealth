@@ -1,7 +1,8 @@
 import { keysFromSignature, keyRequestTypedData, metaAddress, parseMeta, deriveForPayment, checkAnnouncement, decodeMetadata, hex, unhex, keccak, signDigest, randomBytes32 } from "./stealth-crypto.js";
 import { postRelay } from "./relay-post.js";
 import { paymentNonce, receiveTypedData, splitSig, payAmounts as calcAmounts, feeWithinCap, payFeeFor } from "./pay-auth.js";
-import { CHAINS, pickChain, chainOfMeta, addChainParams, appFeesOf } from "./chains.js";
+import { CHAINS, pickChain, chainOfMeta, addChainParams, appFeesOf, assetOf, assetKey, fmtUnits } from "./chains.js";
+import * as ETH from "./eth-send.js";
 import * as PW from "./private-withdraw.js";
 import { hopCard, hopView, statusLine } from "./hop-card.js";
 import { getBalances, fetchBatch, authorizationUsed, waitFinal, hasTransfer, hasPaid, hasAuthUsed, recentLogs, logSpanSince, timeoutSignal, TRANSFER_TOPIC, PAID_TOPIC, AUTH_USED_TOPIC, ETH_TOKEN } from "./chain-read.js";
@@ -10,11 +11,17 @@ const C = pickChain(), TOK = C.token, SYM = TOK.symbol, NAT = C.native.symbol;
 const USDC = TOK.address, STEALTHPAY = C.stealthPay, CHAIN_HEX = C.chainHex, API = C.api || "/stealth-api";
 const TUNIT = 10 ** TOK.decimals, NUNIT = 10 ** C.native.decimals;
 const fmtTok = v => (Number(v) / TUNIT).toFixed(2);
+// native ETH next to the stablecoin, only on a chain that sets chain.eth (Robinhood Chain). An "asset" below is "TOKEN" (the stablecoin; every record saved before ETH existed) or "ETH".
+const ETHOK = !!C.eth, fmtEth = v => fmtUnits(v, C.native.decimals, 6), fmtAs = (a, v) => a === "ETH" ? fmtEth(v) : fmtTok(v), symAs = a => a === "ETH" ? NAT : SYM, decAs = a => a === "ETH" ? C.native.decimals : TOK.decimals;
+const unitsOf = (chain, rec) => { try { const a = assetOf(chain, assetKey(rec)); return { fmt: v => a.decimals > 6 ? fmtUnits(v, a.decimals, 6) : (Number(v) / 10 ** a.decimals).toFixed(2), sym: a.symbol }; } catch { return { fmt: v => String(v), sym: "" }; } };      // amount text + symbol of a saved record's coin on its own chain
+const ethFeeFor = new Map(), ethFeeAt = new Map();      // stealth -> worst-case fee (wei) of its ETH transfer, as read for the preview (kept 5 min so "all" is the same amount on the confirming click)
+let ethFeeNow = null;      // worst-case network fee (wei) of one ETH transfer, read at Scan: below it an ETH balance cannot be sent (null = not read)
 const $ = id => document.getElementById(id);
 $("sp-addr").textContent = STEALTHPAY || "not deployed on " + C.name + " yet";
 document.querySelectorAll(".chain-name").forEach(e => e.textContent = C.name);
 document.querySelectorAll(".tok-sym").forEach(e => e.textContent = SYM);
-{ const o = document.querySelectorAll("#token option"); if (o[0]) { o[0].value = "TOKEN"; o[0].textContent = SYM; } if (o[1]) { o[1].value = "NATIVE"; o[1].textContent = NAT; } }
+{ const o = document.querySelectorAll("#token option"); if (o[0]) { o[0].value = "TOKEN"; o[0].textContent = SYM; } if (o[1]) { if (ETHOK) { o[1].value = "NATIVE"; o[1].textContent = NAT; } else o[1].remove(); } }      // ETH as a second pay token: Robinhood Chain only, Base stays USDC only
+document.querySelectorAll(".wd-sym").forEach(e => e.textContent = SYM);
 document.title = "Loophole · " + C.name;
 $("to-meta").placeholder = "st:" + C.key + ":0x… or a pay link";
 const say = (id, msg, cls) => { const e = $(id); e.textContent = msg; e.className = "hint" + (cls ? " " + cls : ""); };
@@ -23,6 +30,8 @@ const el = (tag, cls, text) => { const e = document.createElement(tag); if (cls)
 let acct = null, keys = null, found = [];
 // one run at a time per button (a double click used to start two wallet prompts / two payments)
 const once = fn => { let on = false; return async (...a) => { if (on) return; on = true; try { return await fn(...a); } finally { on = false; } }; };
+const ethDust = f => f.eth === undefined || f.eth === null ? false : f.eth <= (ethFeeNow ?? 0n);      // an ETH balance that cannot pay for its own transfer
+const isEmpty = f => f.usdc === 0n && (f.token !== "ETH" || ethDust(f));      // nothing left to withdraw from this payment (what a private transfer that has left the address leaves behind)
 const hitOf = f => checkAnnouncement(f.legacy && keys && keys.legacy ? keys.legacy : keys, f.eph, null);
 const sel = sig => hex(keccak(new TextEncoder().encode(sig)).slice(0, 4));
 const pad = v => (typeof v === "bigint" ? v.toString(16) : String(v).replace(/^0x/, "")).padStart(64, "0");
@@ -189,6 +198,7 @@ async function scan() {
   if (keys !== K) return;                                    // the account changed while scanning: nothing of this run is shown
   found = mine; render(); showResume().catch(() => {}); resumeFast().catch(() => {});      // 1101 M-1: the payments are listed BEFORE any balance is read; a failing RPC can no longer hide them
   const unread = await refreshBalances(true);
+  if (ETHOK) ethResolve().then(any => { if (any) render(); }).catch(() => {});
   checkLost().catch(() => {});      // 1130 G: in the background; a failure only means no card
   const msg = n + " announcements scanned, " + found.length + " are yours." + (found.some(f => f.legacy) ? " Some are under your legacy keys (withdraw only)." : "") + (unread ? " Balances of " + unread + " could not be read from the chain right now; scan again to retry." : "");
   if (head.lag != null && head.lag > 50) say("pay-hint", msg + " Index is " + head.lag + " blocks behind.", "warn"); else say("pay-hint", msg, unread ? "warn" : "ok");
@@ -204,9 +214,10 @@ async function refreshBalances(redraw = true) {
     let b = null; for (let t = 0; t < 2 && !b; t++) { try { b = await getBalances(rpcBatch, USDC, part.map(f => f.stealth)); } catch { if (t === 0) await new Promise(z => setTimeout(z, 1500)); } }
     for (const f of part) { const x = b && b.get(f.stealth.toLowerCase());
       if (!x) { f.usdc = null; unread++; continue; }      // 1109 I-5: a failed re-read never keeps an old amount (and its Withdraw button) on screen
-      f.usdc = x.usdc; f.eth = x.eth; const sp = spent.get(f.stealth.toLowerCase()); if (sp && Date.now() < sp.until && f.usdc > sp.left) f.usdc = sp.left; }
+      f.usdc = x.usdc; f.eth = x.eth; const sp = spent.get(f.stealth.toLowerCase()); if (sp && Date.now() < sp.until) { if (sp.asset === "ETH") { if (f.eth > sp.left) f.eth = sp.left; } else if (f.usdc > sp.left) f.usdc = sp.left; } }
   } };
   await Promise.all(Array.from({ length: Math.min(3, pages.length) }, worker));
+  if (ETHOK) { const ef = list.find(f => f.token === "ETH" && f.eth > 0n); if (ef) { try { ethFeeNow = (await ETH.planFee(ethRpc, { from: ef.stealth, to: ef.stealth, value: 1n })).fee; } catch { ethFeeNow = null; } } }      // an ETH balance below one transfer's fee is dust: no Withdraw button for it
   if (redraw && list === found) render();
   return unread;
 }
@@ -247,7 +258,7 @@ async function checkLost() {
     const HM = await hopMod(), store = HM.idbStore(), sleep = ms => new Promise(r => setTimeout(r, ms)); let done = 0;
     for (const f of found.slice()) {
       if (done >= LOST_PER_PASS) break;
-      const k = f.stealth.toLowerCase(); if (f.legacy || f.usdc !== 0n || (hops.get(k) || {}).running || lost.has(k) || lostNone.has(k) || lostSeen.fresh(k)) continue;
+      const k = f.stealth.toLowerCase(); if (f.legacy || !isEmpty(f) || (hops.get(k) || {}).running || lost.has(k) || lostNone.has(k) || lostSeen.fresh(k)) continue;
       const hit = hitOf(f); if (!hit || hit.stealth.toLowerCase() !== k) continue;
       const ctx = { store, stealth: f.stealth, priv: hit.stealthPriv, words: await HM.loadWords(), getUtxos: HM.makeGetUtxos(), sleep };
       let cnt = null; try { cnt = await HM.makeCountPriorHops(C, chainRpc)(f.stealth); } catch {}
@@ -318,7 +329,8 @@ async function lostGuard(l) {
   if (l.found.length && HM.lostYoung(l.found, tip)) { l.young = true; renderHops(); throw new Error("This may still be running on another device: its ZEC is too recent to touch. Try again in about 2 hours."); }
 }
 // 1136 F-4: Return needs only the keys: no record is adopted, so every recoverable wallet keeps its Return button (h.lost marks the card the result comes back to)
-const lostReturn = (k, l, card) => returnZec({ f: l.f, hit: l.hit, running: false, msg: "", st: { n: l.n }, lost: k }, card);
+const payAsset = f => f.token === "ETH" ? "ETH" : "TOKEN";      // a lost transfer has no record to say which coin it moved: the coin of the payment to that address (a private transfer pays out the coin it took in)
+const lostReturn = (k, l, card) => returnZec({ f: l.f, hit: l.hit, running: false, msg: "", st: { n: l.n }, lost: k, asset: payAsset(l.f) }, card);
 async function lostContinue(k, l, to, line) {
   if (!self.crossOriginIsolated) throw new Error("This page cannot run the Zcash wallet here (it is not cross-origin isolated).");
   if (!vetRecipient(to, l.f)) { line.textContent = "Cancelled."; return; }
@@ -328,7 +340,7 @@ async function lostContinue(k, l, to, line) {
   let birthday, account, zats = l.total;
   if (l.shielded) { if (l.found.length) throw new Error("ZEC also sits on the transparent addresses: press Return money first."); birthday = HM.birthdayFromTime(l.shielded.blockTimeSec, await ZR.getTip(ZC.lightwalletd)); account = l.shielded.account; }
   else { account = HM.lostContinueAcct(l.found); if (account == null) throw new Error("The ZEC is on several accounts: press Return money first, it sweeps all of them."); zats = l.found.reduce((s, x) => s + x.value, 0n); const hs = l.found.map(x => x.height).filter(x => x > 0); birthday = (hs.length ? Math.min(...hs) : (await ZR.getTip(ZC.lightwalletd)) - 5000) - 10; }
-  const r = await HM.adoptLostHop(ctx, { n: l.n, account, birthday, zats, recipient: to, chain: C, dest: C });
+  const r = await HM.adoptLostHop(ctx, { n: l.n, account, birthday, zats, recipient: to, chain: C, dest: C, asset: payAsset(l.f) });
   if (!r.created) throw NOT_ADOPTED(r);      // 1133 L-1: never run on another record's recipient
   lost.delete(k); renderHops(); render(); await runHop(l.f, l.hit, null, { interactive: true });
 }
@@ -380,7 +392,7 @@ async function returnZec(h, card) {
       return false; },
     quote: async () => {
       step("Getting a quote…");
-      const j = await PW.requestQuote({ req: HM.reqOut({ dest: C, amount, recipient: acct, refundT: key.addr }), okDeposit: a => /^t1[1-9A-HJ-NP-Za-km-z]{33}$/.test(a || "") });
+      const j = await PW.requestQuote({ req: HM.reqOut({ dest: C, amount, recipient: acct, refundT: key.addr, asset: h.asset || assetKey(h.st) }), okDeposit: a => /^t1[1-9A-HJ-NP-Za-km-z]{33}$/.test(a || "") });
       step("Sending " + (Number(amount) / 1e8) + " ZEC…");
       const sw = ZR.buildSweep({ utxos, key, to: j.quote.depositAddress, tip: await ZR.getTip(ZC.lightwalletd) });
       if (sw.amount !== BigInt(j.quote.amountIn)) throw new Error("amount mismatch; refusing");
@@ -397,7 +409,7 @@ async function finishSweep(HM, h, step, sw) {
     txKnownFn: () => ZR.txKnown(ZC.lightwalletd, sw.txid), settle: status => ZR.settleIntent({ lock: fn => underHopLock(h.f.stealth, fn), get: () => sweepIntents.get(h), set: v => sweepIntents.set(h, v), sw, status }) });
   const settled = fin.settled;      // 1137 L-1 / 1110 L-1: every end settles the intent (SUCCESS too); 1138 M-1: retried while the hop machine holds the lock, never skipped silently
   const sh = h.lost && lost.get(h.lost) && lost.get(h.lost).shielded;      // 1137 L-2: a shielded finding is dropped with the card, so the Done text says it may remain
-  const doneText = (fin.status === "SUCCESS" ? "Done: ≈ " + (Number(sw.amountOut) / 1e6).toFixed(2) + " " + SYM + " sent to your wallet." + (sh ? " Shielded ZEC was found on this wallet earlier and may remain: press Check shielded balance." : "") : fin.untracked ? "NEAR Intents stopped reporting on this swap. Your transaction is on the Zcash network. Check the swap with deposit address " + sw.deposit + "; if the ZEC comes back to this hop address, press Return money again." : "Swap ended as " + fin.status + ". The ZEC is back on the hop address; press Return money again.") + (settled ? "" : " (Could not mark this return as finished in this browser: if ZEC is still listed, press Return money again.)");
+  const doneText = (fin.status === "SUCCESS" ? "Done: ≈ " + unitsOf(C, { asset: h.asset || assetKey(h.st) }).fmt(sw.amountOut) + " " + unitsOf(C, { asset: h.asset || assetKey(h.st) }).sym + " sent to your wallet." + (sh ? " Shielded ZEC was found on this wallet earlier and may remain: press Check shielded balance." : "") : fin.untracked ? "NEAR Intents stopped reporting on this swap. Your transaction is on the Zcash network. Check the swap with deposit address " + sw.deposit + "; if the ZEC comes back to this hop address, press Return money again." : "Swap ended as " + fin.status + ". The ZEC is back on the hop address; press Return money again.") + (settled ? "" : " (Could not mark this return as finished in this browser: if ZEC is still listed, press Return money again.)");
   step(doneText); if (h.lost) { lostSay(h.lost, doneText, fin.status === "SUCCESS"); renderHops(); }      // kept on its own card: the lost card is redrawn or removed below
   if (fin.status === "SUCCESS" && h.lost) { lostForget(h.lost); checkLost().catch(() => {}); }      // a lost wallet has no card to keep: it is looked for again, and any other wallet of this address shows up with its own Return
   else if (fin.status === "SUCCESS") {      // 1122 L-3: the transparent return worked, but the card goes away only when the hop wallet holds nothing at all (shielded ZEC included); a failed check keeps the card
@@ -443,34 +455,35 @@ function render() {
   if (!found.length) { list.appendChild(el("p", "note", "Nothing found yet. Payments appear a few seconds after they land.")); return; }
   found.forEach((f, i) => {
     const row = el("div", "pay"); const top = el("div", "row"); top.style.justifyContent = "space-between";
-    const label = f.token === "ETH" ? (Number(f.amount) / NUNIT).toFixed(5) + " " + NAT : f.token && f.token.toLowerCase() === USDC.toLowerCase() ? fmtTok(f.amount) + " " + SYM : "payment";
+    const label = f.token === "ETH" ? fmtEth(f.amount || 0n) + " " + NAT : f.token && f.token.toLowerCase() === USDC.toLowerCase() ? fmtTok(f.amount) + " " + SYM : "payment";
     top.appendChild(el("span", "amt", label)); top.appendChild(el("span", "mono", f.stealth.slice(0, 8) + "…" + f.stealth.slice(-4)));
     row.appendChild(top);
     const hp = activeHop(f);
-    const small = el("small", null, "block " + f.block + " · " + (hp ? fmtTok(BigInt(hp.st.amount)) + " " + SYM + " · in private transfer" : (f.usdc === undefined ? "reading balance…" : f.usdc === null ? "balance not read (scan again)" : "now holds " + fmtTok(f.usdc) + " " + SYM) + (f.eth ? " + " + (Number(f.eth) / NUNIT).toFixed(5) + " " + NAT : "")) + " · ");
+    const small = el("small", null, "block " + f.block + " · " + (hp ? fmtAs(assetKey(hp.st), BigInt(hp.st.amount)) + " " + symAs(assetKey(hp.st)) + " · in private transfer" : (f.usdc === undefined ? "reading balance…" : f.usdc === null ? "balance not read (scan again)" : f.token === "ETH" ? "now holds " + fmtEth(f.eth || 0n) + " " + NAT + (f.usdc ? " + " + fmtTok(f.usdc) + " " + SYM : "") : "now holds " + fmtTok(f.usdc) + " " + SYM) + (f.token !== "ETH" && f.eth ? " + " + fmtEth(f.eth) + " " + NAT : "")) + " · ");
     const a = el("a", null, "tx"); a.href = C.explorer + "/tx/" + f.tx; a.target = "_blank"; a.rel = "noopener noreferrer"; small.appendChild(a); row.appendChild(small);
     const kk = f.stealth.toLowerCase();
-    if (!hp && f.usdc === 0n && lostNone.has(kk) && !lost.has(kk) && (self.crossOriginIsolated || lostNone.get(kk).capped)) { const nr = lostNone.get(kk), d = el("div"), ln = el("div", "note", scanText(nr)), bar = el("div", "row"); d.style.marginTop = "8px"; d.appendChild(ln); d.appendChild(bar);      // 1136 F-2: an empty result says what it looked at
+    if (!hp && isEmpty(f) && lostNone.has(kk) && !lost.has(kk) && (self.crossOriginIsolated || lostNone.get(kk).capped)) { const nr = lostNone.get(kk), d = el("div"), ln = el("div", "note", scanText(nr)), bar = el("div", "row"); d.style.marginTop = "8px"; d.appendChild(ln); d.appendChild(bar);      // 1136 F-2: an empty result says what it looked at
       const mk = (txt, fn) => { const b = el("button", "btn ghost", txt); b.type = "button"; b.addEventListener("click", () => { b.disabled = true; fn(kk, f, hitOf(f), ln).catch(e => { ln.textContent = (e && e.message) || String(e); }).finally(() => { b.disabled = false; }); }); bar.appendChild(b); };
       if (self.crossOriginIsolated) mk("Check shielded balance", lostShielded); if (nr.capped) mk("Scan older wallets", lostOlder); row.appendChild(d); }
     if (!hp && f.usdc > 0n) { const d = el("div"); d.style.marginTop = "8px"; const b = el("button", "btn ghost", "Withdraw " + SYM); b.type = "button"; b.addEventListener("click", () => openWithdraw(i)); d.appendChild(b); row.appendChild(d); }
+    if (!hp && ETHOK && f.token === "ETH" && f.eth > 0n && !ethDust(f)) { const d = el("div"); d.style.marginTop = "8px"; const b = el("button", "btn ghost", "Withdraw " + NAT); b.type = "button"; b.addEventListener("click", () => openWithdraw(i, "ETH")); d.appendChild(b); row.appendChild(d); }
     list.appendChild(row);
   });
 }
 $("btn-scan").addEventListener("click", once(() => scan().catch(e => say("pay-hint", e.message || String(e), "bad"))));
 
 // ---- withdraw the stablecoin gaslessly: EIP-3009 authorization signed by the stealth key, submitted by the relayer
-let wd = null;
-function openWithdraw(i) {
+let wd = null, wdA = "TOKEN";      // wdA: what this withdraw moves, "TOKEN" (the stablecoin, gasless) or "ETH" (a plain transaction signed by the stealth key, which pays its own gas)
+function openWithdraw(i, asset = "TOKEN") {
   if (fastBusy.has(found[i].stealth.toLowerCase())) { $("withdraw").hidden = true; say("pay-hint", "A private withdraw from this payment is running: wait for it to finish.", "warn"); return; }
   if (activeHop(found[i])) { $("withdraw").hidden = true; say("pay-hint", "This payment has a transfer in progress: use the card above.", "warn"); return; }
-  wd = found[i]; $("wd-from").textContent = wd.stealth; $("wd-to").value = ""; $("wd-amt").value = ""; $("withdraw").hidden = false;
+  wd = found[i]; wdA = asset === "ETH" && ETHOK ? "ETH" : "TOKEN"; document.querySelectorAll(".wd-sym").forEach(e => e.textContent = symAs(wdA)); $("wd-gas-note").textContent = wdA === "ETH" ? "The network fee is paid from this address's own ETH; it is kept back from \"all\"." : "No gas needed."; $("wd-from").textContent = wd.stealth; $("wd-to").value = ""; $("wd-amt").value = ""; $("withdraw").hidden = false;
   // Three ways to send (labels and ETAs come from code constants): standard (direct, gasless), private fast (NEAR Intents only), maximum privacy (the hidden Zcash hop, web/zec-hop.js:
   // only on a cross-origin isolated page and only if the module loads). Fast and maximum need a chain with 1Click and a non-legacy key.
   const mine = wd; $("wd-priv-wrap").hidden = true; setRoutes(null); pvReset();
   const dest = $("wd-dest"); dest.textContent = "";
-  for (const k of [C.key]) {   /* one payout chain for now: the same chain */ const c = CHAINS[k]; if (c && c.oneClick && !Array.from(dest.options).some(o => o.value === c.key)) { const o = el("option", null, c.name + " (" + c.token.symbol + ")" + (c.key === C.key ? " · same chain" : "")); o.value = c.key; dest.appendChild(o); } }
-  if (C.privateWithdraw && C.oneClick && !wd.legacy) {
+  for (const k of [C.key]) {   /* one payout chain for now: the same chain */ const c = CHAINS[k]; if (c && (wdA === "ETH" ? c.eth : c.oneClick) && !Array.from(dest.options).some(o => o.value === c.key)) { const o = el("option", null, c.name + " (" + assetOf(c, wdA).symbol + ")" + (c.key === C.key ? " · same chain" : "")); o.value = c.key; dest.appendChild(o); } }
+  if (C.privateWithdraw && (wdA === "ETH" ? C.eth : C.oneClick) && !wd.legacy) {
     $("wd-priv-wrap").hidden = false; setRoutes(null);
     if (self.crossOriginIsolated) hopMod().then(HM => { if (wd === mine) setRoutes(HM); }).catch(() => {});
   }
@@ -481,21 +494,22 @@ const ROUTE_NOTE = {
   fast: "No Zcash: NEAR Intents swaps the money in 1–2 parts at random times. The link is broken by the swap, not by cryptography: someone who sees both sides and matches amounts and times can still connect them.",
   max: "Through the Zcash shielded pool and back, paid out in 2 parts a few minutes apart: the second is sent about one block after the first (as soon as its change has confirmed, or at its planned time if that is later), not when the first swap has finished, so the gap between them is short and not random. Both swaps then finish on their own. Keep this tab open; it can be resumed if you close it.",
 };
+const ROUTE_NOTE_ETH_STD = "Straight from the stealth address to the recipient, as a normal transaction: the address pays its own network fee from this ETH (no relayer). Anyone can see that link on-chain.";
 function setRoutes(HM) {
   const sel = $("wd-route"), prev = sel.value, priv = !$("wd-priv-wrap").hidden; sel.textContent = "";
   const add = (v, t) => { const o = el("option", null, t); o.value = v; sel.appendChild(o); };
-  add("std", "Standard · gasless, direct · " + PW.standardEtaLabel());
+  add("std", wdA === "ETH" ? "Standard · direct, pays its own network fee · " + PW.standardEtaLabel() : "Standard · gasless, direct · " + PW.standardEtaLabel());
   if (priv) add("fast", "Private, fast · no Zcash · about " + PW.fastEtaLabel());
   if (priv && HM) add("max", "Maximum privacy · via Zcash · about " + HM.etaLabel(HM.DEFAULT_MODE));
   sel.value = Array.from(sel.options).some(o => o.value === prev) ? prev : (HM ? "max" : priv ? "fast" : "std");
   routeChanged();
 }
 const route = () => $("wd-route").value || "std";
-function routeChanged() { $("wd-route-note").textContent = ROUTE_NOTE[route()]; $("wd-priv-opts").hidden = route() === "std"; pvReset(); }
+function routeChanged() { $("wd-route-note").textContent = route() === "std" && wdA === "ETH" ? ROUTE_NOTE_ETH_STD : ROUTE_NOTE[route()]; $("wd-priv-opts").hidden = route() === "std"; pvReset(); }
 // ---- private withdraw: preview (two dry quotes) first, then a second click starts the hop. Any input change drops the preview.
 let pv = null, HOPM = null;
 const hopMod = () => HOPM || (HOPM = import("./zec-hop.js"));
-function pvReset() { pv = null; $("wd-quote").hidden = true; $("btn-wd").textContent = route() === "std" ? "Send without gas" : "Preview"; }
+function pvReset() { pv = null; $("wd-quote").hidden = true; $("btn-wd").textContent = route() === "std" ? (wdA === "ETH" ? "Send ETH" : "Send without gas") : "Preview"; }
 $("wd-route").addEventListener("change", routeChanged);
 ["wd-to", "wd-amt", "wd-dest"].forEach(id => { $(id).addEventListener("input", pvReset); $(id).addEventListener("change", pvReset); });
 // wallet-RPC fallback, used ONLY for the token's domain separator (no stealth address in it); same JSON-RPC shape as fetch, so zec-hop.js stays injectable
@@ -504,11 +518,19 @@ const walletRpc = async (_u, init) => { const { method, params } = JSON.parse(in
 // 1101 L-3/L-5: reads that name a stealth address NEVER fall back to the wallet's provider (it already knows the account and IP); only `allowWallet` calls (the token's domain separator) may. All reads time out.
 const chainRpc = async (u, init, allowWallet = false) => { try { const r = await fetch(u, { ...init, signal: init.signal || timeoutSignal() }); if (r.ok) { const j = await r.clone().json().catch(() => null); if (j && j.result !== undefined) return r; } } catch {} if (allowWallet) return walletRpc(u, init); throw new Error("the chain RPC did not answer"); };
 // 1133 L-5: a rebuilt transfer has no original amount to check a quote against, so the user sees what was found, what is sent and what comes out, and confirms
-const confirmRebuiltQuote = q => confirm("Found on the transfer wallet: " + zecText(q.zecFound) + " ZEC.\nThis payout sends " + zecText(q.amount) + " ZEC" + (q.zatsLeft > q.amount ? " (of " + zecText(q.zatsLeft) + " ZEC still to send)" : "") + " and pays out about " + fmtTok(q.amountOut) + " " + SYM + " (≈ " + (Number(q.amountOut) / TUNIT / (Number(q.amount) / 1e8)).toFixed(2) + " " + SYM + " per ZEC) to " + q.recipient + ".\nThe network fee and swap fee are inside that figure. Pay out at this quote?");
-const confirmHopLoss = q => { const dec = Number.isInteger(q.destDecimals) ? q.destDecimals : TOK.decimals, sym = q.destSymbol || SYM, f = v => (Number(v) / 10 ** dec).toFixed(2), total = Number(q.amountOut) * Number(q.zatsLeft) / Number(q.amount);      // 1138 L-2: the PAYOUT token, not the connected chain's
+const confirmRebuiltQuote = q => { const dec = Number.isInteger(q.destDecimals) ? q.destDecimals : TOK.decimals, sym = q.destSymbol || SYM, f = v => dec > 6 ? fmtUnits(v, dec, 6) : (Number(v) / 10 ** dec).toFixed(2); return confirm("Found on the transfer wallet: " + zecText(q.zecFound) + " ZEC.\nThis payout sends " + zecText(q.amount) + " ZEC" + (q.zatsLeft > q.amount ? " (of " + zecText(q.zatsLeft) + " ZEC still to send)" : "") + " and pays out about " + f(q.amountOut) + " " + sym + " (≈ " + (Number(q.amountOut) / 10 ** dec / (Number(q.amount) / 1e8)).toFixed(dec > 6 ? 6 : 2) + " " + sym + " per ZEC) to " + q.recipient + ".\nThe network fee and swap fee are inside that figure. Pay out at this quote?"); };
+const confirmHopLoss = q => { const dec = Number.isInteger(q.destDecimals) ? q.destDecimals : TOK.decimals, sym = q.destSymbol || SYM, f = v => dec > 6 ? fmtUnits(v, dec, 6) : (Number(v) / 10 ** dec).toFixed(2), total = Number(q.amountOut) * Number(q.zatsLeft) / Number(q.amount);      // 1138 L-2: the PAYOUT token, not the connected chain's
   return confirm("This quote is worse than the " + (q.cap * 100).toFixed(1) + "% limit: the whole transfer would lose about " + (q.loss * 100).toFixed(1) + "%" + (q.approved != null ? " (you approved about " + (q.approved * 100).toFixed(1) + "% on the preview)" : "") + ".\nStill to send: " + zecText(q.zatsLeft) + " ZEC. This payout: about " + f(q.amountOut) + " " + sym + " to " + q.recipient + "; about " + f(BigInt(Math.floor(total))) + " " + sym + " in total if later payouts get this rate (an estimate).\nThe fees on a small transfer are mostly fixed. Pay out at this quote? Cancel keeps the ZEC shielded."); };
-const hopCtx = async (HM, f, hit, o) => ({ getUtxos: HM.makeGetUtxos(), authUsed: HM.makeAuthUsed(C, chainRpc), countPriorHops: HM.makeCountPriorHops(C, chainRpc), txKnown: HM.makeTxKnown(), store: HM.idbStore(), stealth: f.stealth, priv: hit.stealthPriv, chain: C, api: API, words: await HM.loadWords(), loadZjs: HM.sharedZjs, waitReceipt, randomNonce: randomBytes32,
+const hopCtx = async (HM, f, hit, o) => ({ eth: ethApi(f, hit.stealthPriv), getUtxos: HM.makeGetUtxos(), authUsed: HM.makeAuthUsed(C, chainRpc), countPriorHops: HM.makeCountPriorHops(C, chainRpc), txKnown: HM.makeTxKnown(), store: HM.idbStore(), stealth: f.stealth, priv: hit.stealthPriv, chain: C, api: API, words: await HM.loadWords(), loadZjs: HM.sharedZjs, waitReceipt, randomNonce: randomBytes32,
   confirmQuote: q => confirmRebuiltQuote(q), confirmLoss: q => confirmHopLoss(q), balance: async () => (await getBalances(rpcBatch, USDC, [f.stealth])).get(f.stealth.toLowerCase()).usdc, onProgress: (s, m) => hopProgress(f, s, m), ...o });
+// the chain's public RPC, plain: the node's own error is kept (chainRpc/rpcOne turn it into "did not answer"), e.rpc = true when the node ANSWERED with an error (a refused transaction), unset on a network failure. Reads and sends of a stealth key's ETH transactions; never the wallet's provider.
+const ethRpc = async (method, params) => {
+  const r = await fetch(C.rpc, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ jsonrpc: "2.0", id: 1, method, params }), signal: timeoutSignal(30000) });
+  const j = await r.json().catch(() => null); if (!j || typeof j !== "object") throw new Error("the chain RPC did not answer (" + r.status + ")");
+  if (j.error) throw Object.assign(new Error((j.error && j.error.message) || "rpc error"), { rpc: true, code: j.error && j.error.code });
+  if (j.result === undefined) throw new Error("the chain RPC gave no result"); return j.result;
+};
+const ethApi = (f, priv) => ({ prepare: ({ to, value }) => ETH.prepareSend(ethRpc, { priv, chainId: C.chainId, from: f.stealth, to, value }), send: tx => ETH.sendRaw(ethRpc, tx), status: tx => ETH.txStatus(ethRpc, { from: f.stealth, hash: tx.hash, nonce: tx.nonce }) });
 const rpcOne = async (method, params) => { const r = await chainRpc(C.rpc, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ jsonrpc: "2.0", id: 1, method, params }) }); const j = await r.json(); if (j.error) throw new Error(j.error.message || "rpc error"); return j.result; };
 const rpcBatch = async calls => { try { return await fetchBatch(fetch, C.rpc, calls); } catch { const out = []; for (let i = 0; i < calls.length; i += 10) out.push(...await Promise.all(calls.slice(i, i + 10).map(([m, p]) => rpcOne(m, p)))); return out; } };
 async function holdScreen() { try { return navigator.wakeLock ? await navigator.wakeLock.request("screen") : null; } catch { return null; } }
@@ -517,8 +539,8 @@ function hopProgress(f, s, m) {
   const k = f.stealth.toLowerCase(), h = hops.get(k); if (!h) return;
   h.st = s; h.msg = m || ""; h.beatAt = Date.now(); h.hidden = document.hidden;      // beatAt: the card says "no update for N s" if the machine goes quiet
   if (s.relayed && s.inQuote && !h.sp) {                          // the deposit leg has left the stealth address: stop showing its old balance
-    h.sp = true; const amtIn = BigInt(s.inQuote.amountIn);
-    spent.set(k, { left: f.usdc > amtIn ? f.usdc - amtIn : 0n, until: Date.now() + 120_000 }); render(); setTimeout(() => refreshBalances().catch(() => {}), 3000);
+    h.sp = true; const amtIn = BigInt(s.inQuote.amountIn), eth = assetKey(s) === "ETH", have = eth ? f.eth : f.usdc;
+    spent.set(k, { left: have > amtIn ? have - amtIn : 0n, until: Date.now() + 120_000, ...(eth ? { asset: "ETH" } : {}) }); render(); setTimeout(() => refreshBalances().catch(() => {}), 3000);
   }
   if (h.running) { const v = hopView(h); if (v.kind === "run" && v.what) say("pay-hint", statusLine(v), "ok"); }   // green while it runs normally
   renderHops();
@@ -528,8 +550,8 @@ async function runHop(f, hit, o, opts = {}) {
   const k = f.stealth.toLowerCase(); if ((hops.get(k) || {}).running) return;
   const HM = await hopMod(), ctx = await hopCtx(HM, f, hit, { ...(o || {}), interactive: !!o || opts.interactive === true }), key = "zec-hop:" + k;      // 1138 L-3: interactive = the user just clicked (Confirm / Continue); a timer-driven run never opens a dialog
   let h;
-  if (o) h = { f, hit, running: true, msg: "", st: { step: "QUOTE_IN", chain: C.key, dest: o.dest.key, amount: o.amount.toString(), recipient: o.recipient, startedAt: Date.now() } };
-  else { const r = await HM.findHop(ctx.store, f.stealth); if (!r) throw new Error("nothing to resume"); if (r.rec.st.chain !== C.key) throw new Error("This transfer belongs to " + (CHAINS[r.rec.st.chain] || {}).name + ": open the app on that chain to resume it."); ctx.chain = CHAINS[r.rec.st.chain]; ctx.dest = CHAINS[r.rec.st.dest]; h = { f, hit, running: true, msg: "", st: r.rec.st }; }
+  if (o) h = { f, hit, running: true, msg: "", st: { step: "QUOTE_IN", chain: C.key, dest: o.dest.key, ...(o.asset === "ETH" ? { asset: "ETH" } : {}), amount: o.amount.toString(), recipient: o.recipient, startedAt: Date.now() } };
+  else { const r = await HM.findHop(ctx.store, f.stealth); if (!r) throw new Error("nothing to resume"); if (r.rec.st.chain !== C.key) throw new Error("This transfer belongs to " + (CHAINS[r.rec.st.chain] || {}).name + ": open the app on that chain to resume it."); ctx.chain = CHAINS[r.rec.st.chain]; ctx.dest = CHAINS[r.rec.st.dest]; ctx.asset = assetKey(r.rec.st); h = { f, hit, running: true, msg: "", st: r.rec.st }; }
   h.beatAt = h.sessionAt = Date.now(); hops.set(k, h); say("pay-hint", ""); renderHops(); render();
   const lock = await holdScreen();                                // a locked phone screen or a sleeping display freezes the tab and with it the transfer
   const run = () => (o ? HM.startHop(ctx) : HM.runHop(ctx));
@@ -544,37 +566,37 @@ async function runHop(f, hit, o, opts = {}) {
     const n = (autoTries.get(k) || 0) + 1; autoTries.set(k, n); h.retryAt = Date.now() + Math.min(300_000, 15_000 * 2 ** (n - 1));      // 15 s, 30 s, 1, 2, 4, 5, 5 min; the card shows the cause and the countdown
     setTimeout(() => runHop(f, hit, null).catch(e => say("pay-hint", e.message || String(e), "bad")), h.retryAt - Date.now());
   } else if (TERMINAL.includes(st.step)) autoTries.delete(k);
-  if (st.relayed && st.inQuote && !h.sp) { const amtIn = BigInt(st.inQuote.amountIn); spent.set(k, { left: f.usdc > amtIn ? f.usdc - amtIn : 0n, until: Date.now() + 120_000 }); }
+  if (st.relayed && st.inQuote && !h.sp) { const amtIn = BigInt(st.inQuote.amountIn), eth = assetKey(st) === "ETH", have = eth ? f.eth : f.usdc; spent.set(k, { left: have > amtIn ? have - amtIn : 0n, until: Date.now() + 120_000, ...(eth ? { asset: "ETH" } : {}) }); }
   if (st.step === "FAILED_IN") spent.delete(k);
   if (st.step === "FAILED") try { const rec = (await HM.findHop(ctx.store, f.stealth)).rec; h.extra = (await HM.hopSummary(ctx, rec)).filter(x => x.transparent + x.orchard >= HM.HOLD_DUST).map(x => "Hop wallet account " + x.account + ": " + (Number(x.transparent) / 1e8) + " ZEC transparent, " + (Number(x.orchard) / 1e8) + " ZEC shielded").join("\n"); } catch (e) { h.extra = "Could not read the hop wallet: " + e.message; }
   renderHops(); render(); await refreshBalances().catch(() => {});
 }
 /** Quote preview: when the service fee is on (chains.js privateFee), say how much of the shown Fee is ours. Nothing is added while it is off. */
-function feeNote(box, value) {
+function feeNote(box, value, asset = "TOKEN") {
   const af = appFeesOf(); if (!af) return;
-  box.appendChild(el("div", "note", "Includes our service fee " + (af[0].fee / 100) + "% (≈ " + fmtTok(value * BigInt(af[0].fee) / 10000n) + " " + SYM + "), charged on the first step."));
+  box.appendChild(el("div", "note", "Includes our service fee " + (af[0].fee / 100) + "% (≈ " + fmtAs(asset, value * BigInt(af[0].fee) / 10000n) + " " + symAs(asset) + "), charged on the first step."));
 }
-async function privateWithdraw(to, value, hit) {
-  const dest = CHAINS[$("wd-dest").value]; if (!dest || !dest.oneClick) throw new Error("pick a destination chain");
-  const HM = await hopMod(), mode = HM.DEFAULT_MODE, key = [to.toLowerCase(), value, dest.key, mode, "max"].join("|");
+async function privateWithdraw(to, value, hit, asset = "TOKEN") {
+  const dest = CHAINS[$("wd-dest").value]; if (!dest || !(asset === "ETH" ? dest.eth : dest.oneClick)) throw new Error("pick a destination chain");
+  const HM = await hopMod(), mode = HM.DEFAULT_MODE, key = [to.toLowerCase(), value, dest.key, mode, "max", ...(asset === "ETH" ? ["ETH"] : [])].join("|"), A = assetOf(C, asset), D = assetOf(dest, asset), dfmt = v => asset === "ETH" ? fmtUnits(v, D.decimals, 6) : (Number(v) / 10 ** D.decimals).toFixed(2);
   if (!pv || pv.key !== key) {                                    // step 1: show what it will cost, send nothing
     say("pay-hint", "Asking NEAR Intents for a quote…");
-    const q1 = await PW.requestQuote({ base: PW.ONECLICK, req: HM.reqIn({ chain: C, amount: value, tAddr: HM.DRY_T, stealth: wd.stealth, dry: true }) }), zec = BigInt(q1.quote.amountOut);
+    const q1 = await PW.requestQuote({ base: PW.ONECLICK, req: HM.reqIn({ chain: C, amount: value, tAddr: HM.DRY_T, stealth: wd.stealth, dry: true, asset }) }), zec = BigInt(q1.quote.amountOut);
     if (!HM.okSize(zec)) throw new Error("Too small for the private route. Try a larger amount.");
-    const q2 = await PW.requestQuote({ base: PW.ONECLICK, req: HM.reqOut({ dest, amount: HM.previewOut(zec, mode), recipient: to, refundT: HM.DRY_T, dry: true }) });
-    const out = BigInt(q2.quote.amountOut), loss = HM.previewLoss({ value, out, inDec: TOK.decimals, outDec: dest.token.decimals }), fee = loss * Number(value), box = $("wd-quote"); box.textContent = "";      // 1139 I-1: same basis as the machine's projectedLoss (decimals of source and destination differ)
+    const q2 = await PW.requestQuote({ base: PW.ONECLICK, req: HM.reqOut({ dest, amount: HM.previewOut(zec, mode), recipient: to, refundT: HM.DRY_T, dry: true, asset }) });
+    const out = BigInt(q2.quote.amountOut), loss = HM.previewLoss({ value, out, inDec: A.decimals, outDec: D.decimals }), fee = loss * Number(value), box = $("wd-quote"); box.textContent = "";      // 1139 I-1: same basis as the machine's projectedLoss (decimals of source and destination differ)
     const pct = (loss * 100).toFixed(1), qt = el("div", "qt"), c1 = el("div"), c2 = el("div");
-    c1.appendChild(el("span", "note", "Recipient gets")); c1.appendChild(el("span", "big", "≈ " + (Number(out) / 10 ** dest.token.decimals).toFixed(2) + " " + dest.token.symbol));
-    c2.appendChild(el("span", "note", "Fee")); c2.appendChild(el("span", "big", "≈ " + (fee / TUNIT).toFixed(2) + " (" + pct + "%)"));
+    c1.appendChild(el("span", "note", "Recipient gets")); c1.appendChild(el("span", "big", "≈ " + dfmt(out) + " " + D.symbol));
+    c2.appendChild(el("span", "note", "Fee")); c2.appendChild(el("span", "big", "≈ " + (asset === "ETH" ? fmtUnits(BigInt(Math.round(fee)), A.decimals, 6) : (fee / TUNIT).toFixed(2)) + " (" + pct + "%)"));
     const c3 = el("div"); c3.appendChild(el("span", "note", "Takes about")); c3.appendChild(el("span", "big", HM.etaLabel(mode)));
-    qt.appendChild(c1); qt.appendChild(c2); qt.appendChild(c3); box.appendChild(qt); feeNote(box, value); box.appendChild(el("div", "note", "Takes about " + HM.etaLabel(mode) + " · keep this tab open (it can be resumed if you close it)"));
-    box.appendChild(el("div", "note", "Pressing Confirm private transfer accepts this total cost (about " + pct + "% Fee, " + (Number(out) / 10 ** dest.token.decimals).toFixed(2) + " " + dest.token.symbol + " out). The payouts are checked against it; the real rate can differ a little, and if a payout quote ends up clearly worse you are asked to review it in this tab."));
-    if (loss > HM.MAX_LOSS) box.appendChild(el("div", "note", "Zcash fees are mostly fixed, so this route is expensive on small amounts. It is usually cheaper from a few tens of " + TOK.symbol + "; Private fast is usually cheaper below that."));
+    qt.appendChild(c1); qt.appendChild(c2); qt.appendChild(c3); box.appendChild(qt); feeNote(box, value, asset); if (asset === "ETH") box.appendChild(el("div", "note", "Not included: the network fee of the first transfer, about " + fmtEth(ethFeeFor.get(wd.stealth.toLowerCase()) || 0n) + " " + NAT + ", paid by the stealth address from its own ETH.")); box.appendChild(el("div", "note", "Takes about " + HM.etaLabel(mode) + " · keep this tab open (it can be resumed if you close it)"));
+    box.appendChild(el("div", "note", "Pressing Confirm private transfer accepts this total cost (about " + pct + "% Fee, " + dfmt(out) + " " + D.symbol + " out). The payouts are checked against it; the real rate can differ a little, and if a payout quote ends up clearly worse you are asked to review it in this tab."));
+    if (loss > HM.MAX_LOSS) box.appendChild(el("div", "note", "Zcash fees are mostly fixed, so this route is expensive on small amounts. " + (asset === "ETH" ? "It is usually cheaper for larger amounts; Private fast is usually cheaper below that." : "It is usually cheaper from a few tens of " + TOK.symbol + "; Private fast is usually cheaper below that.")));
     box.hidden = false; pv = { key, loss }; $("btn-wd").textContent = "Confirm private transfer";
     say("pay-hint", "Check the quote, then confirm.", "warn"); return;
   }
   $("btn-wd").disabled = true; $("withdraw").hidden = true;
-  try { await runHop(wd, hit, { recipient: to, amount: value, dest, mode, approvedLoss: pv.loss }); } finally { $("btn-wd").disabled = false; pvReset(); }
+  try { await runHop(wd, hit, { recipient: to, amount: value, dest, mode, approvedLoss: pv.loss, asset }); } finally { $("btn-wd").disabled = false; pvReset(); }
 }
 
 // ---- route "private, fast": NEAR Intents only (web/private-withdraw.js runFast). The record (no recipient in it) is kept in localStorage while a part is open, so a closed tab can still follow the swaps.
@@ -609,45 +631,46 @@ const fastNeedsNote = rec => rec.parts.some(p => p.depositAddress && (p.state ==
 let shownNotes = [], fastExtra = [], fastLive = "", fastDeferred = false;      // 1135 L-3: transient lines and the text of a running resume are kept here, so every showFastBox() (e.g. from setAcct) draws them again
 const fastOpenIdle = () => { const m = fastRecs.read(); return Object.keys(m).filter(k => !fastBusy.has(k) && PW.fastOpenRec(m[k])); };
 function showFastBox(extra = []) { for (const x of extra) if (!fastExtra.includes(x)) fastExtra.push(x); const box = $("fast-resume"), n = fastNotes.read(acct), txt = (fastLive ? [fastLive] : []).concat(n.map(x => x.t), fastExtra).join("\n\n"); shownNotes = n.map(x => x.id); box.textContent = txt; box.hidden = !txt; $("btn-fast-dismiss").hidden = !n.length && !fastExtra.length; $("btn-fast-abandon").hidden = !fastOpenIdle().length; }
-async function fastWithdraw(to, value, hit) {
-  const dest = CHAINS[$("wd-dest").value]; if (!dest || !dest.oneClick) throw new Error("pick a destination chain");
-  const key = [to.toLowerCase(), value, dest.key, "fast"].join("|");
+async function fastWithdraw(to, value, hit, asset = "TOKEN") {
+  const dest = CHAINS[$("wd-dest").value]; if (!dest || !(asset === "ETH" ? dest.eth : dest.oneClick)) throw new Error("pick a destination chain");
+  const eth = asset === "ETH", A = assetOf(C, asset), D = assetOf(dest, asset), key = [to.toLowerCase(), value, dest.key, "fast", ...(eth ? ["ETH"] : [])].join("|");
   if (!pv || pv.key !== key) {                                    // step 1: show what it will cost, send nothing
     say("pay-hint", "Asking NEAR Intents for a quote…");
-    const j = await PW.requestQuote({ base: PW.ONECLICK, req: PW.buildQuoteRequest({ from: C, to: dest, amount: value, recipient: to, refundTo: wd.stealth, dry: true }) }), sm = PW.summarizeQuote(j, TOK.decimals, dest.token.decimals);
+    const j = await PW.requestQuote({ base: PW.ONECLICK, req: PW.buildQuoteRequest({ from: C, to: dest, amount: value, recipient: to, refundTo: wd.stealth, dry: true, asset }) }), sm = PW.summarizeQuote(j, A.decimals, D.decimals);
     const box = $("wd-quote"); box.textContent = "";
     const qt = el("div", "qt"), c1 = el("div"), c2 = el("div"), c3 = el("div");
-    c1.appendChild(el("span", "note", "Recipient gets")); c1.appendChild(el("span", "big", "≈ " + sm.outText + " " + dest.token.symbol));
+    c1.appendChild(el("span", "note", "Recipient gets")); c1.appendChild(el("span", "big", "≈ " + sm.outText + " " + D.symbol));
     c2.appendChild(el("span", "note", "Fee")); c2.appendChild(el("span", "big", "≈ " + sm.feeText + " (" + sm.feePct + "%)"));
     c3.appendChild(el("span", "note", "Takes about")); c3.appendChild(el("span", "big", PW.fastEtaLabel()));
-    qt.appendChild(c1); qt.appendChild(c2); qt.appendChild(c3); box.appendChild(qt); feeNote(box, value);
-    box.appendChild(el("div", "note", "Sent in 1–2 parts at random times, up to " + PW.FAST.delayMaxMin + " min apart · keep this tab open. The link is broken by the swap, not by cryptography."));
+    qt.appendChild(c1); qt.appendChild(c2); qt.appendChild(c3); box.appendChild(qt); feeNote(box, value, asset);
+    if (eth) box.appendChild(el("div", "note", "Not included: the network fee of the deposit transfer, about " + fmtEth(ethFeeFor.get(wd.stealth.toLowerCase()) || 0n) + " " + NAT + ", paid by the stealth address from its own ETH. ETH is sent in one part."));
+    box.appendChild(el("div", "note", (eth ? "Sent in one part, after a random wait of up to " + PW.FAST.delayMaxMin + " min" : "Sent in 1–2 parts at random times, up to " + PW.FAST.delayMaxMin + " min apart") + " · keep this tab open. The link is broken by the swap, not by cryptography."));
     box.hidden = false; pv = { key, ratio: Number(sm.amountOut) / Number(sm.amountIn) }; $("btn-wd").textContent = "Confirm private withdraw";
     say("pay-hint", "Check the quote, then confirm.", "warn"); return;
   }
-  const w = wd, k = w.stealth.toLowerCase(), plan = PW.fastPlan(value), ratio = pv.ratio;
-  const rec = { v: 1, stealth: k, chain: C.key, dest: dest.key, startedAt: Date.now(), parts: plan };
+  const w = wd, k = w.stealth.toLowerCase(), plan = PW.fastPlan(value, Math.random, asset), ratio = pv.ratio;
+  const rec = { v: 1, stealth: k, chain: C.key, dest: dest.key, ...(eth ? { asset: "ETH" } : {}), startedAt: Date.now(), parts: plan };
   $("btn-wd").disabled = true; $("withdraw").hidden = true; fastBusy.add(k);
-  const lock = await holdScreen(), fmt = v => fmtTok(v);
+  const lock = await holdScreen(), fmt = v => fmtAs(asset, v);
   const save = r => { try { fastRecs.put(r); } catch (e) { say("pay-hint", e.message + " The withdraw continues, but if this tab is closed it cannot be followed.", "warn"); } };      // 1130 L-1: surfaced, never silent (the START is refused in fastClaim)
   const owner = acct;      // 1135 L-4: the account that started this withdraw owns its notes, whatever is connected when it ends
   let cur = null, claimed = false;      // claimed: this run owns the stored record (a refused second start must not touch the guard or notes of the live one)
-  const noteIfNeeded = () => { if (claimed && fastNeedsNote(rec)) { fastNotes.add("Private withdraw of " + fmtTok(value) + " " + SYM + " (" + C.name + "), started " + new Date(rec.startedAt).toLocaleString() + ":\n" + PW.fastSummary(rec, fmt, SYM).join("\n"), owner); showFastBox(); } };
+  const noteIfNeeded = () => { if (claimed && fastNeedsNote(rec)) { fastNotes.add("Private withdraw of " + fmtAs(asset, value) + " " + symAs(asset) + " (" + C.name + "), started " + new Date(rec.startedAt).toLocaleString() + ":\n" + PW.fastSummary(rec, fmt, symAs(asset)).join("\n"), owner); showFastBox(); } };
   const settleGuard = () => { if (claimed && !rec.parts.some(p => p.state === "SIGNED" || p.state === "UNKNOWN")) pendingWd.delete(k); };
-  const ctx = { from: C, to: dest, priv: hit.stealthPriv, stealth: w.stealth, recipient: to, api: API, base: PW.ONECLICK, fetchFn: fetch, minRatio: ratio * 0.98, randomNonce: randomBytes32,
+  const ctx = { from: C, to: dest, asset, eth: eth ? ethApi(w, hit.stealthPriv) : null, priv: hit.stealthPriv, stealth: w.stealth, recipient: to, api: API, base: PW.ONECLICK, fetchFn: fetch, minRatio: ratio * 0.98, randomNonce: randomBytes32,
     authUsed: (a, n) => authorizationUsed(rpcOne, USDC, a, n), onProgress: m => say("pay-hint", m, "ok"),
     findTx: a => txOfLogs({ address: USDC, topics: [AUTH_USED_TOPIC, "0x" + padAddr(w.stealth), a.nonce], span: logSpanSince(a.validBefore) }, () => true), onRefused: () => pendingWd.delete(k),
     onSigned: info => { cur = info; pendingWd.set(k, (info.validBefore + 60) * 1000); },       // armed before the request leaves; cleared only when the deposit is confirmed
-    waitReceipt: h => waitReceipt(h, x => hasTransfer(x, { token: USDC, from: w.stealth, to: cur.depositAddress, value: cur.amount }) && hasAuthUsed(x, { token: USDC, authorizer: w.stealth, nonce: cur.auth.nonce }), true),
-    onDeposited: info => { if (info.index === rec.parts.length - 1) pendingWd.delete(k); spent.set(k, { left: (spent.get(k) || { left: w.usdc }).left - BigInt(rec.parts[info.index].amount), until: Date.now() + 120_000 }); render(); } };
+    waitReceipt: h => eth ? waitReceipt(h, x => x.ok && x.hash === cur.ethTx.hash.toLowerCase()) : waitReceipt(h, x => hasTransfer(x, { token: USDC, from: w.stealth, to: cur.depositAddress, value: cur.amount }) && hasAuthUsed(x, { token: USDC, authorizer: w.stealth, nonce: cur.auth.nonce }), true),      // ETH: the hash of the transaction we signed binds its nonce, destination and amount
+    onDeposited: info => { if (info.index === rec.parts.length - 1) pendingWd.delete(k); spent.set(k, { left: (spent.get(k) || { left: eth ? w.eth : w.usdc }).left - BigInt(rec.parts[info.index].amount), until: Date.now() + 120_000, ...(eth ? { asset: "ETH" } : {}) }); render(); } };
   try {
     const run = () => { fastClaim(rec); claimed = true; return PW.runFast(ctx, rec, save); };      // claimed inside the lock: a second tab is refused before it can write
     if (navigator.locks) await navigator.locks.request("fast-wd:" + k, { ifAvailable: true }, l => l ? run() : Promise.reject(new Error("A withdraw from this address is already running in another tab."))); else await run();
-    const sums = PW.fastSummary(rec, fmt, SYM), ok = rec.parts.every(p => p.state === "SUCCESS");
+    const sums = PW.fastSummary(rec, fmt, symAs(asset)), ok = rec.parts.every(p => p.state === "SUCCESS");
     if (PW.fastDone(rec)) fastRecs.del(k);
     noteIfNeeded(); settleGuard();
-    say("pay-hint", (ok ? "Done privately: " + fmtTok(value) + " " + SYM + " sent through NEAR Intents to " + to.slice(0, 8) + "… on " + dest.name + "." : "Finished with problems:") + (ok && rec.parts.length < 2 ? "" : "\n" + sums.join("\n")), ok ? "ok" : "warn");
-  } catch (e) { say("pay-hint", (e.message || String(e)) + (e.config ? PW.CONFIG_NOTE + " Use Abandon below to clear this record." : "\n" + PW.fastSummary(rec, fmt, SYM).join("\n")), "bad");      // 1135 L-2: the true reason, the guard stays, Abandon is the way out
+    say("pay-hint", (ok ? "Done privately: " + fmtAs(asset, value) + " " + symAs(asset) + " sent through NEAR Intents to " + to.slice(0, 8) + "… on " + dest.name + "." : "Finished with problems:") + (ok && rec.parts.length < 2 ? "" : "\n" + sums.join("\n")), ok ? "ok" : "warn");
+  } catch (e) { say("pay-hint", (e.message || String(e)) + (e.config ? PW.CONFIG_NOTE + " Use Abandon below to clear this record." : "\n" + PW.fastSummary(rec, fmt, symAs(asset)).join("\n")), "bad");      // 1135 L-2: the true reason, the guard stays, Abandon is the way out
     if (PW.fastDone(rec) && fastRecs.read()[k] && fastRecs.read()[k].startedAt === rec.startedAt) fastRecs.del(k); noteIfNeeded(); settleGuard(); }
   finally { fastBusy.delete(k); showFastBox(); if (lock) lock.release().catch(() => {}); $("btn-wd").disabled = false; pvReset(); await refreshBalances().catch(() => {}); render(); }
 }
@@ -657,10 +680,10 @@ async function resumeFast() {
   for (const k of Object.keys(m)) {
     const rec = m[k]; if (!rec || !Array.isArray(rec.parts) || fastBusy.has(k)) continue;
     let ran = false;
-    const go = async () => { ran = true; fastBusy.add(k); try { await PW.runFast({ base: PW.ONECLICK, fetchFn: fetch, onProgress: t => { fastLive = "Earlier private withdraw: " + t; showFastBox(); } }, rec, r => { try { fastRecs.put(r); } catch {} }, { resume: true }); } finally { fastBusy.delete(k); fastLive = ""; } };
+    const go = async () => { ran = true; fastBusy.add(k); try { await PW.runFast({ base: PW.ONECLICK, fetchFn: fetch, ethStatus: (r, tx) => ETH.txStatus(ethRpc, { from: r.stealth, hash: tx.hash, nonce: tx.nonce }), onProgress: t => { fastLive = "Earlier private withdraw: " + t; showFastBox(); } }, rec, r => { try { fastRecs.put(r); } catch {} }, { resume: true }); } finally { fastBusy.delete(k); fastLive = ""; } };
     try { if (navigator.locks) await navigator.locks.request("fast-wd:" + k, { ifAvailable: true }, l => l ? go() : undefined); else await go(); } catch (e) { extra.push("Earlier private withdraw: " + (e.message || e)); continue; }
     if (!ran) continue;                                      // 1125 F-6: another tab holds the lock, so this record is a LIVE withdraw there, not an earlier one
-    const chain = CHAINS[rec.chain] || C, sums = PW.fastSummary(rec, v => (Number(v) / 10 ** chain.token.decimals).toFixed(2), chain.token.symbol), text = "Earlier private withdraw (" + chain.name + "):\n" + sums.join("\n");
+    const chain = CHAINS[rec.chain] || C, un = unitsOf(chain, rec), sums = PW.fastSummary(rec, un.fmt, un.sym), text = "Earlier private withdraw (" + chain.name + "):\n" + sums.join("\n");
     if (fastNeedsNote(rec)) { if (!acct) { extra.push(text); fastDeferred = true; continue; } fastNotes.add(text, acct); } else extra.push(text);      // 1135 L-4: no account yet -> shown now, the record is kept and followed again when one connects      // 1125 F-2: all summaries are listed (not only the last), and the ones with a deposit address to look up stay
     if (PW.fastDone(rec)) { fastRecs.del(k); if (!rec.parts.some(p => p.state === "UNKNOWN")) pendingWd.delete(k); }   // UNKNOWN: the signed transfer may still land, the guard stays until its authorization expires
   }
@@ -672,8 +695,8 @@ $("btn-fast-abandon").addEventListener("click", once(async () => {
   if (!acct) { say("pay-hint", "Connect your wallet first: the note with the deposit address is saved for your account.", "warn"); return; }
   const ks = fastOpenIdle(); if (!ks.length || !confirm("Abandon the unfinished private withdraw record" + (ks.length > 1 ? "s" : "") + "? Parts already handed to NEAR Intents stay with NEAR Intents (their deposit addresses are kept in a note); this page stops following them.")) return;
   for (const k of ks) {
-    const go = () => { const rec = fastRecs.read()[k]; if (!rec || !PW.fastOpenRec(rec)) return; const chain = CHAINS[rec.chain] || C; PW.abandonRec(rec);
-      fastNotes.add("Abandoned private withdraw (" + chain.name + "), started " + new Date(rec.startedAt).toLocaleString() + ":\n" + PW.fastSummary(rec, v => (Number(v) / 10 ** chain.token.decimals).toFixed(2), chain.token.symbol).join("\n"), acct);
+    const go = () => { const rec = fastRecs.read()[k]; if (!rec || !PW.fastOpenRec(rec)) return; const chain = CHAINS[rec.chain] || C, un = unitsOf(chain, rec); PW.abandonRec(rec);
+      fastNotes.add("Abandoned private withdraw (" + chain.name + "), started " + new Date(rec.startedAt).toLocaleString() + ":\n" + PW.fastSummary(rec, un.fmt, un.sym).join("\n"), acct);
       fastRecs.del(k); };
     if (navigator.locks) await navigator.locks.request("fast-wd:" + k, { ifAvailable: true }, l => { if (l) go(); }); else go();      // a record another tab is running is not abandoned from here
   }
@@ -714,11 +737,66 @@ async function screenRecipient(to) {
   const sc = local ? { listed: sl.addresses.includes(to.toLowerCase()) } : await api("/relay/screen?addr=" + to).catch(() => null);
   if (!sc || sc.listed !== false) throw new Error(sc && sc.listed ? "That recipient address is on a sanctions list; refusing." : "Could not check the recipient against the sanctions list; nothing was sent. Try again.");
 }
+// ---- native ETH withdraw (Robinhood Chain). No EIP-3009 and no relayer for ETH: the stealth key signs a normal transaction and this page sends it; the address pays its own gas, so the fee is kept back from "all" and an amount that does not fit
+// with the fee is refused before anything is signed. The signed bytes are recorded (with the double-send guard) BEFORE they are broadcast; they are only ever re-sent as they are, and a nonce can be mined once, so nothing can be paid twice.
+const ETH_WD_KEY = "stealth-eth-wd", ethWdRec = { all() { try { const o = JSON.parse(localStorage.getItem(ETH_WD_KEY) || "{}"); return o && typeof o === "object" ? o : {}; } catch { return {}; } },
+  put(k, v) { const o = this.all(); o[k] = v; try { localStorage.setItem(ETH_WD_KEY, JSON.stringify(o)); } catch {} }, del(k) { const o = this.all(); delete o[k]; try { localStorage.setItem(ETH_WD_KEY, JSON.stringify(o)); } catch {} } };
+// after a Scan: an earlier ETH withdrawal whose outcome is now known on chain (mined, reverted, or its nonce taken by another transaction) no longer needs its guard
+async function ethResolve() {
+  const m = ethWdRec.all(); let any = false;
+  for (const k of Object.keys(m)) { const r = m[k]; if (!r || !found.some(f => f.stealth.toLowerCase() === k)) continue; let st = null; try { st = await ETH.txStatus(ethRpc, { from: k, hash: r.hash, nonce: r.nonce }); } catch {} if (st === "mined" || st === "failed" || st === "dead") { pendingWd.delete(k); ethWdRec.del(k); any = true; } }
+  return any;
+}
+async function ethFeeOf(stealth, to) {
+  const k = stealth.toLowerCase(); if (ethFeeFor.has(k) && Date.now() - (ethFeeAt.get(k) || 0) < 300_000) return ethFeeFor.get(k);
+  const p = await ETH.planFee(ethRpc, { from: stealth, to, value: 1n }); ethFeeFor.set(k, p.fee); ethFeeAt.set(k, Date.now()); return p.fee;
+}
+async function ethWithdraw(to) {
+  const w = wd, k = w.stealth.toLowerCase(), amtIn = $("wd-amt").value.trim(), hit = hitOf(w);
+  if (!hit || hit.stealth.toLowerCase() !== k) throw new Error("could not re-derive the key for this address");
+  const all = w.eth; if (typeof all !== "bigint") throw new Error("the balance has not been read; scan again");
+  const exact = amtIn ? calcAmounts({ src: "amount", text: amtIn, decimals: C.native.decimals, fee: 0n }) : null;
+  if (amtIn && !exact) throw new Error("enter the amount as a plain number");
+  if ((pendingWd.get(k) || 0) > Date.now() && !confirm("An earlier withdrawal from this address was sent to the network and has not been confirmed yet. Sending again may pay twice. Check the explorer first. Send anyway?")) return;
+  const fee = await ethFeeOf(w.stealth, to), value = exact ? exact.send : all - fee;
+  if (!(value > 0n)) throw new Error("The balance (" + fmtEth(all) + " " + NAT + ") does not cover the network fee (about " + fmtEth(fee) + " " + NAT + ").");
+  if (value + fee > all) throw new Error("The amount plus the network fee (about " + fmtEth(fee) + " " + NAT + ") is more than the balance (" + fmtEth(all) + " " + NAT + "). Enter a little less, or leave the amount empty to send all.");
+  await screenRecipient(to);      // the stablecoin's relayer screens the destination itself; an ETH transfer never touches it, so the page screens EVERY ETH recipient (standard included) before anything is signed
+  if (route() !== "std" && !$("wd-priv-wrap").hidden) { return route() === "fast" ? await fastWithdraw(to, value, hit, "ETH") : await privateWithdraw(to, value, hit, "ETH"); }
+  return await ethStandard(to, value, hit, all);
+}
+async function ethStandard(to, value, hit, all) {
+  const w = wd, k = w.stealth.toLowerCase(), sleep = ms => new Promise(r => setTimeout(r, ms));
+  say("pay-hint", "Signing the " + NAT + " transfer…");
+  const tx = await ETH.prepareSend(ethRpc, { priv: hit.stealthPriv, chainId: C.chainId, from: w.stealth, to, value });      // reads nonce + gas, checks amount + fee fit the balance; nothing is sent
+  pendingWd.set(k, (Math.floor(Date.now() / 1000) + 3600 + 60) * 1000); ethWdRec.put(k, { hash: tx.hash, nonce: tx.nonce, at: Date.now() });      // armed and recorded BEFORE the bytes leave; cleared only by a confirmed outcome
+  say("pay-hint", "Sending from the stealth address (it pays its own network fee)…");
+  for (let i = 0; ; i++) {
+    try { await ETH.sendRaw(ethRpc, tx); break; }
+    catch (e) {
+      if (ETH.refused(e)) { pendingWd.delete(k); ethWdRec.del(k); throw new Error("The network refused the transaction: " + ((e && e.message) || e) + ". Nothing was sent."); }
+      if (i < 2) { await sleep(2000 * 3 ** i); continue; }      // a network failure: the SAME bytes again
+      let st = null; try { st = await ETH.txStatus(ethRpc, { from: w.stealth, hash: tx.hash, nonce: tx.nonce }); } catch {}
+      if (st === "mined" || st === "pending") break;
+      throw new Error("Could not confirm that the transaction was sent (" + ((e && e.message) || e) + "). Check the explorer for tx " + tx.hash + " before sending again.");
+    }
+  }
+  $("withdraw").hidden = true;
+  say("pay-hint", "Submitted: " + fmtEth(value) + " " + NAT + " → " + to.slice(0, 8) + "… waiting for the block…");
+  const rc = await waitReceipt(tx.hash, x => x.ok && x.hash === tx.hash);      // the hash binds nonce, destination and amount of THIS transaction
+  if (!rc.ok && !rc.unexpected) { pendingWd.delete(k); ethWdRec.del(k); }
+  if (!rc.ok) throw new Error(rc.unexpected ? "the transaction is mined but is not the one we signed (tx " + rc.hash.slice(0, 12) + "…). Check the explorer." : "the transfer reverted on chain (tx " + rc.hash.slice(0, 12) + "…). Nothing moved.");
+  pendingWd.delete(k); ethWdRec.del(k); spent.set(k, { left: all - value, until: Date.now() + 120_000, asset: "ETH" });
+  const doneMsg = "Done: " + fmtEth(value) + " " + NAT + " sent, tx " + tx.hash.slice(0, 12) + "…";
+  say("pay-hint", doneMsg, "ok"); await scan();
+  $("pay-hint").textContent = doneMsg + "\n" + $("pay-hint").textContent;
+}
 $("btn-wd").addEventListener("click", once(async () => {
   try {
     if (!wd || !keys) return;
     const to = $("wd-to").value.trim();
     if (!vetRecipient(to, wd)) return;
+    if (wdA === "ETH") return await ethWithdraw(to);      // native ETH: no domain separator, no authorization (see above)
     const all = wd.usdc; const amtIn = $("wd-amt").value.trim();
     const exact = amtIn ? calcAmounts({ src: "amount", text: amtIn, decimals: TOK.decimals, fee: 0n }) : null;      // exact decimals, no floats (1098 I-1)
     if (amtIn && !exact) throw new Error("enter the amount as a plain number");
@@ -795,7 +873,7 @@ async function payStealth({ token, amount, raw: rawIn = null, d, own = false }) 
     say("send-hint", "Pay + announce (" + (al < raw ? "2 of 2" : "1 of 1") + ")…");
     return wallet("eth_sendTransaction", [{ from: acct, to: STEALTHPAY, data }]);
   }
-  const wei = BigInt(Math.round(amount * NUNIT));
+  const wei = rawIn ?? BigInt(Math.round(amount * NUNIT));      // rawIn = exactly what leaves the wallet (18 decimals do not survive a float)
   const data = sel("payETH(address,bytes,bytes1)") + padAddr(d.stealth) + pad(96n) + tagWord + ephLen + ephData;
   return wallet("eth_sendTransaction", [{ from: acct, to: STEALTHPAY, value: "0x" + wei.toString(16), data }]);
 }
@@ -842,8 +920,9 @@ function payAmounts() {
   return calcAmounts({ src: amtSrc, text: $(amtSrc).value, decimals: Math.round(Math.log10(unit())), fee: curFee(), bps: $("token").value === "TOKEN" ? payBpsNow : 0 });   // exact decimals, see pay-auth.js
 }
 function calc() {
+  $("pay-gas-note").textContent = $("token").value === "TOKEN" ? "One signature, no gas." : "A normal transaction from your wallet: you pay the gas from your wallet.";
   const out = $("pay-calc"), a = payAmounts(), other = amtSrc === "amount" ? "amount-get" : "amount", u = unit();
-  $(other).value = a ? String(Number(amtSrc === "amount" ? a.get : a.send) / u) : "";
+  $(other).value = a ? ($("token").value === "TOKEN" ? String(Number(amtSrc === "amount" ? a.get : a.send) / u) : fmtUnits(amtSrc === "amount" ? a.get : a.send, C.native.decimals, C.native.decimals, 0)) : "";      // ETH: exact text (a float prints 1e-7)
   if (a && a.get <= 0n) { $(other).value = ""; out.textContent = "Minimum is above the " + fmtTok(a.fee) + " " + SYM + " network fee."; return; }
   out.textContent = $("token").value !== "TOKEN" ? "Gas is paid from your wallet." : payFee != null ? (payBpsNow ? "Fee " + (payBpsNow / 100) + "% (minimum " + fmtTok(payFee) + " " + SYM + ")" + (a ? " = " + fmtTok(a.fee) + " " + SYM : "") + " included" : "Network fee " + fmtTok(payFee) + " " + SYM + " included") : "";
 }
@@ -859,12 +938,12 @@ async function doPay(own) {
     const m = parseMeta(metaIn);
     await ensureChain();
     const token = $("token").value, a = payAmounts(); if (!a) throw new Error("enter an amount");
-    const amount = Number(a.send) / unit();
+    const amount = token === "TOKEN" ? Number(a.send) / unit() : fmtEth(a.send);
     if (a.get <= 0n) throw new Error("the amount is below the network fee");
     const d = deriveForPayment(m);
     say("send-hint", "Paying " + amount + " " + (token === "TOKEN" ? SYM : NAT) + " to a fresh address " + d.stealth.slice(0, 10) + "…");
-    const tx = await payStealth({ token, amount, raw: token === "TOKEN" ? a.send : null, d, own });   // raw = exactly what leaves the wallet, no float round trip
-    const want = token === "TOKEN" ? { stealthPay: STEALTHPAY, stealth: d.stealth, token: USDC, amount: own ? a.send : a.get } : { stealthPay: STEALTHPAY, stealth: d.stealth, token: ETH_TOKEN };
+    const tx = await payStealth({ token, amount, raw: a.send, d, own });   // raw = exactly what leaves the wallet, no float round trip
+    const want = token === "TOKEN" ? { stealthPay: STEALTHPAY, stealth: d.stealth, token: USDC, amount: own ? a.send : a.get } : { stealthPay: STEALTHPAY, stealth: d.stealth, token: ETH_TOKEN, amount: a.send };
     const rc = await waitReceipt(tx, x => hasPaid(x, want), token === "TOKEN" && !own);
     if (!rc.ok) throw new Error(rc.unexpected ? "the transaction is mined but the pay contract did not record this payment (tx " + rc.hash + "). Check the explorer." : "the payment reverted: " + tx);
     say("send-hint", "Paid. tx " + rc.hash.slice(0, 12) + "… The receiver will find it with their keys.", "ok");

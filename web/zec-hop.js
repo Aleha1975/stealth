@@ -7,7 +7,8 @@ import { keccak, unhex, hex } from "./stealth-crypto.js";
 import * as PW from "./private-withdraw.js";
 import { postRelay } from "./relay-post.js";
 import { hasTransfer, hasAuthUsed, timeoutSignal } from "./chain-read.js";
-import { zcash as ZC, privateFee, appFeesOf } from "./chains.js";
+import { zcash as ZC, privateFee, appFeesOf, assetOf } from "./chains.js";
+import * as ETH from "./eth-send.js";
 
 export const STEPS = ["QUOTE_IN", "DEPOSIT_IN", "WAIT_T", "SHIELD", "DELAY", "QUOTE_OUT", "SEND_OUT"];
 export const DONE_STEPS = new Set(["DONE", "FAILED_IN", "FAILED"]);
@@ -102,24 +103,24 @@ const reqOf = ({ originAsset, destAsset, amount, recipient, refundTo, dry, now =
 /** Fields (name=value) that two quote requests have in common; only protocol constants may show up (M-5 test). */
 export const sharedFields = (a, b) => Object.keys(a).filter(k => k in b && JSON.stringify(a[k]) === JSON.stringify(b[k])).map(k => k + "=" + JSON.stringify(a[k]));
 export const CONSTANT_FIELDS = new Set(["dry", "swapType", "slippageTolerance", "depositType", "refundType", "recipientType", "confidentiality"]);
-/** In-leg: chain stablecoin -> ZEC paid to the hop's t-address; refund goes back to the stealth address. */
-export function reqIn({ chain, amount, tAddr, stealth, dry, now, rand, fees = privateFee }) {
-  if (!chain.oneClick || !isT(tAddr) || !isAddr(stealth)) throw new Error("bad address");
-  const r = reqOf({ originAsset: chain.oneClick.assetId, destAsset: ZC.assetId, amount, recipient: tAddr, refundTo: stealth, dry, now, rand }), af = appFeesOf(fees);
+/** In-leg: chain stablecoin (or ETH) -> ZEC paid to the hop's t-address; refund goes back to the stealth address. */
+export function reqIn({ chain, amount, tAddr, stealth, dry, now, rand, fees = privateFee, asset }) {
+  if (!(asset === "ETH" ? chain.eth : chain.oneClick) || !isT(tAddr) || !isAddr(stealth)) throw new Error("bad address");      // asset "ETH" = the chain's native coin instead of its stablecoin
+  const r = reqOf({ originAsset: assetOf(chain, asset).assetId, destAsset: ZC.assetId, amount, recipient: tAddr, refundTo: stealth, dry, now, rand }), af = appFeesOf(fees);
   if (af) r.appFees = af;      // the service fee (config in chains.js, off by default): FIRST leg only, so the legs still share nothing but protocol constants
   return r;
 }
 /** Out-leg: ZEC -> stablecoin on `dest` to the final recipient; a ZEC-origin refund must be a Zcash t-address (a fresh one of the hop wallet). */
-export function reqOut({ dest, amount, recipient, refundT, dry, now, rand }) {
-  if (!dest.oneClick || !isAddr(recipient) || !isT(refundT)) throw new Error("bad address");
-  return reqOf({ originAsset: ZC.assetId, destAsset: dest.oneClick.assetId, amount, recipient, refundTo: refundT, dry, now, rand });
+export function reqOut({ dest, amount, recipient, refundT, dry, now, rand, asset }) {
+  if (!(asset === "ETH" ? dest.eth : dest.oneClick) || !isAddr(recipient) || !isT(refundT)) throw new Error("bad address");
+  return reqOf({ originAsset: ZC.assetId, destAsset: assetOf(dest, asset).assetId, amount, recipient, refundTo: refundT, dry, now, rand });
 }
 export const outAmount = (orchard, reserve = RESERVE) => (orchard - reserve >= ZC.minIn ? orchard - reserve : 0n);
 export const okSize = zatsOut => zatsOut >= ZC.minIn + SHIELD_FEE + RESERVE + 25000n;     // the ZEC we will get must survive the shield fee, the out reserve and still reach the 1Click minimum
 export const delayMs = (rand = Math.random) => Math.floor((2 + 8 * rand()) * 60_000);       // 2..10 min
 /** Conservative (too early) Zcash height for a unix time: assumes 60 s blocks (real ~75 s) and 500 blocks of slack. */
 export const birthdayFromTime = (tSec, tip, nowSec = Date.now() / 1000) => Math.max(ZC.orchardActivation, tip - Math.ceil(Math.max(0, nowSec - tSec) / 60) - 500);
-export const newState = ({ stealth, chain, dest, recipient, amount, dry, n = 0, mode = DEFAULT_MODE, now = Date.now() }) => ({ v: 2, n, stealth: stealth.toLowerCase(), chain: chain.key, dest: dest.key, recipient, amount: amount.toString(),
+export const newState = ({ stealth, chain, dest, recipient, amount, dry, n = 0, mode = DEFAULT_MODE, now = Date.now(), asset }) => ({ v: 2, n, stealth: stealth.toLowerCase(), chain: chain.key, dest: dest.key, ...(asset === "ETH" ? { asset: "ETH" } : {}), recipient, amount: amount.toString(),
   dry: !!dry, step: "QUOTE_IN", attempt: 0, reserve: RESERVE.toString(), startedAt: now, err: null, mode: MODES[mode] ? mode : DEFAULT_MODE, nAccts: accountsFor(mode), nextAcct: 1 });
 export const afterIn = status => (status === "SUCCESS" ? { step: "WAIT_T" } : { step: "FAILED_IN", result: status });
 /** Legacy (v1 state, one out-leg). */
@@ -262,6 +263,9 @@ export const makeCountPriorHops = (chain, fetchFn = fetch) => async stealth => {
   for (let a = PAY_FROM_BLOCK[chain.key] || 0; a <= tip; a += LOG_SPAN) {
     const r = await rpcCall(fetchFn, chain.rpc, "eth_getLogs", [{ address: chain.token.address, fromBlock: "0x" + a.toString(16), toBlock: "0x" + Math.min(tip, a + LOG_SPAN - 1).toString(16), topics: [AUTH_USED_TOPIC, "0x" + pad32(stealth)] }]);
     if (!Array.isArray(r)) throw new Error("unexpected logs answer"); n += r.length;
+  }
+  if (chain.eth) {      // an ETH hop spends the address with a plain transaction, no AuthorizationUsed: the address's own transaction count joins the count, so a hop of either kind never reuses the counter (hop wallet) of the other. It can only over-count too.
+    const c = await rpcCall(fetchFn, chain.rpc, "eth_getTransactionCount", [stealth, "latest"]); if (!/^0x[0-9a-fA-F]{1,16}$/.test(c)) throw new Error("unexpected transaction count"); n += Number(BigInt(c));
   }
   return n;
 };
@@ -453,10 +457,36 @@ export async function runHop(ctx) {
     }
     return go(a.step, a);
   };
+  /** DEPOSIT_IN for native ETH: no authorization and no relayer, the stealth key signs a plain transaction to the quote's deposit address. ctx.eth = { prepare({to,value}) -> signed tx, send(tx), status(tx) } (web/eth-send.js).
+   *  The signed bytes are saved (st.ethTx) BEFORE the first broadcast. They are the only thing ever sent for this deposit: a resume asks the chain what became of them and re-sends the SAME bytes only while their nonce is still free;
+   *  a new transaction is signed only when the chain shows that nonce was taken by another transaction (our bytes can never be mined) or that ours reverted. One nonce is mined once, so this can never pay twice. -> null, or true when it moved the hop to another step (the caller returns), false when the deposit is done */
+  const depositEth = async q => {
+    if ((await status(q.depositAddress, fIn)) !== PENDING) return false;      // 1Click already has the deposit
+    const E = ctx.eth; if (!E) throw new Halt("this page cannot send ETH from the stealth address; nothing was sent");
+    if (!st.ethTx) {
+      if (Date.now() > q.deadlineMs - 120_000) { await go("QUOTE_IN", { inQuote: null }); return true; }      // quote nearly expired and nothing signed: start over
+      let t; try { t = await E.prepare({ to: q.depositAddress, value: BigInt(q.amountIn) }); } catch (e) { throw e && e.short ? new Halt(e.message) : e; }
+      st.ethTx = t; await save();      // recorded BEFORE it can leave the device
+    }
+    if (!st.txIn) {
+      const s0 = await E.status(st.ethTx);
+      if (s0 === "dead") { say("The earlier ETH deposit can never be mined (its nonce was used by another transaction); starting again with a new quote…"); await go("QUOTE_IN", { ethTx: null, inQuote: null }); return true; }
+      if (s0 === "failed") { st.ethTx = null; await save(); throw new Halt("the ETH deposit transaction reverted; nothing moved. Press Continue to try again"); }
+      if (s0 === "unsent") {
+        say("Sending the ETH deposit from the stealth address…");
+        try { await E.send(st.ethTx); } catch (e) { if (ETH.refused(e)) throw new Halt("the network refused the ETH deposit (" + oneLineErr(e) + "); the signed transaction is kept. Press Continue to check again"); throw e; }      // kept, never replaced: a refusal can be "nonce too low" because it was mined after all
+      }
+      st.txIn = st.ethTx.hash; await save();
+    }
+    const got = await ctx.waitReceipt(st.txIn, rc => rc.ok && String(rc.hash).toLowerCase() === st.ethTx.hash.toLowerCase());      // the hash binds the nonce, the destination and the amount of THIS transaction
+    if (!got.ok) { st.txIn = null; if (!got.unexpected) st.ethTx = null; await save(); throw new Halt(got.unexpected ? "the receipt does not belong to the ETH deposit we signed; nothing was recorded as sent. Press Continue to check again" : "the ETH deposit transaction reverted; nothing moved. Press Continue to try again"); }
+    await PW.submitDeposit({ base, txHash: st.txIn, depositAddress: q.depositAddress, fetchFn: fIn }).catch(() => {});
+    return false;
+  };
   const H = {
     async QUOTE_IN() {
       if (!st.inQuote) {
-        const tIn = await taddr(0), req = reqIn({ chain: ctx.chain, amount: BigInt(st.amount), tAddr: tIn, stealth: st.stealth, dry: st.dry, rand: ctx.rand });
+        const tIn = await taddr(0), req = reqIn({ chain: ctx.chain, amount: BigInt(st.amount), tAddr: tIn, stealth: st.stealth, dry: st.dry, rand: ctx.rand, asset: st.asset });
         const info = quoteInfoOf(await PW.requestQuote({ base, fetchFn: fIn, req }), req);
         if (!okSize(BigInt(info.amountOut))) throw new Halt("too small for the Zcash route: it would deliver only " + info.amountOut + " zatoshi; nothing was sent");
         st.tIn = tIn; st.inQuote = info; await save();
@@ -467,7 +497,8 @@ export async function runHop(ctx) {
       if (st.dry) return go("WAIT_T");                           // dry hops never sign or relay
       const q = st.inQuote;
       if (!st.relayed) {
-        if ((await status(q.depositAddress, fIn)) === PENDING) { // not seen by 1Click yet
+        if (st.asset === "ETH") { if (await depositEth(q)) return; }
+        else if ((await status(q.depositAddress, fIn)) === PENDING) { // not seen by 1Click yet
           if (!st.auth && Date.now() > q.deadlineMs - 120_000) return go("QUOTE_IN", { inQuote: null });      // quote nearly expired and nothing signed: start over
           const spent = st.auth && !st.txIn && ctx.balance && (await ctx.balance()) < BigInt(q.amountIn);       // authorization used but the answer got lost
           let skip = !!spent;
@@ -582,13 +613,13 @@ export async function runHop(ctx) {
       const b = lastB || await bal(p.acct), amount = partsOn() && !p.tries ? BigInt(p.amount) : outAmount(b.o, reserve);
       if (!amount || amount < ZC.minIn) throw new Halt("only " + b.o + " zatoshi are shielded, below the 1Click minimum; they stay in the hop wallet");
       if (partsOn() && p.refundAcct == null) { p.refundAcct = await allocAcct(); await save(); }            // a fresh hop t-address per part and attempt: the refund address is never reused
-      const refundT = await taddr(partsOn() ? p.refundAcct : st.attempt + 1), req = reqOut({ dest: ctx.dest, amount, recipient: st.recipient, refundT, rand: ctx.rand });
+      const refundT = await taddr(partsOn() ? p.refundAcct : st.attempt + 1), req = reqOut({ dest: ctx.dest, amount, recipient: st.recipient, refundT, rand: ctx.rand, asset: st.asset });
       const info = quoteInfoOf(await PW.requestQuote({ base, fetchFn: fOut, okDeposit: isT, req }), req);
       // 31.10: a part whose swap has not ended yet counts at its quoted amountOut (paid or open), so the loss is not overstated; a part refunded and not re-sent yet, or not sent yet, is ZEC still to send
       const cur = st.partIdx || 0, others = partsOn() ? st.parts.map((x, i) => [x, i]).filter(([, i]) => i !== cur) : [];
       const paid = others.filter(([x]) => ["paid", "open"].includes(partState(x)) && x.quote).reduce((a, [x]) => a + Number(x.quote.amountOut), 0);
       const left = others.filter(([x]) => ["unsent", "refund"].includes(partState(x))).reduce((a, [x]) => a + BigInt(x.amount), 0n) + amount;
-      const loss = st.rebuilt ? 0 : projectedLoss({ amountIn: st.amount, inDec: ctx.chain.token.decimals, outDec: ctx.dest.token.decimals, paidOut: paid, rate: Number(info.amountOut) / Number(amount), zatsLeft: left }), cap = ctx.maxLoss == null ? MAX_LOSS : ctx.maxLoss;
+      const loss = st.rebuilt ? 0 : projectedLoss({ amountIn: st.amount, inDec: assetOf(ctx.chain, st.asset).decimals, outDec: assetOf(ctx.dest, st.asset).decimals, paidOut: paid, rate: Number(info.amountOut) / Number(amount), zatsLeft: left }), cap = ctx.maxLoss == null ? MAX_LOSS : ctx.maxLoss;
       const rate = Number(info.amountOut) / Number(amount);
       // 1138 L-3 / C2 / I-1: pressing "Confirm private transfer" on the preview IS the approval of the preview's total cost (st.approvedLoss). Over the cap, a quote passes silently while its
       // projected loss stays within that approved figure + QUOTE_TOL. Beyond it: a run the user just started by clicking (ctx.interactive) shows the dialog; a timer-driven run (a DELAY that ended,
@@ -598,12 +629,12 @@ export async function runHop(ctx) {
       if (!st.rebuilt && loss > cap && !silentOk) {
         const over = "the quote would lose " + (loss * 100).toFixed(1) + "% of the amount in total, above the " + (cap * 100).toFixed(1) + "% limit" + (approved !== null ? " and above the " + (approved * 100).toFixed(1) + "% you approved" : "") + "; nothing was sent, the ZEC stays shielded";
         if (!ctx.interactive || typeof ctx.confirmLoss !== "function") throw new Halt("Quote above what you approved: press Continue transfer to review it (" + over + ")");
-        if (!(await ctx.confirmLoss({ loss, cap, approved, amount, zatsLeft: left, amountOut: BigInt(info.amountOut), rate, recipient: st.recipient, destSymbol: ctx.dest.token.symbol, destDecimals: ctx.dest.token.decimals }))) throw new Halt(over + ". Press Continue transfer to see a new quote, or Return money");
+        if (!(await ctx.confirmLoss({ loss, cap, approved, amount, zatsLeft: left, amountOut: BigInt(info.amountOut), rate, recipient: st.recipient, destSymbol: assetOf(ctx.dest, st.asset).symbol, destDecimals: assetOf(ctx.dest, st.asset).decimals }))) throw new Halt(over + ". Press Continue transfer to see a new quote, or Return money");
         st.quoteRate = rate; st.approvedLoss = loss; await save();
       }
       if (st.rebuilt && !(st.quoteRate > 0 && rate >= st.quoteRate * (1 - QUOTE_TOL))) {      // 1133 L-5: nothing bounds a bad quote of a rebuilt record (the original amount is unknown), so the user sees it against what was found and confirms before any payout. 1136 F-3b: the approval is a RATE; a later quote (after an expiry or refund) that is worse by more than QUOTE_TOL asks again
         if (typeof ctx.confirmQuote !== "function") throw new Halt("this rebuilt transfer needs your confirmation of the quote, and this page cannot ask for it; nothing was sent, the ZEC stays shielded");
-        if (!(await ctx.confirmQuote({ zecFound: BigInt(st.zecFound || 0), amount, zatsLeft: left, amountOut: BigInt(info.amountOut), recipient: st.recipient }))) throw new Halt("the quote was not confirmed; nothing was sent, the ZEC stays shielded. Resume to see a new quote");
+        if (!(await ctx.confirmQuote({ zecFound: BigInt(st.zecFound || 0), amount, zatsLeft: left, amountOut: BigInt(info.amountOut), recipient: st.recipient, destSymbol: assetOf(ctx.dest, st.asset).symbol, destDecimals: assetOf(ctx.dest, st.asset).decimals }))) throw new Halt("the quote was not confirmed; nothing was sent, the ZEC stays shielded. Resume to see a new quote");
         st.quoteRate = rate; await save();
       }
       p.quote = info; p.tx = null; p.raw = null; p.expiry = null; await go("SEND_OUT");
@@ -683,7 +714,7 @@ export async function runHop(ctx) {
  *  Called by the app once the result has been shown (not inside runHop: the caller and tests still read the full state). */
 export async function scrubFinished(store, stealth) {
   const f = await findHop(store, stealth); if (!f || !["DONE", "FAILED_IN"].includes(f.rec.st.step)) return false;
-  const st = f.rec.st; await store.put(f.key, { st: { v: st.v, n: st.n, stealth: st.stealth, chain: st.chain, dest: st.dest, step: st.step, result: st.result, doneAt: st.doneAt, amount: st.amount, hidden: st.hidden, scrubbed: true,
+  const st = f.rec.st; await store.put(f.key, { st: { v: st.v, n: st.n, stealth: st.stealth, chain: st.chain, dest: st.dest, asset: st.asset, step: st.step, result: st.result, doneAt: st.doneAt, amount: st.amount, hidden: st.hidden, scrubbed: true,
     ...(st.step === "FAILED_IN" ? { inDeposit: st.inQuote && st.inQuote.depositAddress, txIn: st.txIn } : {}) }, db: null });   // 1105 L-6: support needs the in-leg deposit address and hash
   return true;
 }
@@ -735,9 +766,9 @@ export async function findLostFunds(ctx) {
  *  A hop at SHIELD that goes on with the ZEC found in `account` (recipient required, a valid address). Return needs no record at all: it works from the keys (1136 F-4).
  *  1133 M-2: the check and the write are one step: under ctx.lock(fn) when given (the app's hop lock; it returns undefined when another tab holds it), and the write is store.add (fails on an existing key).
  *  -> { key, created, reason? } (created false: a record exists for this n, or a NEWER one does and findHop would hide this one; a record below n is harmless: findHop takes the new, higher key) */
-export async function adoptLostHop(ctx, { n, account = 0, birthday = null, zats = 0n, recipient = null, chain, dest, now = Date.now() }) {
+export async function adoptLostHop(ctx, { n, account = 0, birthday = null, zats = 0n, recipient = null, chain, dest, now = Date.now(), asset }) {
   if (!isAddr(recipient)) throw new Error("enter a valid recipient address");
-  const key = ctx.stealth.toLowerCase() + "#" + n, st = newState({ stealth: ctx.stealth, chain, dest, recipient, amount: 0n, n, mode: DEFAULT_MODE, now });
+  const key = ctx.stealth.toLowerCase() + "#" + n, st = newState({ stealth: ctx.stealth, chain, dest, recipient, amount: 0n, n, mode: DEFAULT_MODE, now, asset });      // asset: the payout coin of the rebuilt hop (a lost record cannot say; the caller derives it from the payment)
   Object.assign(st, { rebuilt: true, zecFound: zats.toString(), stepAt: now, relayed: true });
   if (Number.isInteger(birthday)) st.birthday = Math.max(ZC.orchardActivation, birthday); Object.assign(st, { step: "SHIELD", attempt: account, tSeenHeight: null });
   const step = async () => {

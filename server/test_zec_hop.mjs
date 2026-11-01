@@ -56,7 +56,7 @@ function makeWorld(o = {}) {
   w.fetch = async (url, init = {}) => {
     const u = String(url), body = init.body ? JSON.parse(init.body) : null, J = (code, j) => ({ ok: code < 400, status: code, json: async () => j });
     if (u.endsWith("/v0/quote")) {
-      w.quotes.push(body); const isIn = body.originAsset !== ZC.assetId, amt = BigInt(body.amount), out = isIn ? amt * 2n : amt * BigInt(w.outPermille ?? 495) / 1000n;
+      w.quotes.push(body); const isIn = body.originAsset !== ZC.assetId, amt = BigInt(body.amount), out = isIn ? amt * 2n / (w.scale ?? 1n) : amt * BigInt(w.outPermille ?? 495) * (w.scale ?? 1n) / 1000n;      // w.scale: 18-decimal ETH on the stablecoin side of the fake rates (1e9 wei per zatoshi)
       const q = { amountIn: body.amount, amountOut: out.toString(), minAmountOut: (out * 99n / 100n).toString(), timeEstimate: 60, deadline: body.deadline };
       if (!body.dry) { q.depositAddress = isIn ? "0x" + (w.quotes.length.toString(16).padStart(40, "0")) : tOf("dep" + w.quotes.length); w.swaps[q.depositAddress] = { isIn, paid: false, body, amt, out, shown: false }; }
       if (w.mutQuote) w.mutQuote(q, isIn, body); return J(200, { quote: q, quoteRequest: body });
@@ -322,9 +322,9 @@ for (const [name, tk] of [["no txKnown available", undefined], ["txKnown cannot 
   const sc = H.memStore(); const err = await H.startHop(mkCtx(makeWorld(), sc, { countPriorHops: async () => { throw new Error("rpc down"); } })).then(() => null, e => e.message);
   ok("M4 chain unreadable: refuses to start (fail closed), nothing stored", /could not read/.test(err) && (await sc.keys()).length === 0);
   ok("M4 a bogus count is refused", await H.startHop(mkCtx(makeWorld(), H.memStore(), { countPriorHops: async () => -1 })).then(() => false, () => true));
-  const calls = [], TIP = H.PAY_FROM_BLOCK.rh + H.LOG_SPAN + 5, f = async (u, i) => { const b = JSON.parse(i.body); if (b.method === "eth_blockNumber") return { ok: true, json: async () => ({ result: "0x" + TIP.toString(16) }) }; calls.push(b); return { ok: true, json: async () => ({ result: calls.length === 1 ? [{}, {}, {}] : [{}] }) }; }, n = await H.makeCountPriorHops(rh, f)(STEALTH), c = calls[0], sig = keccak256(stringToBytes("AuthorizationUsed(address,bytes32)"));
+  const calls = [], TIP = H.PAY_FROM_BLOCK.rh + H.LOG_SPAN + 5, f = async (u, i) => { const b = JSON.parse(i.body); if (b.method === "eth_blockNumber") return { ok: true, json: async () => ({ result: "0x" + TIP.toString(16) }) }; if (b.method === "eth_getTransactionCount") return { ok: true, json: async () => ({ result: "0x0" }) }; calls.push(b); return { ok: true, json: async () => ({ result: calls.length === 1 ? [{}, {}, {}] : [{}] }) }; }, n = await H.makeCountPriorHops(rh, f)(STEALTH), c = calls[0], sig = keccak256(stringToBytes("AuthorizationUsed(address,bytes32)"));
   ok("M4 log scan starts at the pay contract and splits the range under the RPC cap", calls.length === 2 && parseInt(calls[0].params[0].fromBlock, 16) === H.PAY_FROM_BLOCK.rh && parseInt(calls[1].params[0].toBlock, 16) === TIP && calls.every(x => parseInt(x.params[0].toBlock, 16) - parseInt(x.params[0].fromBlock, 16) < 10_000_000));
-  { let k = 0; const flaky = async (u, i) => { const b = JSON.parse(i.body); if (b.method === "eth_blockNumber") return { ok: true, json: async () => ({ result: "0x" + (H.PAY_FROM_BLOCK.rh + 10).toString(16) }) }; return ++k === 1 ? { ok: false, status: 429, json: async () => ({}) } : { ok: true, json: async () => ({ result: [{}] }) }; };
+  { let k = 0; const flaky = async (u, i) => { const b = JSON.parse(i.body); if (b.method === "eth_blockNumber") return { ok: true, json: async () => ({ result: "0x" + (H.PAY_FROM_BLOCK.rh + 10).toString(16) }) }; if (b.method === "eth_getTransactionCount") return { ok: true, json: async () => ({ result: "0x0" }) }; return ++k === 1 ? { ok: false, status: 429, json: async () => ({}) } : { ok: true, json: async () => ({ result: [{}] }) }; };
     ok("M4 a rate-limited RPC answer is retried", await H.makeCountPriorHops(rh, flaky)(STEALTH) === 1 && k === 2); }
   ok("M4 makeCountPriorHops = number of AuthorizationUsed logs of the stealth address on the token", n === 4 && c.method === "eth_getLogs" && c.params[0].address === rh.token.address && c.params[0].topics[0] === sig && H.AUTH_USED_TOPIC === sig && c.params[0].topics[1] === "0x" + "0".repeat(24) + STEALTH.slice(2)); }
 
@@ -949,6 +949,117 @@ const tAddrOf = async (n, a, i = 0) => ZRm.deriveT(await H.mnemonicSeed(await H.
     const C = await import("../web/hop-card.js"), v = C.hopView({ st: { step: "DONE", stealth: "0x1", chain: "rh", dest: "rh", recipient: "0xD364DB3bf6b681D5aBD23E809D8BbfB26872a500", amount: "9940000", outTotal: "8759715", startedAt: 1000, doneAt: 2404000, shieldedAt: 601000, parts: [{ status: "SUCCESS", quote: { amountOut: "1" }, sentAt: 721000, endAt: 1501000 }, { status: "SUCCESS", quote: { amountOut: "1" }, sentAt: 961000, endAt: 2404000 }] } }, Date.now());
     ok("1141 timing: the finished card says when the ZEC was shielded and when each payout was sent and arrived", v.timing === "Shielded at 10:00 · payout 1 sent at 12:00, arrived at 25:00 · payout 2 sent at 16:00, arrived at 40:03", v.timing); }
   ok("31.10 no unhandled rejection in any of the runs above", unh === 0, String(unh));
+}
+
+// ================= native ETH in the hop: ETH in, ZEC, ETH out (fake chain parses every raw transaction with viem) =================
+{ const { makeEthChain } = await import("./fake_eth_chain.mjs"), E = await import("../web/eth-send.js"), CR = await import("../web/chain-read.js"), Cd = await import("../web/hop-card.js");
+  const { privateKeyToAccount } = await import("viem/accounts"), SE = privateKeyToAccount(PRIV).address.toLowerCase();      // the stealth address of PRIV: the fake chain recovers the sender from the signature, so the address must be the real one
+  const ETHV = 30_000_000_000_000_000n, SC = 1_000_000_000n, nos = async () => {};
+  const mkEth = (o = {}) => { const w = makeWorld({ ...o }); w.scale = SC; const c = makeEthChain({ onApply: tx => { const sw = w.swaps[tx.to]; if (sw && !w.lagPaid) { sw.paid = true; w.ethDeposits = (w.ethDeposits || 0) + 1; w.ethDepositValue = tx.value; w.depositTx = tx; } } }); c.set(SE, 10n ** 18n); return { w, c }; };
+  const ethApi = (c, o = {}) => ({ prepare: ({ to, value }) => E.prepareSend(c.rpc, { priv: PRIV, chainId: 4663, from: SE, to, value }), send: o.send || (tx => E.sendRaw(c.rpc, tx)), status: tx => E.txStatus(c.rpc, { from: SE, hash: tx.hash, nonce: tx.nonce }, { sleep: nos }) });
+  const ectx = (w, c, s, o = {}) => mkCtx(w, s, { stealth: SE, chain: rh, dest: rh, asset: "ETH", amount: ETHV, eth: ethApi(c), waitReceipt: (h, expect) => CR.waitFinal(c.rpc, h, { expect, sleep: nos, tries: 5, everyMs: 0 }), balance: async () => c.balOf(SE), ...o });
+  const rec = async s => (await H.findHop(s, SE)).rec;
+  // --- pure: requests, state, scrub
+  const rin = H.reqIn({ chain: rh, amount: ETHV, tAddr: T, stealth: SE, dry: true, now: 0, asset: "ETH" }), rout = H.reqOut({ dest: rh, amount: 400000n, recipient: A, refundT: T, dry: true, now: 0, asset: "ETH" });
+  ok("ETH in-request: origin is hood ETH, destination ZEC, refund to the stealth address; out-request: ZEC to hood ETH", rin.originAsset === "nep141:hood.omft.near" && rin.destinationAsset === ZC.assetId && rin.refundTo === SE && rin.amount === ETHV.toString() && rout.originAsset === ZC.assetId && rout.destinationAsset === "nep141:hood.omft.near");
+  ok("the stablecoin requests are unchanged (no asset = USDG in, USDC out)", H.reqIn({ chain: rh, amount: 5_000_000n, tAddr: T, stealth: SE, dry: true, now: 0 }).originAsset === rh.oneClick.assetId && H.reqOut({ dest: base, amount: 400000n, recipient: A, refundT: T, dry: true, now: 0 }).destinationAsset === base.oneClick.assetId);
+  ok("ETH requests are refused on a chain without the ETH route", (() => { try { H.reqIn({ chain: base, amount: 1n, tAddr: T, stealth: SE, asset: "ETH" }); return false; } catch { return true; } })() && (() => { try { H.reqOut({ dest: base, amount: 1n, recipient: A, refundT: T, asset: "ETH" }); return false; } catch { return true; } })());
+  ok("newState: asset is stored for ETH only, a stablecoin state keeps exactly its old shape", H.newState({ stealth: SE, chain: rh, dest: rh, recipient: A, amount: 1n, asset: "ETH", now: 1 }).asset === "ETH" && !("asset" in H.newState({ stealth: SE, chain: rh, dest: rh, recipient: A, amount: 1n, now: 1 })) && !("asset" in H.newState({ stealth: SE, chain: rh, dest: rh, recipient: A, amount: 1n, asset: "TOKEN", now: 1 })));
+  // --- happy path
+  { const { w, c } = mkEth(), s = H.memStore(); off = 0; const st = await H.startHop(ectx(w, c, s)), r = await rec(s);
+    ok("ETH happy path: DONE with the asset saved in the record", st.step === "DONE" && !st.err && r.st.asset === "ETH", st.step + " " + st.err);
+    ok("ETH in-leg: NO relayer call, no authorization, exactly one raw transaction", w.relays === 0 && !r.st.auth && c.sends.length === 1 && c.nonceOf(SE) === 1, "relays " + w.relays + " sends " + c.sends.length);
+    const tx = w.depositTx, dep = r.st.inQuote.depositAddress;
+    ok("the transaction the chain accepted: signed by the stealth key, to the quote's deposit address, EXACTLY the quoted amount, nonce 0, chain 4663", tx.from === SE && tx.to === dep.toLowerCase() && tx.value === ETHV && r.st.ethTx.nonce === "0" && r.st.ethTx.hash === r.st.txIn);
+    ok("both real quotes are ETH <-> ZEC on hood: in from ETH to the hop t-address, out from ZEC to ETH for the recipient", w.quotes.filter(q => !q.dry).length === 2 && w.quotes[0].originAsset === "nep141:hood.omft.near" && w.quotes[0].recipient === r.st.tIn && w.quotes[1].destinationAsset === "nep141:hood.omft.near" && w.quotes[1].recipient === A);
+    ok("the stealth address paid its own gas (balance fell by the amount plus the real gas), nothing else left it", c.balOf(SE) === 10n ** 18n - ETHV - 21000n * c.gasPrice * 2n && w.delivered > 0n);
+    ok("loss figures on the ETH path use 18 decimals: no false halt at ~1% loss, payouts arrived in ETH", st.step === "DONE" && w.delivered > ETHV * 90n / 100n && w.delivered < ETHV);
+    const v = Cd.hopView({ st: r.st }, Date.now());
+    ok("the finished card speaks ETH with 18-decimal amounts, not USDG with 6", /^Sent 0\.03 ETH · received 0\.02\d+ ETH · cost 0\.000\d+ ETH \(\d+\.\d%\)$/.test(v.sum) && /ETH/.test(v.title) && !/USDG/.test(JSON.stringify(v)), v.sum + " | " + v.title);
+    const sc = await H.scrubFinished(s, SE), r2 = await rec(s);
+    ok("a scrubbed finished ETH record still says ETH (the card keeps its coin)", sc && r2.st.asset === "ETH" && Cd.hopView({ st: r2.st }, Date.now()).title.includes("ETH")); }
+  // --- resume from every step with a brand-new ctx: still exactly one deposit
+  for (const step of H.STEPS.slice(1)) {
+    const { w, c } = mkEth(), s = H.memStore(); off = 0; const a = await H.startHop(ectx(w, c, s, { stopAt: step })), b = await H.runHop(ectx(w, c, s));
+    ok("ETH resume from " + step + ": DONE, one relayer-free deposit, one broadcast of the ZEC, nonce 1", a.step === step && b.step === "DONE" && w.relays === 0 && c.sends.length <= 1 && c.nonceOf(SE) === 1 && w.broadcasts === 1 && w.ethDeposits === 1, `stopped ${a.step} -> ${b.step} ${b.err || ""}`); }
+  // --- crash and resume at the in-leg
+  { const { w, c } = mkEth(), s = H.memStore(); off = 0; let n = 0;
+    const st1 = await H.startHop(ectx(w, c, s, { eth: ethApi(c, { send: async () => { n++; throw new Error("tab crashed before the broadcast"); } }) })), r1 = await rec(s);
+    ok("crash after signing, before the broadcast: the signed bytes are in the record, nothing reached the chain, nothing was sent twice", st1.step === "DEPOSIT_IN" && r1.st.ethTx && /^0x[0-9a-f]+$/.test(r1.st.ethTx.raw) && c.sends.length === 0 && c.nonceOf(SE) === 0 && n === 4 && !r1.st.txIn, st1.err);
+    const raw = r1.st.ethTx.raw, hash = r1.st.ethTx.hash, q1 = w.quotes.filter(q => !q.dry).length, st2 = await H.runHop(ectx(w, c, s)), r2 = await rec(s);
+    ok("resume: the SAME bytes are broadcast (same hash), no second signature, no second quote, one deposit on chain", st2.step === "DONE" && c.sends.length === 1 && c.sends[0] === raw && r2.st.ethTx.hash === hash && c.nonceOf(SE) === 1 && w.ethDeposits === 1 && w.quotes.filter(q => !q.dry).length === q1 + 1, st2.err); }
+  { const { w, c } = mkEth(), s = H.memStore(); off = 0; c.dropAnswer = 1;      // the chain took it, the answer was lost
+    const st = await H.startHop(ectx(w, c, s)), r = await rec(s);
+    ok("lost answer of the broadcast: 1Click already sees the deposit on the retry, so nothing is sent again (one transaction, one deposit)", st.step === "DONE" && c.sends.length === 1 && w.ethDeposits === 1 && c.nonceOf(SE) === 1 && r.st.relayed === true && r.st.ethTx.nonce === "0", `${st.step} ${st.err} sends ${c.sends.length} dep ${w.ethDeposits} nonce ${c.nonceOf(SE)} txIn ${r.st.txIn}`); }
+  { const { w, c } = mkEth(), s = H.memStore(); off = 0; c.dropAnswer = 1;      // the chain took it, the answer was lost, and 1Click does not see the deposit yet (it learns of it only from the submit call)
+    const f0 = w.fetch; w.fetch = async (u, init) => { const r = await f0(u, init); if (String(u).endsWith("/v0/deposit/submit")) w.swaps[JSON.parse(init.body).depositAddress].paid = true; return r; };
+    w.lagPaid = true; const st = await H.startHop(ectx(w, c, s, { fetchFn: w.fetch })), r = await rec(s);
+    ok("lost answer, 1Click still PENDING: the retry asks the chain by the saved hash, finds it mined, verifies the receipt of THAT hash, and does not send again", st.step === "DONE" && c.sends.length === 1 && c.nonceOf(SE) === 1 && r.st.txIn === r.st.ethTx.hash && w.swaps[r.st.inQuote.depositAddress].submitted === r.st.txIn, `${st.step} ${st.err} sends ${c.sends.length} txIn ${r.st.txIn}`); }
+  { const { w, c } = mkEth(), s = H.memStore(); off = 0; c.dropAnswer = 1; let k = 0;
+    const st1 = await H.startHop(ectx(w, c, s, { eth: ethApi(c, { send: async tx => { if (++k > 1) throw new Error("offline"); return E.sendRaw(c.rpc, tx); } }), stopAt: "WAIT_T" })), r1 = await rec(s);
+    ok("answer lost AND the tab closed before txIn was saved: the record has the bytes but no txIn", r1.st.ethTx && !r1.st.txIn || st1.step === "WAIT_T");
+    const st2 = await H.runHop(ectx(w, c, s));
+    ok("... a new session finds the transaction mined by its hash and goes on; still one transaction", st2.step === "DONE" && c.sends.length === 1 && w.ethDeposits === 1, st2.err); }
+  { const { w, c } = mkEth(), s = H.memStore(); off = 0; c.refuse = "insufficient funds for gas * price + value";
+    const st1 = await H.startHop(ectx(w, c, s)), r1 = await rec(s);
+    ok("the node refuses the broadcast: a Halt (no automatic retry), the signed bytes are KEPT (a refusal can be 'nonce too low' of a mined one), nothing was sent", st1.step === "DEPOSIT_IN" && st1.halted === true && /refused/.test(st1.err) && r1.st.ethTx && c.nonceOf(SE) === 0 && w.ethDeposits === undefined, st1.err);
+    const hash = r1.st.ethTx.hash, st2 = await H.runHop(ectx(w, c, s));
+    ok("... pressing Continue sends those very bytes and completes", st2.step === "DONE" && c.sends.at(-1) === r1.st.ethTx.raw && w.ethDeposits === 1 && (await rec(s)).st.ethTx.hash === hash, st2.err); }
+  { const { w, c } = mkEth(), s = H.memStore(); off = 0; c.refuse = "insufficient funds for gas * price + value";
+    await H.startHop(ectx(w, c, s)); const r1 = await rec(s); c.bump(SE);      // meanwhile ANOTHER transaction uses nonce 0 (and the signed bytes were never mined)
+    const st2 = await H.runHop(ectx(w, c, s)), r2 = await rec(s);
+    ok("its nonce was taken by another transaction: the old bytes are never sent; a new quote and a new transaction (next nonce) complete it, once", st2.step === "DONE" && !c.mined.has(r1.st.ethTx.hash) && r2.st.ethTx.nonce === "1" && w.ethDeposits === 1 && w.quotes.filter(q => !q.dry && q.originAsset === "nep141:hood.omft.near").length === 2, st2.err + " sends " + c.sends.length); }
+  { const { w, c } = mkEth(), s = H.memStore(); off = 0; c.revertNext = true;
+    const st1 = await H.startHop(ectx(w, c, s)), r1 = await rec(s);
+    ok("the deposit reverts on chain: nothing moved (only gas), a Halt, the bytes are dropped so Continue signs a fresh one", st1.step === "DEPOSIT_IN" && st1.halted === true && /reverted; nothing moved/.test(st1.err) && !r1.st.ethTx && !r1.st.txIn && c.balOf(SE) > 10n ** 18n - 10n ** 16n && w.ethDeposits === undefined, st1.err);
+    const st2 = await H.runHop(ectx(w, c, s)); ok("... and then it completes with one deposit", st2.step === "DONE" && w.ethDeposits === 1 && (await rec(s)).st.ethTx.nonce === "1", st2.err); }
+  { const { w, c } = mkEth(), s = H.memStore(); off = 0; c.set(SE, ETHV + 1000n);      // cannot pay the gas on top of the amount
+    const st = await H.startHop(ectx(w, c, s)), r = await rec(s);
+    ok("balance below amount + fee: a Halt BEFORE anything is signed or sent ('Nothing was sent'), no bytes saved", st.step === "DEPOSIT_IN" && st.halted === true && /Nothing was sent/.test(st.err) && !r.st.ethTx && c.sends.length === 0 && c.nonceOf(SE) === 0, st.err); }
+  { const { w, c } = mkEth(), s = H.memStore(); off = 0; let hs = null;
+    const st = await H.startHop(ectx(w, c, s, { waitReceipt: async (h, expect) => { hs = { h, expect }; return CR.waitFinal(c.rpc, h, { expect, sleep: nos, tries: 5, everyMs: 0 }); } })), r = await rec(s);
+    const fake = { ok: true, hash: "0x" + "99".repeat(32) };
+    ok("the receipt expectation is bound to OUR hash: a successful receipt of any other transaction does not count", st.step === "DONE" && hs.expect({ ok: true, hash: r.st.ethTx.hash }) === true && hs.expect(fake) === false && hs.expect({ ok: false, hash: r.st.ethTx.hash }) === false); }
+  { const { w, c } = mkEth(), s = H.memStore(); off = 0; const st = await H.startHop(ectx(w, c, s, { eth: null }));
+    ok("a page that cannot send ETH halts before anything is signed", st.step === "DEPOSIT_IN" && /cannot send ETH/.test(st.err) && c.sends.length === 0, st.err); }
+  // --- 1Click sees the deposit already (a resume after the tab died right after the broadcast): nothing is signed again
+  { const { w, c } = mkEth(), s = H.memStore(); off = 0; await H.startHop(ectx(w, c, s, { stopAt: "WAIT_T" })); const r = await rec(s);
+    ok("stopped after the deposit: relayed is set, the record holds the one transaction", r.st.relayed === true && r.st.ethTx && c.sends.length === 1);
+    const before = c.sends.length, b = await H.runHop(ectx(w, c, s)); ok("... the resume does not touch the chain's send path again", b.step === "DONE" && c.sends.length === before); }
+  // --- the loss cap on the ETH path
+  { const { w, c } = mkEth({ }), s = H.memStore(); off = 0; w.outPermille = 300;      // out-quote far below what the user approved
+    const st = await H.startHop(ectx(w, c, s, { approvedLoss: 0.01 }));
+    ok("ETH loss cap: a payout quote much worse than the approved preview halts without sending the ZEC, and names the loss in percent of ETH (18-decimal math)", st.step === "QUOTE_OUT" && st.halted === true && /Quote above what you approved/.test(st.err) && /lose (\d+\.\d)%/.test(st.err) && Number(/lose (\d+\.\d)%/.exec(st.err)[1]) > 30 && w.broadcasts === 0, st.err); }
+  { const { w, c } = mkEth(), s = H.memStore(); off = 0; let asked = null;
+    w.outPermille = 400; await H.startHop(ectx(w, c, s, { stopAt: "QUOTE_OUT", approvedLoss: 0.0 }));      // a click-started run that did not wait through the DELAY may prompt
+    const st = await H.runHop(ectx(w, c, s, { interactive: true, confirmLoss: async q => { asked = q; return false; } }));
+    ok("... the confirmation dialog gets the payout coin (ETH, 18 decimals), not USDG/6", st.step === "QUOTE_OUT" && asked && asked.destSymbol === "ETH" && asked.destDecimals === 18 && asked.recipient === A, st.err); }
+  ok("previewLoss on the ETH basis equals the machine's projectedLoss (18 decimals both sides)", Math.abs(H.previewLoss({ value: ETHV, out: ETHV * 97n / 100n, inDec: 18, outDec: 18 }) - 0.03) < 1e-9 && H.MAX_LOSS === 0.03);
+  // --- a refunded in-leg: the money is back on the stealth address, the card says ETH
+  { const { w, c } = mkEth({ inOutcome: "REFUNDED" }), s = H.memStore(); off = 0; const st = await H.startHop(ectx(w, c, s)), r = await rec(s);
+    const v = Cd.hopView({ st: r.st }, Date.now());
+    ok("ETH in-leg refunded by 1Click: FAILED_IN, no ZEC steps, the card names ETH with the 18-decimal amount", st.step === "FAILED_IN" && w.sig === 0 && /0\.03 ETH/.test(v.body) && !/USDG/.test(v.body), v.body); }
+  // --- the stablecoin path next to it is untouched: a saved USDG record (no asset) still resumes through the relayer
+  { const w = makeWorld(), s = H.memStore(); off = 0; await H.startHop(mkCtx(w, s, { stopAt: "WAIT_T", stealth: SE })); const r = await rec(s);
+    ok("a USDG record has no asset and no ethTx; its deposit went through the relayer exactly once", !("asset" in r.st) && !r.st.ethTx && r.st.auth && w.relays === 1);
+    const b = await H.runHop(mkCtx(w, s, { stealth: SE, eth: { prepare: async () => { throw new Error("must not be called"); }, send: async () => { throw new Error("must not be called"); }, status: async () => { throw new Error("must not be called"); } } }));
+    ok("... and finishes through the old path although an ETH sender is present", b.step === "DONE" && w.relays === 1, b.err); }
+  // --- counter: ETH hops spend the address without AuthorizationUsed, so the transaction count joins the hop counter on a chain with ETH
+  { const calls = []; const f = async (u, i) => { const b = JSON.parse(i.body); calls.push(b.method); if (b.method === "eth_blockNumber") return { ok: true, json: async () => ({ result: "0x" + (H.PAY_FROM_BLOCK.rh + 10).toString(16) }) }; if (b.method === "eth_getTransactionCount") return { ok: true, json: async () => ({ result: "0x3" }) }; return { ok: true, json: async () => ({ result: [{}] }) }; };
+    ok("makeCountPriorHops on Robinhood Chain = AuthorizationUsed logs + the address's own transaction count (4 here); on Base only the logs", await H.makeCountPriorHops(rh, f)(SE) === 4 && calls.includes("eth_getTransactionCount") && (await (async () => { const n0 = calls.filter(m => m === "eth_getTransactionCount").length; await H.makeCountPriorHops(base, f)(SE); return calls.filter(m => m === "eth_getTransactionCount").length === n0; })()));
+    ok("a bogus transaction count is refused", await H.makeCountPriorHops(rh, async (u, i) => { const b = JSON.parse(i.body); return { ok: true, json: async () => ({ result: b.method === "eth_blockNumber" ? "0x" + (H.PAY_FROM_BLOCK.rh + 10).toString(16) : b.method === "eth_getTransactionCount" ? "garbage" : [] }) }; })(SE).then(() => false, e => /transaction count/.test(e.message)));
+    const { w, c } = mkEth(), s = H.memStore(); off = 0; const st = await H.startHop(ectx(w, c, s, { stopAt: "QUOTE_IN", countPriorHops: async () => 5 }));
+    ok("an ETH hop uses the counter like any other (n = the chain's count when higher than the local one)", st.n === 5); }
+  // --- a lost record: Continue/Return must know the coin
+  { const s = H.memStore(), r = await H.adoptLostHop({ store: s, stealth: SE }, { n: 2, account: 0, birthday: 3_499_990, zats: 5_000_000n, recipient: A, chain: rh, dest: rh, asset: "ETH" }), f = await rec(s);
+    ok("adoptLostHop with asset ETH: the rebuilt hop pays out ETH (record says so); without an asset it stays the stablecoin", r.created && f.st.asset === "ETH" && f.st.rebuilt === true && !("asset" in (await (async () => { const s2 = H.memStore(); await H.adoptLostHop({ store: s2, stealth: SE }, { n: 0, recipient: A, chain: rh, dest: rh }); return (await H.findHop(s2, SE)).rec.st; })())));
+    const { w, c } = mkEth(), s3 = H.memStore(); off = 0; w.tBal = {}; await H.adoptLostHop({ store: s3, stealth: SE }, { n: 0, account: 0, birthday: 3_499_990, zats: 5_000_000n, recipient: A, chain: rh, dest: rh, asset: "ETH" });
+    ok("the app's return quote for an ETH hop asks for ETH out (reqOut with the record's asset)", H.reqOut({ dest: rh, amount: 150000n, recipient: A, refundT: T, dry: true, asset: "ETH" }).destinationAsset === "nep141:hood.omft.near" && H.reqOut({ dest: rh, amount: 150000n, recipient: A, refundT: T, dry: true }).destinationAsset === rh.oneClick.assetId); }
+  // --- the card for an old (USDG) record is as before
+  { const v = Cd.hopView({ st: { step: "QUOTE_IN", stealth: "0x1", chain: "rh", dest: "rh", recipient: A, amount: "5000000", startedAt: 1 } }, Date.now());
+    ok("hop card: a record without an asset still reads 5.00 USDG", /5\.00 USDG/.test(v.amountLine)); }
+  { const v = Cd.hopView({ st: { step: "DEPOSIT_IN", stealth: "0x1", chain: "rh", dest: "rh", asset: "ETH", recipient: A, amount: ETHV.toString(), startedAt: 1, ethTx: { hash: "0x1" } }, running: false }, Date.now());
+    ok("hop card: an ETH transfer paused after signing says the deposit may be on its way (not 'your money has not moved')", /0\.03 ETH/.test(v.amountLine) && /may already be on its way/.test(v.body), v.body); }
 }
 Date.now = realNow;
 console.log(fails ? fails + " FAILED" : "all passed"); process.exit(fails ? 1 : 0);

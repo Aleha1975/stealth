@@ -7,7 +7,8 @@
 import { keccak, signDigest, unhex, hex } from "./stealth-crypto.js";
 import { postRelay } from "./relay-post.js";
 import { timeoutSignal } from "./chain-read.js";
-import { privateFee, appFeesOf } from "./chains.js";
+import { privateFee, appFeesOf, assetOf, fmtUnits } from "./chains.js";
+import { refused as ethRefused } from "./eth-send.js";
 
 export const ONECLICK = "https://1click.chaindefuser.com";
 export const NEAR_RPCS = ["https://rpc.mainnet.near.org", "https://free.rpc.fastnear.com"];   // read-only: current_salt of intents.near
@@ -89,12 +90,13 @@ export async function sessionSignIn({ base = ONECLICK, priv, address, fetchFn = 
 
 // ---------------------------------------------------------------- 1Click quote / deposit / status
 /** Quote request. originAsset = the chain's own token, refundTo = the stealth address (never the user's main wallet). */
-export function buildQuoteRequest({ from, to, amount, recipient, refundTo, dry, confidentiality = "public", now = Date.now(), deadlineMs = 3600_000, fees = privateFee }) {
-  if (!from.oneClick || !to.oneClick) throw new Error("private withdraw is not available on " + (from.oneClick ? to.name : from.name));
+export function buildQuoteRequest({ from, to, amount, recipient, refundTo, dry, asset, confidentiality = "public", now = Date.now(), deadlineMs = 3600_000, fees = privateFee }) {
+  if (asset === "ETH") { if (!from.eth || !to.eth) throw new Error("private withdraw of ETH is not available on " + (from.eth ? to.name : from.name)); }      // asset "ETH": the chain's native coin in and out (same coin on both sides); anything else = the chain stablecoin
+  else if (!from.oneClick || !to.oneClick) throw new Error("private withdraw is not available on " + (from.oneClick ? to.name : from.name));
   if (!isAddr(recipient) || !isAddr(refundTo)) throw new Error("bad address");
   if (!(amount > 0n)) throw new Error("bad amount");
-  const r = { dry: !!dry, swapType: "EXACT_INPUT", slippageTolerance: 100, originAsset: from.oneClick.assetId, depositType: "ORIGIN_CHAIN",
-    destinationAsset: to.oneClick.assetId, amount: amount.toString(), refundTo, refundType: "ORIGIN_CHAIN", recipient, recipientType: "DESTINATION_CHAIN",
+  const r = { dry: !!dry, swapType: "EXACT_INPUT", slippageTolerance: 100, originAsset: assetOf(from, asset).assetId, depositType: "ORIGIN_CHAIN",
+    destinationAsset: assetOf(to, asset).assetId, amount: amount.toString(), refundTo, refundType: "ORIGIN_CHAIN", recipient, recipientType: "DESTINATION_CHAIN",
     deadline: new Date(now + deadlineMs).toISOString(), confidentiality }, af = appFeesOf(fees);
   if (af) r.appFees = af;      // service fee (chains.js privateFee, off by default); this one quote is the whole route, i.e. its first leg
   return r;
@@ -118,12 +120,12 @@ export async function requestQuote({ base = ONECLICK, req, token, fetchFn = fetc
   if (!req.dry) { const d = String(q.depositAddress).toLowerCase(); if ([req.refundTo, req.recipient, "0x0000000000000000000000000000000000000000"].some(a => String(a || "").toLowerCase() === d)) throw new Error("the quote's deposit address is not acceptable; refusing"); }
   return j;
 }
-/** Human numbers from a quote. Both stablecoins here have 6 decimals (token.decimals of the destination chain is used for the output). */
+/** Human numbers from a quote. Both stablecoins here have 6 decimals (token.decimals of the destination chain is used for the output); the same coin in and out (ETH, 18 decimals) is shown exactly, 6 places. */
 export function summarizeQuote(j, inDec = 6, outDec = 6) {
   const q = j.quote, i = BigInt(q.amountIn), o = BigInt(q.amountOut);
-  const f = (v, d) => (Number(v) / 10 ** d).toFixed(4).replace(/0{1,2}$/, "");
-  const fee = i - o;      // nominal: both sides are $1 stablecoins
-  return { amountIn: i, amountOut: o, inText: f(i, inDec), outText: f(o, outDec), feeText: (Number(fee) / 10 ** inDec).toFixed(4), feePct: Number(i) ? (Number(fee) / Number(i) * 100).toFixed(2) : "0",
+  const f = (v, d) => d > 6 ? fmtUnits(v, d, 6) : (Number(v) / 10 ** d).toFixed(4).replace(/0{1,2}$/, "");
+  const fee = i - o;      // nominal: both sides are $1 stablecoins (or the same coin)
+  return { amountIn: i, amountOut: o, inText: f(i, inDec), outText: f(o, outDec), feeText: inDec > 6 ? fmtUnits(fee, inDec, 6) : (Number(fee) / 10 ** inDec).toFixed(4), feePct: Number(i) ? (Number(fee) / Number(i) * 100).toFixed(2) : "0",
     etaSec: q.timeEstimate, minOutText: q.minAmountOut ? f(BigInt(q.minAmountOut), outDec) : null };
 }
 export async function submitDeposit({ base = ONECLICK, txHash, depositAddress, fetchFn = fetch }) {
@@ -193,12 +195,13 @@ export async function runPart(ctx, amount, delayMs) {
   }
   const conf = ctx.token ? "basic" : "public";
   say("Requesting a " + conf + " quote…");
-  const req = buildQuoteRequest({ from: ctx.from, to: ctx.to, amount, recipient: ctx.recipient, refundTo: ctx.stealth, dry: false, confidentiality: conf });
+  const req = buildQuoteRequest({ from: ctx.from, to: ctx.to, amount, recipient: ctx.recipient, refundTo: ctx.stealth, dry: false, asset: ctx.asset, confidentiality: conf });
   const j = await requestQuote({ base: ctx.base, req, token: ctx.token, fetchFn }); const q = j.quote;
   if (ctx.minRatio != null) {      // rate shown in the preview vs the real quote: abort BEFORE signing if it got worse
     const ratio = Number(BigInt(q.amountOut)) / Number(BigInt(q.amountIn));
     if (ratio < ctx.minRatio) throw new Error("the final quote is worse than the preview (" + (ratio * 100).toFixed(2) + "% vs " + (ctx.minRatio * 100).toFixed(2) + "%); nothing was sent");
   }
+  if (ctx.asset === "ETH") return runPartEth(ctx, q, amount, say, fetchFn, sleep);      // native ETH: its own deposit step, everything after the quote check is the same idea
   say("Quote: send " + (Number(q.amountIn) / 1e6).toFixed(4) + ", receive " + (Number(q.amountOut) / 1e6).toFixed(4) + ", ~" + q.timeEstimate + " s. Signing the transfer…");
   const validBefore = Math.floor(Date.now() / 1000) + 3600;
   const auth = signTransferAuth({ chain: ctx.from, priv: ctx.priv, from: ctx.stealth, to: q.depositAddress, value: amount, validBefore, nonce: ctx.randomNonce() });
@@ -220,6 +223,34 @@ export async function runPart(ctx, amount, delayMs) {
   const fin = await pollStatus({ base: ctx.base, depositAddress: q.depositAddress, fetchFn, sleep, intervalMs: ctx.pollMs || 3000, onUpdate: s => say("Status: " + s.status + " (deposit address " + q.depositAddress.slice(0, 10) + "…)") });
   return { status: fin.status, depositAddress: q.depositAddress, txHash: d.hash, quote: q, final: fin };
 }
+/** The ETH twin of the deposit part of runPart. ctx.eth = { prepare({to,value}) -> signed tx (nothing sent), send(tx) (the SAME bytes, idempotent), status(tx) -> "mined"|"failed"|"pending"|"dead"|"unsent" }.
+ *  The signed transaction goes to ctx.onSigned BEFORE the first broadcast (the caller saves it and arms its double-send guard); it is never signed twice for one part, and one nonce can only be mined once. */
+async function runPartEth(ctx, q, amount, say, fetchFn, sleep) {
+  const E = ctx.eth, A = assetOf(ctx.from, "ETH"), fm = v => fmtUnits(v, A.decimals, 6), short = h => h.slice(0, 12) + "…";
+  say("Quote: send " + fm(q.amountIn) + " " + A.symbol + ", receive " + fm(q.amountOut) + " " + A.symbol + ", ~" + q.timeEstimate + " s. Signing the transfer…");
+  const tx = await E.prepare({ to: q.depositAddress, value: amount });      // throws before anything is signed when the balance cannot cover the amount plus the network fee
+  const validBefore = Math.floor(Date.now() / 1000) + 3600;      // the caller's double-send guard window, the same as for an EIP-3009 authorization
+  if (ctx.onSigned) ctx.onSigned({ depositAddress: q.depositAddress, amount, validBefore, ethTx: tx });
+  say("Sending the " + A.symbol + " deposit from the stealth address (it pays its own network fee)…");
+  const refuse = (m, e) => { const x = new Error(m + (e ? ": " + ((e && e.message) || e) : "")); x.refused = true; if (ctx.onRefused) ctx.onRefused(); return x; };
+  for (let i = 0; ; i++) {
+    try { await E.send(tx); break; }
+    catch (e) {
+      if (ethRefused(e)) throw refuse("the network refused the deposit transaction; nothing was sent", e);
+      if (i < 2) { await sleep(2000 * 3 ** i); continue; }      // a network failure: the same bytes are sent again (the same nonce cannot be paid twice)
+      const st = await E.status(tx).catch(() => null); if (st === "mined" || st === "pending") break;
+      throw new Error("could not confirm that the " + A.symbol + " deposit was sent (" + ((e && e.message) || e) + "). Check the explorer for tx " + tx.hash + "; deposit address " + q.depositAddress + ".");
+    }
+  }
+  say("Deposit sent (tx " + short(tx.hash) + "), waiting for the block…");
+  const rc = await ctx.waitReceipt(tx.hash);
+  if (!rc.ok) { if (rc.unexpected) throw new Error("the deposit transaction is mined but is not the one we signed (tx " + short(tx.hash) + "). Check the explorer; deposit address " + q.depositAddress + "."); throw refuse("the deposit transfer reverted (tx " + short(tx.hash) + "); nothing moved", null); }
+  if (ctx.onDeposited) ctx.onDeposited({ depositAddress: q.depositAddress, txHash: rc.hash || tx.hash });
+  await submitDeposit({ base: ctx.base, txHash: tx.hash, depositAddress: q.depositAddress, fetchFn }).catch(e => say("Could not notify NEAR Intents (" + e.message + "); it will still detect the deposit."));
+  say("NEAR Intents is swapping (deposit address " + q.depositAddress + ")…");
+  const fin = await pollStatus({ base: ctx.base, depositAddress: q.depositAddress, fetchFn, sleep, intervalMs: ctx.pollMs || 3000, onUpdate: s => say("Status: " + s.status + " (deposit address " + q.depositAddress.slice(0, 10) + "…)") });
+  return { status: fin.status, depositAddress: q.depositAddress, txHash: tx.hash, quote: q, final: fin };
+}
 
 // ---------------------------------------------------------------- route "private, fast": NEAR Intents only, no Zcash
 /** 1-2 parts of random size, each with its own random delay (0..delayMaxMin) before its quote; parts go one after the other. The link is broken by the swap, not by cryptography.
@@ -233,9 +264,10 @@ const partMin = Object.values(FAST_STEP_MIN).reduce((a, b) => a + b, 0);
 export const fastEtaRangeMin = () => [Math.round(partMin), Math.round(FAST.kMax * (FAST.delayMaxMin + partMin))];
 export const fastEtaLabel = () => { const [a, b] = fastEtaRangeMin(); return a + "–" + b + " min"; };
 export const standardEtaLabel = () => STANDARD_SEC[0] + "–" + STANDARD_SEC[1] + " s";
-/** Plan of a fast withdraw: { parts: [{ amount (decimal string), delayMs, state:"PLANNED", depositAddress:null, txHash:null }] } */
-export function fastPlan(total, rng = Math.random) {
-  const k = total >= FAST.splitMin ? FAST.kMin + Math.min(FAST.kMax - FAST.kMin, Math.floor(rng() * (FAST.kMax - FAST.kMin + 1))) : 1;
+/** ETH is never split: FAST.splitMin and MIN_PART are token amounts (6 decimals), 1Click's own minimum for ETH is not published and no price is available here to convert them, so one part (an amount that is too small is refused by the dry quote in the preview).
+ *  Plan of a fast withdraw: { parts: [{ amount (decimal string), delayMs, state:"PLANNED", depositAddress:null, txHash:null }] } */
+export function fastPlan(total, rng = Math.random, asset = "TOKEN") {
+  const k = asset !== "ETH" && total >= FAST.splitMin ? FAST.kMin + Math.min(FAST.kMax - FAST.kMin, Math.floor(rng() * (FAST.kMax - FAST.kMin + 1))) : 1;
   return randomSplit(total, k, rng).map(a => ({ amount: a.toString(), delayMs: randomDelayMs(FAST.delayMaxMin, rng), state: "PLANNED", depositAddress: null, txHash: null }));
 }
 export const FAST_OPEN = new Set(["PLANNED", "SIGNED", "DEPOSITED"]);
@@ -247,7 +279,11 @@ export async function runFast(ctx, rec, save = () => {}, { resume = false } = {}
   const say = ctx.onProgress || (() => {}), n = rec.parts.length;
   for (let i = 0; i < n; i++) {
     const p = rec.parts[i], tag = n > 1 ? "Part " + (i + 1) + " of " + n + ": " : "";
-    if (p.state === "SIGNED" && resume) { p.state = "UNKNOWN"; save(rec); continue; }
+    if (p.state === "SIGNED" && resume) {
+      let seen = null; if (p.ethTx && ctx.ethStatus) { try { seen = await ctx.ethStatus(rec, p.ethTx); } catch { seen = null; } }      // ETH: the saved hash says what became of the transfer (nothing is ever re-sent on a resume)
+      if (seen === "mined") { p.state = "DEPOSITED"; p.txHash = p.ethTx.hash; save(rec); await submitDeposit({ base: ctx.base, txHash: p.txHash, depositAddress: p.depositAddress, fetchFn: ctx.fetchFn }).catch(() => {}); }
+      else { p.state = seen === "failed" || seen === "dead" ? "NOT_SENT" : "UNKNOWN"; save(rec); continue; }      // reverted, or its nonce was used by another transaction: nothing moved
+    }
     if (p.state === "PLANNED" && resume) { p.state = "NOT_SENT"; save(rec); continue; }
     if (p.state === "DEPOSITED") {
       // 1130 M-2: a poll that gives up (10 errors in a row, or no terminal status within its bound) PARKS the part in STUCK (not in FAST_OPEN, depositAddress kept for the note): it must not block later fast withdraws forever
@@ -257,7 +293,7 @@ export async function runFast(ctx, rec, save = () => {}, { resume = false } = {}
     }
     if (p.state !== "PLANNED") continue;
     const c = { ...ctx, onProgress: m => say(tag + m),
-      onSigned: info => { p.state = "SIGNED"; p.depositAddress = info.depositAddress; save(rec); if (ctx.onSigned) ctx.onSigned({ ...info, index: i }); },
+      onSigned: info => { p.state = "SIGNED"; p.depositAddress = info.depositAddress; if (info.ethTx) p.ethTx = { hash: info.ethTx.hash, nonce: info.ethTx.nonce }; save(rec); if (ctx.onSigned) ctx.onSigned({ ...info, index: i }); },
       onDeposited: info => { p.state = "DEPOSITED"; p.depositAddress = info.depositAddress; p.txHash = info.txHash; save(rec); if (ctx.onDeposited) ctx.onDeposited({ ...info, index: i }); } };
     try { const r = await runPart(c, BigInt(p.amount), p.delayMs); p.state = r.status; p.final = r.status; save(rec); }
     catch (e) { if (p.state === "PLANNED" || (p.state === "SIGNED" && e.refused)) p.state = "NOT_SENT"; else if (p.state === "DEPOSITED") { p.state = "STUCK"; p.stuckWhy = String((e && e.message) || e).slice(0, 160); }      // DEPOSITED + a throw = the 1Click poll gave up (1130 M-2)

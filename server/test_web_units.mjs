@@ -3,7 +3,7 @@ import { unhex, hex, checkAnnouncement, decodeMetadata, keysFromSignature, signK
 import { paymentNonce, feeWithinCap } from "../web/pay-auth.js";
 import * as PWm from "../web/private-withdraw.js";
 import { requestQuote, buildQuoteRequest } from "../web/private-withdraw.js";
-import { CHAINS } from "../web/chains.js";
+import { CHAINS, assetOf, assetKey, fmtUnits, addChainParams } from "../web/chains.js";
 import { cleanLog, ipKey, parseEnvLine } from "./relay-util.mjs";
 import { makeScreen } from "./sanctions/screen.mjs";
 import { postRelay } from "../web/relay-post.js";
@@ -439,9 +439,116 @@ const PRIV = new Uint8Array(32).fill(9), ACC = addressFromPriv(PRIV), A2 = "0x" 
     t("1138 M-1: a failed storage write is retried too", await (async () => { let k = 0; return ZRm.settleIntent({ lock: async fn => fn(), get: () => ({ txid: TXA }), set: () => ++k > 1, sw: { txid: TXA }, status: "SUCCESS", sleep: async () => {} }); })()); } }
 // 1138 L-2: the loss dialog, evaluated from app.js's own text with stubs
 { const app = fs.readFileSync(new URL("../web/app.js", import.meta.url), "utf8"), a = app.indexOf("const confirmHopLoss"), src = app.slice(a, app.indexOf("\n", app.indexOf("Cancel keeps the ZEC shielded", a)) + 1);
-  let shown = ""; const f = new Function("confirm", "TOK", "SYM", "zecText", src + "; return confirmHopLoss;")(m => { shown = m; return true; }, { decimals: 6 }, "USDG", v => String(v));
+  let shown = ""; const f = new Function("confirm", "TOK", "SYM", "zecText", "fmtUnits", src + "; return confirmHopLoss;")(m => { shown = m; return true; }, { decimals: 6 }, "USDG", v => String(v), fmtUnits);
   f({ cap: 0.025, loss: 0.113, approved: 0.1, amount: 10_000_000n, zatsLeft: 20_000_000n, amountOut: 4_000_000n, recipient: "0xabc", destSymbol: "USDC", destDecimals: 6 });
   t("1138 L-2: the dialog names the PAYOUT token (not the connected chain's), says the total is an estimate, shows the cap as 2.5% and the approved preview figure", /USDC/.test(shown) && !/USDG/.test(shown) && /about 8\.00 USDC in total if later payouts get this rate \(an estimate\)/.test(shown) && /2\.5% limit/.test(shown) && /you approved about 10\.0%/.test(shown));
   f({ cap: 0.03, loss: 0.2, amount: 10_000_000n, zatsLeft: 10_000_000n, amountOut: 1_000_000_000_000_000_000n, recipient: "0xabc", destSymbol: "WETH", destDecimals: 18 });
   t("1138 L-2: decimals of the payout token are used (18-decimal token)", /about 1\.00 WETH/.test(shown)); }
+
+// ================= native ETH next to USDG (Robinhood Chain): units =================
+{ const E = await import("../web/eth-send.js"), { makeEthChain } = await import("./fake_eth_chain.mjs"), V = await import("viem"), { privateKeyToAccount } = await import("viem/accounts");
+  const PRIV = "0x" + "45".repeat(32), ACC = privateKeyToAccount(PRIV), FROM = ACC.address.toLowerCase(), TO = "0x" + "d1".repeat(20), RH = CHAINS.rh, rhOnly = CHAINS.base;
+  // --- chains.js: config, assets, text
+  t("ETH: Robinhood Chain has the ETH asset id from 1Click (hood.omft.near, 18 decimals); Base has none", RH.eth.assetId === "nep141:hood.omft.near" && RH.native.decimals === 18 && !rhOnly.eth);
+  const aT = assetOf(RH, "TOKEN"), aE = assetOf(RH, "ETH");
+  t("assetOf: TOKEN = USDG/6 with its 1Click id; ETH = ETH/18 with the hood id; no asset (an old record) = TOKEN; ETH on Base throws", aT.symbol === "USDG" && aT.decimals === 6 && aT.assetId === RH.oneClick.assetId && aE.symbol === "ETH" && aE.decimals === 18 && aE.assetId === "nep141:hood.omft.near" && aE.native && assetOf(RH, undefined).key === "TOKEN" && throws(() => assetOf(rhOnly, "ETH")));
+  t("assetKey: only an explicit ETH record is ETH", assetKey({ asset: "ETH" }) === "ETH" && assetKey({}) === "TOKEN" && assetKey(null) === "TOKEN" && assetKey({ asset: "TOKEN" }) === "TOKEN");
+  t("fmtUnits: exact, cut not rounded, 2 places minimum, tiny amounts named", fmtUnits(30_000_000_000_000_000n, 18, 6) === "0.03" && fmtUnits(1_234_567_890_123_456_789n, 18, 6) === "1.234567" && fmtUnits(10n ** 18n, 18, 6) === "1.00" && fmtUnits(999_999_999_999n, 18, 6) === "<0.000001" && fmtUnits(0n, 18, 6) === "0.00" && fmtUnits(12_345_678n, 6, 6) === "12.345678" && fmtUnits(5n * 10n ** 17n + 1n, 18, 18, 0) === "0.500000000000000001");
+  t("addChainParams still hands the wallet only name/symbol/decimals (the ETH route fields stay out of it)", Object.keys(addChainParams(RH).nativeCurrency).sort().join() === "decimals,name,symbol" && addChainParams(RH).chainId === "0x1237");
+  // --- RLP + the signed transaction, against viem
+  t("rlp: official vectors (empty, single byte, 55/56-byte strings, lists)", hex(E.rlp(new Uint8Array(0))) === "0x80" && hex(E.rlp(Uint8Array.of(0x7f))) === "0x7f" && hex(E.rlp(Uint8Array.of(0x80))) === "0x8180" && E.rlp(new Uint8Array(55).fill(1)).length === 56 && E.rlp(new Uint8Array(56).fill(1)).length === 58 && hex(E.rlp(new Uint8Array(56).fill(1))).startsWith("0xb838") && hex(E.rlp([])) === "0xc0" && hex(E.rlp([new TextEncoder().encode("cat"), new TextEncoder().encode("dog")])) === "0xc88363617483646f67");
+  t("be: minimal big-endian, 0 is empty, negative refused", hex(E.be(0)) === "0x" && hex(E.be(1)) === "0x01" && hex(E.be(256)) === "0x0100" && hex(E.be(2n ** 64n)) === "0x010000000000000000" && throws(() => E.be(-1)));
+  for (const [nonce, value, gl, gp] of [[0n, 1n, 21000n, 1n], [7n, 30_000_000_000_000_000n, 25_000n, 1_000_000_000n], [300n, 12_345_678_901_234_567_890n, 21000n, 123_456_789_012n]]) {
+    const x = E.signLegacyTx({ priv: PRIV, chainId: 4663, nonce, gasPrice: gp, gasLimit: gl, to: TO, value }), p = V.parseTransaction(x.raw);
+    t("signLegacyTx nonce " + nonce + ": viem parses it back to the same nonce, price, gas, destination, value and chain; the signer recovers to the stealth address; the hash is keccak(raw)",
+      p.nonce === Number(nonce) && p.gasPrice === gp && p.gas === gl && p.to.toLowerCase() === TO && p.value === value && p.chainId === 4663 && (await V.recoverTransactionAddress({ serializedTransaction: x.raw })).toLowerCase() === FROM && x.hash === V.keccak256(x.raw) && (!p.data || p.data === "0x")); }
+  { const via = await ACC.signTransaction({ type: "legacy", chainId: 4663, nonce: 3, gasPrice: 2_000_000_000n, gas: 21000n, to: TO, value: 5n }), mine = E.signLegacyTx({ priv: PRIV, chainId: 4663, nonce: 3, gasPrice: 2_000_000_000n, gasLimit: 21000n, to: TO, value: 5n });
+    t("signLegacyTx is byte-for-byte what viem signs (deterministic RFC 6979 signature)", via === mine.raw); }
+  t("signLegacyTx refuses the zero address and a malformed one", throws(() => E.signLegacyTx({ priv: PRIV, chainId: 4663, nonce: 0, gasPrice: 1, gasLimit: 21000, to: "0x" + "00".repeat(20), value: 1 })) && throws(() => E.signLegacyTx({ priv: PRIV, chainId: 4663, nonce: 0, gasPrice: 1, gasLimit: 21000, to: "0x12", value: 1 })));
+  // --- fee plan and "all"
+  { const c = makeEthChain({ gasPrice: 1_000_000_000n, gasEst: 21000n }); c.set(FROM, 10n ** 17n);
+    const p = await E.planFee(c.rpc, { from: FROM, to: TO, value: 1n });
+    t("planFee: gas limit = estimate + 25 %, price = 2 x the node's, fee = limit x price (worst case)", p.gasLimit === 26250n && p.gasPrice === 2_000_000_000n && p.fee === 26250n * 2_000_000_000n);
+    const all = await E.sendableAll(c.rpc, { from: FROM, to: TO, balance: 10n ** 17n });
+    t("sendableAll: balance minus the worst-case fee; send it and the transaction fits the balance (nothing is left unable to pay for itself)", all.value === 10n ** 17n - p.fee && all.fee === p.fee);
+    const tx = await E.prepareSend(c.rpc, { priv: PRIV, chainId: 4663, from: FROM, to: TO, value: all.value }); await E.sendRaw(c.rpc, tx);
+    t("... and it is accepted by the chain, the destination got exactly the value, only the real gas (21000 x price) was spent", c.balOf(TO) === all.value && c.balOf(FROM) === 10n ** 17n - all.value - 21000n * 2_000_000_000n && c.nonceOf(FROM) === 1);
+    t("sendableAll: a balance that cannot even pay the fee gives null", await E.sendableAll(c.rpc, { from: FROM, to: TO, balance: p.fee }) === null && await E.sendableAll(c.rpc, { from: FROM, to: TO, balance: 5n }) === null); }
+  { const c = makeEthChain(); c.set(FROM, 10n ** 16n); const fee = (await E.planFee(c.rpc, { from: FROM, to: TO, value: 1n })).fee;
+    let e1 = null; try { await E.prepareSend(c.rpc, { priv: PRIV, chainId: 4663, from: FROM, to: TO, value: 10n ** 16n - fee + 1n }); } catch (e) { e1 = e; }
+    t("prepareSend: an amount that does not fit with the fee is refused BEFORE signing (e.short, 'Nothing was sent')", e1 && e1.short === true && /Nothing was sent/.test(e1.message) && c.sends.length === 0);
+    t("prepareSend: exactly balance minus fee fits", (await E.prepareSend(c.rpc, { priv: PRIV, chainId: 4663, from: FROM, to: TO, value: 10n ** 16n - fee })).nonce === "0");
+    c.estFail = "execution reverted"; t("prepareSend: a failing gas estimate is an error, nothing is signed", await E.prepareSend(c.rpc, { priv: PRIV, chainId: 4663, from: FROM, to: TO, value: 1n }).then(() => false, e => /reverted/.test(e.message)));
+    c.estFail = null; c.bump(FROM); c.bump(FROM);
+    t("prepareSend reads the nonce at 'latest' (the count of mined transactions)", (await E.prepareSend(c.rpc, { priv: PRIV, chainId: 4663, from: FROM, to: TO, value: 1n })).nonce === "2");
+    t("prepareSend: a zero amount is refused", await E.prepareSend(c.rpc, { priv: PRIV, chainId: 4663, from: FROM, to: TO, value: 0n }).then(() => false, () => true)); }
+  // --- send + status
+  { const c = makeEthChain(); c.set(FROM, 10n ** 18n); const tx = E.signLegacyTx({ priv: PRIV, chainId: 4663, nonce: 0, gasPrice: 2_000_000_000n, gasLimit: 26250n, to: TO, value: 1000n }), nos = ms => Promise.resolve();
+    const st0 = await E.txStatus(c.rpc, { from: FROM, hash: tx.hash, nonce: tx.nonce }, { sleep: nos });
+    await E.sendRaw(c.rpc, tx); await E.sendRaw(c.rpc, tx);      // the second one answers "already known": that is a success, the bytes are the same
+    const st1 = await E.txStatus(c.rpc, { from: FROM, hash: tx.hash, nonce: tx.nonce }, { sleep: nos });
+    t("txStatus: unsent before, mined after; sending the SAME bytes twice is one payment (already known counts as sent)", st0 === "unsent" && st1 === "mined" && c.balOf(TO) === 1000n && c.nonceOf(FROM) === 1);
+    c.hideReceipt = true; t("txStatus: a lagging node (no receipt) but the transaction known = pending, not dead", await E.txStatus(c.rpc, { from: FROM, hash: tx.hash, nonce: tx.nonce }, { sleep: nos }) === "pending"); c.hideReceipt = false;
+    const other = E.signLegacyTx({ priv: PRIV, chainId: 4663, nonce: 1, gasPrice: 2_000_000_000n, gasLimit: 26250n, to: TO, value: 1n });
+    t("txStatus: a never-seen transaction whose nonce another transaction used is dead (after a second look)", await E.txStatus(c.rpc, { from: FROM, hash: other.hash, nonce: "0" }, { sleep: nos }) === "dead");
+    let looks = 0; const lag = async (m, p) => { if (m === "eth_getTransactionCount") return ++looks === 1 ? "0x1" : "0x0"; return m === "eth_getTransactionReceipt" || m === "eth_getTransactionByHash" ? null : c.rpc(m, p); };
+    t("txStatus: 'dead' is only believed if the second look agrees (a node that counted the nonce before serving the receipt)", await E.txStatus(lag, { from: FROM, hash: other.hash, nonce: "0" }, { sleep: nos }) === "unsent");
+    const c2 = makeEthChain(); c2.set(FROM, 10n ** 18n); c2.revertNext = true; const rv = E.signLegacyTx({ priv: PRIV, chainId: 4663, nonce: 0, gasPrice: 1n, gasLimit: 26250n, to: TO, value: 7n }); await E.sendRaw(c2.rpc, rv);
+    t("txStatus: a reverted transaction is 'failed' and the value did not move", await E.txStatus(c2.rpc, { from: FROM, hash: rv.hash, nonce: "0" }, { sleep: nos }) === "failed" && c2.balOf(TO) === 0n);
+    c.refuse = "insufficient funds for gas * price + value"; const e1 = await E.sendRaw(c.rpc, other).then(() => null, e => e);
+    t("sendRaw: a node refusal carries e.rpc and counts as a definite refusal; a network failure does not", e1 && e1.rpc === true && E.refused(e1) && !E.refused(new Error("network down")) && !E.refused(Object.assign(new Error("already known"), { rpc: true })));
+    t("sendRaw: a node that answers with another hash is refused", await E.sendRaw(async () => "0x" + "ee".repeat(32), other).then(() => false, e => e.mismatch === true)); }
+  // --- quote request + summary for ETH
+  { const r = buildQuoteRequest({ from: RH, to: RH, amount: 3n * 10n ** 16n, recipient: TO, refundTo: "0x" + "ab".repeat(20), dry: true, asset: "ETH", now: 0 });
+    t("buildQuoteRequest ETH: origin and destination are the hood ETH asset; the stablecoin request is unchanged", r.originAsset === "nep141:hood.omft.near" && r.destinationAsset === "nep141:hood.omft.near" && r.amount === "30000000000000000" && buildQuoteRequest({ from: RH, to: RH, amount: 1n, recipient: TO, refundTo: TO, dry: true, now: 0 }).originAsset === RH.oneClick.assetId);
+    t("buildQuoteRequest ETH: refused where the chain has no ETH route (Base)", throws(() => buildQuoteRequest({ from: rhOnly, to: rhOnly, amount: 1n, recipient: TO, refundTo: TO, dry: true, asset: "ETH" })) && throws(() => buildQuoteRequest({ from: RH, to: rhOnly, amount: 1n, recipient: TO, refundTo: TO, dry: true, asset: "ETH" })));
+    const echo = (over = {}) => async (u, init) => ({ ok: true, json: async () => ({ quote: { amountIn: r.amount, amountOut: "29700000000000000", depositAddress: "0x" + "d2".repeat(20), timeEstimate: 30 }, quoteRequest: { ...JSON.parse(init.body), ...over } }) });
+    r.dry = false;
+    t("requestQuote ETH: a quote that echoes the right ETH assets is accepted", (await requestQuote({ req: r, fetchFn: echo() })).quote.amountOut === "29700000000000000");
+    t("requestQuote ETH: a quote for the stablecoin instead of ETH (either side) is refused", await requestQuote({ req: r, fetchFn: echo({ originAsset: RH.oneClick.assetId }) }).then(() => false, e => /does not match/.test(e.message)) && await requestQuote({ req: r, fetchFn: echo({ destinationAsset: RH.oneClick.assetId }) }).then(() => false, e => /does not match/.test(e.message)));
+    const sm = PWm.summarizeQuote({ quote: { amountIn: "30000000000000000", amountOut: "29700000000000000", timeEstimate: 30 } }, 18, 18);
+    t("summarizeQuote ETH: exact 18-decimal text, fee in ETH, percent right", sm.inText === "0.03" && sm.outText === "0.0297" && sm.feeText === "0.0003" && sm.feePct === "1.00");
+    t("summarizeQuote USDG is unchanged", PWm.summarizeQuote({ quote: { amountIn: "5000000", amountOut: "4950000", timeEstimate: 30 } }, 6, 6).feeText === "0.0500"); }
+  t("fastPlan: ETH is never split (one part of the whole amount, whatever the size); USDG still splits", [5n, 10n ** 18n, 123_456_789_012_345_678_901n].every(v => { const pl = PWm.fastPlan(v, () => 0.99, "ETH"); return pl.length === 1 && pl[0].amount === v.toString() && pl[0].state === "PLANNED"; }) && PWm.fastPlan(50_000_000n, () => 0.99, "TOKEN").length === 2);
+  // --- metadata + Paid for an ETH payment
+  { const meta = "0x" + "ab" + "eeeeeeee" + "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee" + (30_000_000_000_000_000n).toString(16).padStart(64, "0"), md = decodeMetadata(meta);
+    t("decodeMetadata: an ETH payment reads as token 'ETH' with the exact 18-decimal amount", md.token === "ETH" && md.amount === 30_000_000_000_000_000n && md.viewTag === "0xab");
+    const SP = RH.stealthPay, ST = "0x" + "5a".repeat(20), pad32 = a => "0x" + "0".repeat(24) + a.slice(2), log = { address: SP, topics: [CR.PAID_TOPIC, pad32(ST), pad32(CR.ETH_TOKEN)], data: "0x" + (30_000_000_000_000_000n).toString(16).padStart(64, "0") }, rc = { ok: true, logs: [log] };
+    t("hasPaid: ETH payment proven by Paid(stealth, ETH sentinel, amount); another amount or another token is not", CR.hasPaid(rc, { stealthPay: SP, stealth: ST, token: CR.ETH_TOKEN, amount: 30_000_000_000_000_000n }) && !CR.hasPaid(rc, { stealthPay: SP, stealth: ST, token: CR.ETH_TOKEN, amount: 29_999_999_999_999_999n }) && !CR.hasPaid(rc, { stealthPay: SP, stealth: ST, token: RH.token.address })); }
+  // --- the deployed contract has payETH(address,bytes,bytes1) (selector aea03757) -- offline check of the source selector the page uses
+  { const sel = hex(CR.topic("payETH(address,bytes,bytes1)") ? unhex(CR.topic("payETH(address,bytes,bytes1)")).slice(0, 4) : new Uint8Array(4));
+    t("payETH(address,bytes,bytes1) selector is 0xaea03757 (also found in the deployed bytecode on Robinhood Chain, read-only, 1 Nov)", sel === "0xaea03757"); }
+  // --- app.js: the rules, in its own text
+  // --- the supporting pieces must serve ETH as well as USDG (owner's addition): indexer, sanctions, relayer allow-list, texts
+  { const { spawnSync } = await import("child_process"), py = `
+import os, importlib.util, json
+os.environ.update(STEALTH_CHAIN="rh", STEALTH_RPC="http://127.0.0.1:1", STEALTHPAY="${RH.stealthPay}")
+sp = importlib.util.spec_from_file_location("ix", "stealth_indexer.py"); m = importlib.util.module_from_spec(sp); sp.loader.exec_module(m)
+payer = "0x" + "aa" * 20; st = "0x" + "bb" * 20
+eth_rc = {"from": payer, "logs": [{"address": m.STEALTHPAY, "topics": ["0x" + "11" * 32, "0x" + "0" * 24 + "bb" * 20, "0x" + "0" * 24 + "ee" * 20], "data": "0x"}]}
+print(json.dumps({"eth": m._real_payer(eth_rc, st), "none": m._real_payer({"from": payer, "logs": []}, st), "tok": m.USDC}))`;
+    const r = spawnSync("python3", ["-B", "-I", "-c", "import sys; sys.path.insert(0, '.'); exec(" + JSON.stringify(py) + ")"], { cwd: new URL(".", import.meta.url).pathname, encoding: "utf8" }), o = r.status === 0 ? JSON.parse(r.stdout.trim().split("\n").pop()) : null;
+    t("indexer: the payer of a payETH payment (no token Transfer in the receipt) is the transaction sender, i.e. the real payer; the stablecoin logic is unchanged", o && o.eth === "0x" + "aa".repeat(20) && o.none === "0x" + "aa".repeat(20) && o.tok === RH.token.address.toLowerCase(), r.stderr.slice(0, 200));
+    const ix = fs.readFileSync(new URL("./stealth_indexer.py", import.meta.url), "utf8"), rl = fs.readFileSync(new URL("./relayer.mjs", import.meta.url), "utf8");
+    t("indexer: announcements are stored whole (stealth, caller, eph, meta, view tag) whatever the token, so an ETH payment (selector 0xeeeeeeee) is served by /announcements and the history pages like any other; no filter on the token at ingest", /INSERT OR IGNORE INTO ann\(block,tx,log_index,scheme,stealth,caller,eph,meta,view_tag,payer\)/.test(ix) && !/tok == USDC[^\n]*continue/.test(ix.slice(0, ix.indexOf("/known"))) && /"eth": str\(int\.from_bytes/.test(ix));      // and /balances returns the native balance next to the token one
+    t("indexer /known (the relay allow-list gate) counts only the chain stablecoin: transfer selector a9059cbb + token + minimum; an ETH payment (selector eeeeeeee) never makes an address 'known', so the gasless relay stays USDG/USDC-only", /m\[1:5\] == bytes\.fromhex\("a9059cbb"\)/.test(ix) && /if tok == USDC and amt >= MIN_KNOWN_USDC: ok = True/.test(ix));
+    t("relayer: /relay/pay refuses any token other than the chain stablecoin (the ETH sentinel included), /relay signs only transferWithAuthorization on that token, /relay/stats has no per-asset assumption that ETH could skew (gas, sends, fees only)", /if \(token !== TOKEN\) throw new Error\("unsupported token"\)/.test(rl) && !/0xeeee/i.test(rl) && /address: TOKEN, abi, functionName: "transferWithAuthorization"/.test(rl));
+    const app = fs.readFileSync(new URL("../web/app.js", import.meta.url), "utf8"), ew = app.slice(app.indexOf("async function ethWithdraw"), app.indexOf("async function ethStandard"));
+    t("sanctions: every ETH recipient (standard route too, which never reaches the relayer's screen) is screened by the page before anything is signed", ew.indexOf("await screenRecipient(to)") > 0 && ew.indexOf("await screenRecipient(to)") < ew.indexOf("ethStandard(") && ew.indexOf("await screenRecipient(to)") < ew.indexOf("fastWithdraw(to, value, hit") && ew.indexOf("await screenRecipient(to)") < ew.indexOf("privateWithdraw(to, value, hit"));
+    t("texts: the pay screen no longer says 'no gas' for ETH, the withdraw screen names the fee payer, the route labels carry their ETA from the code constants for ETH too", /id="pay-gas-note"/.test(fs.readFileSync(new URL("../web/app.html", import.meta.url), "utf8")) && /you pay the gas from your wallet/.test(app) && /direct, pays its own network fee · " \+ PW\.standardEtaLabel\(\)/.test(app));
+    t("minimum amounts: ETH has no invented floor: standard needs amount > 0 and amount + fee <= balance; private routes are bounded by 1Click's own minimum (the dry quote in the preview refuses a too-small amount with its message) and the Zcash route by okSize", /!\(value > 0n\)/.test(ew) && /value \+ fee > all/.test(ew) && /Too small for the private route/.test(app) && /call\(fetchFn, base \+ "\/v0\/quote"/.test(fs.readFileSync(new URL("../web/private-withdraw.js", import.meta.url), "utf8"))); }
+  { const app = fs.readFileSync(new URL("../web/app.js", import.meta.url), "utf8");
+    t("pay: the ETH choice exists on Robinhood Chain only (the option is removed where chain.eth is not set), and the amount is the exact wei the wallet sends", /if \(ETHOK\) \{ o\[1\]\.value = "NATIVE"; o\[1\]\.textContent = NAT; \} else o\[1\]\.remove\(\)/.test(app) && /const wei = rawIn \?\? BigInt/.test(app) && /raw: a\.send, d, own/.test(app) && /token: ETH_TOKEN, amount: a\.send/.test(app));
+    const std = app.slice(app.indexOf("async function ethStandard"), app.indexOf('$("btn-wd").addEventListener'));
+    t("ETH standard withdraw: the guard and the record are armed BEFORE the first broadcast; the same signed bytes are re-sent; a refusal clears them, an unknown outcome does not", std.indexOf("pendingWd.set(") > 0 && std.indexOf("pendingWd.set(") < std.indexOf("ETH.sendRaw(") && std.indexOf("ethWdRec.put(") < std.indexOf("ETH.sendRaw(") && /if \(ETH\.refused\(e\)\) \{ pendingWd\.delete\(k\); ethWdRec\.del\(k\);/.test(std) && /Check the explorer for tx " \+ tx\.hash \+ " before sending again/.test(std) && (std.match(/ETH\.prepareSend\(/g) || []).length === 1);
+    t("ETH standard withdraw: success needs the receipt of the very hash we signed; a revert clears the guard, an unexpected receipt does not", /waitReceipt\(tx\.hash, x => x\.ok && x\.hash === tx\.hash\)/.test(std) && /if \(!rc\.ok && !rc\.unexpected\) \{ pendingWd\.delete\(k\); ethWdRec\.del\(k\); \}/.test(std));
+    const h = app.slice(app.indexOf('$("btn-wd").addEventListener'), app.indexOf("async function waitReceipt"));
+    t("ETH withdraw is dispatched BEFORE the stablecoin's domain-separator read and EIP-3009 signing (none of that applies to ETH), and the stablecoin handler is otherwise untouched", h.indexOf('if (wdA === "ETH") return await ethWithdraw(to)') > 0 && h.indexOf('if (wdA === "ETH") return await ethWithdraw(to)') < h.indexOf("0x3644e515") && h.indexOf('if (wdA === "ETH") return await ethWithdraw(to)') < h.indexOf("signDigest(") && (h.match(/pendingWd\.delete/g) || []).length === 3);
+    const ew = app.slice(app.indexOf("async function ethWithdraw"), app.indexOf("async function ethStandard"));
+    t("ETH withdraw: 'all' keeps the network fee back; an amount that does not fit with the fee is refused with both numbers; private routes get the amount only after that check", /exact \? exact\.send : all - fee/.test(ew) && /value \+ fee > all/.test(ew) && ew.indexOf("value + fee > all") < ew.indexOf("fastWithdraw(to, value, hit") && /decimals: C\.native\.decimals/.test(ew));
+    t("ETH hop/fast: the hop context carries the ETH sender, hopCtx for a resume takes the asset from the saved record, a fast record stores asset only for ETH", /eth: ethApi\(f, hit\.stealthPriv\)/.test(app) && /ctx\.asset = assetKey\(r\.rec\.st\)/.test(app) && /\.\.\.\(eth \? \{ asset: "ETH" \} : \{\}\), startedAt/.test(app) && /ethStatus: \(r, tx\) => ETH\.txStatus/.test(app));
+    t("Return/lost: the return quote and the done text use the coin of the record (a lost transfer: the coin of the payment), not the stablecoin", /asset: h\.asset \|\| assetKey\(h\.st\)/.test(app) && /asset: payAsset\(l\.f\)/.test(app) && (app.match(/asset: payAsset\(l\.f\)/g) || []).length === 2);
+    t("render: ETH payments show the ETH amount (18 decimals, exact) and an ETH Withdraw button only above the transfer's own fee", /fmtEth\(f\.amount \|\| 0n\)/.test(app) && /ETHOK && f\.token === "ETH" && f\.eth > 0n && !ethDust\(f\)/.test(app) && /openWithdraw\(i, "ETH"\)/.test(app));
+    t("the chain read for ETH sends/reads is the plain RPC (the node's own error kept) and never the wallet's provider", /const ethRpc = async \(method, params\) => \{\s*const r = await fetch\(C\.rpc,/.test(app) && !/ethRpc[^;]*wallet\(/.test(app.slice(app.indexOf("const ethRpc"), app.indexOf("const ethApi")))); }
+}
 console.log(fail ? "FAILED " + fail : "all passed"); process.exit(fail ? 1 : 0);

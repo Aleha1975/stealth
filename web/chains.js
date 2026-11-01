@@ -24,6 +24,7 @@ export const CHAINS = {
     api: "/stealth-api/rh",                              // nginx: /stealth-api/rh/ -> RH indexer :3883 / relayer :3884
     privateWithdraw: true,
     oneClick: { assetId: "nep141:hood-0x5fc5360d0400a0fd4f2af552add042d716f1d168.omft.near" },
+    eth: { assetId: "nep141:hood.omft.near" },           // native ETH next to USDG (pay, standard and private withdraw): only where this is set. 1Click: GET /v0/tokens -> nep141:hood.omft.near, 18 decimals
   },
 };
 /** Zcash leg of the private withdraw (web/zec-hop.js). lightwalletd = gRPC-web proxy; change this ONE value to switch to our own proxy. */
@@ -49,4 +50,19 @@ export function pickChain(search = (typeof location !== "undefined" ? location.s
   return CHAINS[q.get("chain")] || chainOfMeta(q.get("to") || "") || CHAINS[DEFAULT_CHAIN];
 }
 /** wallet_addEthereumChain parameters. */
-export const addChainParams = c => ({ chainId: c.chainHex, chainName: c.name, nativeCurrency: c.native, rpcUrls: [c.rpc], blockExplorerUrls: [c.explorer] });
+export const addChainParams = c => ({ chainId: c.chainHex, chainName: c.name, nativeCurrency: { name: c.native.name, symbol: c.native.symbol, decimals: c.native.decimals }, rpcUrls: [c.rpc], blockExplorerUrls: [c.explorer] });
+
+/** The asset a send moves: "ETH" = the chain's native coin (only where chain.eth is set), anything else = the chain stablecoin. A record saved before ETH existed has no asset field and so means the stablecoin.
+ *  -> { key: "TOKEN"|"ETH", symbol, decimals, assetId (1Click), native } */
+export function assetOf(chain, asset) {
+  if (asset === "ETH") { if (!chain || !chain.eth) throw new Error("ETH is not available on " + ((chain && chain.name) || "this chain")); return { key: "ETH", symbol: chain.native.symbol, decimals: chain.native.decimals, assetId: chain.eth.assetId, native: true }; }
+  const t = chain.token || {}; return { key: "TOKEN", symbol: t.symbol, decimals: t.decimals, assetId: chain.oneClick && chain.oneClick.assetId, native: false };
+}
+/** "ETH" for a saved record / state that moves the native coin, else "TOKEN". */
+export const assetKey = rec => rec && rec.asset === "ETH" ? "ETH" : "TOKEN";
+/** Exact text of a token amount (BigInt, no float): cut (never rounded up) to `digits` places, trailing zeros trimmed down to `min` places; "<0.000001" for a non-zero amount below the last place. */
+export function fmtUnits(v, dec, digits = 6, min = 2) {
+  const b = BigInt(v), neg = b < 0n, a = neg ? -b : b, u = 10n ** BigInt(dec), whole = a / u; let frac = (a % u).toString().padStart(dec, "0").slice(0, digits);
+  if (a > 0n && whole === 0n && /^0*$/.test(frac)) return "<0." + "0".repeat(Math.max(0, digits - 1)) + "1";
+  frac = frac.replace(/0+$/, "").padEnd(min, "0"); return (neg ? "-" : "") + whole + (frac ? "." + frac : "");
+}

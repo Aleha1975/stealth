@@ -1,6 +1,6 @@
 /* Progress card of the private transfer (DOM only via createElement/textContent). Pure view of a hop record: no network, no keys.
    h = { st (hop state, see zec-hop.js), msg (last progress text), running (this tab is driving it) } */
-import { CHAINS } from "./chains.js";
+import { CHAINS, assetOf, assetKey, fmtUnits } from "./chains.js";
 import { remainingMs, STEPS, STEP_MIN, partsLabel, modeOf, partState } from "./zec-hop.js";
 
 export const STEP_UI = [   // one entry per zec-hop.js STEPS item, in order
@@ -18,7 +18,7 @@ const stepKey = st => st.step === "WAIT_SWAPS" ? "SEND_OUT" : st.step;      // W
 /** raw 1Click status -> friendly word (the raw name never reaches the screen) */
 export const friendly = s => ({ SUCCESS: "done", REFUNDED: "refunded", FAILED: "failed" })[s] || "in progress";
 const short = a => a ? a.slice(0, 6) + "…" + a.slice(-4) : "";
-const amt = (v, dec) => (Number(v) / 10 ** dec).toFixed(2);
+const amt = (v, dec) => dec > 6 ? fmtUnits(typeof v === "string" ? BigInt(v) : BigInt(Math.round(Number(v))), dec, 6) : (Number(v) / 10 ** dec).toFixed(2);      // 18-decimal ETH: exact text, 6 places; stablecoins: 2 places as ever
 export const fmtElapsed = ms => { const s = Math.max(0, Math.floor(ms / 1000)), m = Math.floor(s / 60); if (m >= 60) { const h = Math.floor(m / 60); return h + " h " + String(m % 60).padStart(2, "0") + " min"; } return m + ":" + String(s % 60).padStart(2, "0"); };   // under an hour m:ss, from an hour on "H h MM min"
 /** "27 min left" / "4:05 left" */
 export const fmtLeft = ms => ms >= 600_000 ? "≈ " + Math.ceil(ms / 60_000) + " min left" : fmtElapsed(Math.max(60_000, ms)) + " left";
@@ -81,7 +81,7 @@ export function partRows(st, dtok) {
 
 /** Everything the card says, as plain data (testable). */
 export function hopView(h, now = Date.now()) {
-  const st = h.st, src = CHAINS[st.chain] || {}, dst = CHAINS[st.dest] || src, tok = (src.token || { symbol: "", decimals: 6 }), dtok = dst.token || tok;
+  const st = h.st, src = CHAINS[st.chain] || {}, dst = CHAINS[st.dest] || src, ak = assetKey(st), pick = (c, fb) => { try { return c.token ? assetOf(c, ak) : fb; } catch { return fb; } }, tok = pick(src, { symbol: "", decimals: 6 }), dtok = pick(dst, tok);      // ak: the coin this transfer moves (ETH, or the chain stablecoin for every record saved before ETH)
   const idx = Math.max(0, STEP_ORDER.indexOf(stepKey(st))), waitSw = st.step === "WAIT_SWAPS", ui0 = waitSw ? { ...STEP_UI[idx], name: "Waiting for the payouts to arrive", line: "Waiting for the swaps to deliver", wait: "usually a few minutes" } : STEP_UI[idx], pl = partsLabel(st), inParts = pl && idx >= STEP_ORDER.indexOf("DELAY") && !waitSw;    // "payout 2 of 3" on the three payout steps
   const m = st.mode ? modeOf(st.mode) : null, delayWait = m ? (m.totalMax >= 60 ? "random, spread over " + m.totalMin / 60 + "–" + m.totalMax / 60 + " h" : m.totalMin + "–" + m.totalMax + " min, random") : "2–10 min, random";
   const ui = { ...ui0, name: ui0.name + (inParts ? " · " + pl : ""), line: ui0.line + (inParts ? " (" + pl + ")" : ""), wait: st.step === "DELAY" ? delayWait : ui0.wait };
@@ -97,7 +97,7 @@ export function hopView(h, now = Date.now()) {
     const got = st.outTotal ? amt(st.outTotal, dtok.decimals) : st.outQuote ? amt(st.outQuote.amountOut, dtok.decimals) : amt(st.amount, tok.decimals), p = st.payoutTx;
     v.kind = "done"; v.pct = 100; v.title = "Sent privately: " + got + " " + dtok.symbol + " to " + short(st.recipient); v.amountLine = ""; v.idx = v.total;
     const outN = Number(st.outTotal || (st.outQuote && st.outQuote.amountOut) || 0) / 10 ** dtok.decimals, inN = Number(st.amount || 0) / 10 ** tok.decimals;
-    if (outN && inN && !st.rebuilt) v.sum = "Sent " + amt(st.amount, tok.decimals) + " " + tok.symbol + " · received " + got + " " + dtok.symbol + " · cost " + (inN - outN).toFixed(2) + " " + dtok.symbol + " (" + ((inN - outN) / inN * 100).toFixed(1) + "%)";
+    if (outN && inN && !st.rebuilt) v.sum = "Sent " + amt(st.amount, tok.decimals) + " " + tok.symbol + " · received " + got + " " + dtok.symbol + " · cost " + (inN - outN).toFixed(tok.decimals > 6 ? 6 : 2) + " " + dtok.symbol + " (" + ((inN - outN) / inN * 100).toFixed(1) + "%)";
     v.line = "Total time " + v.elapsed + " (including any pause).";
     const mark = at => at && st.startedAt ? fmtElapsed(at - st.startedAt) : "", P = Array.isArray(st.parts) ? st.parts : [];
     if (P.length > 1 && P.every(x => x && x.sentAt && x.endAt)) v.timing = (st.shieldedAt ? "Shielded at " + mark(st.shieldedAt) + " · " : "") + P.map((x, i) => "payout " + (i + 1) + " sent at " + mark(x.sentAt) + ", arrived at " + mark(x.endAt)).join(" · ");
@@ -126,7 +126,7 @@ export function hopView(h, now = Date.now()) {
   } else {
     const early = idx < STEPS.indexOf("WAIT_T");               // nothing has left the stealth address yet / no ZEC exists yet
     const cause = oneLine(st.err), wait = h.retryAt && h.retryAt > now ? Math.ceil((h.retryAt - now) / 1000) : 0;
-    v.kind = "warn"; v.title = "Transfer paused"; v.body = (wait ? "Problem: " + (cause || "network hiccup") + ". Retrying by itself in " + (wait < 120 ? wait + " s" : Math.ceil(wait / 60) + " min") + ". " : st.err ? "Stopped: " + cause + ". " : "") + (early && !(st.auth || st.relayed || st.txIn) ? "Your money has not moved." : early ? "The deposit may already be on its way: your funds are safe, but do not send from this address again until this transfer finishes." : "Your funds are safe.") + " Press Continue transfer to try again.";
+    v.kind = "warn"; v.title = "Transfer paused"; v.body = (wait ? "Problem: " + (cause || "network hiccup") + ". Retrying by itself in " + (wait < 120 ? wait + " s" : Math.ceil(wait / 60) + " min") + ". " : st.err ? "Stopped: " + cause + ". " : "") + (early && !(st.auth || st.ethTx || st.relayed || st.txIn) ? "Your money has not moved." : early ? "The deposit may already be on its way: your funds are safe, but do not send from this address again until this transfer finishes." : "Your funds are safe.") + " Press Continue transfer to try again.";
     v.action = "continue"; v.detail = ""; v.zec = !early; v.pct = shownPct((st.stealth || "") + "#" + (st.n || 0), st, 0, now);
   }
   return v;
