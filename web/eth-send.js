@@ -1,6 +1,6 @@
 /* A plain ETH transfer signed by a stealth key and sent from the page (no relayer, no EIP-3009: native ETH has no authorization). No DOM, no network of its own: every function takes `rpc(method, params) -> result` (throws on an RPC error, with e.rpc = true when the node answered with an error).
    Legacy (type 0, EIP-155) transaction: accepted by every EVM node, one rule for the fee. The nonce is read at "latest", never "pending", so a transaction that is stuck or whose answer was lost is REPLACED by the next one instead of being followed by a second payment:
-   one nonce can be mined once, so a re-sent or re-signed transfer can never pay twice. The signed bytes are saved by the caller BEFORE the first broadcast and only ever re-sent as they are. */
+   one nonce can be mined once, so a re-sent or re-signed transfer can never pay twice. The caller records the signed transaction (the hop keeps the whole bytes, the withdraw routes its hash and nonce) BEFORE the first broadcast; only the same bytes are ever re-sent, and the standard and fast routes never re-send after a reload (they ask txStatus). */
 import { keccak, signDigest, unhex, hex } from "./stealth-crypto.js";
 
 const cat = list => { const o = new Uint8Array(list.reduce((n, x) => n + x.length, 0)); let i = 0; for (const x of list) { o.set(x, i); i += x.length; } return o; };
@@ -65,5 +65,27 @@ export async function txStatus(rpc, { from, hash, nonce }, { sleep = ms => new P
   const a = await look(); if (a !== "dead") return a;
   await sleep(recheckMs); const b = await look(); return b;
 }
-/** Is this RPC error a definite refusal (the node answered and did not accept the transaction)? */
-export const refused = e => !!(e && e.rpc === true && !KNOWN.test(String(e.message || "")));
+const NONCE_USED = /nonce too low|nonce is too low|nonce has already been used/i, RATE_LIMIT = /rate.?limit|too many requests|\b429\b/i;
+/** Is this RPC error a definite refusal (the node answered and did not accept the transaction)? Not when the words say the nonce is used (the transaction may have been mined after all: a resend after a lost answer gets exactly that), not a hash mismatch (the node took SOMETHING), not a rate-limit body (said nothing about the transaction). Those need txStatus. */
+export const refused = e => !!(e && e.rpc === true && !e.mismatch && !KNOWN.test(String(e.message || "")) && !NONCE_USED.test(String(e.message || "")) && !RATE_LIMIT.test(String(e.message || "")));
+/** May the SAME bytes simply be sent again? A network failure (no answer) or a rate-limit body. Any other answer is either a refusal or needs txStatus first. */
+export const resendable = e => !(e && e.rpc === true) || RATE_LIMIT.test(String(e.message || ""));
+/** 1144 M-1: the broadcast of the SAME saved bytes, up to `tries` times, and what it proves. { send(), status(), sleep(ms) } -> { outcome, error? }:
+ *  "sent" (accepted, "already known", or txStatus says mined / pending) | "refused" (the node refused it on the FIRST answer, or refused it and txStatus says unsent: nothing was sent) | "failed" (mined and reverted: nothing moved) | "unknown" (anything else: the caller keeps its guard).
+ *  Once an attempt has ended without a clear answer, a later "refusal" proves nothing (a resend after a lost answer gets "nonce too low" because the first one was mined): only txStatus decides then. */
+export async function sendSettled({ send, status, sleep }, tries = 3) {
+  let unknown = false;
+  for (let i = 0; ; i++) {
+    try { await send(); return { outcome: "sent" }; }
+    catch (e) {
+      if (refused(e) && !unknown) return { outcome: "refused", error: e };
+      unknown = true;
+      if (resendable(e) && i < tries - 1) { await sleep(2000 * 3 ** i); continue; }      // a network failure or a rate limit: the SAME bytes again
+      let st = null; try { st = await status(); } catch {}
+      if (st === "mined" || st === "pending") return { outcome: "sent", status: st };
+      if (st === "failed") return { outcome: "failed", error: e };
+      if (st === "unsent" && refused(e)) return { outcome: "refused", error: e };      // the node does not know it and its nonce is still free
+      return { outcome: "unknown", error: e };      // incl. "dead": its nonce is used, by this transaction or another; the explorer says which
+    }
+  }
+}

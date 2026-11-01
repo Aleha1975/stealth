@@ -158,7 +158,8 @@ const PW_KEY = "stealth-pending-wd";
 // 1121 L-1: the in-memory copy is ALWAYS consulted too (per key the later expiry wins), so a storage that reads fine but refuses writes cannot hide an armed guard.
 const pendingWd = { _m() { let s = {}; try { s = JSON.parse(localStorage.getItem(PW_KEY) || "{}") || {}; } catch {} const m = { ...(this._mem || {}) }; for (const k of Object.keys(s)) if (!(Number(m[k]) >= Number(s[k]))) m[k] = s[k]; return m; }, _w(m) { this._mem = m; try { localStorage.setItem(PW_KEY, JSON.stringify(m)); } catch {} },
   get(k) { const v = Number(this._m()[k]); return v > Date.now() ? v : 0; }, set(k, until) { const m = this._m(); m[k] = until; this._w(m); }, delete(k) { const m = this._m(); delete m[k]; this._w(m); } };
-const spent = new Map();   // stealth -> { left, until }
+const spent = new Map();   // stealth|asset -> { left, until, asset }: one entry per address AND coin (wei and 6-decimal units must never meet in one number)
+const spentKey = (k, eth) => k.toLowerCase() + "|" + (eth ? "ETH" : "TOKEN");
 async function scan() {
   if (!keys) { say("pay-hint", "Derive your keys first (Receive tab).", "bad"); return; }
   if (lostDone.size) { lostDone.clear(); renderHops(); }      // a new Scan retires the old results
@@ -213,8 +214,8 @@ async function refreshBalances(redraw = true) {
     const part = pages[next++]; if (!part) return;
     let b = null; for (let t = 0; t < 2 && !b; t++) { try { b = await getBalances(rpcBatch, USDC, part.map(f => f.stealth)); } catch { if (t === 0) await new Promise(z => setTimeout(z, 1500)); } }
     for (const f of part) { const x = b && b.get(f.stealth.toLowerCase());
-      if (!x) { f.usdc = null; unread++; continue; }      // 1109 I-5: a failed re-read never keeps an old amount (and its Withdraw button) on screen
-      f.usdc = x.usdc; f.eth = x.eth; const sp = spent.get(f.stealth.toLowerCase()); if (sp && Date.now() < sp.until) { if (sp.asset === "ETH") { if (f.eth > sp.left) f.eth = sp.left; } else if (f.usdc > sp.left) f.usdc = sp.left; } }
+      if (!x) { f.usdc = null; f.eth = null; unread++; continue; }      // 1109 I-5: a failed re-read never keeps an old amount (and its Withdraw button) on screen
+      f.usdc = x.usdc; f.eth = x.eth; const se = spent.get(spentKey(f.stealth, true)), su = spent.get(spentKey(f.stealth, false)); if (se && Date.now() < se.until && f.eth > se.left) f.eth = se.left; if (su && Date.now() < su.until && f.usdc > su.left) f.usdc = su.left; }
   } };
   await Promise.all(Array.from({ length: Math.min(3, pages.length) }, worker));
   if (ETHOK) { const ef = list.find(f => f.token === "ETH" && f.eth > 0n); if (ef) { try { ethFeeNow = (await ETH.planFee(ethRpc, { from: ef.stealth, to: ef.stealth, value: 1n })).fee; } catch { ethFeeNow = null; } } }      // an ETH balance below one transfer's fee is dust: no Withdraw button for it
@@ -288,7 +289,14 @@ function lostCard(k, l) {
   const why = l.young ? "The ZEC arrived recently, so this transfer may still be running on another device. It is available here later (about 2 hours after it arrived); nothing can be sent or returned from this card yet."      // 1133 M-1
     : older ? "This is an earlier transfer wallet of this address, and a newer transfer record exists in this browser, so it cannot be continued from here." + (l.found.length ? " Return money still works." : "")
     : "This browser has no record of it (storage was cleared, or it ran on another device), but the ZEC is still on the transfer's temporary wallet, rebuilt from your key. " + (l.shielded && !l.found.length ? "Continue sends it on to a recipient you enter now." : l.shielded || l.found.length ? "Return it to your wallet" + (l.shielded || l.contAcct == null ? " first (it sweeps every account, in rounds)." : ", or continue the transfer to a recipient you enter now.") : "") + (l.truncated ? " More outputs exist than could be read at once; Return money handles them in rounds." : "");      // truncated = one address's list was cut; the wallet cap is capped (scanText)
-  card.appendChild(el("div", "hop-line", why)); if (!l.young && scanText(l)) card.appendChild(el("div", "note", scanText(l))); card.appendChild(line);
+  card.appendChild(el("div", "hop-line", why));
+  if (ETHOK && !l.young) {      // 1144 L-4: the coin is shown and can be changed; with no default (both held) the buttons say so instead of guessing
+    const cr = el("div", "row"), sel = el("select"), cur = l.coin !== undefined ? l.coin : lostCoinDefault(l.f);
+    sel.setAttribute("aria-label", "Coin of this transfer"); for (const [v, t] of [["", "Choose the coin…"], ["TOKEN", SYM], ["ETH", NAT]]) { const o = el("option", null, t); o.value = v; sel.appendChild(o); } sel.value = cur || "";
+    sel.addEventListener("change", () => { l.coin = sel.value || null; });
+    cr.appendChild(el("span", "note", "Coin of this transfer (this address now holds " + fmtTok(l.f.usdc || 0n) + " " + SYM + " and " + fmtEth(l.f.eth || 0n) + " " + NAT + "): ")); cr.appendChild(sel); card.appendChild(cr);
+  }
+  if (!l.young && scanText(l)) card.appendChild(el("div", "note", scanText(l))); card.appendChild(line);
   const btn = (txt, cls, fn) => { const b = el("button", "btn " + cls, txt); b.type = "button"; b.addEventListener("click", () => fn(b)); acts.appendChild(b); return b; };
   const fail = (b, e) => { if (b) b.disabled = false; line.textContent = (e && e.message) || String(e); };
   if (l.young) btn("Check again", "ghost", b => { lostForget(k); renderHops(); checkLost().catch(() => {}); });
@@ -329,18 +337,22 @@ async function lostGuard(l) {
   if (l.found.length && HM.lostYoung(l.found, tip)) { l.young = true; renderHops(); throw new Error("This may still be running on another device: its ZEC is too recent to touch. Try again in about 2 hours."); }
 }
 // 1136 F-4: Return needs only the keys: no record is adopted, so every recoverable wallet keeps its Return button (h.lost marks the card the result comes back to)
-const payAsset = f => f.token === "ETH" ? "ETH" : "TOKEN";      // a lost transfer has no record to say which coin it moved: the coin of the payment to that address (a private transfer pays out the coin it took in)
-const lostReturn = (k, l, card) => returnZec({ f: l.f, hit: l.hit, running: false, msg: "", st: { n: l.n }, lost: k, asset: payAsset(l.f) }, card);
+// 1144 L-4: a lost transfer has no record to say which coin it moved, and an address can hold both. The default comes from what the address holds now: the coin of the payment to it (a private transfer pays out the coin it took in) when that coin has gone
+// or the other one is not held; when it holds BOTH there is no default and the user chooses on the card. Nothing is signed or returned before a coin is set.
+const lostCoinDefault = f => { if (!ETHOK) return "TOKEN"; const payEth = f.token === "ETH", ethHeld = f.eth > 0n && !ethDust(f), tokHeld = f.usdc > 0n, payHeld = payEth ? ethHeld : tokHeld, otherHeld = payEth ? tokHeld : ethHeld; return payHeld && otherHeld ? null : payEth ? "ETH" : "TOKEN"; };
+const payAsset = l => { const c = l.coin !== undefined ? l.coin : lostCoinDefault(l.f); if (c !== "ETH" && c !== "TOKEN") throw new Error("This address holds both " + SYM + " and " + NAT + ": choose which coin this transfer moved (above the buttons) first."); return c; };
+const lostReturn = async (k, l, card) => returnZec({ f: l.f, hit: l.hit, running: false, msg: "", st: { n: l.n }, lost: k, asset: payAsset(l) }, card);
 async function lostContinue(k, l, to, line) {
   if (!self.crossOriginIsolated) throw new Error("This page cannot run the Zcash wallet here (it is not cross-origin isolated).");
   if (!vetRecipient(to, l.f)) { line.textContent = "Cancelled."; return; }
+  const asset = payAsset(l);      // the coin is settled before anything else is touched
   await lostGuard(l);
   line.textContent = "Checking the recipient…"; await screenRecipient(to);
   const HM = await hopMod(), { zcash: ZC } = await import("./chains.js"), ZR = await import("./zec-return.js"), ctx = { store: HM.idbStore(), stealth: l.f.stealth, lock: lostLock(l.f.stealth) };
   let birthday, account, zats = l.total;
   if (l.shielded) { if (l.found.length) throw new Error("ZEC also sits on the transparent addresses: press Return money first."); birthday = HM.birthdayFromTime(l.shielded.blockTimeSec, await ZR.getTip(ZC.lightwalletd)); account = l.shielded.account; }
   else { account = HM.lostContinueAcct(l.found); if (account == null) throw new Error("The ZEC is on several accounts: press Return money first, it sweeps all of them."); zats = l.found.reduce((s, x) => s + x.value, 0n); const hs = l.found.map(x => x.height).filter(x => x > 0); birthday = (hs.length ? Math.min(...hs) : (await ZR.getTip(ZC.lightwalletd)) - 5000) - 10; }
-  const r = await HM.adoptLostHop(ctx, { n: l.n, account, birthday, zats, recipient: to, chain: C, dest: C, asset: payAsset(l.f) });
+  const r = await HM.adoptLostHop(ctx, { n: l.n, account, birthday, zats, recipient: to, chain: C, dest: C, asset });
   if (!r.created) throw NOT_ADOPTED(r);      // 1133 L-1: never run on another record's recipient
   lost.delete(k); renderHops(); render(); await runHop(l.f, l.hit, null, { interactive: true });
 }
@@ -530,7 +542,7 @@ const ethRpc = async (method, params) => {
   if (j.error) throw Object.assign(new Error((j.error && j.error.message) || "rpc error"), { rpc: true, code: j.error && j.error.code });
   if (j.result === undefined) throw new Error("the chain RPC gave no result"); return j.result;
 };
-const ethApi = (f, priv) => ({ prepare: ({ to, value }) => ETH.prepareSend(ethRpc, { priv, chainId: C.chainId, from: f.stealth, to, value }), send: tx => ETH.sendRaw(ethRpc, tx), status: tx => ETH.txStatus(ethRpc, { from: f.stealth, hash: tx.hash, nonce: tx.nonce }) });
+const ethApi = (f, priv) => ({ prepare: ({ to, value }) => ETH.prepareSend(ethRpc, { priv, chainId: C.chainId, from: f.stealth, to, value }), send: tx => ETH.sendRaw(ethRpc, tx), status: tx => ETH.txStatus(ethRpc, { from: f.stealth, hash: tx.hash, nonce: tx.nonce }), balance: async () => BigInt(await ethRpc("eth_getBalance", [f.stealth, "latest"])) });
 const rpcOne = async (method, params) => { const r = await chainRpc(C.rpc, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ jsonrpc: "2.0", id: 1, method, params }) }); const j = await r.json(); if (j.error) throw new Error(j.error.message || "rpc error"); return j.result; };
 const rpcBatch = async calls => { try { return await fetchBatch(fetch, C.rpc, calls); } catch { const out = []; for (let i = 0; i < calls.length; i += 10) out.push(...await Promise.all(calls.slice(i, i + 10).map(([m, p]) => rpcOne(m, p)))); return out; } };
 async function holdScreen() { try { return navigator.wakeLock ? await navigator.wakeLock.request("screen") : null; } catch { return null; } }
@@ -540,7 +552,7 @@ function hopProgress(f, s, m) {
   h.st = s; h.msg = m || ""; h.beatAt = Date.now(); h.hidden = document.hidden;      // beatAt: the card says "no update for N s" if the machine goes quiet
   if (s.relayed && s.inQuote && !h.sp) {                          // the deposit leg has left the stealth address: stop showing its old balance
     h.sp = true; const amtIn = BigInt(s.inQuote.amountIn), eth = assetKey(s) === "ETH", have = eth ? f.eth : f.usdc;
-    spent.set(k, { left: have > amtIn ? have - amtIn : 0n, until: Date.now() + 120_000, ...(eth ? { asset: "ETH" } : {}) }); render(); setTimeout(() => refreshBalances().catch(() => {}), 3000);
+    spent.set(spentKey(k, eth), { left: have > amtIn ? have - amtIn : 0n, until: Date.now() + 120_000, ...(eth ? { asset: "ETH" } : {}) }); render(); setTimeout(() => refreshBalances().catch(() => {}), 3000);
   }
   if (h.running) { const v = hopView(h); if (v.kind === "run" && v.what) say("pay-hint", statusLine(v), "ok"); }   // green while it runs normally
   renderHops();
@@ -566,8 +578,8 @@ async function runHop(f, hit, o, opts = {}) {
     const n = (autoTries.get(k) || 0) + 1; autoTries.set(k, n); h.retryAt = Date.now() + Math.min(300_000, 15_000 * 2 ** (n - 1));      // 15 s, 30 s, 1, 2, 4, 5, 5 min; the card shows the cause and the countdown
     setTimeout(() => runHop(f, hit, null).catch(e => say("pay-hint", e.message || String(e), "bad")), h.retryAt - Date.now());
   } else if (TERMINAL.includes(st.step)) autoTries.delete(k);
-  if (st.relayed && st.inQuote && !h.sp) { const amtIn = BigInt(st.inQuote.amountIn), eth = assetKey(st) === "ETH", have = eth ? f.eth : f.usdc; spent.set(k, { left: have > amtIn ? have - amtIn : 0n, until: Date.now() + 120_000, ...(eth ? { asset: "ETH" } : {}) }); }
-  if (st.step === "FAILED_IN") spent.delete(k);
+  if (st.relayed && st.inQuote && !h.sp) { const amtIn = BigInt(st.inQuote.amountIn), eth = assetKey(st) === "ETH", have = eth ? f.eth : f.usdc; spent.set(spentKey(k, eth), { left: have > amtIn ? have - amtIn : 0n, until: Date.now() + 120_000, ...(eth ? { asset: "ETH" } : {}) }); }
+  if (st.step === "FAILED_IN") spent.delete(spentKey(k, assetKey(st) === "ETH"));
   if (st.step === "FAILED") try { const rec = (await HM.findHop(ctx.store, f.stealth)).rec; h.extra = (await HM.hopSummary(ctx, rec)).filter(x => x.transparent + x.orchard >= HM.HOLD_DUST).map(x => "Hop wallet account " + x.account + ": " + (Number(x.transparent) / 1e8) + " ZEC transparent, " + (Number(x.orchard) / 1e8) + " ZEC shielded").join("\n"); } catch (e) { h.extra = "Could not read the hop wallet: " + e.message; }
   renderHops(); render(); await refreshBalances().catch(() => {});
 }
@@ -662,7 +674,7 @@ async function fastWithdraw(to, value, hit, asset = "TOKEN") {
     findTx: a => txOfLogs({ address: USDC, topics: [AUTH_USED_TOPIC, "0x" + padAddr(w.stealth), a.nonce], span: logSpanSince(a.validBefore) }, () => true), onRefused: () => pendingWd.delete(k),
     onSigned: info => { cur = info; pendingWd.set(k, (info.validBefore + 60) * 1000); },       // armed before the request leaves; cleared only when the deposit is confirmed
     waitReceipt: h => eth ? waitReceipt(h, x => x.ok && x.hash === cur.ethTx.hash.toLowerCase()) : waitReceipt(h, x => hasTransfer(x, { token: USDC, from: w.stealth, to: cur.depositAddress, value: cur.amount }) && hasAuthUsed(x, { token: USDC, authorizer: w.stealth, nonce: cur.auth.nonce }), true),      // ETH: the hash of the transaction we signed binds its nonce, destination and amount
-    onDeposited: info => { if (info.index === rec.parts.length - 1) pendingWd.delete(k); spent.set(k, { left: (spent.get(k) || { left: eth ? w.eth : w.usdc }).left - BigInt(rec.parts[info.index].amount), until: Date.now() + 120_000, ...(eth ? { asset: "ETH" } : {}) }); render(); } };
+    onDeposited: info => { if (info.index === rec.parts.length - 1) pendingWd.delete(k); spent.set(spentKey(k, eth), { left: (spent.get(spentKey(k, eth)) || { left: eth ? w.eth : w.usdc }).left - BigInt(rec.parts[info.index].amount), until: Date.now() + 120_000, ...(eth ? { asset: "ETH" } : {}) }); render(); } };
   try {
     const run = () => { fastClaim(rec); claimed = true; return PW.runFast(ctx, rec, save); };      // claimed inside the lock: a second tab is refused before it can write
     if (navigator.locks) await navigator.locks.request("fast-wd:" + k, { ifAvailable: true }, l => l ? run() : Promise.reject(new Error("A withdraw from this address is already running in another tab."))); else await run();
@@ -680,7 +692,7 @@ async function resumeFast() {
   for (const k of Object.keys(m)) {
     const rec = m[k]; if (!rec || !Array.isArray(rec.parts) || fastBusy.has(k)) continue;
     let ran = false;
-    const go = async () => { ran = true; fastBusy.add(k); try { await PW.runFast({ base: PW.ONECLICK, fetchFn: fetch, ethStatus: (r, tx) => ETH.txStatus(ethRpc, { from: r.stealth, hash: tx.hash, nonce: tx.nonce }), onProgress: t => { fastLive = "Earlier private withdraw: " + t; showFastBox(); } }, rec, r => { try { fastRecs.put(r); } catch {} }, { resume: true }); } finally { fastBusy.delete(k); fastLive = ""; } };
+    const go = async () => { ran = true; fastBusy.add(k); try { await PW.runFast({ base: PW.ONECLICK, fetchFn: fetch, ethStatus: (r, tx) => ETH.txStatus(ethRpc, { from: r.stealth, hash: tx.hash, nonce: tx.nonce }), senderGone: !!navigator.locks, onProgress: t => { fastLive = "Earlier private withdraw: " + t; showFastBox(); } }, rec, r => { try { fastRecs.put(r); } catch {} }, { resume: true }); } finally { fastBusy.delete(k); fastLive = ""; } };
     try { if (navigator.locks) await navigator.locks.request("fast-wd:" + k, { ifAvailable: true }, l => l ? go() : undefined); else await go(); } catch (e) { extra.push("Earlier private withdraw: " + (e.message || e)); continue; }
     if (!ran) continue;                                      // 1125 F-6: another tab holds the lock, so this record is a LIVE withdraw there, not an earlier one
     const chain = CHAINS[rec.chain] || C, un = unitsOf(chain, rec), sums = PW.fastSummary(rec, un.fmt, un.sym), text = "Earlier private withdraw (" + chain.name + "):\n" + sums.join("\n");
@@ -741,10 +753,12 @@ async function screenRecipient(to) {
 // with the fee is refused before anything is signed. The signed bytes are recorded (with the double-send guard) BEFORE they are broadcast; they are only ever re-sent as they are, and a nonce can be mined once, so nothing can be paid twice.
 const ETH_WD_KEY = "stealth-eth-wd", ethWdRec = { all() { try { const o = JSON.parse(localStorage.getItem(ETH_WD_KEY) || "{}"); return o && typeof o === "object" ? o : {}; } catch { return {}; } },
   put(k, v) { const o = this.all(); o[k] = v; try { localStorage.setItem(ETH_WD_KEY, JSON.stringify(o)); } catch {} }, del(k) { const o = this.all(); delete o[k]; try { localStorage.setItem(ETH_WD_KEY, JSON.stringify(o)); } catch {} } };
-// after a Scan: an earlier ETH withdrawal whose outcome is now known on chain (mined, reverted, or its nonce taken by another transaction) no longer needs its guard
+// after a Scan: an earlier ETH withdrawal whose outcome is now known on chain (mined, reverted, or its nonce taken by another transaction) no longer needs its guard.
+// "unsent" (the node does not know it, its nonce is free) is cleared only once the guard's own window (the 1 h + 60 s armed in ethStandard) has passed: the record holds hash and nonce, not the bytes, so the only copy of them was in the tab that signed them and a send loop there ends within seconds
+const ethArmedUntil = r => (Math.floor((Number(r.at) || 0) / 1000) + 3600 + 60) * 1000;
 async function ethResolve() {
   const m = ethWdRec.all(); let any = false;
-  for (const k of Object.keys(m)) { const r = m[k]; if (!r || !found.some(f => f.stealth.toLowerCase() === k)) continue; let st = null; try { st = await ETH.txStatus(ethRpc, { from: k, hash: r.hash, nonce: r.nonce }); } catch {} if (st === "mined" || st === "failed" || st === "dead") { pendingWd.delete(k); ethWdRec.del(k); any = true; } }
+  for (const k of Object.keys(m)) { const r = m[k]; if (!r || !found.some(f => f.stealth.toLowerCase() === k)) continue; let st = null; try { st = await ETH.txStatus(ethRpc, { from: k, hash: r.hash, nonce: r.nonce }); } catch {} if (st === "mined" || st === "failed" || st === "dead" || (st === "unsent" && Date.now() > ethArmedUntil(r))) { pendingWd.delete(k); ethWdRec.del(k); any = true; } }
   return any;
 }
 async function ethFeeOf(stealth, to) {
@@ -769,24 +783,19 @@ async function ethStandard(to, value, hit, all) {
   const w = wd, k = w.stealth.toLowerCase(), sleep = ms => new Promise(r => setTimeout(r, ms));
   say("pay-hint", "Signing the " + NAT + " transfer…");
   const tx = await ETH.prepareSend(ethRpc, { priv: hit.stealthPriv, chainId: C.chainId, from: w.stealth, to, value });      // reads nonce + gas, checks amount + fee fit the balance; nothing is sent
-  pendingWd.set(k, (Math.floor(Date.now() / 1000) + 3600 + 60) * 1000); ethWdRec.put(k, { hash: tx.hash, nonce: tx.nonce, at: Date.now() });      // armed and recorded BEFORE the bytes leave; cleared only by a confirmed outcome
+  const armedAt = Date.now(); pendingWd.set(k, ethArmedUntil({ at: armedAt })); ethWdRec.put(k, { hash: tx.hash, nonce: tx.nonce, at: armedAt });      // armed and recorded BEFORE the bytes leave; cleared only by a confirmed outcome
   say("pay-hint", "Sending from the stealth address (it pays its own network fee)…");
-  for (let i = 0; ; i++) {
-    try { await ETH.sendRaw(ethRpc, tx); break; }
-    catch (e) {
-      if (ETH.refused(e)) { pendingWd.delete(k); ethWdRec.del(k); throw new Error("The network refused the transaction: " + ((e && e.message) || e) + ". Nothing was sent."); }
-      if (i < 2) { await sleep(2000 * 3 ** i); continue; }      // a network failure: the SAME bytes again
-      let st = null; try { st = await ETH.txStatus(ethRpc, { from: w.stealth, hash: tx.hash, nonce: tx.nonce }); } catch {}
-      if (st === "mined" || st === "pending") break;
-      throw new Error("Could not confirm that the transaction was sent (" + ((e && e.message) || e) + "). Check the explorer for tx " + tx.hash + " before sending again.");
-    }
-  }
+  const sr = await ETH.sendSettled({ send: () => ETH.sendRaw(ethRpc, tx), status: () => ETH.txStatus(ethRpc, { from: w.stealth, hash: tx.hash, nonce: tx.nonce }), sleep });      // 1144 M-1: "refused" is only believed when no earlier attempt ended unclear (the resend of a mined transaction is answered "nonce too low")
+  const why = sr.error && (sr.error.message || sr.error);
+  if (sr.outcome === "refused") { pendingWd.delete(k); ethWdRec.del(k); throw new Error("The network refused the transaction: " + why + ". Nothing was sent."); }
+  if (sr.outcome === "failed") { pendingWd.delete(k); ethWdRec.del(k); throw new Error("The transfer reverted on chain (tx " + tx.hash.slice(0, 12) + "…). Nothing moved."); }
+  if (sr.outcome === "unknown") throw new Error("Could not confirm that the transaction was sent (" + why + "). Check the explorer for tx " + tx.hash + " before sending again.");      // the guard stays
   $("withdraw").hidden = true;
   say("pay-hint", "Submitted: " + fmtEth(value) + " " + NAT + " → " + to.slice(0, 8) + "… waiting for the block…");
   const rc = await waitReceipt(tx.hash, x => x.ok && x.hash === tx.hash);      // the hash binds nonce, destination and amount of THIS transaction
   if (!rc.ok && !rc.unexpected) { pendingWd.delete(k); ethWdRec.del(k); }
   if (!rc.ok) throw new Error(rc.unexpected ? "the transaction is mined but is not the one we signed (tx " + rc.hash.slice(0, 12) + "…). Check the explorer." : "the transfer reverted on chain (tx " + rc.hash.slice(0, 12) + "…). Nothing moved.");
-  pendingWd.delete(k); ethWdRec.del(k); spent.set(k, { left: all - value, until: Date.now() + 120_000, asset: "ETH" });
+  pendingWd.delete(k); ethWdRec.del(k); spent.set(spentKey(k, true), { left: all - value, until: Date.now() + 120_000, asset: "ETH" });
   const doneMsg = "Done: " + fmtEth(value) + " " + NAT + " sent, tx " + tx.hash.slice(0, 12) + "…";
   say("pay-hint", doneMsg, "ok"); await scan();
   $("pay-hint").textContent = doneMsg + "\n" + $("pay-hint").textContent;
@@ -831,7 +840,7 @@ $("btn-wd").addEventListener("click", once(async () => {
     if (!rc.ok && !rc.unexpected) pendingWd.delete(w.stealth.toLowerCase());
     if (!rc.ok) throw new Error(rc.unexpected ? "the transaction is mined but does not contain the expected transfer (tx " + rc.hash.slice(0, 12) + "…). Check the explorer." : "the transfer reverted on chain (tx " + rc.hash.slice(0, 12) + "…). Nothing moved.");
     d.hash = rc.hash; pendingWd.delete(w.stealth.toLowerCase());
-    spent.set(w.stealth.toLowerCase(), { left: all - value, until: Date.now() + 120_000 });
+    spent.set(spentKey(w.stealth, false), { left: all - value, until: Date.now() + 120_000 });
     const doneMsg = "Done: " + fmtTok(value) + " " + SYM + " sent, tx " + d.hash.slice(0, 12) + "…";
     say("pay-hint", doneMsg, "ok"); await scan();
     $("pay-hint").textContent = doneMsg + "\n" + $("pay-hint").textContent;                // the rescan's status must not erase the confirmation

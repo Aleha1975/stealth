@@ -18,7 +18,7 @@ const stepKey = st => st.step === "WAIT_SWAPS" ? "SEND_OUT" : st.step;      // W
 /** raw 1Click status -> friendly word (the raw name never reaches the screen) */
 export const friendly = s => ({ SUCCESS: "done", REFUNDED: "refunded", FAILED: "failed" })[s] || "in progress";
 const short = a => a ? a.slice(0, 6) + "…" + a.slice(-4) : "";
-const amt = (v, dec) => dec > 6 ? fmtUnits(typeof v === "string" ? BigInt(v) : BigInt(Math.round(Number(v))), dec, 6) : (Number(v) / 10 ** dec).toFixed(2);      // 18-decimal ETH: exact text, 6 places; stablecoins: 2 places as ever
+const amt = (v, dec) => dec > 6 ? fmtUnits(typeof v === "bigint" ? v : typeof v === "string" ? BigInt(v) : BigInt(Math.round(Number(v))), dec, 6) : (Number(v) / 10 ** dec).toFixed(2);      // 18-decimal ETH: exact text, 6 places; stablecoins: 2 places as ever. 1144 I-6: wei is a string or a BigInt, never a Number (a Number loses digits above 2^53 wei, ~0.009 ETH); the callers below add wei as BigInt
 export const fmtElapsed = ms => { const s = Math.max(0, Math.floor(ms / 1000)), m = Math.floor(s / 60); if (m >= 60) { const h = Math.floor(m / 60); return h + " h " + String(m % 60).padStart(2, "0") + " min"; } return m + ":" + String(s % 60).padStart(2, "0"); };   // under an hour m:ss, from an hour on "H h MM min"
 /** "27 min left" / "4:05 left" */
 export const fmtLeft = ms => ms >= 600_000 ? "≈ " + Math.ceil(ms / 60_000) + " min left" : fmtElapsed(Math.max(60_000, ms)) + " left";
@@ -89,7 +89,7 @@ export function hopView(h, now = Date.now()) {
     left: "", pct: 0, what: "", elapsed: st.doneAt && st.startedAt ? fmtElapsed(st.doneAt - st.startedAt) : (h.sessionAt || st.stepAt || st.startedAt) ? fmtElapsed(now - (h.sessionAt || st.stepAt || st.startedAt)) : "", paid: "", paidLink: null, kind: "run", title: "Private transfer in progress", line: "", note: "", body: "", detail: "", action: null, link: null };
   const okParts = (Array.isArray(st.parts) ? st.parts : []).filter(p => p && p.status === "SUCCESS" && p.quote && p.quote.amountOut);      // payout parts that already arrived
   if (okParts.length && st.step !== "DONE" && st.step !== "FAILED_IN") {
-    v.paid = "Already sent to the recipient: ≈ " + amt(okParts.reduce((a, p) => a + Number(p.quote.amountOut), 0), dtok.decimals) + " " + dtok.symbol + " (" + okParts.map(p => "≈ " + amt(p.quote.amountOut, dtok.decimals)).join(" + ") + ", " + okParts.length + " of " + st.parts.length + " payouts)";
+    v.paid = "Already sent to the recipient: ≈ " + amt(dtok.decimals > 6 ? okParts.reduce((a, p) => a + BigInt(p.quote.amountOut), 0n) : okParts.reduce((a, p) => a + Number(p.quote.amountOut), 0), dtok.decimals) + " " + dtok.symbol + " (" + okParts.map(p => "≈ " + amt(p.quote.amountOut, dtok.decimals)).join(" + ") + ", " + okParts.length + " of " + st.parts.length + " payouts)";
     if (st.recipient && dst.explorer) v.paidLink = { text: "Recipient " + short(st.recipient) + " on " + (dst.explorerName || "the explorer"), href: dst.explorer + "/address/" + st.recipient };
   }
   const rows = partRows(st, dtok); if (rows.length && st.step !== "DONE" && st.step !== "FAILED_IN") v.parts = rows;
@@ -97,7 +97,9 @@ export function hopView(h, now = Date.now()) {
     const got = st.outTotal ? amt(st.outTotal, dtok.decimals) : st.outQuote ? amt(st.outQuote.amountOut, dtok.decimals) : amt(st.amount, tok.decimals), p = st.payoutTx;
     v.kind = "done"; v.pct = 100; v.title = "Sent privately: " + got + " " + dtok.symbol + " to " + short(st.recipient); v.amountLine = ""; v.idx = v.total;
     const outN = Number(st.outTotal || (st.outQuote && st.outQuote.amountOut) || 0) / 10 ** dtok.decimals, inN = Number(st.amount || 0) / 10 ** tok.decimals;
-    if (outN && inN && !st.rebuilt) v.sum = "Sent " + amt(st.amount, tok.decimals) + " " + tok.symbol + " · received " + got + " " + dtok.symbol + " · cost " + (inN - outN).toFixed(tok.decimals > 6 ? 6 : 2) + " " + dtok.symbol + " (" + ((inN - outN) / inN * 100).toFixed(1) + "%)";
+    const wei = tok.decimals > 6 && tok.decimals === dtok.decimals ? { i: BigInt(st.amount || 0), o: BigInt(st.outTotal || (st.outQuote && st.outQuote.amountOut) || 0) } : null;      // 18 decimals: the cost is a BigInt difference, only its percentage is a float
+    if (wei && wei.o && wei.i && !st.rebuilt) v.sum = "Sent " + amt(st.amount, tok.decimals) + " " + tok.symbol + " · received " + got + " " + dtok.symbol + " · cost " + (wei.i >= wei.o ? "" : "-") + fmtUnits(wei.i >= wei.o ? wei.i - wei.o : wei.o - wei.i, tok.decimals, 6) + " " + dtok.symbol + " (" + (Number((wei.i - wei.o) * 1000n / wei.i) / 10).toFixed(1) + "%)";
+    else if (outN && inN && !st.rebuilt) v.sum = "Sent " + amt(st.amount, tok.decimals) + " " + tok.symbol + " · received " + got + " " + dtok.symbol + " · cost " + (inN - outN).toFixed(tok.decimals > 6 ? 6 : 2) + " " + dtok.symbol + " (" + ((inN - outN) / inN * 100).toFixed(1) + "%)";
     v.line = "Total time " + v.elapsed + " (including any pause).";
     const mark = at => at && st.startedAt ? fmtElapsed(at - st.startedAt) : "", P = Array.isArray(st.parts) ? st.parts : [];
     if (P.length > 1 && P.every(x => x && x.sentAt && x.endAt)) v.timing = (st.shieldedAt ? "Shielded at " + mark(st.shieldedAt) + " · " : "") + P.map((x, i) => "payout " + (i + 1) + " sent at " + mark(x.sentAt) + ", arrived at " + mark(x.endAt)).join(" · ");
@@ -126,8 +128,8 @@ export function hopView(h, now = Date.now()) {
   } else {
     const early = idx < STEPS.indexOf("WAIT_T");               // nothing has left the stealth address yet / no ZEC exists yet
     const cause = oneLine(st.err), wait = h.retryAt && h.retryAt > now ? Math.ceil((h.retryAt - now) / 1000) : 0;
-    v.kind = "warn"; v.title = "Transfer paused"; v.body = (wait ? "Problem: " + (cause || "network hiccup") + ". Retrying by itself in " + (wait < 120 ? wait + " s" : Math.ceil(wait / 60) + " min") + ". " : st.err ? "Stopped: " + cause + ". " : "") + (early && !(st.auth || st.ethTx || st.relayed || st.txIn) ? "Your money has not moved." : early ? "The deposit may already be on its way: your funds are safe, but do not send from this address again until this transfer finishes." : "Your funds are safe.") + " Press Continue transfer to try again.";
-    v.action = "continue"; v.detail = ""; v.zec = !early; v.pct = shownPct((st.stealth || "") + "#" + (st.n || 0), st, 0, now);
+    v.kind = "warn"; v.title = "Transfer paused"; v.body = (wait ? "Problem: " + (cause || "network hiccup") + ". Retrying by itself in " + (wait < 120 ? wait + " s" : Math.ceil(wait / 60) + " min") + ". " : st.err ? "Stopped: " + cause + ". " : "") + (early && !(st.auth || st.ethTx || st.relayed || st.txIn || (st.prevIn && st.prevIn.length)) ? "Your money has not moved." : early ? "The deposit may already be on its way: your funds are safe, but do not send from this address again until this transfer finishes." : "Your funds are safe.") + " Press Continue transfer to try again.";
+    v.action = "continue"; v.detail = ""; v.zec = !early || !!(st.prevIn && st.prevIn.length);      // 1144 L-2: an earlier ETH deposit that was given up may still have landed: its ZEC comes to this hop wallet, so Return stays offered v.pct = shownPct((st.stealth || "") + "#" + (st.n || 0), st, 0, now);
   }
   return v;
 }

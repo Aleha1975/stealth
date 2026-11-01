@@ -956,7 +956,7 @@ const tAddrOf = async (n, a, i = 0) => ZRm.deriveT(await H.mnemonicSeed(await H.
   const { privateKeyToAccount } = await import("viem/accounts"), SE = privateKeyToAccount(PRIV).address.toLowerCase();      // the stealth address of PRIV: the fake chain recovers the sender from the signature, so the address must be the real one
   const ETHV = 30_000_000_000_000_000n, SC = 1_000_000_000n, nos = async () => {};
   const mkEth = (o = {}) => { const w = makeWorld({ ...o }); w.scale = SC; const c = makeEthChain({ onApply: tx => { const sw = w.swaps[tx.to]; if (sw && !w.lagPaid) { sw.paid = true; w.ethDeposits = (w.ethDeposits || 0) + 1; w.ethDepositValue = tx.value; w.depositTx = tx; } } }); c.set(SE, 10n ** 18n); return { w, c }; };
-  const ethApi = (c, o = {}) => ({ prepare: ({ to, value }) => E.prepareSend(c.rpc, { priv: PRIV, chainId: 4663, from: SE, to, value }), send: o.send || (tx => E.sendRaw(c.rpc, tx)), status: tx => E.txStatus(c.rpc, { from: SE, hash: tx.hash, nonce: tx.nonce }, { sleep: nos }) });
+  const ethApi = (c, o = {}) => ({ prepare: ({ to, value }) => E.prepareSend(c.rpc, { priv: PRIV, chainId: 4663, from: SE, to, value }), send: o.send || (tx => E.sendRaw(c.rpc, tx)), status: tx => E.txStatus(c.rpc, { from: SE, hash: tx.hash, nonce: tx.nonce }, { sleep: nos }), balance: async () => c.balOf(SE) });
   const ectx = (w, c, s, o = {}) => mkCtx(w, s, { stealth: SE, chain: rh, dest: rh, asset: "ETH", amount: ETHV, eth: ethApi(c), waitReceipt: (h, expect) => CR.waitFinal(c.rpc, h, { expect, sleep: nos, tries: 5, everyMs: 0 }), balance: async () => c.balOf(SE), ...o });
   const rec = async s => (await H.findHop(s, SE)).rec;
   // --- pure: requests, state, scrub
@@ -1004,11 +1004,51 @@ const tAddrOf = async (n, a, i = 0) => ZRm.deriveT(await H.mnemonicSeed(await H.
     const st1 = await H.startHop(ectx(w, c, s)), r1 = await rec(s);
     ok("the node refuses the broadcast: a Halt (no automatic retry), the signed bytes are KEPT (a refusal can be 'nonce too low' of a mined one), nothing was sent", st1.step === "DEPOSIT_IN" && st1.halted === true && /refused/.test(st1.err) && r1.st.ethTx && c.nonceOf(SE) === 0 && w.ethDeposits === undefined, st1.err);
     const hash = r1.st.ethTx.hash, st2 = await H.runHop(ectx(w, c, s));
-    ok("... pressing Continue sends those very bytes and completes", st2.step === "DONE" && c.sends.at(-1) === r1.st.ethTx.raw && w.ethDeposits === 1 && (await rec(s)).st.ethTx.hash === hash, st2.err); }
+    ok("... 1144 M-2: pressing Continue gives the refused bytes up (nonce free): a new quote, a NEW transaction on the SAME nonce, one deposit", st2.step === "DONE" && c.sends.at(-1) !== r1.st.ethTx.raw && w.ethDeposits === 1 && (await rec(s)).st.ethTx.hash !== hash && (await rec(s)).st.ethTx.nonce === r1.st.ethTx.nonce && c.nonceOf(SE) === 1, st2.err); }
   { const { w, c } = mkEth(), s = H.memStore(); off = 0; c.refuse = "insufficient funds for gas * price + value";
     await H.startHop(ectx(w, c, s)); const r1 = await rec(s); c.bump(SE);      // meanwhile ANOTHER transaction uses nonce 0 (and the signed bytes were never mined)
     const st2 = await H.runHop(ectx(w, c, s)), r2 = await rec(s);
     ok("its nonce was taken by another transaction: the old bytes are never sent; a new quote and a new transaction (next nonce) complete it, once", st2.step === "DONE" && !c.mined.has(r1.st.ethTx.hash) && r2.st.ethTx.nonce === "1" && w.ethDeposits === 1 && w.quotes.filter(q => !q.dry && q.originAsset === "nep141:hood.omft.near").length === 2, st2.err + " sends " + c.sends.length); }
+  // --- 1144 M-2: saved bytes whose nonce is still free are given up when their quote is about to expire; the replacement takes the SAME nonce
+  { const { w, c } = mkEth(), s = H.memStore(); off = 0;
+    const st1 = await H.startHop(ectx(w, c, s, { eth: ethApi(c, { send: async () => { throw new Error("tab crashed before the broadcast"); } }) })), r1 = await rec(s), oldRaw = r1.st.ethTx.raw, oldDep = r1.st.inQuote.depositAddress;
+    off += 3500_000;      // 100 s before the quote's deadline: inside the 120 s margin
+    const st2 = await H.runHop(ectx(w, c, s)), r2 = await rec(s);
+    ok("1144 M-2: unsent bytes + a quote inside its margin -> dropped, new quote, a new transaction on the SAME nonce 0; the old bytes were never sent; one deposit, to the NEW address", st2.step === "DONE" && !c.sends.includes(oldRaw) && c.sends.length === 1 && r2.st.ethTx.nonce === "0" && r2.st.ethTx.hash !== r1.st.ethTx.hash && r2.st.inQuote.depositAddress !== oldDep && w.ethDeposits === 1 && c.nonceOf(SE) === 1 && w.depositTx.to === r2.st.inQuote.depositAddress.toLowerCase(), st2.err);
+    ok("... the dropped transaction and its quote were kept while it could still land, and are cleared once the replacement is mined (same nonce: the old one is dead)", r1.st.prevIn === undefined && r2.st.prevIn === null); }
+  { const { w, c } = mkEth(), s = H.memStore(); off = 0; let oldRaw = null;
+    await H.startHop(ectx(w, c, s, { eth: ethApi(c, { send: async () => { throw new Error("tab crashed before the broadcast"); } }) })); const r1 = await rec(s); oldRaw = r1.st.ethTx.raw; off += 3500_000;
+    const race = ethApi(c); const prep = race.prepare; race.prepare = async a => { if (!race.landed) { race.landed = true; await E.sendRaw(c.rpc, { raw: oldRaw, hash: r1.st.ethTx.hash }); } return prep(a); };      // the OLD bytes land between the status read and the re-sign
+    const st2 = await H.runHop(ectx(w, c, s, { eth: race })), r2 = await rec(s);
+    ok("1144 M-2 race: the old bytes land after the drop -> the re-sign sees nonce 1 (not 0), signs and sends NOTHING more, follows the OLD deposit: one transaction on chain, one deposit, DONE", st2.step === "DONE" && c.sends.length === 1 && c.sends[0] === oldRaw && c.nonceOf(SE) === 1 && w.ethDeposits === 1 && r2.st.ethTx.hash === r1.st.ethTx.hash, st2.step + " " + st2.err + " sends " + c.sends.length); }
+  { const { w, c } = mkEth(), s = H.memStore(); off = 0; c.refuse = "max fee per gas less than block base fee";
+    const st1 = await H.startHop(ectx(w, c, s)), r1 = await rec(s);
+    ok("1144 M-2: a refusal is remembered in the record (ethRefused), the bytes are kept for now", st1.halted === true && r1.st.ethRefused === true && r1.st.ethTx);
+    const st2 = await H.runHop(ectx(w, c, s)), r2 = await rec(s);
+    ok("... the next Continue is not wedged: the refused bytes are given up, a new transaction on the same nonce completes it", st2.step === "DONE" && r2.st.ethTx.hash !== r1.st.ethTx.hash && r2.st.ethTx.nonce === "0" && w.ethDeposits === 1, st2.err); }
+  { const { w, c } = mkEth(), s = H.memStore(); off = 0; c.refuse = "nonce too low";
+    const st1 = await H.startHop(ectx(w, c, s)), r1 = await rec(s);
+    ok("1144 M-1: a 'nonce too low' answer is NOT a refusal (it may have been mined): no ethRefused flag, no Halt; the next pass asks the chain, finds it unsent and sends the SAME bytes (one transaction, one deposit)", !r1.st.ethRefused && st1.step === "DONE" && c.sends.length === 2 && c.sends[0] === c.sends[1] && w.ethDeposits === 1, JSON.stringify([r1.st.ethRefused, st1.step, st1.err])); }
+  // --- 1144 L-1: not mined in time -> the next pass asks the chain again and re-sends the same bytes when the transaction was dropped
+  { const { w, c } = mkEth(), s = H.memStore(); off = 0; let swallowed = null;
+    const st1 = await H.startHop(ectx(w, c, s, { eth: ethApi(c, { send: async tx => { swallowed = tx.raw; } }) })), r1 = await rec(s);      // the node "accepted" it and then dropped it
+    ok("1144 L-1: the receipt never comes -> txIn is cleared, the signed bytes stay", st1.step === "DEPOSIT_IN" && !r1.st.txIn && r1.st.ethTx && r1.st.ethTx.raw === swallowed && c.sends.length === 0, st1.err);
+    const st2 = await H.runHop(ectx(w, c, s)), r2 = await rec(s);
+    ok("... the next pass finds it unsent and re-sends the SAME bytes: done, one deposit", st2.step === "DONE" && c.sends.length === 1 && c.sends[0] === swallowed && w.ethDeposits === 1 && r2.st.ethTx.hash === r1.st.ethTx.hash, st2.err); }
+  // --- 1144 L-2: a lagging node counts the nonce before it serves the receipt: never "dead" while the balance says the deposit left
+  { const { w, c } = mkEth(), s = H.memStore(); off = 0;
+    await H.startHop(ectx(w, c, s, { eth: ethApi(c, { send: async () => { throw new Error("tab crashed before the broadcast"); } }) })); const r1 = await rec(s), q0 = w.quotes.filter(q => !q.dry).length;
+    w.lagPaid = true; c.hideReceipt = true; c.hideTx = true; await E.sendRaw(c.rpc, { raw: r1.st.ethTx.raw, hash: r1.st.ethTx.hash });      // mined, but this node serves neither the receipt nor the transaction yet, and 1Click has not seen the deposit
+    const st2 = await H.runHop(ectx(w, c, s)), r2 = await rec(s);
+    ok("1144 L-2: nonce used + receipt not served + balance fell by the deposit -> a Halt, NOT 'dead': same bytes kept, no new quote, nothing signed or sent", st2.step === "DEPOSIT_IN" && st2.halted === true && /probably landed/.test(st2.err) && r2.st.ethTx.hash === r1.st.ethTx.hash && !r2.st.prevIn && w.quotes.filter(q => !q.dry).length === q0 && c.sends.length === 1, st2.err);
+    c.hideReceipt = false; c.hideTx = false; w.lagPaid = false; w.swaps[r1.st.inQuote.depositAddress].paid = true;
+    const st3 = await H.runHop(ectx(w, c, s)); ok("... when the node catches up the same deposit is followed to the end: DONE, still one transaction, no new quote", st3.step === "DONE" && c.sends.length === 1 && c.nonceOf(SE) === 1 && w.quotes.filter(q => !q.dry).length === q0 + 1, st3.step + " " + st3.err + " " + c.sends.length); }
+  { const { w, c } = mkEth(), s = H.memStore(); off = 0;
+    await H.startHop(ectx(w, c, s, { eth: ethApi(c, { send: async () => { throw new Error("tab crashed before the broadcast"); } }) })); const r1 = await rec(s); c.bump(SE);      // another transaction took the nonce for real (the balance did not fall)
+    const st2 = await H.runHop(ectx(w, c, s)), r2 = await rec(s);
+    ok("1144 L-2: nonce taken by ANOTHER transaction, balance unchanged -> the old bytes go to prevIn with their quote while the hop starts again (then cleared by the mined replacement)", st2.step === "DONE" && r2.st.prevIn === null && r2.st.ethTx.nonce === "1" && w.ethDeposits === 1 && !c.mined.has(r1.st.ethTx.hash), st2.step + " " + st2.err + " " + JSON.stringify([r2.st.prevIn, r2.st.ethTx && r2.st.ethTx.nonce, w.ethDeposits]));
+    const mid = { st: { ...r2.st, step: "DEPOSIT_IN", prevIn: [{ quote: r1.st.inQuote, tx: r1.st.ethTx }], ethTx: null, err: "x", halted: true } };
+    ok("a paused ETH hop with an earlier deposit given up still offers Return money (its ZEC would come to the hop wallet)", Cd.hopView({ st: mid.st, running: false, msg: "" }, Date.now()).zec === true && Cd.hopView({ st: { ...mid.st, prevIn: null }, running: false, msg: "" }, Date.now()).zec === false); }
   { const { w, c } = mkEth(), s = H.memStore(); off = 0; c.revertNext = true;
     const st1 = await H.startHop(ectx(w, c, s)), r1 = await rec(s);
     ok("the deposit reverts on chain: nothing moved (only gas), a Halt, the bytes are dropped so Continue signs a fresh one", st1.step === "DEPOSIT_IN" && st1.halted === true && /reverted; nothing moved/.test(st1.err) && !r1.st.ethTx && !r1.st.txIn && c.balOf(SE) > 10n ** 18n - 10n ** 16n && w.ethDeposits === undefined, st1.err);

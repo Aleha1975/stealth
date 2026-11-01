@@ -8,7 +8,7 @@ import { keccak, signDigest, unhex, hex } from "./stealth-crypto.js";
 import { postRelay } from "./relay-post.js";
 import { timeoutSignal } from "./chain-read.js";
 import { privateFee, appFeesOf, assetOf, fmtUnits } from "./chains.js";
-import { refused as ethRefused } from "./eth-send.js";
+import { sendSettled } from "./eth-send.js";
 
 export const ONECLICK = "https://1click.chaindefuser.com";
 export const NEAR_RPCS = ["https://rpc.mainnet.near.org", "https://free.rpc.fastnear.com"];   // read-only: current_salt of intents.near
@@ -233,15 +233,10 @@ async function runPartEth(ctx, q, amount, say, fetchFn, sleep) {
   if (ctx.onSigned) ctx.onSigned({ depositAddress: q.depositAddress, amount, validBefore, ethTx: tx });
   say("Sending the " + A.symbol + " deposit from the stealth address (it pays its own network fee)…");
   const refuse = (m, e) => { const x = new Error(m + (e ? ": " + ((e && e.message) || e) : "")); x.refused = true; if (ctx.onRefused) ctx.onRefused(); return x; };
-  for (let i = 0; ; i++) {
-    try { await E.send(tx); break; }
-    catch (e) {
-      if (ethRefused(e)) throw refuse("the network refused the deposit transaction; nothing was sent", e);
-      if (i < 2) { await sleep(2000 * 3 ** i); continue; }      // a network failure: the same bytes are sent again (the same nonce cannot be paid twice)
-      const st = await E.status(tx).catch(() => null); if (st === "mined" || st === "pending") break;
-      throw new Error("could not confirm that the " + A.symbol + " deposit was sent (" + ((e && e.message) || e) + "). Check the explorer for tx " + tx.hash + "; deposit address " + q.depositAddress + ".");
-    }
-  }
+  const sr = await sendSettled({ send: () => E.send(tx), status: () => E.status(tx), sleep });      // 1144 M-1: "refused" is only believed when no earlier attempt ended unclear (the resend of a mined transaction is answered "nonce too low")
+  if (sr.outcome === "refused") throw refuse("the network refused the deposit transaction; nothing was sent", sr.error);
+  if (sr.outcome === "failed") throw refuse("the deposit transfer reverted (tx " + short(tx.hash) + "); nothing moved", null);
+  if (sr.outcome === "unknown") throw new Error("could not confirm that the " + A.symbol + " deposit was sent (" + ((sr.error && sr.error.message) || sr.error) + "). Check the explorer for tx " + tx.hash + "; deposit address " + q.depositAddress + ".");
   say("Deposit sent (tx " + short(tx.hash) + "), waiting for the block…");
   const rc = await ctx.waitReceipt(tx.hash);
   if (!rc.ok) { if (rc.unexpected) throw new Error("the deposit transaction is mined but is not the one we signed (tx " + short(tx.hash) + "). Check the explorer; deposit address " + q.depositAddress + "."); throw refuse("the deposit transfer reverted (tx " + short(tx.hash) + "); nothing moved", null); }
@@ -273,7 +268,7 @@ export function fastPlan(total, rng = Math.random, asset = "TOKEN") {
 export const FAST_OPEN = new Set(["PLANNED", "SIGNED", "DEPOSITED"]);
 /** Runs (or, with `resume`, only follows) the parts of `rec` one after the other. `save(rec)` is called at every transition, so a closed tab loses nothing that was sent:
  *  DEPOSITED parts are followed to their end on resume (1Click swaps whether or not the tab is open); a PLANNED part that was never signed becomes NOT_SENT (its money never left the stealth address);
- *  a SIGNED part whose deposit we did not see confirmed becomes UNKNOWN (check the explorer and the deposit address).
+ *  a SIGNED part whose deposit we did not see confirmed becomes UNKNOWN (check the explorer and the deposit address), except an ETH one the chain does not know with its nonce free and no live sender (ctx.senderGone): that one is NOT_SENT.
  *  ctx = what runPart needs + { onProgress, onSigned, onDeposited }. Returns rec. Throws after saving when a part fails before the money left. */
 export async function runFast(ctx, rec, save = () => {}, { resume = false } = {}) {
   const say = ctx.onProgress || (() => {}), n = rec.parts.length;
@@ -282,7 +277,7 @@ export async function runFast(ctx, rec, save = () => {}, { resume = false } = {}
     if (p.state === "SIGNED" && resume) {
       let seen = null; if (p.ethTx && ctx.ethStatus) { try { seen = await ctx.ethStatus(rec, p.ethTx); } catch { seen = null; } }      // ETH: the saved hash says what became of the transfer (nothing is ever re-sent on a resume)
       if (seen === "mined") { p.state = "DEPOSITED"; p.txHash = p.ethTx.hash; save(rec); await submitDeposit({ base: ctx.base, txHash: p.txHash, depositAddress: p.depositAddress, fetchFn: ctx.fetchFn }).catch(() => {}); }
-      else { p.state = seen === "failed" || seen === "dead" ? "NOT_SENT" : "UNKNOWN"; save(rec); continue; }      // reverted, or its nonce was used by another transaction: nothing moved
+      else { p.state = seen === "failed" || seen === "dead" || (seen === "unsent" && ctx.senderGone) ? "NOT_SENT" : "UNKNOWN"; save(rec); continue; }      // reverted, or its nonce was used by another transaction: nothing moved. 1144 I-3: "unsent" with ctx.senderGone (the caller holds the record's lock, so no tab is running it) = the node does not know it, its nonce is free and the only copy of the bytes died with the tab: it can never land
     }
     if (p.state === "PLANNED" && resume) { p.state = "NOT_SENT"; save(rec); continue; }
     if (p.state === "DEPOSITED") {
