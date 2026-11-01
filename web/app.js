@@ -674,7 +674,7 @@ async function fastWithdraw(to, value, hit, asset = "TOKEN") {
     findTx: a => txOfLogs({ address: USDC, topics: [AUTH_USED_TOPIC, "0x" + padAddr(w.stealth), a.nonce], span: logSpanSince(a.validBefore) }, () => true), onRefused: () => pendingWd.delete(k),
     onSigned: info => { cur = info; pendingWd.set(k, (info.validBefore + 60) * 1000); },       // armed before the request leaves; cleared only when the deposit is confirmed
     waitReceipt: h => eth ? waitReceipt(h, x => x.ok && x.hash === cur.ethTx.hash.toLowerCase()) : waitReceipt(h, x => hasTransfer(x, { token: USDC, from: w.stealth, to: cur.depositAddress, value: cur.amount }) && hasAuthUsed(x, { token: USDC, authorizer: w.stealth, nonce: cur.auth.nonce }), true),      // ETH: the hash of the transaction we signed binds its nonce, destination and amount
-    onDeposited: info => { if (info.index === rec.parts.length - 1) pendingWd.delete(k); spent.set(spentKey(k, eth), { left: (spent.get(spentKey(k, eth)) || { left: eth ? w.eth : w.usdc }).left - BigInt(rec.parts[info.index].amount), until: Date.now() + 120_000, ...(eth ? { asset: "ETH" } : {}) }); render(); } };
+    onDeposited: info => { if (info.index === rec.parts.length - 1) pendingWd.delete(k); spent.set(spentKey(k, eth), { left: (spent.get(spentKey(k, eth)) || { left: (eth ? w.eth : w.usdc) ?? 0n }).left - BigInt(rec.parts[info.index].amount), until: Date.now() + 120_000, ...(eth ? { asset: "ETH" } : {}) }); render(); } };
   try {
     const run = () => { fastClaim(rec); claimed = true; return PW.runFast(ctx, rec, save); };      // claimed inside the lock: a second tab is refused before it can write
     if (navigator.locks) await navigator.locks.request("fast-wd:" + k, { ifAvailable: true }, l => l ? run() : Promise.reject(new Error("A withdraw from this address is already running in another tab."))); else await run();
@@ -692,7 +692,7 @@ async function resumeFast() {
   for (const k of Object.keys(m)) {
     const rec = m[k]; if (!rec || !Array.isArray(rec.parts) || fastBusy.has(k)) continue;
     let ran = false;
-    const go = async () => { ran = true; fastBusy.add(k); try { await PW.runFast({ base: PW.ONECLICK, fetchFn: fetch, ethStatus: (r, tx) => ETH.txStatus(ethRpc, { from: r.stealth, hash: tx.hash, nonce: tx.nonce }), senderGone: !!navigator.locks, onProgress: t => { fastLive = "Earlier private withdraw: " + t; showFastBox(); } }, rec, r => { try { fastRecs.put(r); } catch {} }, { resume: true }); } finally { fastBusy.delete(k); fastLive = ""; } };
+    const go = async () => { ran = true; fastBusy.add(k); try { await PW.runFast({ base: PW.ONECLICK, fetchFn: fetch, ethStatus: (r, tx) => ETH.txStatus(ethRpc, { from: r.stealth, hash: tx.hash, nonce: tx.nonce }), onProgress: t => { fastLive = "Earlier private withdraw: " + t; showFastBox(); } }, rec, r => { try { fastRecs.put(r); } catch {} }, { resume: true }); } finally { fastBusy.delete(k); fastLive = ""; } };
     try { if (navigator.locks) await navigator.locks.request("fast-wd:" + k, { ifAvailable: true }, l => l ? go() : undefined); else await go(); } catch (e) { extra.push("Earlier private withdraw: " + (e.message || e)); continue; }
     if (!ran) continue;                                      // 1125 F-6: another tab holds the lock, so this record is a LIVE withdraw there, not an earlier one
     const chain = CHAINS[rec.chain] || C, un = unitsOf(chain, rec), sums = PW.fastSummary(rec, un.fmt, un.sym), text = "Earlier private withdraw (" + chain.name + "):\n" + sums.join("\n");

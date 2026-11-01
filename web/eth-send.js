@@ -67,6 +67,8 @@ export async function txStatus(rpc, { from, hash, nonce }, { sleep = ms => new P
 }
 const NONCE_USED = /nonce too low|nonce is too low|nonce has already been used/i, RATE_LIMIT = /rate.?limit|too many requests|\b429\b/i;
 /** Is this RPC error a definite refusal (the node answered and did not accept the transaction)? Not when the words say the nonce is used (the transaction may have been mined after all: a resend after a lost answer gets exactly that), not a hash mismatch (the node took SOMETHING), not a rate-limit body (said nothing about the transaction). Those need txStatus. */
+/** 1145 L-3: a refusal that does not prove the saved bytes are out of play (the node holds another tx at this nonce, its pool is full, or it lags on the balance): they are kept rather than replaced. */
+export const mayStillLand = e => /underpriced|pool is full|insufficient funds/i.test(String((e && e.message) || ""));
 export const refused = e => !!(e && e.rpc === true && !e.mismatch && !KNOWN.test(String(e.message || "")) && !NONCE_USED.test(String(e.message || "")) && !RATE_LIMIT.test(String(e.message || "")));
 /** May the SAME bytes simply be sent again? A network failure (no answer) or a rate-limit body. Any other answer is either a refusal or needs txStatus first. */
 export const resendable = e => !(e && e.rpc === true) || RATE_LIMIT.test(String(e.message || ""));

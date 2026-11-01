@@ -129,7 +129,8 @@ export function hopView(h, now = Date.now()) {
     const early = idx < STEPS.indexOf("WAIT_T");               // nothing has left the stealth address yet / no ZEC exists yet
     const cause = oneLine(st.err), wait = h.retryAt && h.retryAt > now ? Math.ceil((h.retryAt - now) / 1000) : 0;
     v.kind = "warn"; v.title = "Transfer paused"; v.body = (wait ? "Problem: " + (cause || "network hiccup") + ". Retrying by itself in " + (wait < 120 ? wait + " s" : Math.ceil(wait / 60) + " min") + ". " : st.err ? "Stopped: " + cause + ". " : "") + (early && !(st.auth || st.ethTx || st.relayed || st.txIn || (st.prevIn && st.prevIn.length)) ? "Your money has not moved." : early ? "The deposit may already be on its way: your funds are safe, but do not send from this address again until this transfer finishes." : "Your funds are safe.") + " Press Continue transfer to try again.";
-    v.action = "continue"; v.detail = ""; v.zec = !early || !!(st.prevIn && st.prevIn.length);      // 1144 L-2: an earlier ETH deposit that was given up may still have landed: its ZEC comes to this hop wallet, so Return stays offered v.pct = shownPct((st.stealth || "") + "#" + (st.n || 0), st, 0, now);
+    v.action = "continue"; v.detail = ""; v.zec = !early || !!(st.prevIn && st.prevIn.length);      // 1144 L-2: an earlier ETH deposit that was given up may still have landed: its ZEC comes to this hop wallet, so Return stays offered
+    v.pct = shownPct((st.stealth || "") + "#" + (st.n || 0), st, 0, now);
   }
   return v;
 }

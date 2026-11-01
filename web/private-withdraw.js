@@ -268,7 +268,7 @@ export function fastPlan(total, rng = Math.random, asset = "TOKEN") {
 export const FAST_OPEN = new Set(["PLANNED", "SIGNED", "DEPOSITED"]);
 /** Runs (or, with `resume`, only follows) the parts of `rec` one after the other. `save(rec)` is called at every transition, so a closed tab loses nothing that was sent:
  *  DEPOSITED parts are followed to their end on resume (1Click swaps whether or not the tab is open); a PLANNED part that was never signed becomes NOT_SENT (its money never left the stealth address);
- *  a SIGNED part whose deposit we did not see confirmed becomes UNKNOWN (check the explorer and the deposit address), except an ETH one the chain does not know with its nonce free and no live sender (ctx.senderGone): that one is NOT_SENT.
+ *  a SIGNED part whose deposit we did not see confirmed becomes UNKNOWN (check the explorer and the deposit address)
  *  ctx = what runPart needs + { onProgress, onSigned, onDeposited }. Returns rec. Throws after saving when a part fails before the money left. */
 export async function runFast(ctx, rec, save = () => {}, { resume = false } = {}) {
   const say = ctx.onProgress || (() => {}), n = rec.parts.length;
@@ -277,7 +277,7 @@ export async function runFast(ctx, rec, save = () => {}, { resume = false } = {}
     if (p.state === "SIGNED" && resume) {
       let seen = null; if (p.ethTx && ctx.ethStatus) { try { seen = await ctx.ethStatus(rec, p.ethTx); } catch { seen = null; } }      // ETH: the saved hash says what became of the transfer (nothing is ever re-sent on a resume)
       if (seen === "mined") { p.state = "DEPOSITED"; p.txHash = p.ethTx.hash; save(rec); await submitDeposit({ base: ctx.base, txHash: p.txHash, depositAddress: p.depositAddress, fetchFn: ctx.fetchFn }).catch(() => {}); }
-      else { p.state = seen === "failed" || seen === "dead" || (seen === "unsent" && ctx.senderGone) ? "NOT_SENT" : "UNKNOWN"; save(rec); continue; }      // reverted, or its nonce was used by another transaction: nothing moved. 1144 I-3: "unsent" with ctx.senderGone (the caller holds the record's lock, so no tab is running it) = the node does not know it, its nonce is free and the only copy of the bytes died with the tab: it can never land
+      else { p.state = seen === "failed" || seen === "dead" ? "NOT_SENT" : "UNKNOWN"; save(rec); continue; }      // reverted, or its nonce was used by another transaction: nothing moved. 1145 M-1: "unsent" stays UNKNOWN: a single node not knowing it, with no tab running, does not prove a broadcast already on its way cannot land
     }
     if (p.state === "PLANNED" && resume) { p.state = "NOT_SENT"; save(rec); continue; }
     if (p.state === "DEPOSITED") {

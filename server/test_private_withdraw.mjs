@@ -346,10 +346,10 @@ async function fastUnit() {
       await PW.runFast(ectx(w, c, { eth: api(c, { send: async () => { throw new Error("died before the broadcast"); } }), onSigned: i => { hash = i.ethTx.hash; } }), r, () => {}).catch(() => {});
       const base = { base: "http://1click", fetchFn: world().fetchFn, sleep: async () => {}, ethStatus: (rc, tx) => E.txStatus(c.rpc, { from: rc.stealth, hash: tx.hash, nonce: tx.nonce }, { sleep: nos }) };
       await PW.runFast({ ...base }, r, () => {}, { resume: true }); ok("1144 I-3: resume without proof that no tab is running it -> UNKNOWN as before", r.parts[0].state === "UNKNOWN");
-      r.parts[0].state = "SIGNED"; await PW.runFast({ ...base, senderGone: true }, r, () => {}, { resume: true });
-      ok("1144 I-3: resume under the record's lock (senderGone), node does not know it, nonce free -> NOT_SENT: nothing can land, no hour of guard", r.parts[0].state === "NOT_SENT" && PW.fastDone(r) && c.sends.length === 0);
+      r.parts[0].state = "SIGNED"; await PW.runFast(base, r, () => {}, { resume: true });
+      ok("1145 M-1: a node not knowing the tx is no proof: even with no tab running the part stays UNKNOWN, never NOT_SENT", r.parts[0].state === "UNKNOWN" && c.sends.length === 0);
       const r2 = erec(); r2.parts[0].state = "SIGNED"; r2.parts[0].depositAddress = "0x" + "e2".repeat(20); r2.parts[0].ethTx = { hash: "0x" + "ab".repeat(32), nonce: "0" };
-      await PW.runFast({ ...base, senderGone: true, ethStatus: async () => "pending" }, r2, () => {}, { resume: true }); ok("... a pending transaction is still UNKNOWN even then", r2.parts[0].state === "UNKNOWN"); }
+      await PW.runFast({ ...base, ethStatus: async () => "pending" }, r2, () => {}, { resume: true }); ok("... a pending transaction is still UNKNOWN even then", r2.parts[0].state === "UNKNOWN"); }
     { const w = world(), c = mkc(), r = erec(); let hash = null;
       await PW.runFast(ectx(w, c, { eth: api(c, { send: async tx => { await E.sendRaw(c.rpc, tx); throw new Error("tab died here"); } }), waitReceipt: async () => { throw new Error("tab died here"); }, onSigned: i => { hash = i.ethTx.hash; } }), r, () => {}).catch(() => {});
       ok("tab dies after the broadcast: the record is SIGNED with the hash", r.parts[0].state === "SIGNED" && r.parts[0].ethTx.hash === hash);

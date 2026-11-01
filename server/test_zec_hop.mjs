@@ -948,6 +948,10 @@ const tAddrOf = async (n, a, i = 0) => ZRm.deriveT(await H.mnemonicSeed(await H.
     ok("1141 M3: an exhausted part still stops an unsent part, and FAILED stays the end when nothing can be retried", H.nextStep({ parts: [r(1), { amount: "1" }] }).step === "FAILED" && H.nextStep({ parts: [r(1), { status: "AWAITING", tx: "t" }] }).step === "WAIT_SWAPS");
     const C = await import("../web/hop-card.js"), v = C.hopView({ st: { step: "DONE", stealth: "0x1", chain: "rh", dest: "rh", recipient: "0xD364DB3bf6b681D5aBD23E809D8BbfB26872a500", amount: "9940000", outTotal: "8759715", startedAt: 1000, doneAt: 2404000, shieldedAt: 601000, parts: [{ status: "SUCCESS", quote: { amountOut: "1" }, sentAt: 721000, endAt: 1501000 }, { status: "SUCCESS", quote: { amountOut: "1" }, sentAt: 961000, endAt: 2404000 }] } }, Date.now());
     ok("1141 timing: the finished card says when the ZEC was shielded and when each payout was sent and arrived", v.timing === "Shielded at 10:00 · payout 1 sent at 12:00, arrived at 25:00 · payout 2 sent at 16:00, arrived at 40:03", v.timing); }
+  { const E = await import("../web/eth-send.js"), C = await import("../web/hop-card.js"), bad = m => E.mayStillLand({ rpc: true, message: m });
+    ok("1145 L-3: underpriced, full pool and a lagging balance do not give the saved bytes up; a fee refusal does", bad("replacement transaction underpriced") && bad("txpool is full") && bad("insufficient funds for gas") && !bad("max fee per gas less than block base fee"));
+    const v = C.hopView({ st: { step: "SHIELD", stealth: "0x2", n: 0, chain: "rh", dest: "rh", recipient: "0xD364DB3bf6b681D5aBD23E809D8BbfB26872a500", amount: "1000000", startedAt: 1, stepAt: 1, err: "stop", halted: true }, running: false }, Date.now());
+    ok("1145 L-1: the paused card keeps its progress", v.pct > 0, String(v.pct)); }
   ok("31.10 no unhandled rejection in any of the runs above", unh === 0, String(unh));
 }
 
@@ -1000,7 +1004,7 @@ const tAddrOf = async (n, a, i = 0) => ZRm.deriveT(await H.mnemonicSeed(await H.
     ok("answer lost AND the tab closed before txIn was saved: the record has the bytes but no txIn", r1.st.ethTx && !r1.st.txIn || st1.step === "WAIT_T");
     const st2 = await H.runHop(ectx(w, c, s));
     ok("... a new session finds the transaction mined by its hash and goes on; still one transaction", st2.step === "DONE" && c.sends.length === 1 && w.ethDeposits === 1, st2.err); }
-  { const { w, c } = mkEth(), s = H.memStore(); off = 0; c.refuse = "insufficient funds for gas * price + value";
+  { const { w, c } = mkEth(), s = H.memStore(); off = 0; c.refuse = "max fee per gas less than block base fee";
     const st1 = await H.startHop(ectx(w, c, s)), r1 = await rec(s);
     ok("the node refuses the broadcast: a Halt (no automatic retry), the signed bytes are KEPT (a refusal can be 'nonce too low' of a mined one), nothing was sent", st1.step === "DEPOSIT_IN" && st1.halted === true && /refused/.test(st1.err) && r1.st.ethTx && c.nonceOf(SE) === 0 && w.ethDeposits === undefined, st1.err);
     const hash = r1.st.ethTx.hash, st2 = await H.runHop(ectx(w, c, s));

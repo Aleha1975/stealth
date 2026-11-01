@@ -487,6 +487,9 @@ export async function runHop(ctx) {
       const pv = prevOf()[prevOf().length - 1];
       if (pv && String(t.nonce) !== String(pv.tx.nonce)) {      // 1144 M-2: a replacement must take the nonce of the dropped bytes. A later nonce means the chain moved on: either those bytes landed in between, or the nonce was taken by another transaction
         const o = await E.status(pv.tx).catch(() => null);
+        if (o === "dead" && await resumePrev()) return true;      // 1145 L-2: same checks as the dead path below before an earlier deposit is forgotten
+        if (o === "dead" && pv.bal != null && bal === null) throw new Halt("could not read the balance to tell whether the earlier ETH deposit landed; nothing new was signed. Press Continue to check again");
+        if (o === "dead" && pv.bal != null && BigInt(bal) + BigInt(pv.quote.amountIn) <= BigInt(pv.bal)) throw new Halt("the balance fell by the amount of an earlier ETH deposit, so it probably landed; nothing new was signed. Press Continue to check again");
         if (o === "dead" || o === "failed") st.prevIn = prevOf().filter(x => x !== pv);      // can never be mined / reverted: the later nonce is safe (saved with t below)
         else if (o === "mined" || o === "pending") { if (await resumePrev()) return true; throw new Halt("an earlier ETH deposit is on the network; following it. Press Continue"); }
         else throw new Halt("the address's transaction count moved but the earlier ETH deposit cannot be told apart from another transaction; nothing new was signed. Press Continue to check again");
@@ -511,7 +514,7 @@ export async function runHop(ctx) {
           await dropEth(st.ethRefused ? "The network refused the saved ETH deposit; starting again with a new quote and a new transaction…" : "The saved ETH deposit was never sent and its quote is about to expire; starting again with a new quote…"); return true;
         }
         say("Sending the ETH deposit from the stealth address…");
-        try { await E.send(st.ethTx); } catch (e) { if (ETH.refused(e)) { st.ethRefused = true; await save(); throw new Halt("the network refused the ETH deposit (" + oneLineErr(e) + "); the signed transaction is kept. Press Continue to check again"); } throw e; }      // kept until the next pass asks the chain again: a refusal worded "nonce too low" is not a refusal (it was mined after all) and is never counted here
+        try { await E.send(st.ethTx); } catch (e) { if (ETH.refused(e)) { st.ethRefused = !ETH.mayStillLand(e); await save(); throw new Halt("the network refused the ETH deposit (" + oneLineErr(e) + "); the signed transaction is kept. Press Continue to check again"); } throw e; }      // kept until the next pass asks the chain again: a refusal worded "nonce too low" is not a refusal (it was mined after all) and is never counted here
       }
       st.txIn = st.ethTx.hash; await save();
     }
