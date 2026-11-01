@@ -146,9 +146,10 @@ const canRetry = p => (p.tries || 0) + 1 < PART_TRIES && p.refundAcct != null;
 export const failedPart = st => st.parts.findIndex(p => { const x = partState(p); return x === "failed" || (x === "refund" && !canRetry(p)); });
 export function nextStep(st) {
   const P = st.parts, S = P.map(partState), bad = failedPart(st), open = S.includes("open");
-  if (bad >= 0) return open ? { step: "WAIT_SWAPS" } : { step: "FAILED", result: P[bad].status };
-  const un = S.indexOf("unsent"); if (un >= 0) return { step: "DELAY", partIdx: un, delayUntil: P[un].at };
-  const rf = S.indexOf("refund"); if (rf >= 0) return { step: "WAIT_T", partIdx: rf, attempt: P[rf].refundAcct, tSeenHeight: null, tSeenAt: null };
+  const rf = P.findIndex((p, i) => S[i] === "refund" && canRetry(p));      // 1141 M: a part's own retry is not given up because a different part has ended for good
+  if (bad >= 0 && rf < 0) return open ? { step: "WAIT_SWAPS" } : { step: "FAILED", result: P[bad].status };
+  const un = bad >= 0 ? -1 : S.indexOf("unsent"); if (un >= 0) return { step: "DELAY", partIdx: un, delayUntil: P[un].at };
+  if (rf >= 0) return { step: "WAIT_T", partIdx: rf, attempt: P[rf].refundAcct, tSeenHeight: null, tSeenAt: null };
   return open ? { step: "WAIT_SWAPS" } : { step: "DONE" };
 }
 const stepNo = st => STEPS.indexOf(st.step === "WAIT_SWAPS" ? "SEND_OUT" : st.step) + 1;      // WAIT_SWAPS is the tail of the last step
@@ -420,7 +421,7 @@ export async function runHop(ctx) {
       if (announce && swapSeen.get(i) !== j.status) { swapSeen.set(i, j.status); say(partTag(i) + ": swap " + j.status); }
       if (PW.TERMINAL.has(j.status)) {
         const t = (((j.swapDetails || {}).destinationChainTxHashes) || [])[0];
-        p.status = j.status; if (t && t.hash) p.payoutTx = { hash: String(t.hash), url: String(t.explorerUrl || "") }; changed = true;
+        p.status = j.status; p.endAt = Date.now(); if (t && t.hash) p.payoutTx = { hash: String(t.hash), url: String(t.explorerUrl || "") }; changed = true;
       }
     }
     if (changed) { try { await save(); } catch {} }
@@ -558,7 +559,7 @@ export async function runHop(ctx) {
       if (partsOn()) { const p = P(); p.acct = i; p.refundAcct = null; p.at = Date.now() + delayMs(ctx.rand); await go("DELAY", { delayUntil: p.at }); }      // a refunded part is shielded again: short own delay, then sent from this account
       else if (st.mode) {                                        // H-1: split the shielded balance into random parts, each with its own random time
         const parts = planParts({ orchard: (lastB || await bal(i)).o, reserve: BigInt(st.reserve), mode: st.mode, rand: ctx.rand, now: Date.now(), acct: i });
-        await go("DELAY", { parts, partIdx: 0, delayUntil: parts[0].at });
+        await go("DELAY", { parts, partIdx: 0, delayUntil: parts[0].at, shieldedAt: Date.now() });
       } else await go("DELAY", { delayUntil: Date.now() + delayMs(ctx.rand) });         // state of the old code: one out-leg
     },
     async DELAY() {
@@ -570,7 +571,7 @@ export async function runHop(ctx) {
     },
     async QUOTE_OUT() {
       const p = P();
-      if (partsOn() && !p.tx && !p.raw) {                          // a part has ended for good while this one was waiting: nothing new is sent (as in the sequential build), the open swaps are followed to their end
+      if (partsOn() && !p.tx && !p.raw && !p.tries) {             // a part has ended for good while this one was waiting: nothing new is sent (as in the sequential build), the open swaps are followed to their end
         const f = failedPart(st); if (f >= 0 && f !== (st.partIdx || 0)) return openParts(st).length ? go("WAIT_SWAPS") : go("FAILED", { result: st.parts[f].status });
       }
       if (p.quote && (p.raw || Date.now() < p.quote.deadlineMs - 120_000)) return go("SEND_OUT");

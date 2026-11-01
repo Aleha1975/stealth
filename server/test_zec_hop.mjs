@@ -942,6 +942,12 @@ const tAddrOf = async (n, a, i = 0) => ZRm.deriveT(await H.mnemonicSeed(await H.
     ok("31.10 K2: one payout keeps the single tx link", v1.payouts.length === 1 && v1.link && /0xcccccccc/.test(v1.link.text), JSON.stringify(v1));
     const v0 = C.hopView({ st: { ...base, rebuilt: true } }, Date.now());
     ok("31.10 K3: a transfer rebuilt from the chain states no cost", !v0.sum, JSON.stringify(v0)); }
+  { const r = (tries, x = {}) => ({ status: "REFUNDED", tx: "t", tries, refundAcct: 5, ...x }), bad3 = { parts: [r(1), { status: "AWAITING", tx: "t" }, r(0)] };
+    ok("1141 M: with no open swap, an exhausted part does not cancel a different part's retry", H.nextStep({ parts: [r(1), { status: "SUCCESS", tx: "t" }, r(0)] }).step === "WAIT_T" && H.nextStep({ parts: [r(1), { status: "SUCCESS", tx: "t" }, r(0)] }).partIdx === 2);
+    ok("1141 M2: an open swap does not hold that retry back either", H.nextStep(bad3).step === "WAIT_T");
+    ok("1141 M3: an exhausted part still stops an unsent part, and FAILED stays the end when nothing can be retried", H.nextStep({ parts: [r(1), { amount: "1" }] }).step === "FAILED" && H.nextStep({ parts: [r(1), { status: "AWAITING", tx: "t" }] }).step === "WAIT_SWAPS");
+    const C = await import("../web/hop-card.js"), v = C.hopView({ st: { step: "DONE", stealth: "0x1", chain: "rh", dest: "rh", recipient: "0xD364DB3bf6b681D5aBD23E809D8BbfB26872a500", amount: "9940000", outTotal: "8759715", startedAt: 1000, doneAt: 2404000, shieldedAt: 601000, parts: [{ status: "SUCCESS", quote: { amountOut: "1" }, sentAt: 721000, endAt: 1501000 }, { status: "SUCCESS", quote: { amountOut: "1" }, sentAt: 961000, endAt: 2404000 }] } }, Date.now());
+    ok("1141 timing: the finished card says when the ZEC was shielded and when each payout was sent and arrived", v.timing === "Shielded at 10:00 · payout 1 sent at 12:00, arrived at 25:00 · payout 2 sent at 16:00, arrived at 40:03", v.timing); }
   ok("31.10 no unhandled rejection in any of the runs above", unh === 0, String(unh));
 }
 Date.now = realNow;

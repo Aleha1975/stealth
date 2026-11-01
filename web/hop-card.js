@@ -99,6 +99,8 @@ export function hopView(h, now = Date.now()) {
     const outN = Number(st.outTotal || (st.outQuote && st.outQuote.amountOut) || 0) / 10 ** dtok.decimals, inN = Number(st.amount || 0) / 10 ** tok.decimals;
     if (outN && inN && !st.rebuilt) v.sum = "Sent " + amt(st.amount, tok.decimals) + " " + tok.symbol + " · received " + got + " " + dtok.symbol + " · cost " + (inN - outN).toFixed(2) + " " + dtok.symbol + " (" + ((inN - outN) / inN * 100).toFixed(1) + "%)";
     v.line = "Total time " + v.elapsed + " (including any pause).";
+    const mark = at => at && st.startedAt ? fmtElapsed(at - st.startedAt) : "", P = Array.isArray(st.parts) ? st.parts : [];
+    if (P.length > 1 && P.every(x => x && x.sentAt && x.endAt)) v.timing = "Shielded at " + mark(st.shieldedAt) + " · " + P.map((x, i) => "payout " + (i + 1) + " sent at " + mark(x.sentAt) + ", arrived at " + mark(x.endAt)).join(" · ");
     const txUrl = x => /^https:\/\//.test(x.url || "") ? x.url : (dst.explorer || "") + "/tx/" + x.hash;
     v.payouts = (Array.isArray(st.parts) ? st.parts : []).filter(x => x && x.status === "SUCCESS" && x.quote && x.payoutTx && x.payoutTx.hash).map((x, i) => ({ text: "Payout " + (i + 1) + ": " + amt(x.quote.amountOut, dtok.decimals) + " " + dtok.symbol + " · tx " + x.payoutTx.hash.slice(0, 10) + "…", href: txUrl(x.payoutTx) }));
     if (st.recipient && dst.explorer) v.paidLink = { text: "Recipient " + short(st.recipient) + " on " + (dst.explorerName || "the explorer"), href: dst.explorer + "/address/" + st.recipient };
@@ -145,6 +147,7 @@ export function hopCard(h, cb = {}, now = Date.now()) {
   }
   if (v.sum) card.appendChild(el("div", "hop-line", v.sum));
   if (v.line) card.appendChild(el("div", "hop-line", v.line));
+  if (v.timing) card.appendChild(el("div", "hop-line", v.timing));
   if (v.payouts && v.payouts.length > 1) for (const r of v.payouts) { const a = el("a", "hop-link hop-payout", r.text); a.href = r.href; a.target = "_blank"; a.rel = "noopener noreferrer"; card.appendChild(a); }
   if (v.note) card.appendChild(el("div", "note hop-stale", v.note));
   if (v.body) card.appendChild(el("div", "hop-line", v.body));
