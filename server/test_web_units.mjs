@@ -475,8 +475,8 @@ const PRIV = new Uint8Array(32).fill(9), ACC = addressFromPriv(PRIV), A2 = "0x" 
     t("... and it is accepted by the chain, the destination got exactly the value, only the real gas (21000 x price) was spent", c.balOf(TO) === all.value && c.balOf(FROM) === 10n ** 17n - all.value - 21000n * 2_000_000_000n && c.nonceOf(FROM) === 1);
     t("sendableAll: a balance that cannot even pay the fee gives null", await E.sendableAll(c.rpc, { from: FROM, to: TO, balance: p.fee }) === null && await E.sendableAll(c.rpc, { from: FROM, to: TO, balance: 5n }) === null); }
   { const c = makeEthChain(); c.set(FROM, 10n ** 16n); const fee = (await E.planFee(c.rpc, { from: FROM, to: TO, value: 1n })).fee;
-    let e1 = null; try { await E.prepareSend(c.rpc, { priv: PRIV, chainId: 4663, from: FROM, to: TO, value: 10n ** 16n - fee + 1n }); } catch (e) { e1 = e; }
-    t("prepareSend: an amount that does not fit with the fee is refused BEFORE signing (e.short, 'Nothing was sent')", e1 && e1.short === true && /Nothing was sent/.test(e1.message) && c.sends.length === 0);
+    let e1 = null; try { await E.prepareSend(c.rpc, { priv: PRIV, chainId: 4663, from: FROM, to: TO, value: 10n ** 16n - fee / E.PRICE_X + 1n }); } catch (e) { e1 = e; }
+    t("prepareSend: an amount that does not fit with the fee at the node's own price is refused BEFORE signing (e.short, 'Nothing was sent')", e1 && e1.short === true && /Nothing was sent/.test(e1.message) && c.sends.length === 0);
     t("prepareSend: exactly balance minus fee fits", (await E.prepareSend(c.rpc, { priv: PRIV, chainId: 4663, from: FROM, to: TO, value: 10n ** 16n - fee })).nonce === "0");
     c.estFail = "execution reverted"; t("prepareSend: a failing gas estimate is an error, nothing is signed", await E.prepareSend(c.rpc, { priv: PRIV, chainId: 4663, from: FROM, to: TO, value: 1n }).then(() => false, e => /reverted/.test(e.message)));
     c.estFail = null; c.bump(FROM); c.bump(FROM);
