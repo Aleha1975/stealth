@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Offline test of the audit 1158 fixes in stealth_indexer.py (fake RPC, no node, no network): pinned head+logs (F-1), strict STEALTHPAY (F-2), /known needs a settled
+"""Offline test of the audit 1158 / 1163 / 1165 fixes in stealth_indexer.py (fake RPC, no node, no network): one trust rule (1165: head moves only over a block whose hash two endpoints return; one configured endpoint = trusted provider + parentHash chain; safe = min; receipts and logs checked against the agreed hash), strict STEALTHPAY (F-2), strict STEALTHPAY (F-2), /known needs a settled
 Transfer (F-3), reconcile deletes only on two agreeing reads + retry of failed receipts + retraction signal (F-4), bounded canonical cache (F-5), strict input and exact
 routes (F-6/F-11), total deadline and permit release (F-7). Run: python3 -B server/test_indexer_audit.py"""
-import json, os, socket, sqlite3, sys, tempfile, threading, time, urllib.request, urllib.error, importlib
+import hashlib, io, json, os, socket, sqlite3, sys, tempfile, threading, time, urllib.request, urllib.error, importlib, contextlib
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 V3 = "0xc07f54984abda1ef76dab6f602270b76a04e916d"
@@ -31,6 +31,7 @@ def load(**env):
 S = lambda n: "0x%040x" % (0xa000 + n)
 TX = lambda n: "0x%064x" % n
 w = lambda x: "%064x" % x
+H = lambda n, salt="": "0x" + hashlib.sha256(("%s:%d" % (salt, n)).encode()).hexdigest()      # хэш блока n в цепи «salt»: у честных точек salt пустой
 
 
 def mk_log(block, idx, stealth, caller, amount, n=None):
@@ -38,19 +39,23 @@ def mk_log(block, idx, stealth, caller, amount, n=None):
     eph = bytes.fromhex("02" + "ab" * 32)
     pad = lambda b: b + b"\0" * (-len(b) % 32)
     d = bytes.fromhex(w(64) + w(64 + 32 + 64)) + bytes.fromhex(w(33)) + pad(eph) + bytes.fromhex(w(len(meta))) + pad(meta)
-    return {"blockNumber": hex(block), "logIndex": hex(idx), "transactionHash": TX(n if n is not None else block * 100 + idx), "data": "0x" + d.hex(),
+    return {"blockNumber": hex(block), "blockHash": H(block), "logIndex": hex(idx), "transactionHash": TX(n if n is not None else block * 100 + idx), "data": "0x" + d.hex(),
             "topics": ["0x" + "5" * 64, "0x" + w(1), "0x" + w(int(stealth, 16)), "0x" + w(int(caller, 16))]}
 
 
-def rcpt(block, frm, transfers):
-    return {"from": frm, "blockNumber": hex(block), "status": "0x1",
+def rcpt(block, frm, transfers, bh=None):
+    return {"from": frm, "blockNumber": hex(block), "blockHash": bh or H(block), "status": "0x1",
             "logs": [{"address": USDC, "logIndex": hex(i), "topics": [TT, "0x" + w(int(a, 16)), "0x" + w(int(b, 16))], "data": "0x" + w(v)} for i, (a, b, v) in enumerate(transfers)]}
 
 
 class Chain:
-    """Fake endpoints: name -> {head, logs, receipts, fail}. Lagging node: honest about a shorter chain, answers a clean empty result beyond its head."""
+    """Fake endpoints: name -> {head, logs, receipts, fail, salt, safe, blocks_to, fake_high}. salt -- «своя цепь» (другие хэши блоков); lagging node: честен про короткую цепь, за головой отдаёт чистый пустой результат;
+    fake_high -- на любой номер отвечает выдуманным блоком (врущий «вверх» узел)."""
     def __init__(self, m, eps):
-        self.eps = eps; self.calls = []; m.RPCS = list(eps)
+        self.eps = eps; self.calls = []; m.RPCS = list(eps); m.NEED = min(2, len(eps))
+        def blk(e, n):
+            if e.get("fake_high"): return {"number": hex(n), "hash": H(n, "fake"), "parentHash": H(n - 1, "fake")}
+            return {"number": hex(n), "hash": H(n, e.get("salt", "")), "parentHash": H(n - 1, e.get("salt", ""))} if n <= e.get("blocks_to", e["head"]) else None
         def rpc1(u, method, params, t):
             e = self.eps[u]; self.calls.append((u, method))
             if e.get("fail"): raise RuntimeError("down")
@@ -58,8 +63,11 @@ class Chain:
                 e["once_fail"] = False; raise RuntimeError("down once")
             if method == "eth_blockNumber": return hex(e["head"])
             if method == "eth_getBlockByNumber":
-                if params[0] in ("safe", "latest"): return {"number": hex(e["head"])}
-                n = int(params[0], 16); return {"number": hex(n)} if n <= e.get("blocks_to", e["head"]) else None
+                if params[0] == "safe":
+                    if e.get("safe", 0) is None: raise RuntimeError("no safe tag")
+                    return blk({"head": 10**9, "salt": e.get("salt", "")}, e.get("safe", e["head"]))
+                if params[0] == "latest": return blk({"head": 10**9, "salt": e.get("salt", "")}, e["head"])
+                return blk(e, int(params[0], 16))
             if method == "eth_getLogs":
                 a, b = int(params[0]["fromBlock"], 16), int(params[0]["toBlock"], 16)
                 return [l for l in e["logs"] if a <= int(l["blockNumber"], 16) <= min(b, e["head"])]
@@ -101,80 +109,149 @@ os.environ["STEALTHPAY"] = V3.upper().replace("0X", "0x")
 sys.modules.pop("stealth_indexer", None); mm = importlib.import_module("stealth_indexer")
 check("F-2 mixed-case valid address accepted (lowercased)", mm.STEALTHPAY == V3)
 
-# ---- F-1 / 1163 M-1: head trust. A lags (head 100, clean empty beyond), B is ahead (200) and holds the announcement at block 150
-m = load()
-A = {"head": 100, "logs": []}; B = {"head": 200, "logs": [mk_log(150, 0, S(1), V3, 5_000_000)], "receipts": {TX(15000): rcpt(150, PAYER, [(PAYER, S(1), 5_000_000)])}}
-ch = Chain(m, {"A": A, "B": B})
-u, h, sf = m.pick_head(0)
-check("M-1 two endpoints: accepted head = the SECOND-highest (100), pinned to a node that has it", (u, h) == ("A", 100) and m._pk["quorum"])
-u, h, sf = m.pick_head(120)
-check("M-1 second endpoint lags (100 < head_done 120), the top one is ahead: no advance, no rollback", h == 120)
-A["head"] = 90; B["head"] = 95
-u, h, sf = m.pick_head(120)
-check("F-1 two endpoints below head_done = rollback accepted (to the second-highest)", h == 90)
-B["fail"] = True
-try: m.pick_head(120); r = False
-except RuntimeError: r = True
-check("F-1/I-2 one lagging answer alone (2 configured) is NOT a rollback at once", r)
-m.FALLBACK_S = 0.2; time.sleep(0.3)
-u, h, sf = m.pick_head(120)
-check("I-2 survivor still lagging after FALLBACK_S -> accepted (no endless stall)", h == 90)
-m.FALLBACK_S = 600; B["fail"] = False; A["head"] = 100; B["head"] = 200
-# whole loop: A=100 lags, B=200 (A within HEAD_SKEW): head_done stays <= 100; when A reaches 200 block 150 is delivered
-m.POLL = 0.02; m.RECONCILE_EVERY = 0.3
-threading.Thread(target=m.index_loop, daemon=True).start()
-time.sleep(1.0); c = m.db()
-hd = int(c.execute("SELECT v FROM meta WHERE k='head'").fetchone()[0])
-check("M-1 loop: head_done never above the second-highest head while A lags", hd <= 100 and count(m) == 0)
-A["head"] = 200; A["logs"] = B["logs"]; t0 = time.time()
-while time.time() - t0 < 10 and count(m) < 1: time.sleep(0.05)
-hd = int(c.execute("SELECT v FROM meta WHERE k='head'").fetchone()[0])
-check("F-1 loop: announcement at 150 found once both endpoints have the block", count(m) == 1 and hd == 200)
-c.close()
+def run_loop(m, secs=None, until=None, limit=10):
+    """Запустить index_loop в потоке; ждать until() до limit с (или secs секунд)."""
+    m.POLL = 0.02; m.RECONCILE_EVERY = 0.3
+    threading.Thread(target=m.index_loop, daemon=True).start()
+    if secs: time.sleep(secs); return
+    t0 = time.time()
+    while time.time() - t0 < limit and not until(): time.sleep(0.05)
 
-# ---- 1163 M-1: a lying-high head. B claims 5000 and has no logs; A is honest at 300 and gets announcements later
-m = load(); A = {"head": 300, "logs": []}; B = {"head": 5000, "logs": [], "blocks_to": 300}
-ch = Chain(m, {"A": A, "B": B})
-u, h, sf = m.pick_head(0)
-check("M-1 a head far above the second-highest is not accepted (300, not 5000)", h == 300)
-m = load(); B = {"head": 5000, "logs": [], "blocks_to": 300}; ch = Chain(m, {"B": B}); m.RPCS = ["B"]
-u, h, sf = m.pick_head(0)
-check("M-1 single endpoint: not quorum, head as claimed (5000) but ...", h == 5000 and not m._pk["quorum"])
-check("M-1 single endpoint: advance cut to the highest block the endpoint returns (300)", m._confirm_upto("B", 1, 5000) == 300)
-check("M-1 single endpoint: the whole chunk is returned when the block at its end exists", m._confirm_upto("B", 1, 200) == 200)
-try: m._confirm_upto("B", 301, 400); r = False
+
+def meta_get(m, k):
+    c = m.db(); r = c.execute("SELECT v FROM meta WHERE k=?", (k,)).fetchone(); c.close(); return r[0] if r else None
+
+
+# ---- 1165 M-1: ONE rule. head_done moves to b only over a block whose hash NEED endpoints return (2 configured -> two different endpoints; 1 configured -> trusted + parentHash chain)
+m = load(); A = {"head": 100, "logs": []}; B = {"head": 200, "logs": []}
+Chain(m, {"A": A, "B": B})
+check("1165 heads: candidate = the second-highest claim (100), not the top endpoint's 200", m.heads_now()[0] == 100)
+hb, eps = m.agreed(100, {})
+check("1165 agreed: both endpoints return the same hash at 100", hb == H(100) and eps == ["A", "B"])
+try: m.agreed(150, {}); r = False
 except RuntimeError: r = True
-check("M-1 single endpoint: nothing to advance over -> error, head_done stays", r)
-# whole loop with a single liar: head_done stops at 300; later real announcement at 400 is not skipped
-m.POLL = 0.02; m.RECONCILE_EVERY = 0.3; B["logs"] = []
-threading.Thread(target=m.index_loop, daemon=True).start(); time.sleep(0.8)
-c = m.db(); hd = int(c.execute("SELECT v FROM meta WHERE k='head'").fetchone()[0]); c.close()
-check("M-1 loop: single liar cannot move head_done over blocks it does not return (<= 300)", hd == 300)
-B["blocks_to"] = 5000; B["logs"] = [mk_log(400, 0, S(1), V3, 5_000_000)]; B["receipts"] = {TX(40000): rcpt(400, PAYER, [(PAYER, S(1), 5_000_000)])}
+check("1165 agreed: block 150 exists on B only -> no agreement (wait)", r)
+B["salt"] = "x"
+try: m.agreed(100, {}); r = False
+except RuntimeError as e: r = "no 2 endpoints agree" in str(e)
+check("1165 two endpoints with different hashes at the same block -> no agreement, no advance", r)
+B["salt"] = ""; B["fail"] = True
+try: m.heads_now(); r = False
+except RuntimeError: r = True
+check("1165 2 configured, only 1 answers -> waits (never takes one endpoint's word)", r)
+try: m.agreed(100, {}); r = False
+except RuntimeError: r = True
+check("1165 2 configured, only 1 returns the block -> no agreement", r)
+# safe tag: the lower of the two
+B["fail"] = False; A["head"] = B["head"] = 600; A["safe"] = 500; B["safe"] = 300; m.MODE = "latest"; m.CONF = 20
+check("1165 safe tag = min of the two endpoints (300), not one endpoint's (500)", m.heads_now() == (580, 300))
+A["safe"] = None
+check("1165 safe tag missing on one of two endpoints -> None (no safe claim)", m.heads_now() == (580, None))
+m = load(); Chain(m, {"A": {"head": 600, "logs": [], "safe": 500}}); m.MODE = "latest"; m.CONF = 20
+check("1165 one configured endpoint: head and safe are its own", m.heads_now() == (580, 500))
+
+# whole loop, 2 endpoints disagree on the hash -> no advance (and an ALERT after WAIT_ALERT_S); agree later -> the announcement at 150 is found, not skipped
+m = load(); m.WAIT_ALERT_S = 0.3
+A = {"head": 200, "logs": [mk_log(150, 0, S(1), V3, 5_000_000)], "receipts": {TX(15000): rcpt(150, PAYER, [(PAYER, S(1), 5_000_000)])}}
+B = {"head": 200, "logs": [mk_log(150, 0, S(1), V3, 5_000_000)], "salt": "x", "receipts": A["receipts"]}
+Chain(m, {"A": A, "B": B}); out = io.StringIO()
+with contextlib.redirect_stdout(out):
+    run_loop(m, secs=1.0)
+check("1165 loop: endpoints disagree on the hash -> head_done does not move, nothing indexed", meta_get(m, "head") is None and count(m) == 0)
+check("1165 loop: ALERT in the log after WAIT_ALERT_S without progress", "ALERT indexing has not advanced" in out.getvalue())
+B["salt"] = ""; t0 = time.time()
+while time.time() - t0 < 10 and count(m) < 1: time.sleep(0.05)
+time.sleep(0.2)
+check("1165 loop: once both agree the announcement at 150 is indexed and head_done = 200 with its hash stored", count(m) == 1 and meta_get(m, "head") == "200" and meta_get(m, "head_hash") == H(200))
+
+# one endpoint lies HIGH with fabricated block numbers: A honest at 300, B claims 5000 and invents every block
+m = load(); A = {"head": 300, "logs": []}; B = {"head": 5000, "logs": [], "fake_high": True}
+Chain(m, {"A": A, "B": B})
+check("1165 lying-high: candidate head is 300 (second-highest claim)", m.heads_now()[0] == 300)
+run_loop(m, secs=0.8)
+check("1165 lying-high with 2 endpoints: the fabricated hash at 300 is not confirmed by A -> no advance at all", meta_get(m, "head") is None)
+# the liar is honest up to 300 and silent above: moves to 300 only; the real announcement at 400 appears later and is NOT skipped
+m = load(); A = {"head": 300, "logs": []}; B = {"head": 5000, "logs": [], "blocks_to": 300}
+Chain(m, {"A": A, "B": B})
+run_loop(m, secs=0.8)
+check("1165 lying-high (honest below 300): head_done stops at 300, never over unmined blocks", meta_get(m, "head") == "300")
+A["head"] = 500; A["logs"] = [mk_log(400, 0, S(1), V3, 5_000_000)]; A["receipts"] = {TX(40000): rcpt(400, PAYER, [(PAYER, S(1), 5_000_000)])}
+time.sleep(0.6)
+check("1165 lying-high: head_done does not pass the liar's last real block while it cannot confirm 400", meta_get(m, "head") == "300" and count(m) == 0)
+B["blocks_to"] = 5000; B["head"] = 500; B["logs"] = A["logs"]                                       # the second endpoint catches up (and, being honest now, agrees)
+B["fake_high"] = False; B["receipts"] = A["receipts"]
 t0 = time.time()
 while time.time() - t0 < 10 and count(m) < 1: time.sleep(0.05)
-check("M-1 loop: the announcement at block 400 is indexed once the blocks exist (not skipped)", count(m) == 1)
+check("1165 lying-high: once two endpoints confirm block 500 the announcement at 400 is indexed (not skipped)", count(m) == 1 and meta_get(m, "head") == "500")
 
-# ---- 1163 I-2: a single configured endpoint: a low read must repeat
-m = load(); A = {"head": 100, "logs": []}; ch = Chain(m, {"A": A})
-try: m.pick_head(150); r = False
+# logs: a getLogs answer from the agreed chain must carry the agreed blockHash and stay inside [a,b]
+m = load(); A = {"head": 300, "logs": []}; B = {"head": 300, "logs": []}; Chain(m, {"A": A, "B": B})
+bad = mk_log(150, 0, S(1), V3, 5_000_000); bad["blockHash"] = H(150, "other")
+try: m.check_logs([bad], 100, 200, {}); r = False
+except RuntimeError as e: r = "agreed hash" in str(e)
+check("1165 logs: a log whose blockHash is not the agreed hash of its block is rejected", r)
+try: m.check_logs([mk_log(250, 0, S(1), V3, 5_000_000)], 100, 200, {}); r = False
+except RuntimeError as e: r = "outside" in str(e)
+check("1165 logs: a block outside the requested range is rejected", r)
+check("1165 logs: honest logs pass", m.check_logs([mk_log(150, 0, S(1), V3, 5_000_000)], 100, 200, {}) is None)
+B["salt"] = "x"
+try: m.check_logs([mk_log(150, 0, S(1), V3, 5_000_000)], 100, 200, {}); r = False
 except RuntimeError: r = True
-check("I-2 single endpoint: first low read refused", r)
-u, h, sf = m.pick_head(150)
-check("I-2 single endpoint: second consecutive low read accepted as rollback", h == 100)
-m = load(); A = {"head": 100, "logs": []}; ch = Chain(m, {"A": A})
-try: m.pick_head(150)
-except RuntimeError: pass
-A["head"] = 160; m.pick_head(150); A["head"] = 100
-try: m.pick_head(150); r = False
-except RuntimeError: r = True
-check("I-2 a normal read in between resets the low-read counter", r)
+check("1165 logs: endpoints that disagree on the block of a log -> not accepted", r)
 
-# ---- 1163 M-1: --rewind
-m = load(); meta_set(m, head=1000); put(m, 900, 0, S(1), V3, 5_000_000, 5_000_000)
+# ONE configured endpoint (trusted provider): moves by its own word, but parentHash continuity against the stored hash catches a backend switch
+m = load(); A = {"head": 200, "logs": []}; Chain(m, {"A": A})
+run_loop(m, until=lambda: meta_get(m, "head") == "200")
+check("1165 single endpoint: indexes to 200 and stores the hash of block 200", meta_get(m, "head") == "200" and meta_get(m, "head_hash") == H(200))
+A["salt"] = "z"; A["head"] = 400; A["logs"] = [mk_log(150, 0, S(7), V3, 5_000_000)]            # backend switched to another chain: its block 201 has another parent
+for l in A["logs"]: l["blockHash"] = H(150, "z")
+A["receipts"] = {TX(15000): rcpt(150, PAYER, [(PAYER, S(7), 5_000_000)], bh=H(150, "z"))}
+out = io.StringIO(); t0 = time.time()
+with contextlib.redirect_stdout(out):
+    while time.time() - t0 < 10 and count(m) < 1: time.sleep(0.05)
+    time.sleep(0.3)
+check("1165 single endpoint backend switch: parentHash mismatch is reported", "does not match the stored hash" in out.getvalue())
+check("1165 single endpoint backend switch: the window is re-read (announcement at 150 not skipped) and the chain continues from the new hashes", count(m) == 1 and meta_get(m, "head") == "400" and meta_get(m, "head_hash") == H(400, "z"))
+# first start / a database without head_hash: the first step is accepted without a comparison
+m = load(); meta_set(m, head=100); Chain(m, {"A": {"head": 150, "logs": []}}); run_loop(m, until=lambda: meta_get(m, "head") == "150")
+check("1165 no stored hash yet (new database / older version): accepted, hash stored", meta_get(m, "head") == "150" and meta_get(m, "head_hash") == H(150))
+# a single endpoint that claims a head it cannot serve does not move the index (the block at b must exist)
+m = load(); Chain(m, {"A": {"head": 5000, "logs": [], "blocks_to": 300}}); run_loop(m, secs=0.6)
+check("1165 single endpoint claiming a head it cannot serve: waits", meta_get(m, "head") is None)
+
+# a head below head_done is not a rollback (no automatic walk back on one word): the loop just waits; a real fork shows as a parentHash mismatch
+m = load(); meta_set(m, head=150); Chain(m, {"A": {"head": 100, "logs": []}, "B": {"head": 100, "logs": []}}); run_loop(m, secs=0.5)
+check("1165 head below head_done: no rollback, head_done stays", meta_get(m, "head") == "150")
+
+# receipts used for paid (and /known): blockHash must equal the agreed hash of the block (2 endpoints)
+m = load(); A = {"head": 500, "logs": [], "receipts": {}}; B = {"head": 500, "logs": []}; Chain(m, {"A": A, "B": B})
+rowb = {"scheme": 1, "eph": "0x02" + "ab" * 32, "meta": "0x11a9059cbb" + USDC[2:] + w(5_000_000), "view_tag": "0x11", "log_index": 10}
+A["receipts"][TX(1)] = rcpt(10, PAYER, [(PAYER, V3, 5_000_000), (V3, S(1), 5_000_000)])
+A["receipts"][TX(2)] = rcpt(10, PAYER, [(PAYER, V3, 5_000_000), (V3, S(2), 5_000_000)], bh=H(10, "forged"))     # right block number, forged block hash
+A["receipts"][TX(3)] = rcpt(10, PAYER, [(PAYER, V3, 5_000_000), (V3, S(3), 5_000_000)])
+for n in (1, 2): pc = m.db(); m.put_row(pc, dict(rowb, block=10, tx=TX(n), stealth=S(n), caller=V3), {}, "A"); pc.commit(); pc.close()
+B["salt"] = "x"                                                                                    # the endpoints now disagree about block 10
+pc = m.db(); m.put_row(pc, dict(rowb, block=10, tx=TX(3), stealth=S(3), caller=V3), {}, "A"); pc.commit(); pc.close()
+c = m.db(); rows = {r[0]: r[1:] for r in c.execute("SELECT stealth,payer,paid FROM ann")}; c.close()
+check("1165 receipt: blockHash equals the agreed hash -> payer and paid set", rows[S(1)] == (PAYER, 5_000_000))
+check("1165 receipt: right blockNumber but forged blockHash -> payer and paid stay NULL", rows[S(2)] == (None, None))
+check("1165 receipt: no agreement on the block hash between endpoints -> NULL (retried later)", rows[S(3)] == (None, None))
+B["salt"] = ""; meta_set(m, safe_block=1000)
+check("1165 receipt: row with a forged receipt is not known", True)
+n = m.fix_rows(m.db(), "A", 1000); c = m.db(); rows = {r[0]: r[1:] for r in c.execute("SELECT stealth,payer,paid FROM ann")}; c.close()
+check("1165 receipt: fix_rows retries; agreed rows filled, the forged one stays NULL", rows[S(3)] == (PAYER, 5_000_000) and rows[S(2)] == (None, None))
+m2 = load(); Chain(m2, {"A": {"head": 500, "logs": [], "receipts": {TX(1): rcpt(10, PAYER, [(PAYER, V3, 5_000_000), (V3, S(1), 5_000_000)], bh=H(10, "forged"))}}})
+pc = m2.db(); m2.put_row(pc, dict(rowb, block=10, tx=TX(1), stealth=S(1), caller=V3), {}, "A"); pc.commit(); pc.close()
+c = m2.db(); r1 = c.execute("SELECT payer,paid FROM ann").fetchone(); c.close()
+check("1165 receipt: ONE configured endpoint = trusted provider, the receipt is taken as served", r1 == (PAYER, 5_000_000))
+
+# ---- 1163 M-1 / 1165 I-5: --rewind (bumps epoch, drops the stored hash)
+m = load(); meta_set(m, head=1000, head_hash=H(1000)); put(m, 900, 0, S(1), V3, 5_000_000, 5_000_000)
 m.START = 1; m.rewind(300)
 c = m.db(); check("M-1 rewind moves head back N blocks, rows stay", c.execute("SELECT v FROM meta WHERE k='head'").fetchone()[0] == "700" and count(m) == 1)
+check("1165 I-5 rewind bumps epoch (clients re-read) and drops the stored hash", meta_get(m, "epoch") == "1" and meta_get(m, "head_hash") is None)
 m.rewind(10_000_000); check("M-1 rewind never goes below START-1", c.execute("SELECT v FROM meta WHERE k='head'").fetchone()[0] == "0"); c.close()
+check("1165 I-5 every rewind bumps epoch", meta_get(m, "epoch") == "2")
 import subprocess
 env = dict(os.environ); r0 = subprocess.run([sys.executable, "-B", os.path.join(HERE, "stealth_indexer.py"), "--rewind", "x"], env=env, capture_output=True, text=True)
 check("M-1 rewind CLI refuses a bad N", r0.returncode != 0 and "usage" in (r0.stdout + r0.stderr))
@@ -415,6 +492,7 @@ def refuses(**env):
 check("I-4 KNOWN_SAFE=0 with a public RPC refused", refuses(STEALTH_KNOWN_SAFE="0", STEALTH_RPC="https://base-rpc.publicnode.com"))
 check("I-4 KNOWN_SAFE=0 with no RPC set (chains.json public defaults) refused", refuses(STEALTH_KNOWN_SAFE="0"))
 check("I-4 KNOWN_SAFE=0 with a lookalike host refused", refuses(STEALTH_KNOWN_SAFE="0", STEALTH_RPC="http://127.0.0.1.evil.example:8545"))
+check("1165 I-2 KNOWN_SAFE=0 with URL userinfo (http://localhost:80@evil.example/) refused: the host is evil.example", refuses(STEALTH_KNOWN_SAFE="0", STEALTH_RPC="http://localhost:80@evil.example/"))
 check("I-4 KNOWN_SAFE=0 on a loopback fork accepted", not refuses(STEALTH_KNOWN_SAFE="0", STEALTH_RPC="http://127.0.0.1:8545"))
 check("I-4 KNOWN_SAFE=0 with STEALTH_FORK=1 accepted", not refuses(STEALTH_KNOWN_SAFE="0", STEALTH_RPC="https://example.org", STEALTH_FORK="1"))
 check("I-4 default (KNOWN_SAFE on) unaffected", not refuses(STEALTH_RPC="https://base-rpc.publicnode.com"))
@@ -424,6 +502,33 @@ m.pages_step = lambda c, fb: seen_fin.append(fb)
 threading.Thread(target=m.index_loop, daemon=True).start(); time.sleep(0.6)
 c = m.db(); fbm = c.execute("SELECT v FROM meta WHERE k='final_block'").fetchone(); c.close()
 check("I-4 pages_step gets the same final block as the meta (500 - 200 = 300)", seen_fin and set(seen_fin) == {300} and fbm and fbm[0] == "300")
+
+# ---- 1165 L-2: one process-wide token bucket for API-originated RPC calls (the indexer thread is not charged)
+m = load(); Chain(m, {"A": {"head": 5, "logs": []}})
+m.API_RPC_RATE = 0.0; m._tb.update({"n": 3.0, "t": time.monotonic()}); m._tl.calls = 0
+n_ok = 0
+try:
+    for _ in range(10): m.rpc("eth_blockNumber", []); n_ok += 1
+except m.RateLimited: pass
+check("1165 L-2 the bucket stops API-originated RPC calls after its capacity (3), across requests", n_ok == 3)
+m._tl.calls = None
+check("1165 L-2 the indexer thread (no per-request counter) does not draw from the bucket", all(m.rpc("eth_blockNumber", []) for _ in range(20)))
+m.API_RPC_RATE = 1000.0; m._tb.update({"n": 0.0, "t": time.monotonic()}); time.sleep(0.05); m._tl.calls = 0
+check("1165 L-2 the bucket refills with time", m.rpc("eth_blockNumber", []) is not None); m._tl.calls = None
+m.API_RPC_RATE = 0.0; m._tb.update({"n": 0.0, "t": time.monotonic()}); srv, J = serve(m)
+st, d = J("/receipt?tx=0x" + "c" * 64)
+check("1165 L-2 an empty bucket answers 429 (retryable), not 500", st == 429)
+m._tb.update({"n": 5.0, "t": time.monotonic()}); st, d = J("/head")
+check("1165 L-2 routes that make no RPC call are unaffected by an empty bucket", st == 200)
+
+# ---- 1165 I-3: what verified means
+m = load(); sqlx = m.db(); ETHM = "0x11eeeeeeee" + "ee" * 20 + w(10 ** 15)
+def ins(n, caller, meta, paid): sqlx.execute("INSERT INTO ann(block,tx,log_index,scheme,stealth,caller,eph,meta,view_tag,payer,paid) VALUES(?,?,?,?,?,?,?,?,?,?,?)", (n, TX(n), 0, 1, S(n), caller, "0x02" + "ab" * 32, meta, "0x11", None, paid))
+TOKM = "0x11a9059cbb" + USDC[2:] + w(5_000_000)
+ins(1, V3, TOKM, 5_000_000); ins(2, V3, TOKM, 0); ins(3, V3, TOKM, None); ins(4, V3, ETHM, 0); ins(5, V3, ETHM, None); ins(6, OTHER, TOKM, 5_000_000); ins(7, V3, "0x11deadbeef" + "00" * 52, 0); sqlx.commit(); sqlx.close()
+srv, J = serve(m); st, d = J("/announcements?since=0&limit=10")
+check("1165 I-3 verified: token row with a found Transfer = 1; token row with paid 0 = 0; receipt pending = 0; payETH with a parsed receipt = 1; payETH pending = 0; foreign caller = 0; unknown selector = 0",
+      [r["verified"] for r in d["rows"]] == [1, 0, 0, 1, 0, 0, 0])
 
 # ---- 1163 I-3: nginx wasm location (text check; nginx is not run here)
 ng = open(os.path.join(HERE, "..", "ops", "nginx-stealth-zec.conf")).read()

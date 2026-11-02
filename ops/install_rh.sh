@@ -68,12 +68,15 @@ if [ -f $OPT/watch.env ]; then ok "watch.env present"; else echo "[warn] $OPT/wa
 
 # 5. nginx (zones, snippet, include check, nginx -t; reload only after a passing test)
 ZONES=/etc/nginx/conf.d/stealth-rh-zones.conf; SNIP=/etc/nginx/snippets/stealth-rh.conf
-if nginx -T 2>/dev/null | grep -q 'zone=st_rh_read'; then ok "nginx zones st_rh_* already defined"; else
+if nginx -T 2>/dev/null | grep -q 'zone=st_rh_read'; then ok "nginx zones st_rh_* already defined"
+  nginx -T 2>/dev/null | grep 'zone=st_rh_' | grep -q 'binary_remote_addr' && echo "[todo] the st_rh_* zones still key on \$binary_remote_addr: switch them to \$st_ipkey (map: $D/stealth-ipkey-map.conf)"
+else
   say "write $ZONES (limit_req/limit_conn zones + st_tail cache path)"
   if [ $APPLY = 1 ]; then
     grep -rq 'keys_zone=st_tail' /etc/nginx 2>/dev/null && TAIL="" || TAIL='proxy_cache_path /var/cache/nginx/stealth_tail levels=1 keys_zone=st_tail:2m max_size=64m inactive=1m use_temp_path=off;'
     install -d /var/cache/nginx
-    printf '%s\n' 'limit_req_zone $binary_remote_addr zone=st_rh_read:10m rate=10r/s;' 'limit_req_zone $binary_remote_addr zone=st_rh_post:10m rate=10r/m;' 'limit_conn_zone $binary_remote_addr zone=st_rh_conn:10m;' "$TAIL" > $ZONES
+    nginx -T 2>/dev/null | grep -q 'map $remote_addr $st_ipkey' && MAP="" || MAP="$(cat "$D/stealth-ipkey-map.conf")"       # the conf header calls the map REQUIRED (audit 1099 M-2); the zones below key on it
+    printf '%s\n' "$MAP" 'limit_req_zone $st_ipkey zone=st_rh_read:10m rate=10r/s;' 'limit_req_zone $st_ipkey zone=st_rh_post:10m rate=10r/m;' 'limit_conn_zone $st_ipkey zone=st_rh_conn:10m;' "$TAIL" > $ZONES
   fi
 fi
 if [ -f $SNIP ] && cmp -s "$D/stealth-rh.conf" $SNIP; then ok "snippet $SNIP"; else run install -D -m 644 "$D/stealth-rh.conf" $SNIP; fi

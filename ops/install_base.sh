@@ -105,12 +105,15 @@ done
 # 6. nginx: own zones, snippet, include; reload only after a passing nginx -t, restore on failure
 ZONES=/etc/nginx/conf.d/stealth-base-zones.conf; SNIP=/etc/nginx/snippets/stealth-base.conf
 NGX_CH=0
-if nginx -T 2>/dev/null | grep -q 'zone=st_base_read'; then ok "nginx zones st_base_* already defined"; else
+if nginx -T 2>/dev/null | grep -q 'zone=st_base_read'; then ok "nginx zones st_base_* already defined"
+  nginx -T 2>/dev/null | grep 'zone=st_base_' | grep -q 'binary_remote_addr' && echo "[todo] the st_base_* zones still key on \$binary_remote_addr: switch them to \$st_ipkey (map: $D/stealth-ipkey-map.conf; README_ops.txt, audit 1165 L-2)"
+else
   say "write $ZONES (limit_req/limit_conn zones st_base_*; the st_tail cache path comes from the RH zones file)"
   if [ $APPLY = 1 ]; then
     grep -rq 'keys_zone=st_tail' /etc/nginx 2>/dev/null && TAIL="" || TAIL='proxy_cache_path /var/cache/nginx/stealth_tail levels=1 keys_zone=st_tail:2m max_size=64m inactive=1m use_temp_path=off;'
     install -d /var/cache/nginx; guard_path $ZONES; backup $ZONES
-    printf '%s\n' 'limit_req_zone $binary_remote_addr zone=st_base_read:10m rate=10r/s;' 'limit_req_zone $binary_remote_addr zone=st_base_post:10m rate=10r/m;' 'limit_conn_zone $binary_remote_addr zone=st_base_conn:10m;' "$TAIL" > $ZONES
+    nginx -T 2>/dev/null | grep -q 'map $remote_addr $st_ipkey' && MAP="" || MAP="$(cat "$D/stealth-ipkey-map.conf")"       # audit 1165 L-2: one IPv6 /64 = one client; the map is defined once per host (the RH installer writes the same one)
+    printf '%s\n' "$MAP" 'limit_req_zone $st_ipkey zone=st_base_read:10m rate=10r/s;' 'limit_req_zone $st_ipkey zone=st_base_post:10m rate=10r/m;' 'limit_conn_zone $st_ipkey zone=st_base_conn:10m;' "$TAIL" > $ZONES
   fi
   NGX_CH=1
 fi

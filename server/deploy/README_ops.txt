@@ -166,11 +166,9 @@ StealthPay used[] griefing and fee collision (audit 1161; contracts unchanged, f
   The NatSpec text in src/StealthPay.sol is NOT changed (it would change the metadata hash of the verified deployed bytecode).
 
 Audit 1163 (indexer re-review) -- what changes on deploy
-  M-1  Head trust. With >= 2 endpoints the indexer takes the SECOND-highest head (a node that overstates its head cannot move the index over unmined blocks); with one endpoint every step is cut to the highest block that endpoint returns
-       (eth_getBlockByNumber) and a lower head is a rollback only after two reads in a row. Base ships two endpoints: live Base = dRPC (STEALTH_RPC, key only in the root-only env file) + publicnode, see base.env.example.
-       Tolerance STEALTH_HEAD_SKEW_S: 300 s on Base (the safe tag moves in L1-batch jumps of minutes), 30 s on RH (latest, seconds); beyond it for STEALTH_FALLBACK_S (600 s) the lagging endpoint is treated as stuck and the single-endpoint rule applies.
-       RH chains.json has one official endpoint: add a second one in STEALTH_RPC when one exists. block_ms in chains.json (Base 2000, RH 104: measured over 100k blocks on 02.11.2026) converts seconds to blocks.
-       RECOVERY after a past lie (rows missing): stop the service, then  python3 stealth_indexer.py --rewind <N blocks>  (same env file), start the service. Rows above stay; the re-read only inserts the missing ones. N = blocks since the first bad head.
+  M-1  (REPLACED by the single rule of audit 1165 below: second-highest head, pinning, fallback, STEALTH_HEAD_SKEW_S, STEALTH_FALLBACK_S and the per-step block-number probe are gone.)
+       RECOVERY after a past lie (rows missing): stop the service, then  python3 stealth_indexer.py --rewind <N blocks>  (same env file), start the service. Rows above stay; the re-read only inserts the missing ones.
+       N = blocks since the first bad head. Since 1165 it also bumps `epoch` (clients re-read) and drops the stored head hash.
   L-1  paid = the one Transfer to the stealth address whose amount equals the announced amount and that StealthPay made (from = StealthPay) or that precedes the announce log in the receipt (payToken: transferFrom by the payer, then announce;
        payWithAuthorization: payer -> StealthPay -> stealth, then announce; v2 and v3 have the same layout). Extra Transfers in the same tx no longer count. This replaces the 1161 L-1 "sum of all Transfers" (feeRecipient == stealth now gives paid = the net, as announced).
        After deploy run once:  python3 stealth_indexer.py --backfill-paid  (rows filled earlier keep the old sum until then; /known only needs paid >= MIN, so nothing is refused that was accepted for a real payment).
@@ -178,6 +176,32 @@ Audit 1163 (indexer re-review) -- what changes on deploy
   L-4  /balances without Multicall3 takes at most STEALTH_MAX_SINGLE (20) addresses; every API request has an RPC-call budget STEALTH_REQ_MAX_CALLS (100). limit_req for /stealth-api/base/ and /stealth-api/rh/ is in stealth-base.conf / stealth-rh.conf (st_*_read on every
        indexer location). The OLD live Base location (/stealth-api/ -> 3873, outside this repo) must carry its own limit_req_zone/limit_req on the same routes: check it on the host.
   I-1  announcement cache: also <= STEALTH_ANN_CACHE_ENTRIES (2048) entries, and only for since <= current max id.
-  I-2  one configured endpoint: a lower head must repeat on the next read; several configured but one answering and lagging: accepted as a rollback after STEALTH_FALLBACK_S instead of stalling forever.
+  I-2  (REPLACED by 1165: a head below head_done is never a rollback by itself; the loop waits, a real fork shows as a parentHash mismatch, see below.)
   I-3  ops/nginx-stealth-zec.conf: no types{} override at the zec location any more (inherits the http map); the .wasm location has an empty types{} + default_type application/wasm. nginx -t before reload.
   I-4  STEALTH_KNOWN_SAFE=0 refused unless every RPC is loopback or STEALTH_FORK=1; final_block and the pages margin use one formula; a failing DB open answers 500.
+
+Audit 1165 (indexer, third re-review) -- ONE trust rule instead of pinning / second-highest / fallback / skew
+  Rule.  head_done moves to block b only when b's hash is confirmed. >= 2 configured endpoints: the SAME hash must come from two different endpoints (a block hash covers the whole chain under it); logs for [a,b]
+         come from one of those two, every log must lie in [a,b] and carry the agreed blockHash of its block (a log of another chain / an invented block is refused). Disagreement, one endpoint down, or a block only
+         one endpoint has -> indexing WAITS, it never advances on one endpoint's word. Exactly ONE configured endpoint (RH today): a trusted provider by configuration (stated in rh.env.example); the only check is that
+         block a's parentHash equals the stored hash of head_done (meta head_hash), so a switched or forking backend makes the indexer step back 100 blocks and re-read (INSERT OR IGNORE, a non-insert-only reconcile
+         follows) instead of skipping. Residual: an endpoint that agrees on the hash at b but OMITS logs inside [a,b] is not detected (the 60 s reconcile window re-reads the last 100 blocks); a lying single provider
+         is not detected at all.
+  Wait.  No progress for STEALTH_WAIT_ALERT_S (default 600 s = a node restart or resync; longer is an outage someone must see) -> "ALERT indexing has not advanced ..." in the log, repeated every 600 s; /head `ts` stops
+         moving meanwhile, so the stealth_watch lag check fires too. Base with two providers: if one is down the index stalls until it is back (by design); remove its URL from STEALTH_RPC to run on one, knowingly.
+  Safe.  With >= 2 endpoints the safe tag is the lower of the two (second-highest of >= 3), never one endpoint's.
+  Receipts.  With >= 2 endpoints a receipt (payer, paid, therefore /known) counts only if its blockHash equals the agreed hash of its block (blockNumber alone is not enough). A receipt that fails stays NULL and fix_rows retries.
+  Removed.  pick_head, _pin, _confirm_upto, _blk_exists, HEAD_SKEW (STEALTH_HEAD_SKEW_S), FALLBACK_S (STEALTH_FALLBACK_S), automatic head rollback on a low read. An old STEALTH_HEAD_SKEW_S / STEALTH_FALLBACK_S in the env file is ignored.
+  L-2  One process-wide token bucket for API-originated RPC calls: STEALTH_API_RPC_RATE 20 calls/s, STEALTH_API_RPC_BURST = STEALTH_REQ_MAX_CALLS (100). Empty bucket -> HTTP 429 (retryable). The Base nginx zones now key on $st_ipkey
+       (one IPv6 /64 = one client) like RH; the map is deploy/stealth-ipkey-map.conf, written by the installers. EXISTING hosts: the zones file already exists with $binary_remote_addr (the installers only print a [todo]); edit
+       conf.d/stealth-base-zones.conf (and stealth-rh-zones.conf) to $st_ipkey, make sure `map $remote_addr $st_ipkey` is defined once, nginx -t, reload.
+  I-1  limit_conn on /announcements, limit_req + limit_conn on the pages locations (pages burst 300: the client downloads missing pages with 6 workers and fails on 429; raise the burst before the history passes 300 pages).
+  I-2  STEALTH_KNOWN_SAFE=0 loopback check parses the URL (urlparse hostname) instead of a regex.
+  I-3  `verified` = our StealthPay announced it AND the receipt was parsed AND, for a token row, a Transfer to the stealth address of exactly the announced amount was found in it (paid > 0). payETH rows (selector 0xeeeeeeee):
+       logs do not show native ETH, the contract itself guarantees the amount (the call to the stealth address succeeded, msg.value is announced), so a parsed receipt is enough (paid = 0). Token rows with paid = 0, unknown selectors
+       and foreign callers are unverified. Rows verified earlier that no longer qualify flip to 0: run  --backfill-paid  once after deploy so the history pages (and their manifest version) are rewritten.
+  I-4  moot: the skew default is gone; the mode everywhere is MODE (STEALTH_HEAD_MODE override).
+  I-5  --rewind bumps epoch.
+  DEPLOY ORDER  (1) on the host: edit the nginx zones to $st_ipkey (above), nginx -t; (2) stop the indexer, deploy stealth_indexer.py (the DB needs no migration; meta head_hash appears after the first step), start it, watch the log
+       for "index error" lines: "no 2 endpoints agree" means the two providers really differ; (3) --backfill-paid once; (4) RH: nothing to configure (one endpoint = stated trust); add a second URL when one exists;
+       (5) Base: STEALTH_RPC must hold TWO independent providers (dRPC + publicnode), as in base.env.example.
