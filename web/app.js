@@ -31,7 +31,7 @@ let acct = null, keys = null, found = [];
 // one run at a time per button (a double click used to start two wallet prompts / two payments)
 const once = fn => { let on = false; return async (...a) => { if (on) return; on = true; try { return await fn(...a); } finally { on = false; } }; };
 const ethDust = f => f.eth === undefined || f.eth === null ? false : f.eth <= (ethFeeNow ?? 0n);      // an ETH balance that cannot pay for its own transfer
-const isEmpty = f => f.usdc === 0n && (f.token !== "ETH" || ethDust(f));      // nothing left to withdraw from this payment (what a private transfer that has left the address leaves behind)
+const isEmpty = f => f.usdc === 0n && (!ETHOK || ethDust(f));      // nothing left to withdraw from this payment (what a private transfer that has left the address leaves behind)
 const hitOf = f => checkAnnouncement(f.legacy && keys && keys.legacy ? keys.legacy : keys, f.eph, null);
 const sel = sig => hex(keccak(new TextEncoder().encode(sig)).slice(0, 4));
 const pad = v => (typeof v === "bigint" ? v.toString(16) : String(v).replace(/^0x/, "")).padStart(64, "0");
@@ -53,7 +53,7 @@ function setAcct(a) {
   const changed = acct && (a || "").toLowerCase() !== acct;
   acct = a ? a.toLowerCase() : null;
   $("wbtn").textContent = acct ? acct.slice(0, 6) + "…" + acct.slice(-4) : "Connect wallet"; $("wbtn").classList.toggle("on", !!acct);
-  if (changed) { keys = null; found = []; $("recv-out").hidden = true; $("pay-list").textContent = ""; $("withdraw").hidden = true; say("recv-hint", "Account changed: derive the keys again for this account.", "warn"); }
+  if (changed) { keys = null; found = []; try { hops.clear(); lost.clear(); lostNone.clear(); lostDone.clear(); renderHops(); } catch {} $("recv-out").hidden = true; $("pay-list").textContent = ""; $("withdraw").hidden = true; say("recv-hint", "Account changed: derive the keys again for this account.", "warn"); }
   try { if ($("fast-resume")) { showFastBox(); if (acct && fastDeferred) { fastDeferred = false; resumeFast().catch(() => {}); } } } catch {}      // 1132 M-1: this account's recovery notes (a try/catch, not a typeof check: showFastBox is hoisted, the bindings it reads are not). 1135 L-4: records that waited for an account are followed now
 }
 async function connect() {
@@ -132,18 +132,20 @@ function idb() {
 }
 const idbGet = (db, key) => new Promise(res => { try { const q = db.transaction("p").objectStore("p").get(key); q.onsuccess = () => res(q.result || null); q.onerror = () => res(null); } catch { res(null); } });
 const idbPut = (db, key, val) => new Promise(res => { try { const t = db.transaction("p", "readwrite"); t.objectStore("p").put(val, key); t.oncomplete = () => res(); t.onerror = () => res(); t.onabort = () => res(); } catch { res(); } });
+// 1159 I-3: a full history page has exactly page_size rows of [id, block, tx, stealth, eph, meta, payer(, verified)]; 7 fields = a page written before the verification field (all its rows count as unverified)
+const goodPage = (rows, man) => Array.isArray(rows) && rows.length === man.page_size && rows.every(r => Array.isArray(r) && (r.length === 7 || r.length === 8) && isHash(r[2]) && isAddr(r[3]));
 /** Returns k => rows[] for pages 0..full_pages-1; fetches only pages missing from the local cache (6 at a time). */
 async function getPages(man) {
   const db = await idb(), pages = new Array(man.full_pages), key = k => C.key + "|" + k + "|" + man.version;
   const need = [];
-  for (let k = 0; k < man.full_pages; k++) { const hit = db ? await idbGet(db, key(k)) : null; if (Array.isArray(hit)) pages[k] = hit; else need.push(k); }
+  for (let k = 0; k < man.full_pages; k++) { const hit = db ? await idbGet(db, key(k)) : null; if (goodPage(hit, man)) pages[k] = hit; else need.push(k); }      // 1159 I-3: a cached page that does not look like a full page is fetched again
   let next = 0;
   const worker = async () => {
     for (;;) {
       const i = next++; if (i >= need.length) return; const k = need[i];
       const r = await fetch(API + "/pages/p" + String(k).padStart(6, "0") + ".json?v=" + man.version, { signal: timeoutSignal(60000) });      // 1109 L-2
       if (!r.ok) throw new Error("history page " + k + " unavailable (" + r.status + ")");
-      const rows = await r.json(); if (!Array.isArray(rows)) throw new Error("bad history page " + k);
+      const rows = await r.json(); if (!goodPage(rows, man)) throw new Error("bad history page " + k);
       pages[k] = rows; if (db) await idbPut(db, key(k), rows);
       if (i % 8 === 0) say("pay-hint", "Downloading history " + (man.full_pages - need.length + i + 1) + "/" + man.full_pages + "…");
     }
@@ -166,15 +168,18 @@ async function scan() {
   const head = await api("/head");
   if (head.lag != null && head.lag > 50) say("pay-hint", "Index is " + head.lag + " blocks behind the chain; very recent payments may not show yet.", "warn");
   else say("pay-hint", "Reading announcements on " + C.name + "…");
-  const K = keys, mine = []; let n = 0;                      // 1101 I-2: this run works on its own list and its own keys; a changed account discards it
-  const check = (id, block, tx, stealth, eph, meta, payer) => {
+  const K = keys, A = acct, mine = [], byStealth = new Map(); let n = 0;                      // 1101 I-2: this run works on its own list and its own keys; a changed account discards it
+  const check = (id, block, tx, stealth, eph, meta, payer, v) => {
     n++;
     if (!eph || !isHash(tx) || !isAddr(stealth)) return;
     const md = decodeMetadata(meta) || {};
     for (const [k, legacy] of K.legacy ? [[K, false], [K.legacy, true]] : [[K, false]]) {       // 1098 L-1: legacy (raw high-s) keys are scanned too
       const hit = checkAnnouncement(k, eph, md.viewTag);          // view-tag filter first, full check only on a tag match
       if (!hit || hit.stealth.toLowerCase() !== stealth.toLowerCase()) continue;
-      mine.push({ stealth: hit.stealth, tx, block: Number(block) || 0, token: md.token, amount: md.amount, payer: isAddr(payer) ? payer : null, eph, legacy }); return;
+      // 1159 M-1: v = the indexer saw our StealthPay announce it and parsed the receipt (history page field 8 / API "verified"); anything else (an old page, a forged Announcer call) stays unverified. One row per stealth address: a verified one wins
+      const rec = { stealth: hit.stealth, tx, block: Number(block) || 0, token: md.token, amount: md.amount, payer: isAddr(payer) ? payer : null, eph, legacy, v: v === 1 || v === true, acct: A }, sk = hit.stealth.toLowerCase(), at = byStealth.get(sk);
+      if (at === undefined) { byStealth.set(sk, mine.length); mine.push(rec); } else if (rec.v && !mine[at].v) mine[at] = rec;
+      return;
     }
   };
   let since = 0;
@@ -184,7 +189,7 @@ async function scan() {
   if (man) {
     const rowsOf = await getPages(man);
     for (let k = 0; k < man.full_pages; k++) {
-      for (const r of rowsOf(k)) check(r[0], r[1], r[2], r[3], r[4], r[5], r[6]);
+      for (const r of rowsOf(k)) check(r[0], r[1], r[2], r[3], r[4], r[5], r[6], r[7]);
       if (k % 20 === 19) say("pay-hint", n + " announcements checked…");
     }
     since = man.tail_since_id;
@@ -192,9 +197,10 @@ async function scan() {
   for (let loops = 0; ; loops++) {
     if (loops > 5000) throw new Error("The index returned an implausible number of announcements; stopping.");     // 1098 I-3
     const d = await api("/announcements?since=" + since + "&limit=2000");
-    for (const r of d.rows) { if (r.scheme === 1) check(r.id, r.block, r.tx, r.stealth, r.eph, r.meta, r.payer); }
+    if (!Array.isArray(d.rows)) throw new Error("bad announcements answer");      // 1159 I-3: checked BEFORE iterating
+    for (const r of d.rows) { if (r && r.scheme === 1) check(r.id, r.block, r.tx, r.stealth, r.eph, r.meta, r.payer, r.verified); }
     if (n % 2000 === 0 && n) say("pay-hint", n + " announcements checked…");
-    if (!Array.isArray(d.rows) || !d.rows.length || d.next === since) break; since = d.next;
+    if (!d.rows.length || d.next === since) break; since = d.next;
   }
   if (keys !== K) return;                                    // the account changed while scanning: nothing of this run is shown
   found = mine; render(); showResume().catch(() => {}); resumeFast().catch(() => {});      // 1101 M-1: the payments are listed BEFORE any balance is read; a failing RPC can no longer hide them
@@ -218,7 +224,7 @@ async function refreshBalances(redraw = true) {
       f.usdc = x.usdc; f.eth = x.eth; const se = spent.get(spentKey(f.stealth, true)), su = spent.get(spentKey(f.stealth, false)); if (se && Date.now() < se.until && f.eth > se.left) f.eth = se.left; if (su && Date.now() < su.until && f.usdc > su.left) f.usdc = su.left; }
   } };
   await Promise.all(Array.from({ length: Math.min(3, pages.length) }, worker));
-  if (ETHOK) { const ef = list.find(f => f.token === "ETH" && f.eth > 0n); if (ef) { try { ethFeeNow = (await ETH.planFee(ethRpc, { from: ef.stealth, to: ef.stealth, value: 1n })).fee; } catch { ethFeeNow = null; } } }      // an ETH balance below one transfer's fee is dust: no Withdraw button for it
+  if (ETHOK) { const ef = list.find(f => f.eth > 0n); if (ef) { try { ethFeeNow = (await ETH.planFee(ethRpc, { from: ef.stealth, to: ef.stealth, value: 1n })).fee; } catch { ethFeeNow = null; } } }      // an ETH balance below one transfer's fee is dust: no Withdraw button for it
   if (redraw && list === found) render();
   return unread;
 }
@@ -249,6 +255,7 @@ const zecText = z => (Number(z) / 1e8).toFixed(8).replace(/0+$/, "").replace(/\.
 // 1136 F-2: the range of hop wallets looked at is always said (1-based), with what was NOT looked at when the cap cut it
 const scanText = r => r && r.top > r.lo ? "Looked at transfer wallet" + (r.top - r.lo > 1 ? "s " + (r.lo + 1) + "–" + r.top : " " + r.top) + (r.capped ? "; " + r.lo + " older wallet" + (r.lo > 1 ? "s were" : " was") + " not looked at." : ".") : "";
 async function setLost(HM, k, f, hit, res) {      // res: a findLostFunds result (or one merged with an older scan)
+  if (f.acct !== acct) return;      // 1159 L-2: a check that outlived an account switch adds no card
   if (!res.found.length) { lostNone.set(k, res); return; }
   let tip = null; try { tip = await (await import("./zec-return.js")).getTip((await import("./chains.js")).zcash.lightwalletd); } catch {}      // 1133 M-1: no tip = young (fail closed)
   lost.set(k, { f, hit, ...res, n: res.found[0].n, young: HM.lostYoung(res.found, tip), contAcct: HM.lostContinueAcct(res.found) });
@@ -339,7 +346,7 @@ async function lostGuard(l) {
 // 1136 F-4: Return needs only the keys: no record is adopted, so every recoverable wallet keeps its Return button (h.lost marks the card the result comes back to)
 // 1144 L-4: a lost transfer has no record to say which coin it moved, and an address can hold both. The default comes from what the address holds now: the coin of the payment to it (a private transfer pays out the coin it took in) when that coin has gone
 // or the other one is not held; when it holds BOTH there is no default and the user chooses on the card. Nothing is signed or returned before a coin is set.
-const lostCoinDefault = f => { if (!ETHOK) return "TOKEN"; const payEth = f.token === "ETH", ethHeld = f.eth > 0n && !ethDust(f), tokHeld = f.usdc > 0n, payHeld = payEth ? ethHeld : tokHeld, otherHeld = payEth ? tokHeld : ethHeld; return payHeld && otherHeld ? null : payEth ? "ETH" : "TOKEN"; };
+const lostCoinDefault = f => { if (!ETHOK) return "TOKEN"; const payEth = f.v && f.token === "ETH", ethHeld = f.eth > 0n && !ethDust(f), tokHeld = f.usdc > 0n, payHeld = payEth ? ethHeld : tokHeld, otherHeld = payEth ? tokHeld : ethHeld; return payHeld && otherHeld ? null : payEth ? "ETH" : "TOKEN"; };
 const payAsset = l => { const c = l.coin !== undefined ? l.coin : lostCoinDefault(l.f); if (c !== "ETH" && c !== "TOKEN") throw new Error("This address holds both " + SYM + " and " + NAT + ": choose which coin this transfer moved (above the buttons) first."); return c; };
 const lostReturn = async (k, l, card) => returnZec({ f: l.f, hit: l.hit, running: false, msg: "", st: { n: l.n }, lost: k, asset: payAsset(l) }, card);
 async function lostContinue(k, l, to, line) {
@@ -365,6 +372,7 @@ const SWEEP_KEY = "stealth-sweep-intents", sweepIntents = { key: h => h.f.stealt
 async function returnZec(h, card) {
   const [HM, ZR] = await Promise.all([hopMod(), import("./zec-return.js")]), { zcash: ZC } = await import("./chains.js");
   if (!acct) throw new Error("Connect your wallet first.");
+  if (!h.f || h.f.acct !== acct) throw new Error("These keys were derived for another account: switch back to it (or derive the keys again for this account and scan) before returning the money.");      // 1159 L-2: the payout is quoted to the connected account
   const line = el("div", "hop-line", "Looking for the ZEC…"); card.appendChild(line); const step = t => { line.textContent = t; };
   const seed = await HM.mnemonicSeed(await HM.mnemonicFor(h.hit.stealthPriv, await HM.loadWords(), h.st.n || 0));
   let key = null, utxos = [], unspendable = false;
@@ -467,18 +475,19 @@ function render() {
   if (!found.length) { list.appendChild(el("p", "note", "Nothing found yet. Payments appear a few seconds after they land.")); return; }
   found.forEach((f, i) => {
     const row = el("div", "pay"); const top = el("div", "row"); top.style.justifyContent = "space-between";
-    const label = f.token === "ETH" ? fmtEth(f.amount || 0n) + " " + NAT : f.token && f.token.toLowerCase() === USDC.toLowerCase() ? fmtTok(f.amount) + " " + SYM : "payment";
+    const ethFirst = f.v && f.token === "ETH", held = f.usdc > 0n ? fmtTok(f.usdc) + " " + SYM : f.eth > 0n ? fmtEth(f.eth) + " " + NAT : null;      // 1159 M-1: the announced figure is shown only for a verified row; otherwise the balance on the chain is the main figure
+    const label = !f.v ? (held ? held + " (unverified)" : "unverified payment") : f.token === "ETH" ? fmtEth(f.amount || 0n) + " " + NAT : f.token && f.token.toLowerCase() === USDC.toLowerCase() ? fmtTok(f.amount) + " " + SYM : "payment";
     top.appendChild(el("span", "amt", label)); top.appendChild(el("span", "mono", f.stealth.slice(0, 8) + "…" + f.stealth.slice(-4)));
     row.appendChild(top);
     const hp = activeHop(f);
-    const small = el("small", null, "block " + f.block + " · " + (hp ? fmtAs(assetKey(hp.st), BigInt(hp.st.amount)) + " " + symAs(assetKey(hp.st)) + " · in private transfer" : (f.usdc === undefined ? "reading balance…" : f.usdc === null ? "balance not read (scan again)" : f.token === "ETH" ? "now holds " + fmtEth(f.eth || 0n) + " " + NAT + (f.usdc ? " + " + fmtTok(f.usdc) + " " + SYM : "") : "now holds " + fmtTok(f.usdc) + " " + SYM) + (f.token !== "ETH" && f.eth ? " + " + fmtEth(f.eth) + " " + NAT : "")) + " · ");
+    const small = el("small", null, "block " + f.block + " · " + (hp ? fmtAs(assetKey(hp.st), BigInt(hp.st.amount)) + " " + symAs(assetKey(hp.st)) + " · in private transfer" : (f.usdc === undefined ? "reading balance…" : f.usdc === null ? "balance not read (scan again)" : ethFirst ? "now holds " + fmtEth(f.eth || 0n) + " " + NAT + (f.usdc ? " + " + fmtTok(f.usdc) + " " + SYM : "") : "now holds " + fmtTok(f.usdc) + " " + SYM) + (!ethFirst && f.eth ? " + " + fmtEth(f.eth) + " " + NAT : "")) + " · ");
     const a = el("a", null, "tx"); a.href = C.explorer + "/tx/" + f.tx; a.target = "_blank"; a.rel = "noopener noreferrer"; small.appendChild(a); row.appendChild(small);
     const kk = f.stealth.toLowerCase();
     if (!hp && isEmpty(f) && lostNone.has(kk) && !lost.has(kk) && (self.crossOriginIsolated || lostNone.get(kk).capped)) { const nr = lostNone.get(kk), d = el("div"), ln = el("div", "note", scanText(nr)), bar = el("div", "row"); d.style.marginTop = "8px"; d.appendChild(ln); d.appendChild(bar);      // 1136 F-2: an empty result says what it looked at
       const mk = (txt, fn) => { const b = el("button", "btn ghost", txt); b.type = "button"; b.addEventListener("click", () => { b.disabled = true; fn(kk, f, hitOf(f), ln).catch(e => { ln.textContent = (e && e.message) || String(e); }).finally(() => { b.disabled = false; }); }); bar.appendChild(b); };
       if (self.crossOriginIsolated) mk("Check shielded balance", lostShielded); if (nr.capped) mk("Scan older wallets", lostOlder); row.appendChild(d); }
     if (!hp && f.usdc > 0n) { const d = el("div"); d.style.marginTop = "8px"; const b = el("button", "btn ghost", "Withdraw " + SYM); b.type = "button"; b.addEventListener("click", () => openWithdraw(i)); d.appendChild(b); row.appendChild(d); }
-    if (!hp && ETHOK && f.token === "ETH" && f.eth > 0n && !ethDust(f)) { const d = el("div"); d.style.marginTop = "8px"; const b = el("button", "btn ghost", "Withdraw " + NAT); b.type = "button"; b.addEventListener("click", () => openWithdraw(i, "ETH")); d.appendChild(b); row.appendChild(d); }
+    if (!hp && ETHOK && f.eth > 0n && !ethDust(f)) { const d = el("div"); d.style.marginTop = "8px"; const b = el("button", "btn ghost", "Withdraw " + NAT); b.type = "button"; b.addEventListener("click", () => openWithdraw(i, "ETH")); d.appendChild(b); row.appendChild(d); }
     list.appendChild(row);
   });
 }

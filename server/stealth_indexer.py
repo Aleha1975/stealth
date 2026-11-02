@@ -8,9 +8,9 @@
 удаляются/вставляются заново. Одна служба = одна цепь (порт/БД/цепь задаются окружением); конфиг цепей -- chains.json.
 API (127.0.0.1:3873, за nginx как /stealth-api/):
   GET /head                                  -> {head, chain_head, lag, count, ts, start, final_block, safe_block, epoch}   (epoch растёт, когда реорг/откат цепи убрал строки: клиент, державший старые, перечитывает)
-  GET /announcements?since=<id>&limit=<n>     -> {rows:[{id,block,tx,scheme,stealth,caller,eph,meta,payer,final}], next, final_block, epoch}   (final = block <= final_block: строку реорг уже не уберёт)
+  GET /announcements?since=<id>&limit=<n>     -> {rows:[{id,block,tx,scheme,stealth,caller,eph,meta,payer,final,verified}], next, final_block, epoch}   (final = block <= final_block: строку реорг уже не уберёт)
   Статические страницы истории (nginx, не Python): STEALTH_PAGES_DIR/manifest.json + p<k>.json(.gz), по PAGE_SIZE=1024 строк на страницу
-  (id в [k*1024+1, (k+1)*1024]), строка = [id,block,tx,stealth,eph,meta,payer]. Страница пишется только когда полная И все её строки
+  (id в [k*1024+1, (k+1)*1024]), строка = [id,block,tx,stealth,eph,meta,payer,verified] (verified: 1 = объявил наш StealthPay и квитанция разобрана; старые страницы без 8-го поля клиент считает «не подтверждено», пока --backfill-paid не перепишет их и не поднимет версию). Страница пишется только когда полная И все её строки
   не новее "финального" блока (реорг-страж их уже не тронет); /announcements?since=tail_since_id отдаёт только хвост.
   GET /known?addr=0x..                        -> {known: bool}   (объявлено ЧЕРЕЗ наш StealthPay или через один из STEALTHPAY_LEGACY -- payToken или payWithAuthorization, токен цепи >= MIN_KNOWN_USDC И в квитанции есть Transfer токена на stealth-адрес >= MIN_KNOWN_USDC, строка не новее safe-блока)
   GET /balances?addrs=0x..,0x..               -> {addr: {usdc, eth}} (до 100 адресов, Multicall3 + кэш 15 с; usdc = токен цепи)
@@ -283,18 +283,18 @@ def fix_rows(c, ep, upto):
     """Дозаполнить строки до блока upto: payer IS NULL (квитанция тогда не пришла) и paid IS NULL у объявлений через наш StealthPay (старые БД после миграции). Круговой курсор по id."""
     pc = tuple(PAY_CALLERS)
     with _lock:
-        rows = c.execute("SELECT id,tx,stealth,caller,block,payer FROM ann WHERE id>? AND block<=? AND (payer IS NULL OR (paid IS NULL AND caller IN (%s))) ORDER BY id LIMIT ?" % ",".join("?" * len(pc)),
+        rows = c.execute("SELECT id,tx,stealth,caller,block,payer,paid FROM ann WHERE id>? AND block<=? AND (payer IS NULL OR (paid IS NULL AND caller IN (%s))) ORDER BY id LIMIT ?" % ",".join("?" * len(pc)),
                          (_fix["after"], upto) + pc + (FIX_BATCH,)).fetchall()
     if not rows: _fix["after"] = 0; return 0
     _fix["after"] = rows[-1][0]
     cache = {}; changed = []; n = 0
-    for id_, tx, stealth, caller, block, old in rows:
+    for id_, tx, stealth, caller, block, old, old_paid in rows:
         r = {"tx": tx, "stealth": stealth, "caller": caller, "block": block}
         rc = receipt_of(r, cache, ep)
         if not rc: continue
-        payer = _payer_from(r, rc); n += 1
-        with _lock: c.execute("UPDATE ann SET payer=COALESCE(?,payer), paid=? WHERE id=?", (payer, _paid_to(rc, stealth), id_))
-        if payer != old: changed.append(id_)
+        payer = _payer_from(r, rc); n += 1; paid = _paid_to(rc, stealth)
+        with _lock: c.execute("UPDATE ann SET payer=COALESCE(?,payer), paid=? WHERE id=?", (payer, paid, id_))
+        if payer != old or verified(caller, paid) != verified(caller, old_paid): changed.append(id_)      # M-1: a row that became verified is on a written page: rewrite it
     with _lock: c.commit()
     _rewrite_pages(c, changed)
     if n: print("fix_rows: filled", n, "rows", flush=True)
@@ -389,10 +389,15 @@ def _atomic(path, data):
 def _page_name(k): return "p%06d.json" % k
 
 
+def verified(caller, paid):
+    """Аудит 1159 M-1: 1 = объявление сделал один из наших StealthPay (он объявляет только настоящий платёж) И квитанция уже разобрана (paid не NULL); иначе 0 -- сумма в metadata не подтверждена."""
+    return 1 if caller in PAY_CALLERS and paid is not None else 0
+
+
 def _write_page(c, k):
-    """Записать страницу k (json + json.gz) из БД; вернуть число строк."""
-    rows = c.execute("SELECT id,block,tx,stealth,eph,meta,payer FROM ann WHERE id>? AND id<=? ORDER BY id", (k * PAGE_SIZE, (k + 1) * PAGE_SIZE)).fetchall()
-    raw = json.dumps([list(r) for r in rows], separators=(",", ":")).encode()
+    """Записать страницу k (json + json.gz) из БД; вернуть число строк. Строка: [id,block,tx,stealth,eph,meta,payer,verified] (verified добавлен в конец, старые клиенты читают первые 7)."""
+    rows = c.execute("SELECT id,block,tx,stealth,eph,meta,payer,caller,paid FROM ann WHERE id>? AND id<=? ORDER BY id", (k * PAGE_SIZE, (k + 1) * PAGE_SIZE)).fetchall()
+    raw = json.dumps([list(r[:7]) + [verified(r[7], r[8])] for r in rows], separators=(",", ":")).encode()
     base = os.path.join(PAGES_DIR, _page_name(k))
     _atomic(base, raw); _atomic(base + ".gz", gzip.compress(raw, 9, mtime=0))
     return len(rows)
@@ -675,10 +680,10 @@ class H(BaseHTTPRequestHandler):
                 if canon:
                     with _ann_lock: hit = _ann_cache.get(key)
                     if hit and now - hit[0] < ANN_TTL: return self._raw(200, hit[1])
-                rows = c.execute("SELECT id,block,tx,scheme,stealth,caller,eph,meta,payer FROM ann WHERE id>? ORDER BY id LIMIT ?", (since, limit)).fetchall()
+                rows = c.execute("SELECT id,block,tx,scheme,stealth,caller,eph,meta,payer,paid FROM ann WHERE id>? ORDER BY id LIMIT ?", (since, limit)).fetchall()
                 fb = c.execute("SELECT v FROM meta WHERE k='final_block'").fetchone(); fb = int(fb[0]) if fb else -1
                 ep = c.execute("SELECT v FROM meta WHERE k='epoch'").fetchone()
-                out = [{"id": r[0], "block": r[1], "tx": r[2], "scheme": r[3], "stealth": r[4], "caller": r[5], "eph": r[6], "meta": r[7], "payer": r[8], "final": r[1] <= fb} for r in rows]
+                out = [{"id": r[0], "block": r[1], "tx": r[2], "scheme": r[3], "stealth": r[4], "caller": r[5], "eph": r[6], "meta": r[7], "payer": r[8], "final": r[1] <= fb, "verified": verified(r[5], r[9])} for r in rows]
                 body = json.dumps({"rows": out, "next": out[-1]["id"] if out else since, "final_block": fb if fb >= 0 else None, "epoch": int(ep[0]) if ep else 0}, separators=(",", ":")).encode()
                 if canon: _ann_put(key, now, body)
                 return self._raw(200, body)

@@ -205,6 +205,16 @@ st, d = J("/head")
 check("F-4 /head exposes final_block, safe_block, epoch", (d["final_block"], d["safe_block"], d["epoch"]) == (500, 800, 3))
 check("F-4 old fields of /announcements kept", all(k in d0 for d0 in J("/announcements?since=0")[1]["rows"] for k in ("id", "block", "tx", "scheme", "stealth", "caller", "eph", "meta", "payer")))
 
+# ---- audit 1159 M-1: a verification signal per row (our StealthPay caller + parsed receipt) in /announcements and in the history pages
+m = load(); LEG = "0x00000000000000000000000000000000000000cc"; m.PAY_CALLERS = frozenset([V3, LEG])
+put(m, 10, 0, S(1), V3, 5_000_000, 5_000_000); put(m, 11, 0, S(2), OTHER, 1_000_000_000_000, 0); put(m, 12, 0, S(3), V3, 5_000_000, None); put(m, 13, 0, S(4), LEG, 5_000_000, 5_000_000)
+srv, J = serve(m)
+st, d = J("/announcements?since=0&limit=10")
+check("M-1 /announcements verified: our caller + parsed receipt = 1; foreign caller, receipt pending = 0; legacy v2 = 1", [r["verified"] for r in d["rows"]] == [1, 0, 0, 1])
+pd = tempfile.mkdtemp(); m.PAGES_DIR = pd; m.PAGE_SIZE = 4; m._write_page(m.db(), 0)
+pg = json.load(open(os.path.join(pd, m._page_name(0))))
+check("M-1 page rows: 7 old fields kept, verified appended last", [len(r) for r in pg] == [8] * 4 and [r[7] for r in pg] == [1, 0, 0, 1] and pg[0][6] is None and pg[0][3] == S(1))
+
 # ---- F-5: cache only canonical keys, bounded by bytes
 m = load(STEALTH_ANN_CACHE_BYTES="3000"); meta_set(m, final_block=1)
 for i in range(1, 8): put(m, i, 0, S(i), V3, 5_000_000, 5_000_000)
