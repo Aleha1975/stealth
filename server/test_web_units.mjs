@@ -1,5 +1,5 @@
 /* Unit tests of the audit hardening that need neither anvil nor forge. Run: node test_web_units.mjs */
-import { unhex, hex, checkAnnouncement, decodeMetadata, keysFromSignature, signKeyRequestWith, addressFromPriv, metaAddress } from "../web/stealth-crypto.js";
+import { keccak, unhex, hex, checkAnnouncement, decodeMetadata, keysFromSignature, signKeyRequestWith, addressFromPriv, metaAddress } from "../web/stealth-crypto.js";
 import { paymentNonce, feeWithinCap } from "../web/pay-auth.js";
 import * as PWm from "../web/private-withdraw.js";
 import { requestQuote, buildQuoteRequest } from "../web/private-withdraw.js";
@@ -616,5 +616,23 @@ print(json.dumps({"eth": m._real_payer(eth_rc, st), "none": m._real_payer({"from
   // I-2: framing is closed by response headers (a <meta> CSP cannot carry frame-ancestors)
   { const c = fs.readFileSync(new URL("../ops/nginx-stealth-zec.conf", import.meta.url), "utf8");      // the only conf in the repo that serves app pages (server/deploy/stealth-{rh,base}.conf proxy JSON under /stealth-api/ only)
     t("1159 I-2: the app-page location sends frame-ancestors 'none' and nosniff, in the wasm sub-location too", (c.match(/frame-ancestors 'none'/g) || []).length === 2 && (c.match(/X-Content-Type-Options\s+"nosniff"/g) || []).length === 2); }
+}
+// audit 1161 M-1 / L-1: the client checks used[stealth] before it asks for anything, and picks a new address when the old one is taken
+{ const PA = await import("../web/pay-auth.js"), app = fs.readFileSync(new URL("../web/app.js", import.meta.url), "utf8");
+  const S = "0x" + "ab".repeat(20);
+  t("1161 M-1: used(address) call data = selector + padded address; selectors equal keccak of the signatures", PA.usedCall(S) === "0xc497da8d" + "0".repeat(24) + "ab".repeat(20) && PA.USED_SELECTOR === hex(keccak(new TextEncoder().encode("used(address)"))).slice(0, 10) && PA.NOT_FRESH_SELECTOR === hex(keccak(new TextEncoder().encode("NotFresh(address)"))).slice(0, 10));
+  t("1161 M-1: isUsedAnswer true only for a non-zero word", PA.isUsedAnswer("0x" + "0".repeat(63) + "1") && !PA.isUsedAnswer("0x" + "0".repeat(64)) && !PA.isUsedAnswer("0x") && !PA.isUsedAnswer(null) && !PA.isUsedAnswer("junk"));
+  t("1161 M-1: isNotFresh recognises the selector in wallet error data, the name, and the relayer's refusal; not other errors",
+    PA.isNotFresh({ message: "execution reverted", data: { data: "0x59246e68" + "0".repeat(64) } }) && PA.isNotFresh(new Error("reverted: NotFresh(0xabc)")) && PA.isNotFresh("stealth address already used: it was paid or blocked by someone else") && PA.isNotFresh({ error: { data: "0x59246E68" + "00" } })
+    && !PA.isNotFresh(new Error("user rejected the request")) && !PA.isNotFresh("authorization already used") && !PA.isNotFresh(null) && !PA.isNotFresh({}));
+  const gl = app.slice(app.indexOf("async function payGasless"), app.indexOf("// ---- amount: two linked fields"));
+  t("1161 M-1: gasless pay checks used[] before the balance read and the signature", gl.indexOf("await requireFresh(d.stealth)") > 0 && gl.indexOf("await requireFresh(d.stealth)") < gl.indexOf("eth_signTypedData_v4"));
+  t("1161 M-1: a NotFresh answer from the relayer becomes a notFresh error (no hash is awaited)", /isNotFresh\(j\.error\)\) throw new NotFreshError/.test(gl) && gl.indexOf("isNotFresh(j.error)") < gl.indexOf("if (!r.ok || j.error)"));
+  const ps = app.slice(app.indexOf("async function payStealth"), app.indexOf("async function payGasless"));
+  t("1161 M-1: own-gas token and ETH payments check used[] first and map a NotFresh revert to notFresh", (ps.match(/await requireFresh\(d\.stealth\)/g) || []).length === 2 && (ps.match(/isNotFresh\(e\) \? new NotFreshError/g) || []).length === 2);
+  const dp = app.slice(app.indexOf("async function doPay"), app.indexOf("const doPayOnce"));
+  t("1161 M-1: doPay derives a new address per try: gasless up to 2 more times with a 'sign again' message, own gas once after a confirm", /d = deriveForPayment\(m\)/.test(dp) && /tries >= \(token === "TOKEN" && !own \? 2 : 1\)/.test(dp) && /please sign again/.test(dp) && /else if \(!confirm\(msg\)\)/.test(dp));
+  t("1161 M-1: only a notFresh error is retried (any other failure is rethrown at once)", /if \(!e \|\| !e\.notFresh \|\|/.test(dp));
+  t("1161 L-1: the client refuses to sign when the fee recipient equals the one-time address, before the signature", /feeTo\.toLowerCase\(\) === d\.stealth\.toLowerCase\(\)\) throw/.test(gl) && gl.indexOf("feeTo.toLowerCase() === d.stealth.toLowerCase()") < gl.indexOf("eth_signTypedData_v4"));
 }
 console.log(fail ? "FAILED " + fail : "all passed"); process.exit(fail ? 1 : 0);

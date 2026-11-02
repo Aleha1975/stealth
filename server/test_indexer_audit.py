@@ -140,6 +140,11 @@ for n, st in ((1, S(1)), (2, S(2)), (3, S(3)), (4, S(4))):
 c = m.db(); rows = {r[0]: r[1:] for r in c.execute("SELECT stealth,payer,paid FROM ann")}
 check("F-3 paid = Transfer to the stealth address, not the announced amount", rows[S(1)] == (PAYER, 4_900_000) and rows[S(2)][1] == 10)
 check("F-4 wrong-block / missing receipt -> payer NULL and paid NULL (to be retried)", rows[S(3)] == (None, None) and rows[S(4)] == (None, None))
+# audit 1161 L-1: feeRecipient == stealth address: the fee leg and the net leg both reach it; the announcement says 90, the paid column holds the real 100
+ch.eps["A"]["receipts"][TX(5)] = rcpt(13, PAYER, [(PAYER, V3, 100), (V3, S(5), 10), (V3, S(5), 90)])
+pc = m.db(); m.put_row(pc, dict(base, block=13, tx=TX(5), stealth=S(5), caller=V3, meta="0x11a9059cbb" + USDC[2:] + w(90)), {}, "A"); pc.commit(); pc.close()
+c = m.db(); p5 = c.execute("SELECT paid FROM ann WHERE stealth=?", (S(5),)).fetchone()[0]; c.close()
+check("1161 L-1 paid column = sum of every Transfer to the stealth address (100), not the announced net (90)", p5 == 100)
 meta_set(m, safe_block=1000)
 srv, J = serve(m)
 check("F-3 known: settled Transfer >= MIN", J("/known?addr=" + S(1)) == (200, {"known": True}))

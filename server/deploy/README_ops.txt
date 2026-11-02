@@ -140,3 +140,11 @@ Audit 1160 (relayer.mjs). Operator notes
   I-2  nginx POST timeout 45 s instead of 30 s (see M-2). L-4 (front-run burn of a /relay authorization) is inherent to EIP-3009 and stays accepted: bounded by 3 per address per day and the gas budget.
   Deploy order: relayer.mjs + relay-util.mjs + stealth_watch.py, restart the relayer unit (brief 503s), regenerate the nginx snippets from the two .conf files, nginx -t, reload.
   First start on an existing state file: unsure records written before this version carry no reserve; their watchers do not adjust the day's gas (conservative), and their send-time reservation stays until midnight.
+
+StealthPay used[] griefing and fee collision (audit 1161; contracts unchanged, full text in audit/stealthpay-v3-residuals.md)
+  M-1  Anyone can mark a one-time stealth address "used" first (payETH with 1 wei is the cheapest way; it works across payToken / payWithAuthorization / payETH, needs no mempool or
+       sequencer access when the attacker sees the request, e.g. a relayer). For payWithAuthorization this kills the payer's signature (it is bound to that address): a new signature is
+       needed. No funds are lost. /relay/pay therefore reads StealthPay.used(stealth) before it spends gas and refuses with "stealth address already used: ..." (honest, charged to the network);
+       the web client checks used[] before asking the wallet and derives a new one-time address automatically (gasless: up to 2 retries with "please sign again"; own gas: 1 retry after a confirm).
+  L-1  feeRecipient == stealth makes the Paid event under-report; the relayer answers "bad destination" and the client refuses to sign. The indexer's paid column sums all Transfers to the stealth address.
+  The NatSpec text in src/StealthPay.sol is NOT changed (it would change the metadata hash of the verified deployed bytecode).

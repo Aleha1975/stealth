@@ -50,6 +50,7 @@ const payAbi = parseAbi([
   "struct Authorization { address from; uint256 validAfter; uint256 validBefore; uint8 v; bytes32 r; bytes32 s; }",
   "function payWithAuthorization(address token, uint256 amount, address stealthAddress, bytes ephemeralPubKey, bytes1 viewTag, uint256 fee, address feeRecipient, Authorization auth)",
   "function paymentNonce(address token, address stealthAddress, bytes ephemeralPubKey, bytes1 viewTag, uint256 fee, address feeRecipient) view returns (bytes32)",
+  "function used(address) view returns (bool)",
 ]);
 const STEALTHPAY = /^0x[0-9a-fA-F]{40}$/.test((E.STEALTHPAY || "").trim()) ? getAddress(E.STEALTHPAY.trim()) : null;   // StealthPay этой цепи; нет -> /relay/pay выключен
 const PAY_FEE_MIN = BigInt(E.STEALTH_RELAY_PAY_FEE_MIN || "0");                                  // минимальная комиссия за газ в платеже
@@ -761,6 +762,7 @@ const RECEIVE_TYPES = { ReceiveWithAuthorization: [{ name: "from", type: "addres
 export const localPaymentNonce = (token, stealth, eph, tag, fee, feeTo) => keccak256(encodeAbiParameters(
   [{ type: "bytes32" }, { type: "uint256" }, { type: "address" }, { type: "address" }, { type: "address" }, { type: "bytes32" }, { type: "bytes1" }, { type: "uint256" }, { type: "address" }],
   [keccak256(toHex("StealthPay.payWithAuthorization")), BigInt(CC.id), STEALTHPAY, token, stealth, keccak256(eph), tag, fee, feeTo]));
+export const STEALTH_USED_MSG = "stealth address already used: it was paid or blocked by someone else; sign again for a new one-time address";   // the web client matches the start of this text
 export async function relayPay(b, ip, ctx = {}) {
   if (!STEALTHPAY) throw new Error("payments are not enabled on this chain");
   if (!b || !b.auth || !isAddress(b.token || "") || !isAddress(b.stealth || "") || !isAddress(b.auth.from || "") || !isAddress(b.feeRecipient || "")) throw new Error("bad request");
@@ -778,6 +780,7 @@ export async function relayPay(b, ip, ctx = {}) {
   if (PAY_FEE_BPS && fee < payFeeFor(amount, PAY_FEE_MIN, PAY_FEE_BPS)) throw new Error("fee out of range");   // percentage fee (off by default)
   if (fee > 0n ? feeTo !== account.address : feeTo !== "0x0000000000000000000000000000000000000000") throw new Error("fee recipient must be the relayer");
   if (stealth === STEALTHPAY || stealth === TOKEN || stealth === account.address || stealth === from) throw new Error("bad destination");
+  if (stealth === feeTo) throw new Error("bad destination");           // audit 1161 L-1: the fee leg and the net leg must not land on one address (the Paid event would announce only the net part)
   roll();
   const nonce = localPaymentNonce(token, stealth, eph, tag, fee, feeTo), dupKey = ("pay:" + from + ":" + nonce + ":" + amount + ":" + auth.validBefore).toLowerCase();   // audit 1120 I-2: terms that the payment nonce does not cover are part of the key
   // audit 1099 M-2/I-6: the signature is decided offline, before the lock and before any RPC
@@ -813,10 +816,14 @@ export async function relayPay(b, ip, ctx = {}) {
     // audit 1102 M-1: ONE cheap read first -- a self-signed junk request from an empty wallet costs one RPC instead of five
     const bal = await pub.readContract({ address: TOKEN, abi, functionName: "balanceOf", args: [from] });
     if (bal < amount) throw new Refusal("the wallet holds less than the amount", { honest: true });
-    const [onchain, code, bw] = await Promise.all([
+    const [onchain, code, bw, spent] = await Promise.all([
       pub.readContract({ address: STEALTHPAY, abi: payAbi, functionName: "paymentNonce", args: [token, stealth, eph, tag, fee, feeTo] }),
       pub.getCode({ address: stealth }),
-      pub.getBalance({ address: account.address })]);
+      pub.getBalance({ address: account.address }),
+      pub.readContract({ address: STEALTHPAY, abi: payAbi, functionName: "used", args: [stealth] })]);
+    // audit 1161 M-1: anyone can mark an address used for 1 wei (payETH/payToken) and the contract would then refuse this signed payment (NotFresh) -- say so before any gas is spent;
+    // the signature is bound to this address, so the payer must sign again for a new one. Not the signer's fault: charged to the network, like other honest refusals.
+    if (spent) throw new Refusal(STEALTH_USED_MSG, { honest: true, net: true });
     if (onchain.toLowerCase() !== nonce.toLowerCase()) throw new Refusal("payment nonce mismatch");
     if (code) throw new Refusal("destination is a contract");
     if (bw < MIN_BALANCE_WEI) { alertOnce("relayer balance low:", formatEther(bw), "ETH < threshold", formatEther(MIN_BALANCE_WEI)); throw new Refusal("relayer is out of gas funds, try again later", { honest: true, net: true }); }

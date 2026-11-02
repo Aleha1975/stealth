@@ -59,3 +59,15 @@ export const payFeeFor = (amount, flat, bps = 0) => { const p = (BigInt(amount) 
 /** Client-side cap on the relayer's fee (audit 1086 L-1): the fee and its recipient come from our relayer API, so a compromised API must not be able to take (almost) the whole
  *  payment. Refused when the fee is above `maxAbs` token units (default 1.00 with 6 decimals) or above half of what leaves the wallet. */
 export const feeWithinCap = (fee, raw, maxAbs = 1_000_000n, pctCapBps = 0) => fee >= 0n && (fee <= maxAbs || fee * 10000n <= raw * BigInt(pctCapBps)) && fee * 2n <= raw;   // pctCapBps: a percentage fee announced by the relayer may exceed maxAbs, but never this share of the payment (0 = no such allowance)
+
+/** audit 1161 M-1: StealthPay.used(address) selector and the NotFresh(address) error selector. Anyone can mark an address used (1 wei through payETH), which makes the contract refuse a payment to it. */
+export const USED_SELECTOR = "0xc497da8d", NOT_FRESH_SELECTOR = "0x59246e68";
+/** eth_call data for used(stealth). */
+export const usedCall = stealth => USED_SELECTOR + String(stealth).replace(/^0x/, "").toLowerCase().padStart(64, "0");
+/** true when an eth_call answer for used() says "used". */
+export const isUsedAnswer = r => /^0x0*[1-9a-f][0-9a-f]*$/i.test(String(r || "")) && BigInt(r) !== 0n;
+/** true when a failure (wallet error, relayer answer) means "this one-time address is no longer fresh": the NotFresh selector anywhere in the error data, the word NotFresh, or the relayer's own refusal text. */
+export const isNotFresh = e => {
+  let t = ""; try { t = typeof e === "string" ? e : [e && e.message, e && e.data && (e.data.data || e.data), e && e.error && (e.error.data || e.error.message), e && e.cause && e.cause.message].map(x => typeof x === "string" ? x : x ? JSON.stringify(x) : "").join(" "); } catch {}
+  return /NotFresh/i.test(t) || t.toLowerCase().includes(NOT_FRESH_SELECTOR) || /^\s*stealth address already used/i.test(t);
+};

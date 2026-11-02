@@ -1,6 +1,6 @@
 import { keysFromSignature, keyRequestTypedData, metaAddress, parseMeta, deriveForPayment, checkAnnouncement, decodeMetadata, hex, unhex, keccak, signDigest, randomBytes32 } from "./stealth-crypto.js";
 import { postRelay } from "./relay-post.js";
-import { paymentNonce, receiveTypedData, splitSig, payAmounts as calcAmounts, feeWithinCap, payFeeFor } from "./pay-auth.js";
+import { paymentNonce, receiveTypedData, splitSig, payAmounts as calcAmounts, feeWithinCap, payFeeFor, usedCall, isUsedAnswer, isNotFresh } from "./pay-auth.js";
 import { CHAINS, pickChain, chainOfMeta, addChainParams, appFeesOf, assetOf, assetKey, fmtUnits } from "./chains.js";
 import * as ETH from "./eth-send.js";
 import * as PW from "./private-withdraw.js";
@@ -878,12 +878,19 @@ async function txOfLogs(filter, match) {
 // ---- pay someone: derive the one-time address, then hand off to payStealth() (the only code that builds/sends pay txs,
 //      so the flow can be swapped without touching the rest)
 /** Sends the payment + announcement from the payer's wallet. token: "TOKEN" (chain stablecoin) or "NATIVE". Returns the tx hash. */
+/** audit 1161 M-1: a one-time address that StealthPay already marks used (someone paid or blocked it first) is refused by the contract. Checked right before the wallet is asked for anything. */
+class NotFreshError extends Error { constructor(m) { super(m); this.notFresh = true; } }
+async function requireFresh(stealth) {
+  let r = null; try { r = await wallet("eth_call", [{ to: STEALTHPAY, data: usedCall(stealth) }, "latest"]); } catch { return; }      // an unreadable answer is not a refusal: the contract and the relayer still check
+  if (isUsedAnswer(r)) throw new NotFreshError("This one-time address was already used.");
+}
 async function payStealth({ token, amount, raw: rawIn = null, d, own = false }) {
   if (!STEALTHPAY) throw new Error("The pay contract is not deployed on " + C.name + " yet");
   const ephLen = pad(33n), ephData = d.ephPub.slice(2).padEnd(128, "0"), tagWord = d.viewTag.slice(2).padEnd(64, "0");
   if (token === "TOKEN" && !own) return payGasless({ amount, raw: rawIn, d, ephLen, ephData, tagWord });
   if (token === "TOKEN") {
     const raw = rawIn ?? BigInt(Math.round(amount * TUNIT));
+    await requireFresh(d.stealth);
     const al = BigInt(await wallet("eth_call", [{ to: USDC, data: "0xdd62ed3e" + padAddr(acct) + padAddr(STEALTHPAY) }, "latest"]));
     if (al < raw) {
       say("send-hint", "Approve " + amount + " " + SYM + " for the pay contract (1 of 2)…");
@@ -892,11 +899,12 @@ async function payStealth({ token, amount, raw: rawIn = null, d, own = false }) 
     }
     const data = sel("payToken(address,uint256,address,bytes,bytes1)") + padAddr(USDC) + pad(raw) + padAddr(d.stealth) + pad(160n) + tagWord + ephLen + ephData;
     say("send-hint", "Pay + announce (" + (al < raw ? "2 of 2" : "1 of 1") + ")…");
-    return wallet("eth_sendTransaction", [{ from: acct, to: STEALTHPAY, data }]);
+    return wallet("eth_sendTransaction", [{ from: acct, to: STEALTHPAY, data }]).catch(e => { throw isNotFresh(e) ? new NotFreshError("This one-time address was already used.") : e; });
   }
   const wei = rawIn ?? BigInt(Math.round(amount * NUNIT));      // rawIn = exactly what leaves the wallet (18 decimals do not survive a float)
   const data = sel("payETH(address,bytes,bytes1)") + padAddr(d.stealth) + pad(96n) + tagWord + ephLen + ephData;
-  return wallet("eth_sendTransaction", [{ from: acct, to: STEALTHPAY, value: "0x" + wei.toString(16), data }]);
+  await requireFresh(d.stealth);
+  return wallet("eth_sendTransaction", [{ from: acct, to: STEALTHPAY, value: "0x" + wei.toString(16), data }]).catch(e => { throw isNotFresh(e) ? new NotFreshError("This one-time address was already used.") : e; });
 }
 /** Token payment with ONE signature and no gas for the payer: EIP-3009 ReceiveWithAuthorization bound (via the nonce) to this exact
  *  stealth address, key, tag, fee and fee recipient; our relayer submits StealthPay.payWithAuthorization and takes `fee` from the amount. */
@@ -907,6 +915,8 @@ async function payGasless({ amount, raw: rawIn = null, d, ephLen, ephData, tagWo
   const bps = payBps(stats), raw = rawIn ?? BigInt(Math.round(amount * TUNIT)), fee = payFeeFor(raw, BigInt(stats.pay_fee), bps), feeTo = stats.relayer;   // "you pay" = raw = what leaves the wallet; the fee comes out of it (flat fee, or bps of it when the relayer announces one)
   if (fee < 0n || fee >= raw) throw new Error("The amount is below the relayer fee (" + fmtTok(fee) + " " + SYM + ").");
   if (!feeWithinCap(fee, raw, BigInt(TUNIT), bps ? PAY_BPS_CAP : 0)) throw new Error("The relayer asks " + fmtTok(fee) + " " + SYM + " in fees for a " + fmtTok(raw) + " " + SYM + " payment, which is more than this page accepts (max " + (bps ? "1.00 or " + PAY_BPS_CAP / 100 + "%" : "1.00") + " and half of the payment). Refusing.");   // audit 1086 L-1
+  if (feeTo.toLowerCase() === d.stealth.toLowerCase()) throw new Error("The fee recipient equals the one-time address; refusing to sign.");      // audit 1161 L-1: the Paid event would announce only the net part
+  await requireFresh(d.stealth);      // audit 1161 M-1: before the signature, which is bound to this address and dies with it
   const bal = BigInt(await wallet("eth_call", [{ to: USDC, data: "0x70a08231" + padAddr(acct) }, "latest"]));
   if (bal < raw) throw new Error("Your wallet holds less than " + amount + " " + SYM + ".");
   const args = { chainId: C.chainId, stealthPay: STEALTHPAY, token: USDC, stealth: d.stealth, eph: d.ephPub, viewTag: d.viewTag, fee, feeRecipient: feeTo };
@@ -924,6 +934,7 @@ async function payGasless({ amount, raw: rawIn = null, d, ephLen, ephData, tagWo
     token: USDC, amount: raw.toString(), stealth: d.stealth, eph: d.ephPub, viewTag: d.viewTag, fee: fee.toString(), feeRecipient: feeTo,
     auth: { from: acct, validAfter: "0", validBefore: String(validBefore), v: sig.v, r: sig.r, s: sig.s } },
     { onBusy: m => say("send-hint", m, "warn"), check: () => authorizationUsed(rpcOne, USDC, acct, nonce) });
+  if (isNotFresh(j.error)) throw new NotFreshError("That one-time address was taken before the payment went through.");
   if (!r.ok || j.error) throw new Error((j.error || "relayer error") + ".");
   if (j.used) j.hash = await txOfLogs({ address: STEALTHPAY, topics: [PAID_TOPIC, "0x" + padAddr(d.stealth)] }, () => true);
   if (!isHash(j.hash)) throw new Error("The relayer answered without a valid transaction hash; check the explorer and your balance before paying again.");
@@ -961,9 +972,20 @@ async function doPay(own) {
     const token = $("token").value, a = payAmounts(); if (!a) throw new Error("enter an amount");
     const amount = token === "TOKEN" ? Number(a.send) / unit() : fmtEth(a.send);
     if (a.get <= 0n) throw new Error("the amount is below the network fee");
-    const d = deriveForPayment(m);
-    say("send-hint", "Paying " + amount + " " + (token === "TOKEN" ? SYM : NAT) + " to a fresh address " + d.stealth.slice(0, 10) + "…");
-    const tx = await payStealth({ token, amount, raw: a.send, d, own });   // raw = exactly what leaves the wallet, no float round trip
+    // audit 1161 M-1: anyone can mark a one-time address used before our payment lands; then a new address is derived and the wallet is asked again
+    // (gasless: up to 2 new addresses, no gas was spent; own gas: once, after the user agrees)
+    let d, tx;
+    for (let tries = 0; ; tries++) {
+      d = deriveForPayment(m);
+      say("send-hint", "Paying " + amount + " " + (token === "TOKEN" ? SYM : NAT) + " to a fresh address " + d.stealth.slice(0, 10) + "…");
+      try { tx = await payStealth({ token, amount, raw: a.send, d, own }); break; }   // raw = exactly what leaves the wallet, no float round trip
+      catch (e) {
+        if (!e || !e.notFresh || tries >= (token === "TOKEN" && !own ? 2 : 1)) throw e;
+        const msg = "The one-time address was already used by someone else. Nothing was spent. Use a new address and ask the wallet again?";
+        if (token === "TOKEN" && !own) say("send-hint", "That one-time address was taken. Using a new one: please sign again.", "warn");
+        else if (!confirm(msg)) throw new Error("Cancelled. Nothing was sent.");
+      }
+    }
     const want = token === "TOKEN" ? { stealthPay: STEALTHPAY, stealth: d.stealth, token: USDC, amount: own ? a.send : a.get } : { stealthPay: STEALTHPAY, stealth: d.stealth, token: ETH_TOKEN, amount: a.send };
     const rc = await waitReceipt(tx, x => hasPaid(x, want), token === "TOKEN" && !own);
     if (!rc.ok) throw new Error(rc.unexpected ? "the transaction is mined but the pay contract did not record this payment (tx " + rc.hash + "). Check the explorer." : "the payment reverted: " + tx);

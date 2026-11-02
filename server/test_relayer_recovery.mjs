@@ -49,6 +49,7 @@ function makeNode() {
         const data = p[0].data || p[0].input, sel = data.slice(0, 10);
         if (sel === "0x70a08231") return "0x" + (10n ** 12n).toString(16).padStart(64, "0");   // balanceOf
         if (sel === "0xe94a0102") return "0x" + "0".repeat(64);                                                                 // authorizationState: unused
+        if (sel === "0xc497da8d") { c.usedReads = (c.usedReads || 0) + 1; return "0x" + (process.env.FAKE_STEALTH_USED === "1" || c.stealthUsed ? "1" : "0").padStart(64, "0"); }   // StealthPay.used(address)
         const d = decodeFunctionData({ abi: parseAbi(["function paymentNonce(address token, address stealthAddress, bytes ephemeralPubKey, bytes1 viewTag, uint256 fee, address feeRecipient) view returns (bytes32)"]), data });
         const [token, stealth, eph, tag, f, feeTo] = d.args;
         return keccak256(encodeAbiParameters([{ type: "bytes32" }, { type: "uint256" }, { type: "address" }, { type: "address" }, { type: "address" }, { type: "bytes32" }, { type: "bytes1" }, { type: "uint256" }, { type: "address" }],
@@ -201,6 +202,20 @@ const priceOf = t => t.maxFeePerGas ?? t.gasPrice;
   const s = stateOf(e);
   ok("M-1/L-2 the fill is charged to the day's gas (21000 x its max fee)", node.nonceOf(RELAYER) === 1 && !!s && s.gas === String(21000n * priceOf(fill)), JSON.stringify(s && s.gas));
   node.srv.close(); }
+
+// ---- audit 1161 M-1: an address somebody else already marked used is refused before any gas is spent, with the text the web client matches
+{ const node = makeNode(); node.stealthUsed = true; await node.listen(); const e = env(node, "u1a");
+  const c = run(e, "pay", { LINGER_MS: "300" }); const err = await c.wait("error"); await c.exit;
+  ok("1161 M-1 used[stealth] on chain: refused with the 'stealth address already used' text, honest refusal, nothing signed or sent, no gas charged",
+    err && err.name === "Refusal" && /^stealth address already used/.test(err.message) && node.sends.length === 0 && (node.calls.eth_estimateGas || 0) === 0 && (stateOf(e)?.gas ?? "0") === "0", JSON.stringify(err) + " sends " + node.sends.length);
+  ok("1161 M-1 used[] was read from the contract", (node.usedReads || 0) >= 1);
+  node.srv.close(); }
+{ const node = makeNode(); await node.listen(); const e = env(node, "u1b");
+  const c = run(e, "pay", { LINGER_MS: "300" }); const hash = (await c.wait("hash"))?.hash; await c.exit;
+  ok("1161 M-1 a fresh address still goes through", !!hash && node.sends.length >= 1, String(hash));
+  node.srv.close(); }
+{ const src = fs.readFileSync(path.join(HERE, "relayer.mjs"), "utf8");
+  ok("1161 L-1 the relayer refuses feeRecipient == stealth before any RPC (after the screen, before roll())", /if \(stealth === feeTo\) throw new Error\("bad destination"\);\s*\/\/ audit 1161 L-1[^\n]*\n\s*roll\(\);/.test(src)); }
 
 // ---- L-2: hard fee ceiling
 { const node = makeNode(); await node.listen(); node.baseFee = 100n * GWEI;
