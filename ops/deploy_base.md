@@ -31,7 +31,10 @@ forge verify-contract $ADDR src/StealthPay.sol:StealthPay --chain 8453 --verifie
 forge verify-contract $ADDR src/StealthPay.sol:StealthPay --chain base --verifier etherscan --etherscan-api-key "$ETHERSCAN_API_KEY" \
   --constructor-args $(cast abi-encode 'constructor(address,address)' $ANNOUNCER $TOKEN) --watch
 ```
-## 4. Server (Base units are LIVE: change one thing at a time)
+## 4. Server
+Preferred: a NEW stack next to the live one, installed by `ops/install_base.sh` (dry run by default; see `server/deploy/README_ops.txt`, section "Base v3": units `stealth-indexer-base` / `stealth-relayer-base`, ports 3893/3894, nginx path `/stealth-api/base/`, indexer reads from block 31700000 with `STEALTHPAY_LEGACY` = v2, so v2 payments stay findable and withdrawable). The live v2 units are not touched; users switch when the web copy that points at `/stealth-api/base` is published.
+
+Alternative (in place, replaces the live units; not recommended). Base units are LIVE: change one thing at a time.
 1. `/opt/stealth/relayer.env`: `STEALTHPAY=<new addr>`; indexer env: new start block / watched contract per `stealth_indexer.py`.
 2. `web/chains.js` `base.stealthPay` (web owner). Old clients with the old address keep working against v2 until the web is switched.
 3. `systemctl restart stealth-relayer` (not done by install_rh.sh), then `curl -s http://127.0.0.1:3874/stealth-api/relay/stats` (pay_enabled, stealthpay), `curl -s .../stealth-api/head`, `curl -s https://app.deepyield.ai/stealth-api/pages/manifest.json`.

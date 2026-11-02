@@ -1,0 +1,34 @@
+[Unit]
+Description=Stealth relayer (Base, StealthPay v3)
+After=network-online.target stealth-indexer-base.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=stealth
+Group=stealth
+WorkingDirectory=/opt/stealth-base
+# base.env holds RELAYER_KEY: chmod 600, owner stealth. The live Base units (stealth-relayer.service) keep their own /opt/stealth/relayer.env.
+EnvironmentFile=/opt/stealth-base/base.env
+Environment=NODE_OPTIONS=--dns-result-order=ipv4first
+ExecStart=/usr/bin/node /opt/stealth-base/relayer.mjs
+Restart=always
+RestartSec=5
+StartLimitIntervalSec=0
+StandardOutput=journal
+StandardError=journal
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+ReadWritePaths=/opt/stealth-base/data
+MemoryMax=512M
+TasksMax=200
+LimitNOFILE=8192
+
+[Install]
+WantedBy=multi-user.target

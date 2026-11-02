@@ -12,7 +12,7 @@ API (127.0.0.1:3873, за nginx как /stealth-api/):
   Статические страницы истории (nginx, не Python): STEALTH_PAGES_DIR/manifest.json + p<k>.json(.gz), по PAGE_SIZE=1024 строк на страницу
   (id в [k*1024+1, (k+1)*1024]), строка = [id,block,tx,stealth,eph,meta,payer]. Страница пишется только когда полная И все её строки
   не новее "финального" блока (реорг-страж их уже не тронет); /announcements?since=tail_since_id отдаёт только хвост.
-  GET /known?addr=0x..                        -> {known: bool}   (объявлено ЧЕРЕЗ наш StealthPay -- payToken или payWithAuthorization, токен цепи >= MIN_KNOWN_USDC)
+  GET /known?addr=0x..                        -> {known: bool}   (объявлено ЧЕРЕЗ наш StealthPay или через один из STEALTHPAY_LEGACY -- payToken или payWithAuthorization, токен цепи >= MIN_KNOWN_USDC)
   GET /balances?addrs=0x..,0x..               -> {addr: {usdc, eth}} (до 100 адресов, Multicall3 + кэш 15 с; usdc = токен цепи)
   GET /receipt?tx=0x..                        -> {status: 1|0|null}
   GET /usdc-domain                            -> {domain_separator, chain, token}
@@ -28,6 +28,13 @@ if CHAIN not in _CH:
 CC = _CH[CHAIN]
 ANNOUNCER = "0x55649E01B5Df198D18D95b5cc5051630cfD45564".lower()
 STEALTHPAY = os.environ.get("STEALTHPAY", "").lower()
+# Прежние StealthPay той же цепи (через запятую): их платежи остаются «нашими» -- /known их признаёт (релеер выводит с таких адресов), payer считается так же.
+# Индексатор и так читает ВСЕ объявления общего Announcer с START, так что строки старого контракта в БД есть; здесь только признание их платежами через Stealth.
+LEGACY = [a.strip().lower() for a in os.environ.get("STEALTHPAY_LEGACY", "").split(",") if a.strip()]
+for _a in LEGACY:
+    if len(_a) != 42 or not _a.startswith("0x") or any(ch not in "0123456789abcdef" for ch in _a[2:]):
+        raise SystemExit("STEALTHPAY_LEGACY: bad address %r" % _a)
+PAY_CALLERS = frozenset(([STEALTHPAY] if STEALTHPAY else []) + LEGACY)    # пусто -> «объявлено кем угодно» (как раньше без STEALTHPAY)
 USDC = CC["token"].lower()                                      # токен цепи (USDC на Base, USDG на RH); имя оставлено для совместимости
 MULTICALL3 = CC["multicall3"].lower()
 _sb = os.environ.get("STEALTH_START_BLOCK") or CC.get("start_block")
@@ -158,8 +165,8 @@ def _real_payer(rc, stealth):
         t = lg.get("topics") or []
         if (lg.get("address") or "").lower() != USDC or len(t) != 3 or t[0].lower() != TRANSFER_T: continue
         frm, to = "0x" + t[1][-40:].lower(), "0x" + t[2][-40:].lower()
-        if to == STEALTHPAY and to_sp is None: to_sp = frm
-        elif to == stealth and frm != STEALTHPAY and to_st is None: to_st = frm
+        if to in PAY_CALLERS and to_sp is None: to_sp = frm
+        elif to == stealth and frm not in PAY_CALLERS and to_st is None: to_st = frm
     return to_sp or to_st or tx_from
 
 
@@ -170,7 +177,7 @@ def payer_of(r, cache):
         except Exception: cache[r["tx"]] = None
     rc = cache[r["tx"]]
     if not rc: return None
-    if STEALTHPAY and r["caller"] == STEALTHPAY: return _real_payer(rc, r["stealth"])
+    if r["caller"] in PAY_CALLERS: return _real_payer(rc, r["stealth"])
     return (rc.get("from") or "").lower() or None
 
 
@@ -183,9 +190,9 @@ def put_row(c, r, payers):
 
 def refill_payers():
     """Одноразово: пересчитать payer у существующих строк (caller == STEALTHPAY), затем перезаписать страницы и поднять версию манифеста."""
-    if not STEALTHPAY: raise SystemExit("--refill-payers needs STEALTHPAY")
+    if not PAY_CALLERS: raise SystemExit("--refill-payers needs STEALTHPAY")
     c = db(); cache = {}; n = ch = 0
-    for id_, tx, stealth, caller, old in c.execute("SELECT id,tx,stealth,caller,payer FROM ann WHERE caller=? ORDER BY id", (STEALTHPAY,)).fetchall():
+    for id_, tx, stealth, caller, old in c.execute("SELECT id,tx,stealth,caller,payer FROM ann WHERE caller IN (%s) ORDER BY id" % ",".join("?" * len(PAY_CALLERS)), tuple(PAY_CALLERS)).fetchall():
         new = payer_of({"tx": tx, "stealth": stealth, "caller": caller}, cache)
         n += 1
         if new and new != old:
@@ -491,7 +498,7 @@ class H(BaseHTTPRequestHandler):
                 rows = c.execute("SELECT caller, meta FROM ann WHERE stealth=?", (addr,)).fetchall()
                 ok = False
                 for caller, meta in rows:
-                    if STEALTHPAY and caller != STEALTHPAY: continue
+                    if PAY_CALLERS and caller not in PAY_CALLERS: continue
                     try:
                         m = bytes.fromhex(meta[2:]); amt = int.from_bytes(m[25:57], "big") if len(m) >= 57 else 0
                         tok = "0x" + m[5:25].hex() if len(m) >= 57 and m[1:5] == bytes.fromhex("a9059cbb") else ""   # viewTag|transfer-селектор|токен|сумма (payToken и payWithAuthorization)
@@ -524,5 +531,5 @@ if __name__ == "__main__":
     if "--refill-payers" in sys.argv:
         refill_payers(); raise SystemExit(0)
     threading.Thread(target=index_loop, daemon=True).start()
-    print("stealth indexer", CHAIN, "mode", MODE, "conf", CONF, "on", PORT, "db", DB, "from block", START if START is not None else "(head-%d)" % BACKFILL, "stealthpay", STEALTHPAY or "(any caller)", flush=True)
+    print("stealth indexer", CHAIN, "mode", MODE, "conf", CONF, "on", PORT, "db", DB, "from block", START if START is not None else "(head-%d)" % BACKFILL, "stealthpay", STEALTHPAY or "(any caller)", "legacy", ",".join(LEGACY) or "-", flush=True)
     BoundedServer(("127.0.0.1", PORT), H).serve_forever()

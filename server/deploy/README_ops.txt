@@ -72,3 +72,41 @@ Charging model and nonce model (audit 1120, round 8; supersedes the M-2 text abo
   L-4 FIXED: a feeAuth with the same nonce as the transfer is refused offline.
   L-5 FIXED: an unconfirmed (ambiguous) send keeps its gas reservation (the day budget never undercounts); a retry reserves again (safe direction, like I-1).
   I-1 ACCEPTED (safe direction, now also true for L-5). I-2 ACCEPTED (self-healing within GAP_GRACE_MS, delay only; the lift is what protects a real recent send). I-3 ACCEPTED (availability, per the client's decision).
+
+Base v3 (StealthPay 0xC07f54984AbDa1EF76DaB6F602270B76a04E916d, block 53408013) -- NEW stack next to the live Base v2 stack
+  Files: base.env.example, stealth-indexer-base.service, stealth-relayer-base.service, stealth-base.conf (nginx snippet), ../../ops/install_base.sh.
+  Live v2 stack (stealth-indexer / stealth-relayer, 3873/3874, /opt/stealth, StealthPay v2 0xc1b372731c1ee68ee89f212a05cb8ac9a7929f76) is never touched. RH (3883/3884, /opt/stealth-rh) is never touched.
+  New: code and state in /opt/stealth-base (state in /opt/stealth-base/data), ports 127.0.0.1:3893 (indexer) and :3894 (relayer), nginx https://app.deepyield.ai/stealth-api/base/ .
+  Old payments: the indexer reads EVERY Announcer event from STEALTH_START_BLOCK=31700000 (the live indexer's start, before v2), so the new database contains the v2 payments, and the client scan
+  (view tag + key, no contract check) finds them. STEALTHPAY_LEGACY=<v2> makes /known accept v2-announced addresses: without it the relayer refuses to withdraw from a v2-paid address ("not a stealth address paid through Stealth").
+
+  1. Create /opt/stealth-base/base.env WITHOUT the key passing through a terminal (run as root on the host, from the repo's server/ directory; prints only a yes/no):
+       ( umask 077; install -d -m 755 /opt/stealth-base; { grep -v '^RELAYER_KEY=' deploy/base.env.example; grep -m1 -E '^RELAYER_KEY=0x[0-9a-fA-F]{64}$' /opt/stealth/relayer.env; } > /opt/stealth-base/base.env ) && chown stealth:stealth /opt/stealth-base/base.env && chmod 600 /opt/stealth-base/base.env && [ "$(grep -c '^RELAYER_KEY=0x' /opt/stealth-base/base.env)" = 1 ] && echo KEY-LINE-COPIED
+     (The key line is read from the root-only file /opt/stealth/relayer.env straight into base.env; /opt/mprhedged/exec/.env is not used. If the old file stores the value quoted or in another form the count is 0 and nothing usable was written: fix by hand, do not paste a key into a terminal.)
+     Alternative with its OWN key (no shared account): { grep -v '^RELAYER_KEY=' deploy/base.env.example; node --input-type=module -e 'import{generatePrivateKey}from"viem/accounts";console.log("RELAYER_KEY="+generatePrivateKey())'; } > ... (run in /opt/stealth-base so viem resolves), then read the address
+     with the relayer's own start line (journalctl -u stealth-relayer-base | grep " as ") and fund it with ETH on Base. Default above = the live relayer's funded key.
+  2. Dry run, read the output:   ops/install_base.sh            (prints every action; changes nothing)
+  3. Apply:                      ops/install_base.sh --apply --add-include
+     (copies code, installs the two units, nginx zones + snippet + the include line in the app.deepyield.ai vhost, nginx -t, reload, starts only the two new units; backups in /var/backups/stealth-base/<time>/.
+      Without --add-include it prints the include line for you to add by hand.)
+  4. Checks (the first run indexes Base from 31.7M: minutes; head must reach the chain):
+       curl -s 127.0.0.1:3893/stealth-api/head          -> chain base, start 31700000, count >= the live indexer's count (curl -s 127.0.0.1:3873/stealth-api/head), lag small
+       curl -s 127.0.0.1:3894/stealth-api/relay/stats   -> chain base, stealthpay 0xC07f...916d (checksummed), pay_enabled true, relayer balance > 0
+       curl -s "127.0.0.1:3893/stealth-api/known?addr=<a v2-paid stealth address>"   -> {"known":true}
+       curl -s https://app.deepyield.ai/stealth-api/base/head ; curl -s https://app.deepyield.ai/stealth-api/base/pages/manifest.json
+       systemctl is-active stealth-indexer stealth-relayer stealth-indexer-base stealth-relayer-base      (all four active)
+  5. Only then publish the web copy whose chains.js has base.stealthPay = v3 and base.api = "/stealth-api/base" (lab first: ops/deploy_lab.sh).
+  Rollback (touches only new things; the live stack never stopped):
+       systemctl disable --now stealth-relayer-base stealth-indexer-base
+       restore the vhost: cp -p /var/backups/stealth-base/<time>/etc/nginx/sites-enabled/app-deepyield /etc/nginx/sites-enabled/app-deepyield   (or delete the include line), rm /etc/nginx/snippets/stealth-base.conf /etc/nginx/conf.d/stealth-base-zones.conf, nginx -t && systemctl reload nginx
+       rm /etc/systemd/system/stealth-{indexer,relayer}-base.service && systemctl daemon-reload ; (optional) rm -r /opt/stealth-base
+       web: redeploy the previous web copy (base.stealthPay v2, api /stealth-api).
+  Risks (Base v3):
+   - Shared relayer key: while stealth-relayer (v2) and stealth-relayer-base run, both send from ONE account. Each reconciles its nonce with the node's pending count and fills gaps (see "Nonce" above), so a collision
+     costs at most a failed attempt that the client retries, but it is real. Use the own-key alternative in step 1, or stop the v2 relayer once the web no longer points at it.
+   - Funds: the v2 contract holds no user money (payToken moves tokens straight to the stealth address). Funds sit at the stealth addresses; withdrawal is USDC transferWithAuthorization from the stealth address, independent of either StealthPay.
+   - Cut-over is per web copy: an open old page keeps using v2 API and v2 contract until reloaded. Keep the v2 stack running while old pages may exist.
+   - The pages cache in the browser is keyed chain|page|version (not by API): a rebuilt database with the same version would be served stale pages. Do not delete /opt/stealth-base/data after users have scanned; if you must, bump the manifest version.
+   - Not installed by this script (not installed for RH on the host either): stealth-watch.timer and stealth-sanctions.timer. If the watchdog is added later, append base=http://127.0.0.1:3893|http://127.0.0.1:3894|/opt/stealth-base/data/relayer.base.log|0.0003 to STEALTH_WATCH_CHAINS.
+     The sanctions list in /opt/stealth-base/sanctions/evm.json is the repo copy; refresh it before launch.
+   - install_rh.sh does not copy relay-util.mjs (current relayer.mjs imports it); install_base.sh does. Re-running install_rh.sh --apply on a fresh host would fail for that reason.

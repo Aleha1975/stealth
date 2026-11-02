@@ -8,9 +8,9 @@ export const CHAINS = {
     native: { symbol: "ETH", name: "Ether", decimals: 18 },
     token: { symbol: "USDC", address: "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913", decimals: 6, domainName: "USD Coin", domainVersion: "2" },
     explorer: "https://basescan.org", explorerName: "Basescan",
-    stealthPay: "0xc1b372731c1ee68ee89f212a05cb8ac9a7929f76",
+    stealthPay: "0xC07f54984AbDa1EF76DaB6F602270B76a04E916d",   // v3, Base block 53408013, Sourcify exact match. v2 0xc1b372731c1ee68ee89f212a05cb8ac9a7929f76: its payments are still scanned and withdrawn (neither depends on this address)
     rpc: "https://mainnet.base.org",
-    api: "/stealth-api",
+    api: "/stealth-api/base",                            // nginx: /stealth-api/base/ -> Base v3 indexer :3893 / relayer :3894 (server/deploy/stealth-base.conf). The prod web copy keeps "/stealth-api" (v2, :3873/:3874)
     privateWithdraw: true,                               // withdraw through NEAR Intents 1Click (web/private-withdraw.js)
     oneClick: { assetId: "nep141:base-0x833589fcd6edb6e08f4c7c32d4f71b54bda02913.omft.near" },
   },
