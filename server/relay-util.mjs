@@ -1,4 +1,5 @@
 /* Small pure helpers of the relayer (no env, no network), so they can be unit-tested on their own. */
+import { isIP } from "node:net";
 
 /** Audit 1087 L-1: log lines are parsed by stealth_watch.py (ALERT / reverted). User-controlled text must never be able to start a new line:
  *  every control character, CR/LF and the Unicode line separators become one space. */
@@ -26,7 +27,7 @@ export function clientIp(remote, xff) {
   const hops = String(xff || "").split(",").map(x => x.trim()).filter(Boolean);
   if (!hops.length) return r;
   const last = hops[hops.length - 1];
-  return /^[0-9a-fA-F:.]{2,45}$/.test(last) && /[.:]/.test(last) ? last : "-";
+  return isIP(last) ? last : "-";   // audit 1164 I-1: a real IPv4 / IPv6 literal only (never a half-address that could be mistaken for a bucket key)
 }
 
 /** Audit 1087 L-2: one line of an env file. `KEY=value`, `KEY="value # kept"`, `KEY='x'`, `KEY=value  # comment`; quotes may hold # and the other quote. Returns [key, value] or null. */
@@ -47,7 +48,29 @@ export function capMap(m, max) { while (m.size > max) m.delete(m.keys().next().v
 
 /** Audit 1113 I-1: one canonical form for allow-list entries: an optional prefix length (/64, /128) is dropped, then the same ipKey() as for requests (compressed IPv6 included). */
 export const allowKey = x => ipKey(String(x).trim().replace(/\/\d{1,3}$/, ""));
-export const parseAllow = str => new Set(String(str || "").split(",").map(x => x.trim()).filter(Boolean).map(x => safeIp(allowKey(x))));
+/** audit 1164 I-1: an entry that is not an IPv4 address or an IPv6 address (hostname, typo) is DROPPED (onDrop(entry) is called for the log); it never becomes the "-" bucket of junk requests.
+ *  audit 1164 I-2 (decision): an IPv6 entry allow-lists its whole /64, like every other per-network key (one customer owns a /64); that is documented in README_ops. Prefer an IPv4 address for a trusted host. */
+const V4_KEY = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/, V6_KEY = /^([0-9a-f]{1,4}:){3}[0-9a-f]{1,4}::\/64$/;
+export const allowEntryOk = k => { const m = V4_KEY.exec(k); return m ? m.slice(1).every(x => Number(x) <= 255) : V6_KEY.test(k); };
+export function parseAllow(str, onDrop = () => {}) {
+  const out = new Set();
+  for (const x of String(str || "").split(",").map(y => y.trim()).filter(Boolean)) { const k = allowKey(x); if (allowEntryOk(k)) out.add(k); else onDrop(x); }
+  return out;
+}
+
+/** audit 1164 L-1: the lock file holds "<pid>:<start time>" (field 22 of /proc/<pid>/stat, clock ticks since boot). A pid that is alive but has another start time, or whose command line is not this
+ *  script, is a reused pid of an unrelated process: the lock is stale. `sys` = { kill(pid), proc(path) -> text | null } so the rule is testable with a fake /proc. Without /proc (not Linux) kill(0) decides. */
+export const procStart = (pid, proc) => { const t = proc("/proc/" + pid + "/stat"); const i = t ? t.lastIndexOf(")") : -1; const f = i < 0 ? [] : t.slice(i + 2).split(" "); return /^\d+$/.test(f[19] || "") ? f[19] : null; };
+export function lockHolderAlive(content, script, sys) {
+  const m = /^(\d+)(?::(\d+))?$/.exec(String(content).trim()); if (!m) return false;
+  const pid = Number(m[1]); if (!(pid > 0)) return false;
+  let dead = false; try { sys.kill(pid); } catch (e) { if (e.code !== "EPERM") dead = true; }   // EPERM = alive but another user's: NOT enough, the checks below decide
+  if (dead) return false;
+  const start = procStart(pid, sys.proc), cmd = sys.proc("/proc/" + pid + "/cmdline");
+  if (start === null && cmd === null) return true;                  // no /proc: nothing more can be checked
+  if (m[2] !== undefined) return start === m[2];                    // exact process: same pid and same start time
+  return typeof cmd === "string" && cmd.split("\0").some(a => a === script || a.includes(script));   // lock of an older version (pid only): the command line must name this exact script
+}
 
 /** Audit 1113 M-3: a small in-memory counter map: LRU (a touched key moves to the back), bounded. */
 export function makeCounters(max = 20000) {

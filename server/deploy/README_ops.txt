@@ -10,7 +10,7 @@ Install notes (NOT done; files only)
   Watchdog log of RH relayer = /opt/stealth/data-rh/relayer.rh.log (set STEALTH_RELAY_LOG above).
 
 Allow-list for trusted test clients (audit 1108; empty = off, NOT set in any committed config)
-  STEALTH_RELAY_ALLOW_KEYS=<trusted host IP>       (comma-separated IPv4 addresses or IPv6 addresses/ /64 keys; put it in rh.env / relayer.env on the host only)
+  STEALTH_RELAY_ALLOW_KEYS=<trusted host IP>       (comma-separated IPv4 addresses or IPv6 addresses / /64 keys: an IPv6 entry covers its whole /64; put it in rh.env / relayer.env on the host only)
   Requests from these networks skip the per-key token bucket, the per-IP and per-payer daily counters and the failure counter. They still pass EVERY validation, the sanctions check,
   MAX_CONCURRENT and the daily gas budget. The relayer logs one fixed line per allowed request ("allow-listed request <key> relay|pay").
   nginx needs the same exemption from limit_req: see the "allow-list" snippet in stealth-rh.conf (keep both lists identical).
@@ -138,6 +138,22 @@ Audit 1160 (relayer.mjs). Operator notes
   I-3  <state file>.lock holds the pid; a second process on the same state file refuses to start (a lock of a dead pid is taken over). Deploy: stop the old unit before starting the new one (systemd does).
   I-1  The "allow-listed request" line is rate limited (STEALTH_RELAY_ALLOW_LOG_PER_MIN, 600).
   I-2  nginx POST timeout 45 s instead of 30 s (see M-2). L-4 (front-run burn of a /relay authorization) is inherent to EIP-3009 and stays accepted: bounded by 3 per address per day and the gas budget.
+Audit 1164 (re-review of the 1160 / 1161 fixes), operations notes
+  M-1  A replacement of a stuck send is signed from the call the relayer itself signed and persisted in the unsure record (`tx`: to, data, gas; value 0; the record's nonce), never from what an RPC node returns for the
+       stuck hash. The node is asked only for the stuck transaction's FEES, and must show OUR transaction (from = relayer, same nonce / target / data, value 0) or nothing is signed. UNSURE RECORDS WRITTEN BY AN OLDER
+       VERSION have no `tx`: after the upgrade they are only watched (log "stuck transaction has no persisted call, watched only"); if such a transaction wedges the nonce for WEDGE_S, the periodic check cancels it
+       with a 0-value self-transfer at the same nonce (the authorization stays unused, the client may retry; gas is charged to the day, see L-3). No operator step is needed; new sends carry `tx` from the first save.
+  L-1/L-4  The lock file holds "<pid>:<process start time>". A live pid with another start time (reused by an unrelated process) is a stale lock; the check also runs for pids of other users. A stale lock is moved to
+       a unique name and compared before it is removed; if a concurrent starter's live lock was moved by mistake it is put back and this process exits (systemd starts it again). Linux only for the /proc checks.
+  L-2  The wedge check skips a round on any lookup error other than "not found" (no fill over a transaction that may exist). L-3 A gap fill is checked against and charged to the current day.
+  L-5  /relay/status follows the whole chain of replacements again after a restart, and asks every hash of the send (newest first).
+  I-1  An STEALTH_RELAY_ALLOW_KEYS entry that is not an IPv4 / IPv6 address is dropped at start with a log line ("ALLOW_KEYS entry dropped"); check the log after changing the list. clientIp() returns only a real address or "-".
+  I-2  An IPv6 allow-list entry covers its whole /64 (the same unit as every per-network limit, one customer owns a /64): do not allow-list a shared hosting address that way; IPv4 entries match one address.
+  I-3  If the nonce-lock deadline passes before the broadcast, the unsure record and the fee marker written for it are taken back (nothing was sent).
+  I-4  For client authors: after a half-failed pair (fee leg mined, main leg failed) RETRY WITH THE SAME SIGNATURES. A client that signs new authorizations (new nonces) pays the fee a second time; EIP-3009 gives the
+       relayer no way to tell the two requests apart. Bounded by MAX_PER_FROM and the small fee.
+  I-5  Accepted residual: someone who lands payETH / payToken on the destination between the relayer's used[] read / gas estimate and inclusion makes the relayer's transaction revert on the relayer's gas. On Base
+       the sequencer has no public mempool; the cost is bounded by MAX_PER_PAYER_PER_DAY (20) per payer and the daily gas budget.
   Deploy order: relayer.mjs + relay-util.mjs + stealth_watch.py, restart the relayer unit (brief 503s), regenerate the nginx snippets from the two .conf files, nginx -t, reload.
   First start on an existing state file: unsure records written before this version carry no reserve; their watchers do not adjust the day's gas (conservative), and their send-time reservation stays until midnight.
 

@@ -4,7 +4,7 @@
 import { spawn, spawnSync } from "child_process"; import fs from "fs"; import os from "os"; import path from "path"; import http from "http"; import { fileURLToPath } from "url";
 import { parseTransaction, recoverTransactionAddress, keccak256, parseAbi, decodeFunctionData, encodeAbiParameters, toHex, getAddress, hexToBigInt, parseSignature, encodeFunctionResult, decodeAbiParameters } from "viem";
 import { generatePrivateKey, privateKeyToAccount } from "viem/accounts";
-import { clientIp } from "./relay-util.mjs";
+import { clientIp, parseAllow, lockHolderAlive, procStart } from "./relay-util.mjs";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url)), ME = fileURLToPath(import.meta.url);
 const CC = JSON.parse(fs.readFileSync(path.join(HERE, "chains.json"), "utf8")).rh;
@@ -69,6 +69,8 @@ function makeNode() {
       }
       case "eth_getTransactionByHash": {
         const t = c.pool.get(p[0]) || c.mined.get(p[0]); if (!t) return null;
+        if (c.lookupFails) throw rpcErr("429 rate limit", -32005);                                  // audit 1164 L-2: a lookup that fails, which is not "not found"
+        if (c.hostile && c.pool.has(p[0])) { const hs = c.hostile; c.hostile = null; const real = await c.rpc(method, p); c.hostile = hs; return { ...real, ...hs }; }           // audit 1164 M-1: a lying node: the real answer with fields replaced
         return { hash: t.hash, from: t.from, to: t.to, nonce: hx(t.nonce), gas: hx(t.gas), value: hx(t.value), input: c.hideInput ? "0x" : t.input, type: t.type === "legacy" ? "0x0" : "0x2", chainId: hx(CC.id), ...(t.maxFeePerGas !== undefined ? { maxFeePerGas: hx(t.maxFeePerGas), maxPriorityFeePerGas: hx(t.maxPriorityFeePerGas) } : { gasPrice: hx(t.gasPrice) }),
           blockNumber: c.mined.has(p[0]) ? hx(t.block) : null, blockHash: c.mined.has(p[0]) ? "0x" + "bb".repeat(32) : null, transactionIndex: c.mined.has(p[0]) ? "0x0" : null, v: "0x1", r: "0x1", s: "0x1", yParity: "0x1" };
       }
@@ -298,5 +300,107 @@ const priceOf = t => t.maxFeePerGas ?? t.gasPrice;
   ok("M-2 every relayer location in both nginx configs sets X-Forwarded-For to $remote_addr and none appends", conf.every(c => relayerBlocks(c).length === 3 && relayerBlocks(c).every(b => /proxy_set_header X-Forwarded-For \$remote_addr;/.test(b)) && !/proxy_add_x_forwarded_for/.test(c)));
   ok("M-2 the allow-listed address is not in the repo's docs or configs", spawnSync("grep", ["-rlE", "195\\.201\\.164\\.", HERE, "--exclude-dir=node_modules", "--exclude=test_relayer_recovery.mjs"], { encoding: "utf8" }).stdout.trim() === "");
   srv.kill("SIGKILL"); node.srv.close(); }
+
+
+// ---- audit 1164 M-1: a replacement is rebuilt from the call the relayer itself signed and persisted, never from what a node says the stuck transaction contained
+const ATTACKER = "0x" + "ab".repeat(20), EVIL = "0xa9059cbb" + "00".repeat(12) + "ab".repeat(20) + "ff".repeat(32);   // transfer(attacker, max)
+for (const [name, hostile] of [["input", { input: EVIL }], ["target", { to: ATTACKER }], ["value", { value: hx(10n ** 18n) }], ["sender", { from: ATTACKER }], ["nonce", { nonce: hx(7) }]]) {
+  const node = makeNode(); await node.listen(); const e = env(node, "h1" + name, { STEALTH_RELAY_MAX_REPLACE: "2" });
+  const c = run(e, "pay", { LINGER_MS: "9000" }); const hash = (await c.wait("hash"))?.hash; await waitFor(() => stateOf(e)?.unsure[0]?.[1]?.tx);
+  const rec = stateOf(e)?.unsure[0]?.[1], p0 = node.poolOf(RELAYER)[0];
+  ok("1164 M-1 the unsure record persists the exact signed call (to, data, gas)", !!rec?.tx && [TOKEN, SP].includes(rec.tx.to), JSON.stringify(rec && rec.tx).slice(0, 120));
+  ok("1164 M-1 the persisted data equals the data that went on the wire", !!rec?.tx && rec.tx.data.toLowerCase() === p0.input.toLowerCase() && rec.tx.gas === String(p0.gas));
+  node.hostile = hostile; node.baseFee = 5n * GWEI;
+  await waitFor(() => /replace failed|replacement pay/.test(logOf(e)), 8000); await sleep(1500);
+  const evil = node.sends.some(r => { const t = parseTransaction(r); return (t.data || "0x").toLowerCase().includes("ab".repeat(20)) || (t.to || "").toLowerCase() === ATTACKER || (t.value || 0n) !== 0n; });
+  const ownReplacement = node.sends.length > 1 && node.sends.slice(1).every(r => { const t = parseTransaction(r); return t.data === p0.input && key(t.to) === p0.to && !t.value && t.nonce === p0.nonce; });
+  ok(`1164 M-1 hostile node (${name} replaced): nothing it dictates is ever signed`, !!hash && !evil && (node.sends.length === 1 || ownReplacement), "sends " + node.sends.length);
+  if (name !== "input" && name !== "target") ok(`1164 M-1 hostile ${name}: the node's answer is not our transaction, replacement refused and logged`, /the node's answer is not our stuck transaction/.test(logOf(e)) && node.sends.length === 1, logOf(e).slice(-250));
+  c.p.kill("SIGKILL"); node.srv.close();
+}
+{ // input / target mismatch also refused
+  const node = makeNode(); await node.listen(); const e = env(node, "h1x", { STEALTH_RELAY_MAX_REPLACE: "1" });
+  const c = run(e, "pay", { LINGER_MS: "6000" }); await c.wait("hash"); await waitFor(() => stateOf(e)?.unsure[0]?.[1]?.tx); node.hostile = { input: EVIL }; node.baseFee = 5n * GWEI;
+  await waitFor(() => /replace failed/.test(logOf(e)), 8000);
+  ok("1164 M-1 hostile node with another payload: replacement refused, nothing re-sent", /the node's answer is not our stuck transaction/.test(logOf(e)) && node.sends.length === 1, logOf(e).slice(-250));
+  c.p.kill("SIGKILL"); node.srv.close(); }
+{ // a record of an older version (no persisted call): watched only, never replaced from the node's payload
+  const node = makeNode(); await node.listen(); const e = env(node, "h1old", { STEALTH_RELAY_MAX_REPLACE: "2", STEALTH_RELAY_WEDGE_S: "100000" });
+  const a = run(e, "pay", { LINGER_MS: "60000" }); await a.wait("hash"); await waitFor(() => stateOf(e)?.unsure[0]?.[1]?.tx);
+  a.p.kill("SIGKILL"); await a.exit; const j = stateOf(e); delete j.unsure[0][1].tx; fs.writeFileSync(e.state, JSON.stringify(j));
+  node.hostile = { input: EVIL }; node.baseFee = 5n * GWEI;
+  const b = run(e, "restart", { LINGER_MS: "5000" }); await b.wait("reattached"); await sleep(3500);
+  ok("1164 M-1 old record without a persisted call: no replacement is signed (watched only), ALERT line", node.sends.length === 1 && /no persisted call, watched only/.test(logOf(e)), "sends " + node.sends.length + logOf(e).slice(-200));
+  b.p.kill("SIGKILL"); node.srv.close(); }
+{ // the periodic check on such a record cancels with a 0-value self-transfer (known relayer send), never re-sends the node's payload
+  const node = makeNode(); await node.listen(); const e = env(node, "h1cancel", { STEALTH_RELAY_WEDGE_S: "1", STEALTH_RELAY_MAX_REPLACE: "1" });
+  const a = run(e, "pay", { LINGER_MS: "60000" }); const hash = (await a.wait("hash"))?.hash; await waitFor(() => stateOf(e)?.unsure[0]?.[1]?.tx);
+  a.p.kill("SIGKILL"); await a.exit; const j = stateOf(e); delete j.unsure[0][1].tx; fs.writeFileSync(e.state, JSON.stringify(j));
+  node.hostile = { input: EVIL }; node.baseFee = 4n * GWEI;
+  const b = run(e, "wedge", { LINGER_MS: "4000", WEDGE_CALLS: "6", WEDGE_EVERY_MS: "600" });
+  const fill = await waitFor(() => node.poolOf(RELAYER).find(t => t.hash !== hash));
+  ok("1164 M-1 old record in the pool: replaced by a 0-value self-transfer with empty data at the same nonce", !!fill && fill.to === key(RELAYER) && fill.input === "0x" && fill.value === 0n && fill.nonce === 0, fill ? JSON.stringify({ to: fill.to, i: fill.input }) : "none");
+  ok("1164 M-1 the hostile payload was never signed", !node.sends.some(r => (parseTransaction(r).data || "").toLowerCase().includes("ab".repeat(20))));
+  node.mining = true; await b.exit; node.srv.close(); }
+
+// ---- audit 1164 L-2: an RPC error while looking for the wedged transaction is not "not found": no self-transfer over a live transaction
+{ const node = makeNode(); await node.listen(); const e = env(node, "l2w", { STEALTH_RELAY_WEDGE_S: "1" });
+  const a = run(e, "pay", { LINGER_MS: "60000" }); await a.wait("hash"); await waitFor(() => stateOf(e)?.unsure.length === 1); a.p.kill("SIGKILL"); await a.exit;
+  node.lookupFails = true; node.baseFee = 4n * GWEI;
+  const b = run(e, "wedge", { LINGER_MS: "300", WEDGE_CALLS: "5", WEDGE_EVERY_MS: "500" }); await b.exit;
+  ok("1164 L-2 lookups failing with a 429: nothing is replaced or filled, the round is skipped and logged", node.sends.length === 1 && /transaction lookup failed, skipping this round/.test(logOf(e)) && !/filling with a self-transfer/.test(logOf(e)), "sends " + node.sends.length);
+  node.srv.close(); }
+
+// ---- audit 1164 L-3: a fill after midnight is charged to the current day and checked against it
+{ const src = fs.readFileSync(path.join(HERE, "relayer.mjs"), "utf8"), fn = src.slice(src.indexOf("async function fillNonce"), src.indexOf("async function syncNonce"));
+  ok("1164 L-3 fillNonce checks and charges st.day (no day parameter, charge after rolling)", /async function fillNonce\(n, ctl, bumps = 0\)/.test(fn) && /roll\(\); st\.gas \+= cost/.test(fn) && !/d0/.test(fn));
+  const node = makeNode(); await node.listen(); const e = env(node, "l3day", { STEALTH_RELAY_WEDGE_S: "1", STEALTH_RELAY_DAY_MS: "3000" });
+  const acct = privateKeyToAccount(KEY), ser = await acct.signTransaction({ chainId: CC.id, nonce: 0, gas: 21000n, to: acct.address, value: 0n, type: "eip1559", maxFeePerGas: GWEI * 11n / 10n, maxPriorityFeePerGas: GWEI / 100n });
+  await node.rpc("eth_sendRawTransaction", [ser]); node.baseFee = 3n * GWEI; await sleep(3200);
+  const b = run(e, "wedge", { LINGER_MS: "500", WEDGE_CALLS: "6", WEDGE_EVERY_MS: "600" }); await waitFor(() => node.poolOf(RELAYER).find(t => priceOf(t) > GWEI * 11n / 10n)); node.mining = true; await b.exit;
+  const s = stateOf(e); ok("1164 L-3 a fill sent in a later day than the pool transaction was created is charged to the gas of the current day", !!s && BigInt(s.gas) > 0n, JSON.stringify(s && s.gas));
+  node.srv.close(); }
+
+// ---- audit 1164 L-5: after a restart the status of a replaced send is followed again
+{ const node = makeNode(); await node.listen(); const e = env(node, "l5", { STEALTH_RELAY_MAX_REPLACE: "2", STEALTH_RELAY_PORT: String(39000 + Math.floor(Math.random() * 900)) });
+  const a = run(e, "pay", { LINGER_MS: "60000" }); const hash = (await a.wait("hash"))?.hash; node.baseFee = 5n * GWEI;
+  const rep = await waitFor(() => node.poolOf(RELAYER).find(t => t.hash !== hash)); await waitFor(() => stateOf(e)?.unsure[0]?.[1]?.h === rep?.hash);
+  a.p.kill("SIGKILL"); await a.exit; node.mining = true;
+  const srv = spawn("node", [path.join(HERE, "relayer.mjs")], { env: e.env, stdio: "ignore" }); procs.push(srv);
+  const st1 = await waitFor(async () => { const r = await fetch("http://127.0.0.1:" + e.env.STEALTH_RELAY_PORT + "/stealth-api/relay/status?hash=" + hash).then(x => x.json()); return r.status === "success" && r; }, 15000);
+  ok("1164 L-5 after a restart /relay/status of the ORIGINAL hash reports the mined replacement", !!st1 && key(st1.hash) === key(rep.hash), JSON.stringify(st1));
+  srv.kill("SIGKILL"); node.srv.close(); }
+
+// ---- audit 1164 L-1 / L-4: lock file
+{ const fakeProc = (m) => (f) => (f in m ? m[f] : null), stat = (start) => "123 (no de) S " + Array(18).fill("0").join(" ") + " " + start + " 0 0";
+  const alive = { kill() {} }, eperm = { kill() { throw Object.assign(new Error("x"), { code: "EPERM" }); } }, gone = { kill() { throw Object.assign(new Error("x"), { code: "ESRCH" }); } };
+  const S = "/opt/stealth/relayer.mjs";
+  ok("1164 L-1 procStart reads field 22 even when the command name holds spaces and parentheses", procStart(123, fakeProc({ "/proc/123/stat": stat(777) })) === "777");
+  ok("1164 L-1 a live pid of ANOTHER user (EPERM) with a different start time is a reused pid: stale", lockHolderAlive("123:555", S, { ...eperm, proc: fakeProc({ "/proc/123/stat": stat(777), "/proc/123/cmdline": "/usr/sbin/sshd\0-D" }) }) === false);
+  ok("1164 L-1 same pid and same start time: alive (also under EPERM)", lockHolderAlive("123:777", S, { ...eperm, proc: fakeProc({ "/proc/123/stat": stat(777) }) }) === true);
+  ok("1164 L-1 dead pid: stale", lockHolderAlive("123:777", S, { ...gone, proc: fakeProc({}) }) === false);
+  ok("1164 L-1 old lock (pid only): alive only if the command line names this exact script", lockHolderAlive("123", S, { ...alive, proc: fakeProc({ "/proc/123/stat": stat(1), "/proc/123/cmdline": "node\0" + S }) }) === true
+    && lockHolderAlive("123", S, { ...alive, proc: fakeProc({ "/proc/123/stat": stat(1), "/proc/123/cmdline": "node\0/srv/other/app.js" }) }) === false
+    && lockHolderAlive("123", S, { ...eperm, proc: fakeProc({ "/proc/123/stat": stat(1), "/proc/123/cmdline": "/usr/sbin/cron\0-f" }) }) === false);
+  ok("1164 L-1 no /proc at all (not Linux): kill(0) decides; garbage content is stale", lockHolderAlive("123", S, { ...alive, proc: () => null }) === true && lockHolderAlive("garbage", S, { ...alive, proc: () => null }) === false);
+  // L-4: the takeover through the real function: a stale lock is taken; a live winner's lock that appears between the read and the move is put back, not deleted
+  const dir = fs.mkdtempSync(path.join(tmp, "lk-")), lf = path.join(dir, "s.lock");
+  const t = (extra) => spawnSync("node", ["--input-type=module", "-e", `
+    process.env.STEALTH_RELAY_STATE=${JSON.stringify(path.join(dir, "st.json"))};
+    const R = await import("file://${path.join(HERE, "relayer.mjs")}");
+    import("node:fs").then(fs => { ${extra} });`], { encoding: "utf8", timeout: 20000, env: { ...process.env, STEALTH_ENV_ONLY: "1", STEALTH_CHAIN: "rh", STEALTH_RPC: "http://127.0.0.1:1", RELAYER_KEY: KEY, STEALTH_RELAY_LOG: path.join(dir, "l.log"), STEALTH_RELAY_STATE: path.join(dir, "st.json") } });
+  const lockPath = path.join(dir, "st.json.lock");
+  fs.writeFileSync(lockPath, "1");        // pid 1 is alive (init) but is not this script: an old-format lock of an unrelated live process
+  const r1 = t(`console.log("started")`);
+  ok("1164 L-1 a lock held by an unrelated LIVE process (pid 1, old format) is taken over", /started/.test(r1.stdout) || (process.platform !== "linux" && r1.status === 1), r1.stderr.slice(0, 200) + " [skipped where there is no /proc]");
+  fs.rmSync(lockPath, { force: true });
+  const src = fs.readFileSync(path.join(HERE, "relayer.mjs"), "utf8");
+  ok("1164 L-4 the stale lock is moved to a unique name and compared before it is removed (no blind unlink of LOCK_FILE)", /fs\.renameSync\(lockFile, mv\)/.test(src) && /got !== old/.test(src) && !/fs\.unlinkSync\(lockFile\)/.test(src)); }
+
+// ---- audit 1164 I-1: allow-list parsing
+{ const dropped = []; const A = parseAllow("9.9.9.9, 2001:db8::1, 2001:0db8:0:0::/64, ::ffff:1.2.3.4, my.host.name, 1.2.3, 999.1.1.1, -, junk", x => dropped.push(x));
+  ok("1164 I-1 unparsable entries are dropped (and reported), never the '-' bucket", !A.has("-") && dropped.join("|") === "my.host.name|1.2.3|999.1.1.1|-|junk" && A.size === 3 && A.has("9.9.9.9") && A.has("2001:db8:0:0::/64") && A.has("1.2.3.4"), [...A].join(",") + " / " + dropped.join("|"));
+  ok("1164 I-1 clientIp: a junk rightmost hop never yields a value that could match an allow-list bucket", ["1.2", "::::", "a.b", "1.2.3.4.5", "999.1.1.1x", "1:2"].every(x => clientIp("127.0.0.1", "9.9.9.9, " + x) === "-") && clientIp("127.0.0.1", "10.0.0.1") === "10.0.0.1");
+  ok("1164 I-2 an IPv6 allow entry covers its whole /64 (documented), an IPv4 entry exactly one address", parseAllow("2001:db8::1").has("2001:db8:0:0::/64") && !parseAllow("1.2.3.4").has("1.2.3.5")); }
 
 console.log(fails ? "\nFAILED " + fails + " of " + rows.length : "\nALL PASS " + rows.length); process.exit(fails ? 1 : 0);
