@@ -655,4 +655,18 @@ print(json.dumps({"eth": m._real_payer(eth_rc, st), "none": m._real_payer({"from
   const stdPart = appSrc.slice(appSrc.indexOf("const now = Math.floor(Date.now() / 1000); const validBefore"), appSrc.indexOf("const doneMsg = \"Done: \"", appSrc.indexOf("const now = Math.floor(Date.now() / 1000); const validBefore")));
   t("Standard route (token and ETH) never calls 1Click", stdPart.length > 500 && !/requestQuote|previewQuote|ONECLICK|runFast|runHop/.test(stdPart) && !/requestQuote|previewQuote|ONECLICK|runFast|runHop/.test(appSrc.slice(appSrc.indexOf("async function ethStandard"), appSrc.indexOf("async function ethStandard") + 3000).split("\nasync function ")[0]));
 }
+// next-step highlight + route hints (UI only): the real nextStep() runs against a stub DOM
+{
+  const html = fs.readFileSync(new URL("../web/app.html", import.meta.url), "utf8"), app = fs.readFileSync(new URL("../web/app.js", import.meta.url), "utf8"), css = fs.readFileSync(new URL("../web/loophole.css", import.meta.url), "utf8");
+  t("hint elements exist: keys hint text, route hint line", /id="keys-hint">Sign once to create your private keys\. No payment, no gas\.</.test(html) && /id="wd-route-hint"/.test(html));
+  t("route hints: Standard / Private fast / Maximum lines", /std: "Link visible on-chain", fast: "Hides the link", max: "Strongest, best above ~\$50"/.test(app) && /\$\("wd-route-hint"\)\.textContent = ROUTE_HINT\[route\(\)\]/.test(app));
+  t("pulse css: animation, plus a static outline under prefers-reduced-motion", /\.btn\.next,\.wallet\.next\{animation:nx/.test(css) && /prefers-reduced-motion:reduce\)\{\.btn\.next,\.wallet\.next\{animation:none;outline/.test(css));
+  const src = app.slice(app.indexOf("function nextStep()"), app.indexOf("async function connect()"));
+  const els = {}; for (const id of ["wbtn", "btn-keys", "copy-link", "keys-hint"]) { const c = new Set(); els[id] = { hidden: false, classList: { toggle: (k, v) => v ? c.add(k) : c.delete(k), has: k => c.has(k) } }; }
+  const run = (acct, keys, linkCopied) => { new Function("$", "acct", "keys", "linkCopied", src + "; nextStep();")(id => els[id], acct, keys, linkCopied); return ["wbtn", "btn-keys", "copy-link"].filter(i => els[i].classList.has("next")).join(",") + (els["keys-hint"].hidden ? "|nohint" : "|hint"); };
+  t("nextStep: not connected -> connect button pulses", run(null, null, false) === "wbtn|hint");
+  t("nextStep: connected, no keys -> Derive my keys pulses, hint shown", run("0xabc", null, false) === "btn-keys|hint");
+  t("nextStep: keys derived -> Copy link pulses, keys hint hidden", run("0xabc", {}, false) === "copy-link|nohint");
+  t("nextStep: link copied -> nothing pulses", run("0xabc", {}, true) === "|nohint");
+}
 console.log(fail ? "FAILED " + fail : "all passed"); process.exit(fail ? 1 : 0);

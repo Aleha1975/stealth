@@ -54,7 +54,14 @@ function setAcct(a) {
   acct = a ? a.toLowerCase() : null;
   $("wbtn").textContent = acct ? acct.slice(0, 6) + "…" + acct.slice(-4) : "Connect wallet"; $("wbtn").classList.toggle("on", !!acct);
   if (changed) { keys = null; found = []; try { hops.clear(); lost.clear(); lostNone.clear(); lostDone.clear(); renderHops(); } catch {} $("recv-out").hidden = true; $("pay-list").textContent = ""; $("withdraw").hidden = true; say("recv-hint", "Account changed: derive the keys again for this account.", "warn"); }
+  nextStep();
   try { if ($("fast-resume")) { showFastBox(); if (acct && fastDeferred) { fastDeferred = false; resumeFast().catch(() => {}); } } } catch {}      // 1132 M-1: this account's recovery notes (a try/catch, not a typeof check: showFastBox is hoisted, the bindings it reads are not). 1135 L-4: records that waited for an account are followed now
+}
+// UI only: the one button that is the next required step gets the "next" (pulse) class; nothing pulses once it is done
+let linkCopied = false;
+function nextStep() {
+  const on = (id, v) => $(id).classList.toggle("next", !!v);
+  on("wbtn", !acct); on("btn-keys", acct && !keys); on("copy-link", keys && !linkCopied); $("keys-hint").hidden = !!keys;
 }
 async function connect() {
   if (!window.ethereum) { say("recv-hint", "No wallet found. Open this page inside MetaMask.", "bad"); return null; }
@@ -117,13 +124,14 @@ $("btn-keys").addEventListener("click", once(async () => {
     keys = k1;
     if (!prev) try { localStorage.setItem("stealth.meta." + acct, meta); } catch {}
     $("meta").textContent = meta; $("paylink").textContent = location.origin + location.pathname.replace(/[^/]*$/, "") + "app.html?" + (C.key === pickChain("").key ? "" : "chain=" + C.key + "&") + "to=" + meta;
-    $("recv-out").hidden = false;
+    $("recv-out").hidden = false; linkCopied = false; nextStep();
     if (legacyOnly) say("recv-hint", "Your wallet's signatures are non-canonical (high-s). Older payments made to your previous link are found with the legacy keys (scan and withdraw only); do not share the new link until you have moved those funds. WARNING: the key signature is the master key; sign it only on " + location.host + ".", "warn");
     else say("recv-hint", "Keys derived in this browser. They are not stored anywhere. Remember: the key signature is the master key; sign it only on " + location.host + ".", "ok");
     $("scan-note").textContent = "Ready to scan " + C.name + " for payments to your keys.";
   } catch (e) { say("recv-hint", e.message || String(e), "bad"); }
 }));
-$("copy-link").addEventListener("click", () => navigator.clipboard.writeText($("paylink").textContent).then(() => say("recv-hint", "Link copied.", "ok")));
+$("copy-link").addEventListener("click", () => navigator.clipboard.writeText($("paylink").textContent).then(() => { linkCopied = true; nextStep(); say("recv-hint", "Link copied.", "ok"); }));
+nextStep();
 $("copy-meta").addEventListener("click", () => navigator.clipboard.writeText($("meta").textContent).then(() => say("recv-hint", "Meta-address copied.", "ok")));
 
 // ---- history page cache (IndexedDB, key chain|page|manifest.version). Works without storage: every call is wrapped.
@@ -526,7 +534,8 @@ function setRoutes(HM) {
   routeChanged();
 }
 const route = () => $("wd-route").value || "std";
-function routeChanged() { $("wd-route-note").textContent = route() === "std" && wdA === "ETH" ? ROUTE_NOTE_ETH_STD : ROUTE_NOTE[route()]; $("wd-priv-opts").hidden = route() === "std"; pvReset(); }
+const ROUTE_HINT = { std: "Link visible on-chain", fast: "Hides the link", max: "Strongest, best above ~$50" };
+function routeChanged() { $("wd-route-hint").textContent = ROUTE_HINT[route()]; $("wd-route-note").textContent = route() === "std" && wdA === "ETH" ? ROUTE_NOTE_ETH_STD : ROUTE_NOTE[route()]; $("wd-priv-opts").hidden = route() === "std"; pvReset(); }
 // ---- private withdraw: preview (two dry quotes) first, then a second click starts the hop. Any input change drops the preview.
 let pv = null, HOPM = null;
 const hopMod = () => HOPM || (HOPM = import("./zec-hop.js"));
