@@ -17,6 +17,18 @@ export function ipKey(ip) {
   return g.slice(0, 4).map(x => x.replace(/^0+(?=.)/, "")).join(":") + "::/64";
 }
 
+/** Audit 1160 M-2: the client address of a request. The relayer listens on 127.0.0.1 behind nginx, which OVERWRITES X-Forwarded-For with $remote_addr (deploy/stealth-*.conf).
+ *  The header is read only when the TCP peer is loopback (the proxy); the RIGHTMOST hop is the one the proxy itself appended / set, so an `X-Forwarded-For: <allow-listed ip>` sent by a client is
+ *  never the address used (it stays to the left, or is replaced). Any other peer: its own address, the header is ignored. A rightmost hop that is not an address -> "-" (its own bucket). */
+export function clientIp(remote, xff) {
+  const r = String(remote || "");
+  if (!/^(127\.\d+\.\d+\.\d+|::1|::ffff:127\.\d+\.\d+\.\d+)$/i.test(r)) return r;
+  const hops = String(xff || "").split(",").map(x => x.trim()).filter(Boolean);
+  if (!hops.length) return r;
+  const last = hops[hops.length - 1];
+  return /^[0-9a-fA-F:.]{2,45}$/.test(last) && /[.:]/.test(last) ? last : "-";
+}
+
 /** Audit 1087 L-2: one line of an env file. `KEY=value`, `KEY="value # kept"`, `KEY='x'`, `KEY=value  # comment`; quotes may hold # and the other quote. Returns [key, value] or null. */
 export function parseEnvLine(line) {
   const m = String(line).match(/^\s*(?:export\s+)?([A-Z0-9_]+)=(?:"([^"]*)"|'([^']*)'|([^#\n]*?))\s*(?:#.*)?$/);

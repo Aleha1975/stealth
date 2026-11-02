@@ -10,7 +10,7 @@ Install notes (NOT done; files only)
   Watchdog log of RH relayer = /opt/stealth/data-rh/relayer.rh.log (set STEALTH_RELAY_LOG above).
 
 Allow-list for trusted test clients (audit 1108; empty = off, NOT set in any committed config)
-  STEALTH_RELAY_ALLOW_KEYS=195.201.164.56        (comma-separated IPv4 addresses or IPv6 addresses/ /64 keys; put it in rh.env / relayer.env on the host only)
+  STEALTH_RELAY_ALLOW_KEYS=<trusted host IP>       (comma-separated IPv4 addresses or IPv6 addresses/ /64 keys; put it in rh.env / relayer.env on the host only)
   Requests from these networks skip the per-key token bucket, the per-IP and per-payer daily counters and the failure counter. They still pass EVERY validation, the sanctions check,
   MAX_CONCURRENT and the daily gas budget. The relayer logs one fixed line per allowed request ("allow-listed request <key> relay|pay").
   nginx needs the same exemption from limit_req: see the "allow-list" snippet in stealth-rh.conf (keep both lists identical).
@@ -122,3 +122,21 @@ Audit 1158 (indexer + nginx isolation conf) -- what changes on deploy
   4. New optional env: STEALTH_REQ_DEADLINE (30 s, whole request), STEALTH_ANN_CACHE_BYTES (16 MiB). Paths are matched exactly: /<name>, /stealth-api/<name>, /stealth-api/<chain>/<name>.
   5. nginx: ops/nginx-stealth-zec.conf now includes mime.types, sets nosniff / no-referrer / frame-ancestors 'none', and the wasm year-cache header has no `always`. nginx -t, reload,
      then check: curl -sI https://app.deepyield.ai/stealth-zec/ | grep -iE 'content-security|x-content|referrer|cross-origin' ; and open the wallet page once (crossOriginIsolated === true).
+
+Audit 1160 (relayer.mjs). Operator notes
+  M-1  Stuck sends. A replacement is priced max(stuck price, CURRENT market price) + STEALTH_RELAY_BUMP_PCT, at most STEALTH_RELAY_MAX_REPLACE (3, max 4) times, STEALTH_RELAY_STUCK_S apart. After a restart every persisted
+       unsure send gets its watcher back ("re-attached watchers to unconfirmed sends N" in the log). Every STEALTH_RELAY_WEDGE_S/2 (default WEDGE_S = 2 x STUCK_S) the relayer compares its latest and pending nonce; a pending nonce
+       older than WEDGE_S with no watcher is re-sent from the pool at the market fee, or, if it cannot be re-sent, replaced by a self-transfer ("ALERT wedged nonce"). It also frees a nonce stuck by ANOTHER process using the same key
+       (the Base v3 relayer shares the key and nonce with the live Base relayer).
+  M-2  Client address = rightmost X-Forwarded-For hop, honoured only when the TCP peer is loopback. nginx must OVERWRITE the header (proxy_set_header X-Forwarded-For $remote_addr;) in every relayer location
+       (stealth-rh.conf / stealth-base.conf do; so do the live vhosts, checked 02.11). Never $proxy_add_x_forwarded_for. The nginx POST timeout is 45 s (> STEALTH_RELAY_LOCK_MS 40 s).
+  L-1  The collected-fee marker is written in the same durable save as the unsure record of the fee send, before the fee is sent.
+  L-2  STEALTH_RELAY_MAX_FEE_WEI = hard ceiling on maxFeePerGas / gasPrice of every transaction we sign. Default = GAS_BUDGET / 4 / 250000 (one pay-sized transaction costs at most a quarter of the day):
+       Base 0.0002 ETH -> 0.2 gwei, RH 0.01 ETH -> 10 gwei. Above it: 503 "network fees are very high", "ALERT fee ceiling exceeded". Replacements are charged to the day's budget and refused past it;
+       a gap fill is charged too but may pass the budget by at most budget/4 (it unblocks sends that were already paid for).
+  L-3  Startup refuses: STEALTHPAY set and STEALTH_RELAY_PAY_FEE_MIN=0. STEALTH_RELAY_REQUIRE_WITHDRAW_FEE=1 additionally refuses STEALTH_RELAY_FEE_MIN=0 (default off: the withdraw fee is off by product decision, logged at start).
+  I-3  <state file>.lock holds the pid; a second process on the same state file refuses to start (a lock of a dead pid is taken over). Deploy: stop the old unit before starting the new one (systemd does).
+  I-1  The "allow-listed request" line is rate limited (STEALTH_RELAY_ALLOW_LOG_PER_MIN, 600).
+  I-2  nginx POST timeout 45 s instead of 30 s (see M-2). L-4 (front-run burn of a /relay authorization) is inherent to EIP-3009 and stays accepted: bounded by 3 per address per day and the gas budget.
+  Deploy order: relayer.mjs + relay-util.mjs + stealth_watch.py, restart the relayer unit (brief 503s), regenerate the nginx snippets from the two .conf files, nginx -t, reload.
+  First start on an existing state file: unsure records written before this version carry no reserve; their watchers do not adjust the day's gas (conservative), and their send-time reservation stays until midnight.

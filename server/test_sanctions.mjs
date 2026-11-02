@@ -9,7 +9,7 @@ write([BAD.toUpperCase().replace("0X", "0x")]);                       // mixed c
 let rpcCalls = 0; const stub = http.createServer((q, s) => { let b = ""; q.on("data", c => b += c); q.on("end", () => { rpcCalls++; const j = JSON.parse(b); s.end(JSON.stringify({ jsonrpc: "2.0", id: j.id, result: "0x1" })); }); });
 await new Promise(r => stub.listen(0, "127.0.0.1", r));
 Object.assign(process.env, { STEALTH_CHAIN: "rh", STEALTH_ENV_ONLY: "1", STEALTH_RPC: "http://127.0.0.1:" + stub.address().port, STEALTH_SANCTIONS_FILE: list, STEALTH_RELAY_LOG: path.join(tmp, "r.log"),
-  STEALTH_RELAY_STATE: path.join(tmp, "s.json"), STEALTHPAY: "0x" + "99".repeat(20), RELAYER_KEY: "0x" + "11".repeat(32), STEALTH_RELAY_PAY_FEE_MIN: "0" });
+  STEALTH_RELAY_STATE: path.join(tmp, "s.json"), STEALTHPAY: "0x" + "99".repeat(20), RELAYER_KEY: "0x" + "11".repeat(32), STEALTH_RELAY_PAY_FEE_MIN: "50000" });
 const R = await import("./relayer.mjs");
 let fails = 0; const t = (name, ok) => { console.log(ok ? "PASS" : "FAIL", name); if (!ok) fails++; };
 const sig = { nonce: "0x" + "00".repeat(32), r: "0x" + "00".repeat(32), s: "0x" + "00".repeat(31) + "01", v: 27, value: "300000", validBefore: "99999999999" };
@@ -30,7 +30,7 @@ t("unlisted passes screen", R.screen.isListed(OK) === false && R.screen.isListed
 write([BAD, LATE]); await new Promise(r => setTimeout(r, 1100)); t("reload on file change picks up new address", R.screen.isListed(LATE) === true);
 fs.writeFileSync(list, "{broken"); await new Promise(r => setTimeout(r, 1100)); t("broken reload keeps previous list", R.screen.isListed(LATE) === true);
 write([BAD]); const port = 38000 + Math.floor(Math.random() * 1000);
-const child = spawn("node", [path.join(HERE, "relayer.mjs")], { env: { ...process.env, STEALTH_RELAY_PORT: String(port) }, stdio: "ignore" });
+const child = spawn("node", [path.join(HERE, "relayer.mjs")], { env: { ...process.env, STEALTH_RELAY_PORT: String(port), STEALTH_RELAY_STATE: path.join(tmp, "s2.json") }, stdio: "ignore" });
 await new Promise(r => setTimeout(r, 1500));
 const g = u => fetch("http://127.0.0.1:" + port + u).then(async r => [r.status, await r.json()]);
 const a = await g("/stealth-api/relay/screen?addr=" + BAD), b = await g("/stealth-api/relay/screen?addr=" + OK), c = await g("/stealth-api/relay/screen?addr=zzz");

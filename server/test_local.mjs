@@ -15,7 +15,7 @@ async function parent() {
   const anvil = spawn("anvil", ["--fork-url", "https://rpc.mainnet.chain.robinhood.com", "--port", String(PORT), "--silent"], { stdio: "inherit" });
   for (let i = 0; i < 60; i++) { try { await rpc("eth_chainId"); break; } catch { await new Promise(r => setTimeout(r, 500)); } }
   console.log("anvil fork chainId", parseInt(await rpc("eth_chainId"), 16), "block", parseInt(await rpc("eth_blockNumber"), 16));
-  const run = (sc, env = {}, state = "s_" + sc) => { env = { STEALTH_RELAY_GAS_BUDGET_WEI: "1000000000000000000", ...env };
+  const run = (sc, env = {}, state = "s_" + sc) => { env = { STEALTH_RELAY_GAS_BUDGET_WEI: "1000000000000000000", STEALTH_RELAY_MAX_FEE_WEI: "1000000000000", ...env };   // audit 1160 L-2: the default fee ceiling is derived from the budget; the toy budgets below need an explicit one
     const r = spawnSync("node", [ME, "child", sc], { env: { ...process.env, STEALTH_CHAIN: "rh", STEALTH_RPC: RPC, STEALTH_RELAY_STATE: path.join(tmp, state + ".json"), STEALTH_RELAY_LOG: path.join(tmp, sc + ".log"), RELAYER_KEY: "", ...env }, encoding: "utf8", timeout: 120000 });
     process.stdout.write(r.stdout.split("\n").filter(l => l.startsWith("T:")).join("\n") + "\n"); if (r.status) { console.log("CHILD FAILED", r.stderr.slice(-800), r.stdout.slice(-400)); }
     return r;

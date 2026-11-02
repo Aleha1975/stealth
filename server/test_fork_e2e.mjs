@@ -84,7 +84,7 @@ try {
     const logf = path.join(tmp, name + ".log");
     const p = spawn("nice", ["-n", "10", "node", path.join(HERE, "relayer.mjs")], { env: { ...process.env, STEALTH_ENV_ONLY: "1", STEALTH_CHAIN: "rh", STEALTH_RPC: RPC, STEALTHPAY: SP, RELAYER_KEY: rk, STEALTH_RELAY_PORT: String(port),
       STEALTH_RELAY_STATE: path.join(tmp, name + ".json"), STEALTH_RELAY_LOG: logf, STEALTH_SANCTIONS_FILE: sanctFile, STEALTH_INDEXER: "http://127.0.0.1:" + IPORT,
-      STEALTH_RELAY_PAY_FEE: String(FEE), STEALTH_RELAY_PAY_FEE_MIN: String(FEE), STEALTH_RELAY_GAS_BUDGET_WEI: "1000000000000000000", STEALTH_RELAY_MAX_PER_IP: "1000", STEALTH_RELAY_FAIL_PER_IP: "100000", STEALTH_RELAY_RPC_BURST: "100000", STEALTH_RELAY_GONE_GAP_MS: "1500", STEALTH_RELAY_REFUSED_LOG_PER_MIN: "100000", ...env }, stdio: ["ignore", "pipe", "inherit"] });
+      STEALTH_RELAY_PAY_FEE: String(FEE), STEALTH_RELAY_PAY_FEE_MIN: String(FEE), STEALTH_RELAY_GAS_BUDGET_WEI: "1000000000000000000", STEALTH_RELAY_MAX_FEE_WEI: "1000000000000", STEALTH_RELAY_MAX_PER_IP: "1000", STEALTH_RELAY_FAIL_PER_IP: "100000", STEALTH_RELAY_RPC_BURST: "100000", STEALTH_RELAY_GONE_GAP_MS: "1500", STEALTH_RELAY_REFUSED_LOG_PER_MIN: "100000", ...env }, stdio: ["ignore", "pipe", "inherit"] });
     procs.push(p); await new Promise(r => p.stdout.on("data", d => { if (String(d).includes("stealth relayer")) r(); }));
     return { addr, key: rk, logf, p, state: path.join(tmp, name + ".json"), log: () => fs.readFileSync(logf, "utf8") };
   };
@@ -650,7 +650,7 @@ try {
       fs.chmodSync(R.dir, 0o755);
       const w2 = await post(R.url, "/relay/pay", x.body, nip()); const rc = w2.hash && await pub.waitForTransactionReceipt({ hash: w2.hash, timeout: 15000 }).catch(() => null);
       ok("B14 1116 M-1 after the repair the SAME signature is relayed, exactly once", w2.status === 200 && rc && rc.status === "success" && (await nonceOf(R.addr)) - n0 === 1 && (await bal(x.dd.stealth)) - c0 === 2n * U - FEE, JSON.stringify(w2));
-      await sleep(1500); const j = stOf(R), leftovers = fs.readdirSync(R.dir);
+      await sleep(1500); const j = stOf(R), leftovers = fs.readdirSync(R.dir).filter(f => !f.endsWith(".lock"));   // audit 1160 I-3: the pid lock file is expected next to the state file
       ok("B14 1116 I-2 the state file is valid JSON and the directory holds only it (unique temp names, fsync + rename)", !!j && leftovers.length === 1 && /fsync/.test(fs.readFileSync(path.join(HERE, "relayer.mjs"), "utf8")) && /\.sync\(\)/.test(fs.readFileSync(path.join(HERE, "relayer.mjs"), "utf8")), leftovers.join()); }
 
     // L-1: the stuck-tx replacement writes its unsure record first (and is not sent when that fails)
@@ -921,7 +921,7 @@ try {
     // I-5: a state file that cannot be loaded -> the relayer refuses to start, ALERT line the watchdog matches
     { const bad = [["corrupt", "{not json"], ["dir", null]], res = [];
       for (const [nm, content] of bad) { const sf = path.join(tmp, "bad_" + nm + ".json"), lf = path.join(tmp, "bad_" + nm + ".log"); if (content === null) fs.mkdirSync(sf); else fs.writeFileSync(sf, content);
-        const r = spawnSync("node", [path.join(HERE, "relayer.mjs")], { encoding: "utf8", timeout: 20000, env: { ...process.env, STEALTH_ENV_ONLY: "1", STEALTH_CHAIN: "rh", STEALTH_RPC: RPC, STEALTHPAY: SP, RELAYER_KEY: generatePrivateKey(), STEALTH_RELAY_PORT: String(await freePort()), STEALTH_RELAY_STATE: sf, STEALTH_RELAY_LOG: lf } });
+        const r = spawnSync("node", [path.join(HERE, "relayer.mjs")], { encoding: "utf8", timeout: 20000, env: { ...process.env, STEALTH_ENV_ONLY: "1", STEALTH_CHAIN: "rh", STEALTH_RPC: RPC, STEALTHPAY: SP, RELAYER_KEY: generatePrivateKey(), STEALTH_RELAY_PORT: String(await freePort()), STEALTH_RELAY_PAY_FEE_MIN: String(FEE), STEALTH_RELAY_STATE: sf, STEALTH_RELAY_LOG: lf } });
         res.push({ nm, status: r.status, log: fs.existsSync(lf) ? fs.readFileSync(lf, "utf8") : "" }); }
       const py = spawnSync("python3", ["-B", "-c", "import sys,importlib.util\nspec=importlib.util.spec_from_file_location('w',sys.argv[1]); m=importlib.util.module_from_spec(spec); spec.loader.exec_module(m)\nprint(sum(1 for l in sys.stdin.read().splitlines() if m.LOG_TEMPLATE.match(l)))", path.join(HERE, "stealth_watch.py")], { input: res.map(x => x.log).join(""), encoding: "utf8" });
       ok("B14 1116 I-5 corrupt / unreadable state file: exit code 1 (fail closed), one 'ALERT state load failed' line each, matched by the watchdog template", res.every(x => x.status === 1 && /ALERT state load failed/.test(x.log) && !/stealth relayer rh/.test(x.log)) && Number(py.stdout) === 2, JSON.stringify(res.map(x => [x.nm, x.status])) + " py " + py.stdout); }
