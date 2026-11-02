@@ -635,4 +635,24 @@ print(json.dumps({"eth": m._real_payer(eth_rc, st), "none": m._real_payer({"from
   t("1161 M-1: only a notFresh error is retried (any other failure is rethrown at once)", /if \(!e \|\| !e\.notFresh \|\|/.test(dp));
   t("1161 L-1: the client refuses to sign when the fee recipient equals the one-time address, before the signature", /feeTo\.toLowerCase\(\) === d\.stealth\.toLowerCase\(\)\) throw/.test(gl) && gl.indexOf("feeTo.toLowerCase() === d.stealth.toLowerCase()") < gl.indexOf("eth_signTypedData_v4"));
 }
+// 1Click outage: classify, degrade to one short message, never start or sign; input errors keep their text; Standard never touches 1Click
+{ const PWq = PWm, resp = (status, body) => async () => ({ ok: status < 400, status, json: async () => { if (body === undefined) throw new Error("not json"); return body; } });
+  const req = { amount: "1000000", recipient: "0x" + "11".repeat(20), refundTo: "0x" + "22".repeat(20), originAsset: "a", destinationAsset: "b", dry: true };
+  const err = async (fetchFn, f = PWq.requestQuote) => { try { await f({ req, fetchFn }); return null; } catch (e) { return e; } };
+  const down = [["521 no body", resp(521)], ["522", resp(522, {})], ["523", resp(523)], ["524", resp(524)], ["500 json", resp(500, { message: "oops" })], ["network failure", async () => { throw new TypeError("Failed to fetch"); }],
+    ["timeout", async () => { const e = new Error("signal timed out"); e.name = "TimeoutError"; throw e; }], ["pair not available (400)", resp(400, { message: "Quoting for this pair is not available" })]];
+  for (const [n, f] of down) t("1Click outage: " + n + " is classified as service unavailable", PWq.isQuoteUnavailable(await err(f)));
+  t("1Click outage: input problems are not an outage", !PWq.isQuoteUnavailable(await err(resp(400, { message: "Amount is too low for the swap, at least 150000" }))) && !PWq.isQuoteUnavailable(await err(resp(400, { message: "recipient is invalid" }))) && !PWq.isQuoteUnavailable(await err(resp(401, {}))) && !PWq.isQuoteUnavailable(null) && !PWq.isQuoteUnavailable(new Error("bad address")));
+  let calls = 0; const counted = f => async (...a) => { calls++; return f(...a); };
+  for (const [n, f] of down) { const e = await err(counted(f), PWq.previewQuote); t("1Click outage: preview shows the one short message (" + n + ")", !!e && e.message === PWq.QUOTE_DOWN); }
+  t("1Click outage: the message is short English and points to Standard", PWq.QUOTE_DOWN === "This route needs an outside swap service that is not answering right now. Standard withdraw still works. Try again in a few minutes.");
+  const e1 = await err(resp(400, { message: "Amount is too low for the swap, at least 150000" }), PWq.previewQuote);
+  t("1Click outage: preview keeps the readable input message", e1 && e1.message === "Amount is too low for the swap, at least 150000");
+  const appSrc = fs.readFileSync(new URL("../web/app.js", import.meta.url), "utf8"), pvSrc = appSrc.slice(appSrc.indexOf("async function privateWithdraw"), appSrc.indexOf("// ---- route \"private, fast\"")), fsrc = appSrc.slice(appSrc.indexOf("async function fastWithdraw"), appSrc.indexOf("const w = wd, k = w.stealth.toLowerCase(), plan"));
+  t("1Click outage: both preview steps use previewQuote and sit before any hop start or signature (the throw returns to the page handler, the route selector is untouched)",
+    !/PW\.requestQuote/.test(pvSrc + fsrc) && (pvSrc.match(/PW\.previewQuote/g) || []).length === 2 && fsrc.includes("PW.previewQuote") && pvSrc.indexOf("PW.previewQuote") < pvSrc.indexOf("await runHop(") && !/wd-route/.test(pvSrc + fsrc));
+  t("1Click outage: resume paths still call requestQuote directly (zec-hop and the fast resume are unchanged)", /PW\.requestQuote\(\{ base, fetchFn: fIn/.test(fs.readFileSync(new URL("../web/zec-hop.js", import.meta.url), "utf8")) && !/previewQuote/.test(fs.readFileSync(new URL("../web/zec-hop.js", import.meta.url), "utf8")));
+  const stdPart = appSrc.slice(appSrc.indexOf("const now = Math.floor(Date.now() / 1000); const validBefore"), appSrc.indexOf("const doneMsg = \"Done: \"", appSrc.indexOf("const now = Math.floor(Date.now() / 1000); const validBefore")));
+  t("Standard route (token and ETH) never calls 1Click", stdPart.length > 500 && !/requestQuote|previewQuote|ONECLICK|runFast|runHop/.test(stdPart) && !/requestQuote|previewQuote|ONECLICK|runFast|runHop/.test(appSrc.slice(appSrc.indexOf("async function ethStandard"), appSrc.indexOf("async function ethStandard") + 3000).split("\nasync function ")[0]));
+}
 console.log(fail ? "FAILED " + fail : "all passed"); process.exit(fail ? 1 : 0);

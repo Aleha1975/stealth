@@ -218,4 +218,6 @@ Audit 1167/1169 (indexer fork recovery, relayer lock and wedge)
          without the double probe; it logs "ALERT wedged nonce ... not in our records". Why: on Base this key is shared with an older relayer, so an unknown transaction at that nonce may be THEIRS; cancelling it would
          destroy a payment. Set 1 only when this process is the only user of the relayer key: then an unknown transaction, or our record proven gone (allGone, two probes), is replaced by a 0-value self-transfer.
   Old lock files (pid only)  alive only if argv[0] is node and the first argument that does not start with "-" is exactly the relayer script. Node flags with a SEPARATE value (--require x) are not supported: use --flag=value.
+         1171 I-3: also judged stale (a new relayer then takes the lock, and two relayers on one key collide on the nonce): a relative script path, a wrapper (env, npx, sh -c), and `node --require x script`.
+         Stop the old relayer BEFORE starting the new one. When an old pid-only lock is judged stale the relayer logs one line "old pid-only lock of pid N judged stale: ...".
   RPC independence  STEALTH_RPC with two URLs must be two independent providers (different backends); the indexer warns at start when two URLs share a host (see base.env.example).

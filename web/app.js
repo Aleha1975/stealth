@@ -602,9 +602,9 @@ async function privateWithdraw(to, value, hit, asset = "TOKEN") {
   const HM = await hopMod(), mode = HM.DEFAULT_MODE, key = [to.toLowerCase(), value, dest.key, mode, "max", ...(asset === "ETH" ? ["ETH"] : [])].join("|"), A = assetOf(C, asset), D = assetOf(dest, asset), dfmt = v => asset === "ETH" ? fmtUnits(v, D.decimals, 6) : (Number(v) / 10 ** D.decimals).toFixed(2);
   if (!pv || pv.key !== key) {                                    // step 1: show what it will cost, send nothing
     say("pay-hint", "Asking NEAR Intents for a quote…");
-    const q1 = await PW.requestQuote({ base: PW.ONECLICK, req: HM.reqIn({ chain: C, amount: value, tAddr: HM.DRY_T, stealth: wd.stealth, dry: true, asset }) }), zec = BigInt(q1.quote.amountOut);
+    const q1 = await PW.previewQuote({ base: PW.ONECLICK, req: HM.reqIn({ chain: C, amount: value, tAddr: HM.DRY_T, stealth: wd.stealth, dry: true, asset }) }), zec = BigInt(q1.quote.amountOut);
     if (!HM.okSize(zec)) throw new Error("Too small for the private route. Try a larger amount.");
-    const q2 = await PW.requestQuote({ base: PW.ONECLICK, req: HM.reqOut({ dest, amount: HM.previewOut(zec, mode), recipient: to, refundT: HM.DRY_T, dry: true, asset }) });
+    const q2 = await PW.previewQuote({ base: PW.ONECLICK, req: HM.reqOut({ dest, amount: HM.previewOut(zec, mode), recipient: to, refundT: HM.DRY_T, dry: true, asset }) });
     const out = BigInt(q2.quote.amountOut), loss = HM.previewLoss({ value, out, inDec: A.decimals, outDec: D.decimals }), fee = loss * Number(value), box = $("wd-quote"); box.textContent = "";      // 1139 I-1: same basis as the machine's projectedLoss (decimals of source and destination differ)
     const pct = (loss * 100).toFixed(1), qt = el("div", "qt"), c1 = el("div"), c2 = el("div");
     c1.appendChild(el("span", "note", "Recipient gets")); c1.appendChild(el("span", "big", "≈ " + dfmt(out) + " " + D.symbol));
@@ -657,7 +657,7 @@ async function fastWithdraw(to, value, hit, asset = "TOKEN") {
   const eth = asset === "ETH", A = assetOf(C, asset), D = assetOf(dest, asset), key = [to.toLowerCase(), value, dest.key, "fast", ...(eth ? ["ETH"] : [])].join("|");
   if (!pv || pv.key !== key) {                                    // step 1: show what it will cost, send nothing
     say("pay-hint", "Asking NEAR Intents for a quote…");
-    const j = await PW.requestQuote({ base: PW.ONECLICK, req: PW.buildQuoteRequest({ from: C, to: dest, amount: value, recipient: to, refundTo: wd.stealth, dry: true, asset }) }), sm = PW.summarizeQuote(j, A.decimals, D.decimals);
+    const j = await PW.previewQuote({ base: PW.ONECLICK, req: PW.buildQuoteRequest({ from: C, to: dest, amount: value, recipient: to, refundTo: wd.stealth, dry: true, asset }) }), sm = PW.summarizeQuote(j, A.decimals, D.decimals);
     const box = $("wd-quote"); box.textContent = "";
     const qt = el("div", "qt"), c1 = el("div"), c2 = el("div"), c3 = el("div");
     c1.appendChild(el("span", "note", "Recipient gets")); c1.appendChild(el("span", "big", "≈ " + sm.outText + " " + D.symbol));

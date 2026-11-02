@@ -102,10 +102,16 @@ export function buildQuoteRequest({ from, to, amount, recipient, refundTo, dry, 
   return r;
 }
 async function call(fetchFn, url, init) {
-  const r = await fetchFn(url, { ...init, signal: init.signal || timeoutSignal(30000) }); const j = await r.json().catch(() => ({}));
-  if (!r.ok) throw new Error(j.message || ("NEAR Intents error " + r.status));
+  let r; try { r = await fetchFn(url, { ...init, signal: init.signal || timeoutSignal(30000) }); } catch (e) { const x = new Error((e && e.message) || "NEAR Intents is not reachable"); x.unavailable = true; throw x; }      // network / CORS failure or timeout
+  const j = await r.json().catch(() => ({}));
+  if (!r.ok) { const x = new Error(j.message || ("NEAR Intents error " + r.status)); x.status = r.status; throw x; }
   return j;
 }
+/** The 1Click quote service is down (HTTP 5xx incl. Cloudflare 52x, no answer, timeout, or its "Quoting for this pair is not available"), as opposed to a problem with the user's input. */
+export const isQuoteUnavailable = e => !!e && (e.unavailable === true || e.status >= 500 || /Quoting for this pair is not available/i.test(String(e.message || "")));
+export const QUOTE_DOWN = "This route needs an outside swap service that is not answering right now. Standard withdraw still works. Try again in a few minutes.";
+/** requestQuote for a PREVIEW (a new start): a service outage becomes the one short QUOTE_DOWN message, an input problem keeps its own text. Resume paths call requestQuote directly and keep retrying as before. */
+export async function previewQuote(a) { try { return await requestQuote(a); } catch (e) { throw isQuoteUnavailable(e) ? new Error(QUOTE_DOWN) : e; } }
 /** Requests a quote and refuses anything that differs from what we asked (amount, recipient, refund address, assets). */
 export async function requestQuote({ base = ONECLICK, req, token, fetchFn = fetch, okDeposit = isAddr }) {
   const headers = { "content-type": "application/json" }; if (token) headers.authorization = "Bearer " + token;

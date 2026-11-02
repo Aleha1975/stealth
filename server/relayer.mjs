@@ -224,6 +224,7 @@ export function takeLock(sys = SYS, lockFile = LOCK_FILE) {
         let old; try { old = fs.readFileSync(lockFile, "utf8").trim(); } catch (e3) { if (e3.code === "ENOENT") continue; return false; }   // audit 1167 I-1: a lock that cannot be read is a live one (never moved on a read error)
         if (old === mine) return true;
         if (old && lockHolderAlive(old, SCRIPT, sys)) return false;
+        if (/^\d+$/.test(old)) log("old pid-only lock of pid", old, "judged stale: process gone, or its command line is not node [flags] " + SCRIPT + " (relative path, wrapper or a flag with a separate value count as stale)");   // audit 1171 I-3: the operator can see why the lock was taken over
         // audit 1164 L-4: the stale file is MOVED to a name of ours (rename is atomic: only one process gets it), and what was moved is compared with what was judged stale. If another starter had
         // already replaced it with its own live lock, the lock is put back and this process gives up (systemd starts it again), instead of deleting the winner's lock.
         const mv = lockFile + "." + process.pid + ".stale";
