@@ -11,7 +11,7 @@
   },
   "rh": {
     "id": 4663, "name": "Robinhood Chain", "native": "ETH",
-    "rpcs": ["https://rpc.mainnet.chain.robinhood.com"], "block_ms": 250,
+    "rpcs": ["https://rpc.mainnet.chain.robinhood.com"], "block_ms": 104,
     "rpc_env": ["RH_LOGS_RPC", "RH_RPC", "RH_RPC2"],
     "token": "0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168", "token_symbol": "USDG", "token_decimals": 6,
     "domain": {"name": "Global Dollar", "version": "1"},
