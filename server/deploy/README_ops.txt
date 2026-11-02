@@ -148,3 +148,20 @@ StealthPay used[] griefing and fee collision (audit 1161; contracts unchanged, f
        the web client checks used[] before asking the wallet and derives a new one-time address automatically (gasless: up to 2 retries with "please sign again"; own gas: 1 retry after a confirm).
   L-1  feeRecipient == stealth makes the Paid event under-report; the relayer answers "bad destination" and the client refuses to sign. The indexer's paid column sums all Transfers to the stealth address.
   The NatSpec text in src/StealthPay.sol is NOT changed (it would change the metadata hash of the verified deployed bytecode).
+
+Audit 1163 (indexer re-review) -- what changes on deploy
+  M-1  Head trust. With >= 2 endpoints the indexer takes the SECOND-highest head (a node that overstates its head cannot move the index over unmined blocks); with one endpoint every step is cut to the highest block that endpoint returns
+       (eth_getBlockByNumber) and a lower head is a rollback only after two reads in a row. Base ships two endpoints: live Base = dRPC (STEALTH_RPC, key only in the root-only env file) + publicnode, see base.env.example.
+       Tolerance STEALTH_HEAD_SKEW_S: 300 s on Base (the safe tag moves in L1-batch jumps of minutes), 30 s on RH (latest, seconds); beyond it for STEALTH_FALLBACK_S (600 s) the lagging endpoint is treated as stuck and the single-endpoint rule applies.
+       RH chains.json has one official endpoint: add a second one in STEALTH_RPC when one exists. block_ms in chains.json (Base 2000, RH 250) converts seconds to blocks.
+       RECOVERY after a past lie (rows missing): stop the service, then  python3 stealth_indexer.py --rewind <N blocks>  (same env file), start the service. Rows above stay; the re-read only inserts the missing ones. N = blocks since the first bad head.
+  L-1  paid = the one Transfer to the stealth address whose amount equals the announced amount and that StealthPay made (from = StealthPay) or that precedes the announce log in the receipt (payToken: transferFrom by the payer, then announce;
+       payWithAuthorization: payer -> StealthPay -> stealth, then announce; v2 and v3 have the same layout). Extra Transfers in the same tx no longer count. This replaces the 1161 L-1 "sum of all Transfers" (feeRecipient == stealth now gives paid = the net, as announced).
+       After deploy run once:  python3 stealth_indexer.py --backfill-paid  (rows filled earlier keep the old sum until then; /known only needs paid >= MIN, so nothing is refused that was accepted for a real payment).
+  L-2/L-3  reorg delete + epoch bump in one transaction; the request watchdog starts inside the permit-releasing try.
+  L-4  /balances without Multicall3 takes at most STEALTH_MAX_SINGLE (20) addresses; every API request has an RPC-call budget STEALTH_REQ_MAX_CALLS (100). limit_req for /stealth-api/base/ and /stealth-api/rh/ is in stealth-base.conf / stealth-rh.conf (st_*_read on every
+       indexer location). The OLD live Base location (/stealth-api/ -> 3873, outside this repo) must carry its own limit_req_zone/limit_req on the same routes: check it on the host.
+  I-1  announcement cache: also <= STEALTH_ANN_CACHE_ENTRIES (2048) entries, and only for since <= current max id.
+  I-2  one configured endpoint: a lower head must repeat on the next read; several configured but one answering and lagging: accepted as a rollback after STEALTH_FALLBACK_S instead of stalling forever.
+  I-3  ops/nginx-stealth-zec.conf: no types{} override at the zec location any more (inherits the http map); the .wasm location has an empty types{} + default_type application/wasm. nginx -t before reload.
+  I-4  STEALTH_KNOWN_SAFE=0 refused unless every RPC is loopback or STEALTH_FORK=1; final_block and the pages margin use one formula; a failing DB open answers 500.

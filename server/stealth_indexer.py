@@ -46,6 +46,14 @@ BACKFILL = int(os.environ.get("STEALTH_BACKFILL", "200000"))
 MODE = os.environ.get("STEALTH_HEAD_MODE", CC["mode"])         # safe | latest
 CONF = int(os.environ.get("STEALTH_CONFIRMATIONS", CC["confirmations"]))
 RECONCILE_EVERY = int(os.environ.get("STEALTH_RECONCILE_EVERY", "60"))
+# Аудит 1163 M-1/I-2. Допуск расхождения голов узлов: base (тег safe) двигается скачками по пакетам L1 раз в несколько минут, два честных узла расходятся максимум на один скачок -> 300 с;
+# latest (rh) узлы расходятся на секунды распространения блока -> 30 с. В блоках: секунды / время блока (chains.json block_ms). Больше допуска -- второй узел «застрял», а не «чуть отстал».
+BLOCK_MS = int(CC.get("block_ms", 2000))
+HEAD_SKEW = -(-int(float(os.environ.get("STEALTH_HEAD_SKEW_S", "300" if CC["mode"] == "safe" else "30")) * 1000) // BLOCK_MS)
+FALLBACK_S = float(os.environ.get("STEALTH_FALLBACK_S", "600"))   # сколько терпим застрявший второй узел / одинокий отставший: 10 мин = перезапуск или ресинк узла; дольше стоять хуже, чем откатиться (вставки идемпотентны)
+MAX_SINGLE = int(os.environ.get("STEALTH_MAX_SINGLE", "20"))      # аудит 1163 L-4: адресов на запрос без Multicall3 (2 вызова на адрес); клиент балансы берёт из цепи сам, это страховка
+REQ_MAX_CALLS = int(os.environ.get("STEALTH_REQ_MAX_CALLS", "100"))   # RPC-вызовов (попыток, с переключением) на один запрос API: 2 x MAX_SINGLE + getCode, ещё x2 на переключение запас
+ANN_CACHE_ENTRIES = int(os.environ.get("STEALTH_ANN_CACHE_ENTRIES", "2048"))   # аудит 1163 I-1: накладные ~1 КБ на запись (кортеж, int, dict) -> до ~2 МБ сверх байт; канонических ключей и так <= 2 x max_id/1024
 PAGES_DIR = os.environ.get("STEALTH_PAGES_DIR", "")             # пусто -> страницы не пишем (клиент идёт по старому пути)
 PAGE_SIZE = 1024
 PAGES_MARGIN = int(os.environ.get("STEALTH_PAGES_MARGIN", "200"))   # rh: финал = safe - MARGIN (> окна реконсиляции safe-100)
@@ -64,6 +72,10 @@ REQ_DEADLINE = float(os.environ.get("STEALTH_REQ_DEADLINE", "30"))   # весь 
 ANN_CACHE_BYTES = int(os.environ.get("STEALTH_ANN_CACHE_BYTES", str(16 << 20)))   # аудит 1158 F-5: ~12 полных ответов по 1.3 МБ; раньше 256 записей = 300+ МБ
 _env_rpc = [u.strip() for u in os.environ.get("STEALTH_RPC", "").split(",") if u.strip()]
 RPCS = _env_rpc or [u for u in [os.environ.get(k) for k in CC["rpc_env"]] + CC["rpcs"] if u]
+RPCS = list(dict.fromkeys(RPCS))                                # одинаковые URL -- не два независимых узла
+# Аудит 1163 I-4: STEALTH_KNOWN_SAFE=0 снимает ворота safe у /known -- только лаборатория/форк: все точки на loopback или явный STEALTH_FORK=1.
+if not KNOWN_SAFE and os.environ.get("STEALTH_FORK") != "1" and not all(re.match(r"^https?://(127\.0\.0\.1|localhost|\[::1\])[:/]", u + "/") for u in RPCS):
+    raise SystemExit("STEALTH_KNOWN_SAFE=0 only for a local fork (RPC on 127.0.0.1) or with STEALTH_FORK=1")
 UA = {"Content-Type": "application/json", "User-Agent": "deepyield-stealth/1.0"}
 _lock = threading.Lock()
 
@@ -84,6 +96,9 @@ def rpc(method, params, timeout=60, only=None):
     last = None
     for u in ([only] if only else RPCS):
         t = timeout
+        if getattr(_tl, "calls", None) is not None:           # аудит 1163 L-4: потолок RPC-вызовов на запрос API (поток индексатора счётчика не имеет)
+            _tl.calls += 1
+            if _tl.calls > REQ_MAX_CALLS: raise RuntimeError("request rpc call budget")
         dl = getattr(_tl, "dl", None)
         if dl is not None:
             if dl - time.time() <= 0: raise RuntimeError("request deadline")
@@ -175,20 +190,67 @@ def target_head(u=None):
     return max(0, lat - CONF), sf
 
 
+_pk = {"quorum": False, "low_n": 0, "low_since": None, "gap_since": None}
+
+
+def _pin(seen, trusted):
+    """Точка для логов: первая в порядке ротации, чья голова не ниже принятой (после сбоя итерации ротация сдвигается -- одна больная точка не держит индексатор)."""
+    for h, u, sf in seen:
+        if h >= trusted: return u, sf
+    return seen[0][1], seen[0][2]
+
+
 def pick_head(head_done, best=False):
-    """(точка, голова, safe) -- первая точка, ЧЬЯ голова не ниже head_done (аудит 1158 F-1: логи потом читаются у неё же, отстающий узел не двигает head_done дальше своей головы).
-    best=True (раз в RECONCILE_EVERY): опросить все точки и взять с самой высокой головой -- иначе устойчиво отстающая, но «не ниже head_done» точка держала бы индекс позади остальных.
-    Все ответившие ниже head_done -> откат цепи, но только если ответили >= 2 точек (или единственная): одна отставшая не «откатывает» индекс."""
+    """(точка, принятая голова, safe). Аудит 1163 M-1/I-2: голову, которую назвал один узел, нельзя принимать на веру -- врущий «вверх» узел двигал head_done над ещё не намайненными блоками, и вернуться было нельзя.
+    >= 2 ответивших: принятая голова = ВТОРАЯ по высоте (блок на этой высоте есть минимум у двух узлов; на высоте выше неё второго узла с блоком нет по определению). Если верхний выше второго больше HEAD_SKEW дольше
+    FALLBACK_S, второй считается застрявшим и работает правило одной точки (пошаговая проверка блока в index_loop). 1 ответившая: голова её, но каждый шаг подтверждается eth_getBlockByNumber (_confirm_upto).
+    Низкая голова (ниже head_done): >= 2 ответивших и оба ниже -- откат цепи; верхний не ниже, второй ниже -- ждём, не откатываемся; единственная настроенная точка -- откат только по двум чтениям подряд;
+    уцелевшая из нескольких -- через FALLBACK_S (отстающий уцелевший иначе стоял бы вечно). best оставлен для совместимости."""
     seen = []
     for u in RPCS[_rot:] + RPCS[:_rot]:
         try: h, sf = target_head(u)
         except Exception: continue
-        if h >= head_done and not best: return u, h, sf
         seen.append((h, u, sf))
-    if seen and (best or len(seen) >= min(2, len(RPCS))):
-        h, u, sf = max(seen, key=lambda t: t[0])
-        if h >= head_done or len(seen) >= min(2, len(RPCS)): return u, h, sf
-    raise RuntimeError("no endpoint with head >= %d (answered %d of %d)" % (head_done, len(seen), len(RPCS)))
+    if not seen: raise RuntimeError("no endpoint answered (0 of %d)" % len(RPCS))
+    now = time.time(); hs = sorted((t[0] for t in seen), reverse=True); top = hs[0]
+    _pk["quorum"] = len(seen) >= 2
+    if len(seen) >= 2:
+        trusted = hs[1]
+        if top - trusted > HEAD_SKEW:
+            _pk["gap_since"] = _pk["gap_since"] or now
+            if now - _pk["gap_since"] >= FALLBACK_S: trusted = top; _pk["quorum"] = False; print("second endpoint stuck %d blocks behind for %ds: single-endpoint rule" % (top - hs[1], now - _pk["gap_since"]), flush=True)
+        else: _pk["gap_since"] = None
+        if trusted < head_done and top >= head_done:        # второй отстал, верхний не ниже: ждём второго, назад не идём
+            u, sf = _pin(seen, head_done); return u, head_done, sf
+    else:
+        _pk["gap_since"] = None; trusted = top
+        if trusted < head_done:
+            if len(RPCS) == 1:
+                _pk["low_n"] += 1
+                if _pk["low_n"] < 2: raise RuntimeError("single endpoint head %d < %d: need a second read" % (trusted, head_done))
+            else:
+                _pk["low_since"] = _pk["low_since"] or now
+                if now - _pk["low_since"] < FALLBACK_S: raise RuntimeError("no endpoint with head >= %d (answered 1 of %d, waiting)" % (head_done, len(RPCS)))
+    if trusted >= head_done: _pk["low_n"] = 0; _pk["low_since"] = None
+    u, sf = _pin(seen, trusted); return u, trusted, sf
+
+
+def _blk_exists(ep, n):
+    try: b = rpc("eth_getBlockByNumber", [hex(n), False], 20, only=ep)
+    except Exception: return False
+    return bool(b) and int(b["number"], 16) == n
+
+
+def _confirm_upto(ep, a, b):
+    """Аудит 1163 M-1 (одна точка): узел, который не отдаёт блок, не отдаст по нему и логи -- сдвигаем head_done только до самого высокого блока, который ЭТА точка реально возвращает (бинарный поиск в (a-1, b])."""
+    if _blk_exists(ep, b): return b
+    lo, hi = a - 1, b
+    while hi - lo > 1:
+        mid = (lo + hi) // 2
+        if _blk_exists(ep, mid): lo = mid
+        else: hi = mid
+    if lo < a: raise RuntimeError("endpoint cannot return block %d (claimed head too high)" % a)
+    return lo
 
 
 TRANSFER_T = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"
@@ -209,15 +271,30 @@ def _real_payer(rc, stealth):
     return to_sp or to_st or tx_from
 
 
-def _paid_to(rc, stealth):
-    """Аудит 1158 F-3: сколько токена цепи РЕАЛЬНО пришло на stealth-адрес в этой транзакции (сумма Transfer(to=stealth) из квитанции), а не что объявлено в metadata."""
-    tot = 0
+def _ann_amount(meta):
+    """(токен, сумма) из metadata объявления: viewTag|transfer-селектор|токен|сумма (как читает /known); иначе ("", 0)."""
+    try:
+        m = bytes.fromhex(meta[2:])
+        if len(m) >= 57 and m[1:5] == bytes.fromhex("a9059cbb"): return "0x" + m[5:25].hex(), int.from_bytes(m[25:57], "big")
+    except Exception: pass
+    return "", 0
+
+
+def _paid_to(rc, stealth, log_index=None, meta=None):
+    """Аудит 1158 F-3 / 1163 L-1: сколько токена цепи РЕАЛЬНО пришло на stealth-адрес по ЭТОМУ объявлению. Берём один Transfer(to=stealth) токена цепи с суммой ровно как в объявлении, который сделал контракт
+    StealthPay (from в PAY_CALLERS: ветка payWithAuthorization -- плательщик -> контракт -> stealth) ИЛИ стоит в логах раньше объявления (payToken: transferFrom плательщика на stealth, затем announce; плательщик может
+    быть контрактом-кошельком, поэтому from не сверяем). Лишние Transfer в той же tx (чужие, другой суммы) paid не раздувают; не нашли -- 0. Раскладка v2 и v3 одинакова: announce идёт ПОСЛЕ перевода на stealth;
+    ветка from-в-PAY_CALLERS не зависит от порядка (запас для прежнего контракта)."""
+    tok, amt = _ann_amount(meta or "")
+    if tok != USDC or amt <= 0: return 0
     for lg in rc.get("logs") or []:
         t = lg.get("topics") or []
         if (lg.get("address") or "").lower() != USDC or len(t) != 3 or t[0].lower() != TRANSFER_T or "0x" + t[2][-40:].lower() != stealth: continue
-        try: tot += int(lg.get("data") or "0x0", 16)
-        except ValueError: pass
-    return min(tot, PAID_CAP)
+        try: v = int(lg.get("data") or "0x0", 16); li = int(lg["logIndex"], 16) if lg.get("logIndex") is not None else None
+        except ValueError: continue
+        if v != amt: continue
+        if "0x" + t[1][-40:].lower() in PAY_CALLERS or (li is not None and log_index is not None and li < log_index): return min(v, PAID_CAP)
+    return 0
 
 
 def receipt_of(r, cache, ep=None):
@@ -247,7 +324,7 @@ def payer_of(r, cache, ep=None):
 
 def put_row(c, r, payers, ep=None):
     rc = receipt_of(r, payers, ep)
-    payer = _payer_from(r, rc); paid = _paid_to(rc, r["stealth"]) if rc else None
+    payer = _payer_from(r, rc); paid = _paid_to(rc, r["stealth"], r.get("log_index"), r.get("meta")) if rc else None
     with _lock:
         c.execute("INSERT OR IGNORE INTO ann(block,tx,log_index,scheme,stealth,caller,eph,meta,view_tag,payer,paid) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
                   (r["block"], r["tx"], r["log_index"], r["scheme"], r["stealth"], r["caller"], r["eph"], r["meta"], r["view_tag"], payer, paid))
@@ -283,16 +360,16 @@ def fix_rows(c, ep, upto):
     """Дозаполнить строки до блока upto: payer IS NULL (квитанция тогда не пришла) и paid IS NULL у объявлений через наш StealthPay (старые БД после миграции). Круговой курсор по id."""
     pc = tuple(PAY_CALLERS)
     with _lock:
-        rows = c.execute("SELECT id,tx,stealth,caller,block,payer,paid FROM ann WHERE id>? AND block<=? AND (payer IS NULL OR (paid IS NULL AND caller IN (%s))) ORDER BY id LIMIT ?" % ",".join("?" * len(pc)),
+        rows = c.execute("SELECT id,tx,stealth,caller,block,payer,paid,log_index,meta FROM ann WHERE id>? AND block<=? AND (payer IS NULL OR (paid IS NULL AND caller IN (%s))) ORDER BY id LIMIT ?" % ",".join("?" * len(pc)),
                          (_fix["after"], upto) + pc + (FIX_BATCH,)).fetchall()
     if not rows: _fix["after"] = 0; return 0
     _fix["after"] = rows[-1][0]
     cache = {}; changed = []; n = 0
-    for id_, tx, stealth, caller, block, old, old_paid in rows:
+    for id_, tx, stealth, caller, block, old, old_paid, li, meta in rows:
         r = {"tx": tx, "stealth": stealth, "caller": caller, "block": block}
         rc = receipt_of(r, cache, ep)
         if not rc: continue
-        payer = _payer_from(r, rc); n += 1; paid = _paid_to(rc, stealth)
+        payer = _payer_from(r, rc); n += 1; paid = _paid_to(rc, stealth, li, meta)
         with _lock: c.execute("UPDATE ann SET payer=COALESCE(?,payer), paid=? WHERE id=?", (payer, paid, id_))
         if payer != old or verified(caller, paid) != verified(caller, old_paid): changed.append(id_)      # M-1: a row that became verified is on a written page: rewrite it
     with _lock: c.commit()
@@ -304,13 +381,13 @@ def fix_rows(c, ep, upto):
 def refill_payers():
     """Одноразово (--refill-payers / --backfill-paid): пересчитать payer и paid у строк нашего StealthPay (и у любых с payer NULL), затем перезаписать страницы и поднять версию манифеста."""
     c = db(); cache = {}; n = ch = 0
-    q = "SELECT id,tx,stealth,caller,payer,block FROM ann WHERE caller IN (%s) OR payer IS NULL ORDER BY id" % ",".join("?" * len(PAY_CALLERS))
-    for id_, tx, stealth, caller, old, block in c.execute(q, tuple(PAY_CALLERS)).fetchall():
+    q = "SELECT id,tx,stealth,caller,payer,block,log_index,meta FROM ann WHERE caller IN (%s) OR payer IS NULL ORDER BY id" % ",".join("?" * len(PAY_CALLERS))
+    for id_, tx, stealth, caller, old, block, li, meta in c.execute(q, tuple(PAY_CALLERS)).fetchall():
         r = {"tx": tx, "stealth": stealth, "caller": caller, "block": block}
         rc = receipt_of(r, cache)
         if not rc: continue
         new = _payer_from(r, rc); n += 1
-        c.execute("UPDATE ann SET payer=COALESCE(?,payer), paid=? WHERE id=?", (new, _paid_to(rc, stealth), id_))
+        c.execute("UPDATE ann SET payer=COALESCE(?,payer), paid=? WHERE id=?", (new, _paid_to(rc, stealth, li, meta), id_))
         if new and new != old: ch += 1
         if len(cache) > 500: cache.clear()
     c.commit()
@@ -340,9 +417,11 @@ def fetch_range(a, b, ep=None):
     return out
 
 
-def _bump_epoch(c):
-    with _lock:
-        c.execute("INSERT OR REPLACE INTO meta(k,v) VALUES('epoch',?)", (str(int(_meta_get(c, "epoch") or 0) + 1),)); c.commit()
+def _bump_epoch(c, commit=True):
+    """commit=False -- вызывающий держит _lock и коммитит сам (аудит 1163 L-2: удаление строк и подъём epoch одной транзакцией)."""
+    if commit:
+        with _lock: _bump_epoch(c, False); c.commit()
+    else: c.execute("INSERT OR REPLACE INTO meta(k,v) VALUES('epoch',?)", (str(int(_meta_get(c, "epoch") or 0) + 1),))
 
 
 def reconcile(c, sf, head_done, ep=None, insert_only=False):
@@ -369,8 +448,7 @@ def reconcile(c, sf, head_done, ep=None, insert_only=False):
         else: gone = {}                                                       # второго чтения не получили -> не удаляем
         if gone:
             with _lock:
-                c.executemany("DELETE FROM ann WHERE id=?", [(i,) for i in gone.values()]); c.commit()
-            _bump_epoch(c)
+                c.executemany("DELETE FROM ann WHERE id=?", [(i,) for i in gone.values()]); _bump_epoch(c, False); c.commit()      # одна транзакция: падение между ними не оставит удалённые строки без смены epoch
             print("reconcile: removed", len(gone), "rows changed by reorg (two reads agree)", flush=True)
     new = [r for k, r in want.items() if k not in have]
     payers = {}
@@ -463,6 +541,7 @@ def index_loop():
                 with _lock: c.execute("INSERT OR REPLACE INTO meta(k,v) VALUES('head',?)", (str(head),)); c.commit()
             while head_done < head:
                 a = head_done + 1; b = min(a + chunk - 1, head)
+                if not _pk["quorum"]: b = _confirm_upto(ep, a, b)      # одна точка: голова не подтверждена другим узлом -> двигаемся только по блокам, которые она сама отдаёт (аудит 1163 M-1)
                 try:
                     logs = rpc("eth_getLogs", [{"address": ANNOUNCER, "fromBlock": hex(a), "toBlock": hex(b)}], only=ep)
                     if any(not (a <= int(lg["blockNumber"], 16) <= b) for lg in logs): raise RuntimeError("getLogs returned a block outside [%d,%d]" % (a, b))
@@ -493,11 +572,12 @@ def index_loop():
                 c.execute("INSERT OR REPLACE INTO meta(k,v) VALUES('chain_head',?)", (str(head),)); c.commit()
             # safe_block -- до него /known верит строкам; final_block -- после него строку реорг уже не тронет (флаг final, страницы). Без safe (rh, узел не отдал) прежние значения остаются.
             safe_b = head_done if (MODE == "safe" or not KNOWN_SAFE) else (min(sf, head_done) if sf is not None else None)
-            _set_meta(c, safe_block=safe_b, final_block=(head_done if MODE == "safe" else (max(0, safe_b - PAGES_MARGIN) if safe_b is not None else None)))
+            fin = head_done if MODE == "safe" else (max(0, safe_b - PAGES_MARGIN) if safe_b is not None else None)       # одна формула и для меты, и для страниц (аудит 1163 I-4)
+            _set_meta(c, safe_block=safe_b, final_block=fin)
             if time.time() - last_rec >= RECONCILE_EVERY:
                 reconcile(c, sf, head_done, ep, insert_only=(MODE == "safe")); last_rec = time.time()
             fix_rows(c, ep, head_done)
-            pages_step(c, head_done if MODE == "safe" else (sf - PAGES_MARGIN if sf else None))
+            pages_step(c, fin)
         except Exception as e:
             print("index error:", str(e)[:200], flush=True)
             _rot = (_rot + 1) % max(1, len(RPCS))          # следующая итерация начнёт с другой точки
@@ -560,6 +640,7 @@ def _fetch_multicall(addrs):
 
 
 def _fetch_single(addrs):
+    if len(addrs) > MAX_SINGLE: raise RuntimeError("too many addresses without multicall (%d > %d)" % (len(addrs), MAX_SINGLE))     # аудит 1163 L-4: 2 вызова на адрес
     out = {}
     for a in addrs:
         usdc = rpc("eth_call", [{"to": USDC, "data": "0x70a08231" + a[2:].rjust(64, "0")}, "latest"], 15)
@@ -611,9 +692,14 @@ class BoundedServer(ThreadingHTTPServer):
         def kill():                                 # общий срок на весь запрос: SOCK_TIMEOUT -- на одну операцию, а читающий по байту клиент держал бы поток вечно
             try: request.shutdown(socket.SHUT_RDWR)
             except Exception: pass
-        tm = threading.Timer(REQ_DEADLINE, kill); tm.daemon = True; tm.start()
-        try: super().process_request_thread(request, client_address)
-        finally: tm.cancel(); self._sem.release()
+        tm = None
+        try:                                        # аудит 1163 L-3: Timer внутри try -- если и он не стартует, разрешение возвращается, а сокет закрывается
+            try: tm = threading.Timer(REQ_DEADLINE, kill); tm.daemon = True; tm.start()
+            except BaseException: tm = None; self.shutdown_request(request); return
+            super().process_request_thread(request, client_address)
+        finally:
+            if tm is not None: tm.cancel()
+            self._sem.release()
 
 
 ROUTE = re.compile(r"^(?:/stealth-api(?:/[a-z0-9_-]+)?)?/(head|announcements|known|balances|receipt|usdc-domain)$")   # точный путь: nginx отдаёт /stealth-api/<chain>/<имя> (proxy_pass без URI) или просто /<имя>
@@ -632,10 +718,11 @@ def _small_get(key, ttl, fn):
 
 
 def _ann_put(key, now, body):
+    if len(body) > ANN_CACHE_BYTES: return          # одна запись больше всего бюджета не кэшируется
     with _ann_lock:
-        if _ann_size[0] + len(body) > ANN_CACHE_BYTES:
+        if _ann_size[0] + len(body) > ANN_CACHE_BYTES or (key not in _ann_cache and len(_ann_cache) >= ANN_CACHE_ENTRIES):     # аудит 1163 I-1: и по байтам, и по числу записей
             for k in [k for k, v in _ann_cache.items() if now - v[0] >= ANN_TTL]: _ann_size[0] -= len(_ann_cache.pop(k)[1])
-            if _ann_size[0] + len(body) > ANN_CACHE_BYTES: _ann_cache.clear(); _ann_size[0] = 0
+            if _ann_size[0] + len(body) > ANN_CACHE_BYTES or (key not in _ann_cache and len(_ann_cache) >= ANN_CACHE_ENTRIES): _ann_cache.clear(); _ann_size[0] = 0
         old = _ann_cache.get(key)
         if old: _ann_size[0] -= len(old[1])
         _ann_cache[key] = (now, body); _ann_size[0] += len(body)
@@ -657,11 +744,12 @@ class H(BaseHTTPRequestHandler):
         self.send_response(code); self.send_header("Content-Type", "application/json"); self.send_header("Cache-Control", "no-store")
         self.send_header("Content-Length", str(len(body))); self.end_headers(); self.wfile.write(body)
     def do_GET(self):
-        _tl.dl = time.time() + REQ_DEADLINE
-        u = urlparse(self.path); q = parse_qs(u.query); c = rdb()
+        _tl.dl = time.time() + REQ_DEADLINE; _tl.calls = 0
+        u = urlparse(self.path); q = parse_qs(u.query)
         mt = ROUTE.match(u.path); route = mt.group(1) if mt else None
         one = lambda k, d="": (q.get(k, [d])[0] or "").strip()
         try:
+            c = rdb()                                  # аудит 1163 I-4: внутри try -- сбой открытия БД даёт 500, а не оборванный запрос
             if route == "head":
                 g = lambda k: c.execute("SELECT v FROM meta WHERE k=?", (k,)).fetchone()
                 h, ts, ch = g("head"), g("ts"), g("chain_head")
@@ -685,7 +773,7 @@ class H(BaseHTTPRequestHandler):
                 ep = c.execute("SELECT v FROM meta WHERE k='epoch'").fetchone()
                 out = [{"id": r[0], "block": r[1], "tx": r[2], "scheme": r[3], "stealth": r[4], "caller": r[5], "eph": r[6], "meta": r[7], "payer": r[8], "final": r[1] <= fb, "verified": verified(r[5], r[9])} for r in rows]
                 body = json.dumps({"rows": out, "next": out[-1]["id"] if out else since, "final_block": fb if fb >= 0 else None, "epoch": int(ep[0]) if ep else 0}, separators=(",", ":")).encode()
-                if canon: _ann_put(key, now, body)
+                if canon and since <= c.execute("SELECT COALESCE(MAX(id),0) FROM ann").fetchone()[0]: _ann_put(key, now, body)       # только since в пределах таблицы: пустые ответы за хвостом не копятся (аудит 1163 I-1)
                 return self._raw(200, body)
             if route == "known":
                 addr = one("addr").lower()
@@ -726,11 +814,26 @@ class H(BaseHTTPRequestHandler):
             return self._json(500, {"error": "temporarily unavailable"})
 
 
+def rewind(n):
+    """Аудит 1163 M-1: оператор отодвигает голову индекса на n блоков (СЛУЖБА ОСТАНОВЛЕНА: иначе цикл перезапишет значение своим). Строки выше остаются, перечитывание вставляет только недостающее (INSERT OR IGNORE по (tx, log_index))."""
+    c = db(); r = c.execute("SELECT v FROM meta WHERE k='head'").fetchone(); st = c.execute("SELECT v FROM meta WHERE k='start'").fetchone()
+    lo = (START if START is not None else int(st[0]) if st else 0) - 1
+    if not r: raise SystemExit("rewind: no head in the database yet")
+    new = max(lo, int(r[0]) - n)
+    c.execute("INSERT OR REPLACE INTO meta(k,v) VALUES('head',?)", (str(new),)); c.commit()
+    print("rewind: head %s -> %d (rows above stay; the service re-reads from %d and only inserts what is missing)" % (r[0], new, new + 1), flush=True)
+
+
 if __name__ == "__main__":
     os.makedirs(os.path.dirname(os.path.abspath(DB)), exist_ok=True)
     init_db()
     if "--refill-payers" in sys.argv or "--backfill-paid" in sys.argv:
         refill_payers(); raise SystemExit(0)
+    if "--rewind" in sys.argv:
+        try: n = int(sys.argv[sys.argv.index("--rewind") + 1])
+        except (IndexError, ValueError): n = 0
+        if n <= 0: raise SystemExit("usage: stealth_indexer.py --rewind <N blocks > 0>   (stop the service first)")
+        rewind(n); raise SystemExit(0)
     threading.Thread(target=index_loop, daemon=True).start()
     print("stealth indexer", CHAIN, "mode", MODE, "conf", CONF, "on", PORT, "db", DB, "from block", START if START is not None else "(head-%d)" % BACKFILL, "stealthpay", STEALTHPAY, "legacy", ",".join(LEGACY) or "-", flush=True)
     BoundedServer(("127.0.0.1", PORT), H).serve_forever()

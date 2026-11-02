@@ -1,7 +1,7 @@
 {
   "base": {
     "id": 8453, "name": "Base", "native": "ETH",
-    "rpcs": ["https://base-rpc.publicnode.com"],
+    "rpcs": ["https://base-rpc.publicnode.com", "https://mainnet.base.org"], "block_ms": 2000,
     "rpc_env": ["BASE_LOGS_RPC", "BASE_RPC", "BASE_RPC2"],
     "token": "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913", "token_symbol": "USDC", "token_decimals": 6,
     "domain": {"name": "USD Coin", "version": "2"},
@@ -11,7 +11,7 @@
   },
   "rh": {
     "id": 4663, "name": "Robinhood Chain", "native": "ETH",
-    "rpcs": ["https://rpc.mainnet.chain.robinhood.com"],
+    "rpcs": ["https://rpc.mainnet.chain.robinhood.com"], "block_ms": 250,
     "rpc_env": ["RH_LOGS_RPC", "RH_RPC", "RH_RPC2"],
     "token": "0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168", "token_symbol": "USDG", "token_decimals": 6,
     "domain": {"name": "Global Dollar", "version": "1"},
