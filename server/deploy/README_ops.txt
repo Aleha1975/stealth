@@ -110,3 +110,15 @@ Base v3 (StealthPay 0xC07f54984AbDa1EF76DaB6F602270B76a04E916d, block 53408013) 
    - Not installed by this script (not installed for RH on the host either): stealth-watch.timer and stealth-sanctions.timer. If the watchdog is added later, append base=http://127.0.0.1:3893|http://127.0.0.1:3894|/opt/stealth-base/data/relayer.base.log|0.0003 to STEALTH_WATCH_CHAINS.
      The sanctions list in /opt/stealth-base/sanctions/evm.json is the repo copy; refresh it before launch.
    - install_rh.sh does not copy relay-util.mjs (current relayer.mjs imports it); install_base.sh does. Re-running install_rh.sh --apply on a fresh host would fail for that reason.
+
+Audit 1158 (indexer + nginx isolation conf) -- what changes on deploy
+  1. STEALTHPAY is REQUIRED in every indexer env file (0x + 40 hex). The indexer exits at start without it (it used to accept any announcer caller). Check first:
+       grep -c '^STEALTHPAY=0x' <env file>      (count only; must print 1 for each indexer env: live Base, RH, Base v3)
+  2. The database gets a new column ann.paid (added automatically at start, no data lost). /known now needs a settled Transfer of the chain token to the stealth address
+     in the announcing transaction's receipt (>= MIN_KNOWN_USDC) AND a row at or below the safe block. Old rows are filled by the indexer itself (50 receipts per cycle, ring cursor);
+     to do it at once, stop nothing and run:  python3 stealth_indexer.py --backfill-paid   (same job as --refill-payers; also fixes payer NULL rows and rewrites history pages).
+     Until a row is filled /known answers false for it (fail closed). On RH the safe tag lags the head, so a fresh payment becomes withdrawable when the safe block passes it.
+  3. New fields (additive): /head {final_block, safe_block, epoch}; /announcements rows {final} and top-level {final_block, epoch}. epoch rises whenever a reorg removed rows.
+  4. New optional env: STEALTH_REQ_DEADLINE (30 s, whole request), STEALTH_ANN_CACHE_BYTES (16 MiB). Paths are matched exactly: /<name>, /stealth-api/<name>, /stealth-api/<chain>/<name>.
+  5. nginx: ops/nginx-stealth-zec.conf now includes mime.types, sets nosniff / no-referrer / frame-ancestors 'none', and the wasm year-cache header has no `always`. nginx -t, reload,
+     then check: curl -sI https://app.deepyield.ai/stealth-zec/ | grep -iE 'content-security|x-content|referrer|cross-origin' ; and open the wallet page once (crossOriginIsolated === true).

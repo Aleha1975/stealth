@@ -112,7 +112,7 @@ try {
   ok("payToken mined", rc2.status === "success");
   await rpc("anvil_mine", ["0x8"]);
   const IPORT = 3985, IDB = path.join(tmp, "i.db");
-  const iEnv = { ...process.env, STEALTH_CHAIN: "rh", STEALTH_RPC: RPC, STEALTH_DB: IDB, STEALTH_PORT: String(IPORT), STEALTHPAY: SP.toLowerCase(), STEALTH_CONFIRMATIONS: "2", STEALTH_START_BLOCK: String(Number(rc.blockNumber) - 2) };
+  const iEnv = { ...process.env, STEALTH_CHAIN: "rh", STEALTH_KNOWN_SAFE: "0", STEALTH_RPC: RPC, STEALTH_DB: IDB, STEALTH_PORT: String(IPORT), STEALTHPAY: SP.toLowerCase(), STEALTH_CONFIRMATIONS: "2", STEALTH_START_BLOCK: String(Number(rc.blockNumber) - 2) };
   const ip = spawn("python3", ["-B", path.join(HERE, "stealth_indexer.py")], { env: iEnv, stdio: "ignore" }); procs.push(ip);
   const J = async u => (await fetch("http://127.0.0.1:" + IPORT + u)).json();
   let rows = []; for (let i = 0; i < 60; i++) { try { rows = (await J("/stealth-api/announcements?since=0&limit=50")).rows; } catch {} if (rows.length >= 2) break; await sleep(500); }

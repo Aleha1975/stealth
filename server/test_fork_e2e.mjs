@@ -92,7 +92,7 @@ try {
   const R2 = await startRelayer("r2", R2PORT, { STEALTH_RELAY_MAX_PER_IP: "3", STEALTH_RELAY_PAY_PER_PAYER: "2" });
   const stats = await (await fetch(RELAY + "/relay/stats")).json();
   ok("relayer up: pay enabled, StealthPay v3, fee 0.05", stats.pay_enabled && stats.stealthpay === SP && stats.pay_fee === String(FEE) && stats.relayer === R1.addr, JSON.stringify(stats).slice(0, 120));
-  const idx = spawn("nice", ["-n", "10", "python3", "-B", path.join(HERE, "stealth_indexer.py")], { env: { ...process.env, STEALTH_CHAIN: "rh", STEALTH_RPC: RPC, STEALTH_DB: path.join(tmp, "i.db"), STEALTH_PORT: String(IPORT), STEALTHPAY: SP.toLowerCase(),
+  const idx = spawn("nice", ["-n", "10", "python3", "-B", path.join(HERE, "stealth_indexer.py")], { env: { ...process.env, STEALTH_CHAIN: "rh", STEALTH_KNOWN_SAFE: "0", STEALTH_RPC: RPC, STEALTH_DB: path.join(tmp, "i.db"), STEALTH_PORT: String(IPORT), STEALTHPAY: SP.toLowerCase(),
     STEALTH_CONFIRMATIONS: "2", STEALTH_START_BLOCK: String(FORK_BLOCK + 1), STEALTH_POLL: "1" }, stdio: "ignore" }); procs.push(idx);
 
   const post = (base, p, b, ip = "9.9.9.9") => fetch(base + p, { method: "POST", headers: { "content-type": "application/json", "x-forwarded-for": ip }, body: typeof b === "string" ? b : JSON.stringify(b) }).then(async r => ({ status: r.status, ...(await r.json()) }));

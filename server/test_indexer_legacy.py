@@ -32,8 +32,9 @@ def meta(amount, token=USDC): return "0x11a9059cbb" + token[2:] + "%064x" % amou
 
 
 def row(m, i, stealth, caller, amount):
-    c = m.db(); c.execute("INSERT INTO ann(block,tx,log_index,scheme,stealth,caller,eph,meta,view_tag,payer) VALUES(?,?,?,?,?,?,?,?,?,?)",
-                          (i, "0x%064x" % i, 0, 1, stealth, caller, "0x02" + "ab" * 32, meta(amount), "0x11", None)); c.commit(); c.close()
+    c = m.db(); c.execute("INSERT INTO ann(block,tx,log_index,scheme,stealth,caller,eph,meta,view_tag,payer,paid) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                          (i, "0x%064x" % i, 0, 1, stealth, caller, "0x02" + "ab" * 32, meta(amount), "0x11", None, amount))       # paid = Transfer из квитанции (audit 1158 F-3): здесь совпадает с объявленным
+    c.execute("INSERT OR REPLACE INTO meta(k,v) VALUES('safe_block','1000')"); c.commit(); c.close()
 
 
 def receipt(frm_tx, transfers):
@@ -58,7 +59,7 @@ check("known: v2 dust below MIN_KNOWN_USDC refused", J("/known?addr=" + S(4))["k
 check("announcements list the v2 row too", any(r["caller"] == V2 for r in J("/announcements?since=0&limit=10")["rows"]))
 srv.shutdown()
 # 2) payer: v2 payToken moves tokens payer -> stealth directly (tx.from is the payer's own tx); v3 payWithAuthorization via the contract (tx.from = relayer)
-m.rpc = lambda method, params, t=0: receipt(RELAYER, [(PAYER, V3), (V3, S(2))]) if params[0].endswith("2".rjust(64, "0")) else receipt(PAYER, [(PAYER, S(1))])
+m.rpc = lambda method, params, t=0, **kw: receipt(RELAYER, [(PAYER, V3), (V3, S(2))]) if params[0].endswith("2".rjust(64, "0")) else receipt(PAYER, [(PAYER, S(1))])
 cache = {}
 check("payer of a v2 payment (direct transfer)", m.payer_of({"tx": "0x%064x" % 1, "stealth": S(1), "caller": V2}, cache) == PAYER)
 check("payer of a v3 payment (through the contract)", m.payer_of({"tx": "0x%064x" % 2, "stealth": S(2), "caller": V3}, {}) == PAYER)
@@ -69,10 +70,12 @@ row(m, 1, S(1), V2, 5_000_000); row(m, 2, S(2), V3, 5_000_000)
 srv, J = serve(m)
 check("no legacy: v2 row unknown, v3 known", J("/known?addr=" + S(1))["known"] is False and J("/known?addr=" + S(2))["known"] is True)
 srv.shutdown()
-# 4) no STEALTHPAY and no legacy = any caller (old behaviour of a bare indexer)
-os.environ.pop("STEALTHPAY_LEGACY", None); tmp = tempfile.mkdtemp(); os.environ.update({"STEALTHPAY": "", "STEALTH_DB": os.path.join(tmp, "b.db")})
-sys.modules.pop("stealth_indexer", None); m = importlib.import_module("stealth_indexer"); m.init_db(); row(m, 1, S(3), OTHER, 5_000_000)
-srv, J = serve(m); check("bare indexer: any caller known", J("/known?addr=" + S(3))["known"] is True); srv.shutdown()
+# 4) audit 1158 F-2: no STEALTHPAY (or a malformed one) = the indexer refuses to start (it used to accept any caller)
+for bad_sp in ("", "0x1234", "0x" + "g" * 40, V3 + "0"):
+    os.environ.pop("STEALTHPAY_LEGACY", None); os.environ.update({"STEALTHPAY": bad_sp}); sys.modules.pop("stealth_indexer", None)
+    try: importlib.import_module("stealth_indexer"); bad = False
+    except SystemExit: bad = True
+    check("STEALTHPAY %r refuses to start" % bad_sp[:12], bad)
 # 5) a malformed legacy address stops the start
 os.environ.update({"STEALTHPAY": V3, "STEALTHPAY_LEGACY": "0x1234"}); sys.modules.pop("stealth_indexer", None)
 try: importlib.import_module("stealth_indexer"); bad = False

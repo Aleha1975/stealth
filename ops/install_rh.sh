@@ -32,7 +32,7 @@ if [ -f $ENVF ]; then
   ok "$ENVF exists"
   [ "$(stat -c %a $ENVF 2>/dev/null || stat -f %Lp $ENVF)" = 600 ] || echo "[warn] $ENVF mode is not 600"
   grep -q '<' $ENVF && soft "$ENVF still contains <placeholders>"
-  grep -Eq '^STEALTHPAY=0x[0-9a-fA-F]{40}$' $ENVF || soft "STEALTHPAY not set to an address in $ENVF"
+  grep -Eq '^STEALTHPAY=0x[0-9a-fA-F]{40}$' $ENVF || die "STEALTHPAY not set to an address in $ENVF (audit 1158 F-2: the indexer refuses to start without it, and without the caller filter /known would accept any announcement)"   # die even in a dry run
   grep -Eq '^RELAYER_KEY=0x[0-9a-fA-F]{64}$' $ENVF || soft "RELAYER_KEY missing/invalid in $ENVF (value not shown)"
   grep -Eq '^STEALTH_CHAIN=rh$' $ENVF || soft "STEALTH_CHAIN=rh missing in $ENVF"
   grep -Eq '^STEALTH_ENV_ONLY=1$' $ENVF || soft "STEALTH_ENV_ONLY=1 missing (would fall back to the Base key)"

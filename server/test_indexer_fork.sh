@@ -11,7 +11,7 @@ EPH=0x02$(printf 'ab%.0s' $(seq 1 32)); TOK=5fc5360d0400a0fd4f2af552add042d716f1
 ann() { cast send $A "announce(uint256,address,bytes,bytes)" 1 $1 $EPH 0x11a9059cbb${TOK}$(printf '%064x' $2) --from $SP --unlocked --rpc-url $R >/dev/null; }
 S1=0x00000000000000000000000000000000000a0001; S2=0x00000000000000000000000000000000000a0002; S3=0x00000000000000000000000000000000000a0003; S4=0x00000000000000000000000000000000000a0004
 ann $S1 5000000; ann $S2 10                      # S1: $5 (известный), S2: 10 микро (ниже минимума)
-STEALTH_CHAIN=rh STEALTH_RPC=$R STEALTH_DB=$T/i.db STEALTH_PORT=3975 STEALTH_START_BLOCK=$(( $(cast block-number --rpc-url $R) - 100 )) STEALTH_CONFIRMATIONS=5 STEALTH_RECONCILE_EVERY=3 STEALTHPAY=$SP python3 -B "$D/stealth_indexer.py" > $T/idx.log 2>&1 & IP=$!
+STEALTH_KNOWN_SAFE=0 STEALTH_CHAIN=rh STEALTH_RPC=$R STEALTH_DB=$T/i.db STEALTH_PORT=3975 STEALTH_START_BLOCK=$(( $(cast block-number --rpc-url $R) - 100 )) STEALTH_CONFIRMATIONS=5 STEALTH_RECONCILE_EVERY=3 STEALTHPAY=$SP python3 -B "$D/stealth_indexer.py" > $T/idx.log 2>&1 & IP=$!
 J() { curl -s "localhost:3975$1"; echo; }
 AB=$(cast block-number --rpc-url $R)   # блок последнего announce (S1,S2 отправлены выше)
 waitidx() { for i in $(seq 60); do h=$(curl -s "localhost:3975/head" | python3 -c "import sys,json; print(json.load(sys.stdin).get('head') or 0)" 2>/dev/null || echo 0); [ "${h:-0}" -ge "$1" ] && return 0; sleep 1; done; echo "indexer head did not reach $1"; return 1; }

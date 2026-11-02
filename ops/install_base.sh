@@ -80,6 +80,7 @@ if [ -f $ENVF ]; then
   grep -q '<' $ENVF && { echo "[warn] $ENVF still contains <placeholders>"; ENV_OK=0; }
   grep -Eq '^STEALTH_CHAIN=base$' $ENVF || { echo "[warn] STEALTH_CHAIN=base missing"; ENV_OK=0; }
   grep -Eq '^STEALTH_ENV_ONLY=1$' $ENVF || { echo "[warn] STEALTH_ENV_ONLY=1 missing"; ENV_OK=0; }
+  grep -Eiq "^STEALTHPAY=0x[0-9a-fA-F]{40}\$" $ENVF || die "STEALTHPAY missing/not an address in $ENVF (audit 1158 F-2: the indexer refuses to start without it)"   # die even in a dry run
   grep -Eiq "^STEALTHPAY=$SP3\$" $ENVF || { echo "[warn] STEALTHPAY is not the v3 address $SP3"; ENV_OK=0; }
   grep -Eiq "^STEALTHPAY_LEGACY=.*$SP2" $ENVF || { echo "[warn] STEALTHPAY_LEGACY does not list v2 $SP2 (v2 payments would not be withdrawable)"; ENV_OK=0; }
   grep -Eq "^STEALTH_PORT=$IDX_PORT\$" $ENVF && grep -Eq "^STEALTH_RELAY_PORT=$REL_PORT\$" $ENVF && grep -Eq "^STEALTH_INDEXER=http://127.0.0.1:$IDX_PORT\$" $ENVF || { echo "[warn] ports in $ENVF are not $IDX_PORT/$REL_PORT"; ENV_OK=0; }

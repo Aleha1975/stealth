@@ -163,7 +163,7 @@ try {
 
   // indexer + relayer as real processes
   const pagesDir = path.join(tmp, "pages");
-  const idx = spawn("python3", ["-B", path.join(HERE, "stealth_indexer.py")], { env: { ...process.env, STEALTH_CHAIN: "rh", STEALTH_RPC: RPC, STEALTHPAY: SP, STEALTH_PORT: String(IPORT), STEALTH_DB: path.join(tmp, "ann.db"),
+  const idx = spawn("python3", ["-B", path.join(HERE, "stealth_indexer.py")], { env: { ...process.env, STEALTH_CHAIN: "rh", STEALTH_KNOWN_SAFE: "0", STEALTH_RPC: RPC, STEALTHPAY: SP, STEALTH_PORT: String(IPORT), STEALTH_DB: path.join(tmp, "ann.db"),
     STEALTH_START_BLOCK: String(startBlock), STEALTH_CONFIRMATIONS: "1", STEALTH_RECONCILE_EVERY: "2", STEALTH_POLL: "1", STEALTH_PAGES_DIR: pagesDir, STEALTH_PAGES_MARGIN: "0", STEALTH_BAL_TTL: "1" }, stdio: ["ignore", "pipe", "inherit"] });
   procs.push(idx); let idxLog = ""; idx.stdout.on("data", d => { idxLog = (idxLog + d).slice(-1500); });
   const rk = generatePrivateKey(), relayerAddr = privateKeyToAccount(rk).address; await rpc("anvil_setBalance", [relayerAddr, toHex(10n ** 18n)]);

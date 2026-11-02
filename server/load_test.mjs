@@ -61,7 +61,7 @@ try {
   const rk = generatePrivateKey(), relayerAddr = privateKeyToAccount(rk).address;
   await rpc("anvil_setBalance", [relayerAddr, toHex(10n ** 18n)]);
   const DB = path.join(tmp, "ann.db");
-  const idx = spawn("python3", [process.env.INDEXER_FILE || path.join(HERE, "stealth_indexer.py")], { env: { ...process.env, STEALTH_CHAIN: "rh", STEALTH_RPC: RPC, STEALTHPAY: SP, STEALTH_PORT: String(IPORT), STEALTH_DB: DB, STEALTH_START_BLOCK: String(startBlock), STEALTH_CONFIRMATIONS: "0", STEALTH_POLL: "1" }, stdio: ["ignore", "pipe", "inherit"] });
+  const idx = spawn("python3", [process.env.INDEXER_FILE || path.join(HERE, "stealth_indexer.py")], { env: { ...process.env, STEALTH_CHAIN: "rh", STEALTH_KNOWN_SAFE: "0", STEALTH_RPC: RPC, STEALTHPAY: SP, STEALTH_PORT: String(IPORT), STEALTH_DB: DB, STEALTH_START_BLOCK: String(startBlock), STEALTH_CONFIRMATIONS: "0", STEALTH_POLL: "1" }, stdio: ["ignore", "pipe", "inherit"] });
   procs.push(idx); idx.stdout.on("data", () => {});
   const rp = spawn("node", [path.join(HERE, "relayer.mjs")], { env: { ...process.env, STEALTH_CHAIN: "rh", STEALTH_RPC: RPC, STEALTHPAY: SP, RELAYER_KEY: rk, STEALTH_RELAY_PORT: String(RPORT), STEALTH_INDEXER: IDX,
     STEALTH_RELAY_STATE: path.join(tmp, "st.json"), STEALTH_RELAY_LOG: path.join(tmp, "r.log"), STEALTH_RELAY_PAY_FEE: String(FEE), STEALTH_RELAY_PAY_FEE_MIN: String(FEE),
