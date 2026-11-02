@@ -81,7 +81,7 @@ const WEDGE_S = Number(E.STEALTH_RELAY_WEDGE_S || 2 * STUCK_S);
 const GAS_PAD_PCT = 125n;                                                                         // запас к оценке газа для резерва
 const MAX_PER_FROM = Math.max(1, Number(E.STEALTH_RELAY_PER_FROM || 3));
 const ALT_MAX = 16;                                                                               // audit 1167 I-4: the record keeps the ORIGINAL hash and the newest ones (MAX_REPLACE per round of the periodic check; a handful of rounds in practice)
-const capAlt = a => a.length > ALT_MAX ? [a[0], ...a.slice(-(ALT_MAX - 1))] : a;
+const capAlt = a => a.length > ALT_MAX ? [a[0], ...a.slice(-(ALT_MAX - 1))] : a;       // the one cap policy (original + newest); load() uses it too (audit 1169 I-5)
 // audit 1167 L-1: 1 only when this key is used by this process alone. Base shares the key with an older relayer, so a pool transaction that is not in our records may be THEIRS: unwedge then never cancels it (default).
 const SOLE_KEY = E.STEALTH_RELAY_SOLE_KEY === "1";
 const GONE_GAP_MS = Number(E.STEALTH_RELAY_GONE_GAP_MS || 4000);                                // audit 1099 L-3: second "not found" probe this much later
@@ -149,7 +149,7 @@ export let st = { day: day(), gas: 0n, perFrom: {}, perPayer: {} };   // persist
 const bump = (o, k) => { const n = (o[k] || 0) + 1; delete o[k]; o[k] = n; const ks = Object.keys(o); for (let i = 0; i < ks.length - PERSIST_MAX; i++) delete o[ks[i]]; };
 // audit 1113 M-3: the state file is written asynchronously, at most once a second (saveSoon); only the record of an UNSURE send, made just before the send, is written at once (saveNow:
 // restart safety, and bounded by the daily gas budget).
-const snapshot = () => JSON.stringify({ day: st.day, gas: st.gas.toString(), perFrom: st.perFrom, perPayer: st.perPayer, unsure: [...unsure], feePaid: [...feePaid] });
+export const snapshot = () => JSON.stringify({ day: st.day, gas: st.gas.toString(), perFrom: st.perFrom, perPayer: st.perPayer, unsure: [...unsure], feePaid: [...feePaid] });
 let writing = null, again = false, lastWrite = 0, saveTimer = null, dirty = false, tmpSeq = 0;
 // audit 1116 I-2: every write has its OWN temp file (pid + sequence), the file is fsync'ed before the rename and the directory after it, so a power loss cannot leave an empty state file.
 const writeAtomic = async (data) => {
@@ -200,7 +200,7 @@ const recMeta = (v) => ({ tx: recTx(v.tx), rsv: typeof v.rsv === "string" && /^\
 export const load = () => {
   let raw; try { raw = fs.readFileSync(STATE_FILE, "utf8"); } catch (e) { if (e && e.code === "ENOENT") return; throw e; }
   const j = JSON.parse(raw); if (!j || typeof j !== "object") throw new Error("state is not an object");
-  for (const [k, v] of Array.isArray(j.unsure) ? j.unsure : []) if (v && HASH_RE.test(v.h) && Date.now() - v.t < DEDUPE_MS) unsure.set(lc(k), { h: v.h, nonce: v.nonce, t: v.t, counted: !!v.counted, alt: (Array.isArray(v.alt) ? v.alt : []).filter(x => HASH_RE.test(x)).slice(0, ALT_MAX), ...recMeta(v) });   // audit 1108 L-1: survives a restart (also across midnight); 1113 L-1: keys lower-cased
+  for (const [k, v] of Array.isArray(j.unsure) ? j.unsure : []) if (v && HASH_RE.test(v.h) && Date.now() - v.t < DEDUPE_MS) unsure.set(lc(k), { h: v.h, nonce: v.nonce, t: v.t, counted: !!v.counted, alt: capAlt((Array.isArray(v.alt) ? v.alt : []).filter(x => HASH_RE.test(x))), ...recMeta(v) });   // audit 1108 L-1: survives a restart (also across midnight); 1113 L-1: keys lower-cased
   for (const [k, v] of Array.isArray(j.feePaid) ? j.feePaid : []) if (v && HASH_RE.test(v.h) && Date.now() - v.t < DEDUPE_MS) feePaid.set(lc(k), { h: v.h, t: v.t, main: typeof v.main === "string" ? lc(v.main) : null });
   capMap(feePaid, 2000);
   if (j.day === day()) st = { day: j.day, gas: BigInt(j.gas), perFrom: migFrom(j.perFrom), perPayer: migFrom(j.perPayer) };

@@ -69,7 +69,11 @@ export function lockHolderAlive(content, script, sys) {
   const start = procStart(pid, sys.proc), cmd = sys.proc("/proc/" + pid + "/cmdline");
   if (start === null && cmd === null) return true;                  // no /proc: nothing more can be checked
   if (m[2] !== undefined) return start === m[2];                    // exact process: same pid and same start time
-  return typeof cmd === "string" && cmd.split("\0")[1] === script;   // lock of an older version (pid only): argv[1] must equal this exact script (audit 1167 I-2: not a substring)
+  if (typeof cmd !== "string") return false;                         // lock of an older version (pid only): argv[0] is node and the first non-flag argument is exactly this script (1167 I-2: not a substring; 1169 L-2: node flags before it are fine)
+  const argv = cmd.split("\0"); if (argv[argv.length - 1] === "") argv.pop();
+  if (!/^node(js)?$/.test(argv[0].split("/").pop())) return false;
+  const first = argv.slice(1).find(a => !a.startsWith("-"));        // flags that take a SEPARATE value (--require x, --max-old-space-size 256) are not supported: write them as --flag=value
+  return first === script;
 }
 
 /** Audit 1113 M-3: a small in-memory counter map: LRU (a touched key moves to the back), bounded. */

@@ -367,6 +367,15 @@ for (const [name, hostile] of [["input", { input: EVIL }], ["target", { to: ATTA
   ok("1167 L-1 own record gone from the node, another transaction at its nonce, SOLE_KEY off: nothing sent", node.sends.length === n0 && !/filling with a self-transfer/.test(logOf(e)), "sends " + node.sends.length);
   node.srv.close(); }
 
+// ---- audit 1169: SOLE_KEY=1 with an own record (hs not empty) goes through allGone (double probe) before the self-transfer; the foreign transaction at that nonce is then replaced
+{ const node = makeNode(); await node.listen(); const e = env(node, "l1s", { STEALTH_RELAY_WEDGE_S: "1", STEALTH_RELAY_SOLE_KEY: "1", STEALTH_RELAY_GONE_GAP_MS: "100" });
+  const a = run(e, "pay", { LINGER_MS: "60000" }); await a.wait("hash"); await waitFor(() => stateOf(e)?.unsure.length === 1); a.p.kill("SIGKILL"); await a.exit;
+  const acct = privateKeyToAccount(KEY), ser = await acct.signTransaction({ chainId: CC.id, nonce: 0, gas: 21000n, to: acct.address, value: 0n, type: "eip1559", maxFeePerGas: GWEI * 200n, maxPriorityFeePerGas: GWEI });
+  node.pool.clear(); await node.rpc("eth_sendRawTransaction", [ser]); const n0 = node.sends.length, q0 = node.calls.eth_getTransactionByHash || 0;
+  const b = run(e, "wedge", { LINGER_MS: "300", WEDGE_CALLS: "5", WEDGE_EVERY_MS: "500" }); await b.exit;
+  ok("1169 SOLE_KEY=1, own record not found on the node (hs not empty): allGone probes twice, then the self-transfer is sent", node.sends.length > n0 && /filling with a self-transfer/.test(logOf(e)) && (node.calls.eth_getTransactionByHash || 0) - q0 >= 2, "sends " + (node.sends.length - n0) + " " + logOf(e).slice(-200));
+  node.srv.close(); }
+
 // ---- audit 1164 L-3: a fill after midnight is charged to the current day and checked against it
 { const src = fs.readFileSync(path.join(HERE, "relayer.mjs"), "utf8"), fn = src.slice(src.indexOf("async function fillNonce"), src.indexOf("async function syncNonce"));
   ok("1164 L-3 fillNonce checks and charges st.day (no day parameter, charge after rolling)", /async function fillNonce\(n, ctl, bumps = 0\)/.test(fn) && /roll\(\); st\.gas \+= cost/.test(fn) && !/d0/.test(fn));
@@ -422,7 +431,18 @@ for (const [name, hostile] of [["input", { input: EVIL }], ["target", { to: ATTA
 
 // ---- audit 1167 I-4: the record keeps the original hash of a long replacement chain (no .slice(-4))
 { const src = fs.readFileSync(path.join(HERE, "relayer.mjs"), "utf8");
-  ok("1167 I-4 alt is no longer cut to the last 4: capAlt keeps the first (original) hash plus the newest ones; load keeps up to ALT_MAX", !/\.slice\(-4\)/.test(src) && /const capAlt = a => a\.length > ALT_MAX \? \[a\[0\], \.\.\.a\.slice\(-\(ALT_MAX - 1\)\)\] : a/.test(src) && /slice\(0, ALT_MAX\)/.test(src)); }
+  ok("1167 I-4 alt is no longer cut to the last 4: capAlt keeps the first (original) hash plus the newest ones; load keeps up to ALT_MAX", !/\.slice\(-4\)/.test(src) && /const capAlt = a => a\.length > ALT_MAX \? \[a\[0\], \.\.\.a\.slice\(-\(ALT_MAX - 1\)\)\] : a/.test(src) && !/slice\(0, ALT_MAX\)/.test(src)); }
+// ---- audit 1169 I-5: a replacement chain longer than ALT_MAX survives a restart keeping the ORIGINAL hash (load uses capAlt: original + newest 15, not the oldest 16)
+{ const dir = fs.mkdtempSync(path.join(tmp, "alt-")), hh = i => "0x" + i.toString(16).padStart(64, "0"), alt = Array.from({ length: 20 }, (_, i) => hh(i + 1));
+  fs.writeFileSync(path.join(dir, "st.json"), JSON.stringify({ day: new Date().toISOString().slice(0, 10), gas: "0", perFrom: {}, perPayer: {}, feePaid: [], unsure: [["0x" + "ab".repeat(20) + ":0", { h: hh(99), nonce: 0, t: Date.now(), counted: true, alt }]] }));
+  const r = spawnSync("node", ["--input-type=module", "-e", `const R = await import("file://${path.join(HERE, "relayer.mjs")}"); const u = JSON.parse(R.snapshot()).unsure[0][1]; console.log("ALT " + JSON.stringify(u.alt)); process.exit(0)`],
+    { encoding: "utf8", timeout: 20000, env: { ...process.env, STEALTH_ENV_ONLY: "1", STEALTH_CHAIN: "rh", STEALTH_RPC: "http://127.0.0.1:1", RELAYER_KEY: KEY, STEALTH_RELAY_LOG: path.join(dir, "l.log"), STEALTH_RELAY_STATE: path.join(dir, "st.json") } });
+  const got = JSON.parse((/ALT (.*)/.exec(r.stdout) || [0, "[]"])[1]);
+  ok("1169 I-5 20 alternative hashes in the state file: after load 16 remain, the original (first) among them, then the newest 15", got.length === 16 && got[0] === alt[0] && got[1] === alt[5] && got[15] === alt[19], r.stdout.slice(0, 120) + r.stderr.slice(0, 200)); }
+// ---- audit 1169 L-2: an old pid-only lock whose process is `node <flags> <script>` is alive
+{ const S = "/opt/stealth-base/relayer.mjs", alive = { kill() {} }, stat = n => "1 (node) S " + Array(17).fill("0").join(" ") + " " + n + " 0", fakeProc = f => p => (p in f ? f[p] : null), live = cmd => lockHolderAlive("123", S, { ...alive, proc: fakeProc({ "/proc/123/stat": stat(1), "/proc/123/cmdline": cmd }) });
+  ok("1169 L-2 node with flags before the script is alive: --max-old-space-size=256, --dns-result-order=ipv4first, /usr/bin/node", live("node\0--max-old-space-size=256\0" + S + "\0") === true && live("/usr/bin/node\0--dns-result-order=ipv4first\0--no-warnings\0" + S + "\0") === true);
+  ok("1169 L-2 still stale: other script after flags, tail -f S, vim S.bak, non-node binary running S, node with only flags", live("node\0--no-warnings\0/srv/other.mjs\0") === false && live("tail\0-f\0" + S + "\0") === false && live("vim\0" + S + ".bak\0") === false && live("python3\0" + S + "\0") === false && live("node\0--inspect\0") === false); }
 
 // ---- audit 1164 I-1: allow-list parsing
 { const dropped = []; const A = parseAllow("9.9.9.9, 2001:db8::1, 2001:0db8:0:0::/64, ::ffff:1.2.3.4, my.host.name, 1.2.3, 999.1.1.1, -, junk", x => dropped.push(x));

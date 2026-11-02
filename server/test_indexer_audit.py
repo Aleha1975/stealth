@@ -56,6 +56,7 @@ class Chain:
         def blk(e, n):
             if e.get("fake_high"): return {"number": hex(n), "hash": H(n, "fake"), "parentHash": H(n - 1, "fake")}
             sl = lambda k: e.get("salt", "") if k >= e.get("fork_at", 0) else ""                  # fork_at: the chain's own hashes start there (shared history below)
+            if e.get("bad_parent") and n >= e["bad_parent"]: return {"number": hex(n), "hash": H(n, sl(n)), "parentHash": H(n - 1, "lie")}          # right block hash, invented parent
             return {"number": hex(n), "hash": H(n, sl(n)), "parentHash": H(n - 1, sl(n - 1))} if n <= e.get("blocks_to", e["head"]) else None
         def rpc1(u, method, params, t):
             e = self.eps[u]; self.calls.append((u, method))
@@ -235,6 +236,39 @@ A["salt"] = "z"; A["fork_at"] = 1; A["head"] = 500
 out = io.StringIO()
 with contextlib.redirect_stdout(out): time.sleep(0.8)
 check("1167 L-2 nothing stored matches: ALERT, head_done stays, no re-read from the new chain", "ALERT no stored block hash matches" in out.getvalue() and meta_get(m, "head") == "300")
+check("1169 I-4 the deep-divergence ALERT is throttled (many polls, one line)", out.getvalue().count("ALERT no stored block hash matches") == 1)
+# 1169 M-1: two endpoints, ONE of them invents the parentHash of the next block (right block hash): the other does not confirm -> no step back, no delete, no epoch bump; the index keeps moving (via the honest one)
+m = load(); m.CHUNK0 = 50; A = {"head": 300, "logs": []}; B = {"head": 300, "logs": []}; Chain(m, {"A": A, "B": B})
+run_loop(m, until=lambda: meta_get(m, "head") == "300"); put(m, 150, 0, S(9), V3, 5_000_000, 5_000_000)
+A["bad_parent"] = 301; A["head"] = B["head"] = 700
+fc = []; _fc = m.find_common; m.find_common = lambda *a: (fc.append(a), _fc(*a))[1]
+out = io.StringIO()
+with contextlib.redirect_stdout(out):
+    t0 = time.time()
+    while time.time() - t0 < 10 and meta_get(m, "head") != "700": time.sleep(0.05)
+    time.sleep(0.2)
+check("1169 M-1 2 endpoints, one lies about parentHash: no rollback, no delete, no epoch bump, the old row stays, indexing reaches 700",
+      not fc and count(m) == 1 and meta_get(m, "epoch") is None and meta_get(m, "head") == "700" and meta_get(m, "head_hash") == H(700))
+# both of them agree the parent differs (a real fork seen by both): the walk back still happens
+m = load(); m.CHUNK0 = 50; A = {"head": 300, "logs": []}; B = {"head": 300, "logs": []}; Chain(m, {"A": A, "B": B})
+run_loop(m, until=lambda: meta_get(m, "head") == "300")
+A["salt"] = B["salt"] = "z"; A["fork_at"] = B["fork_at"] = 251; A["head"] = B["head"] = 500
+out = io.StringIO()
+with contextlib.redirect_stdout(out):
+    t0 = time.time()
+    while time.time() - t0 < 10 and meta_get(m, "head") != "500": time.sleep(0.05)
+    time.sleep(0.2)
+check("1169 M-1 2 endpoints both confirm the mismatch: step back and follow the new chain", "re-reading from" in out.getvalue() and meta_get(m, "head_hash") == H(500, "z"))
+# find_common: the stored hash of head_done is still agreed -> no rollback needed
+c = m.db(); r = m.find_common(c, 500, {}, H(500, "z")); c.close()
+check("1169 M-1 find_common returns head_done itself when its stored hash is still agreed", r == (500, H(500, "z")))
+# 1169 L-3: hex integers of a receipt compare as numbers
+m = load(); Chain(m, {"A": {"head": 20, "logs": []}, "B": {"head": 20, "logs": []}})
+rw = {"tx": TX(1), "block": 10}; r1 = rcpt(10, PAYER, [(PAYER, V3, 1)]); r2 = dict(r1, blockNumber="0x0a", status="0x01"); r2["logs"] = [dict(l, logIndex="0x00") for l in r1["logs"]]; r1["logs"] = [dict(l, logIndex="0x0") for l in r1["logs"]]
+r1["transactionHash"] = r2["transactionHash"] = TX(1)
+for l in r1["logs"] + r2["logs"]: l["transactionHash"] = TX(1)
+k1, k2 = m._rc_key(rw, r1, {}), m._rc_key(rw, r2, {})
+check("1169 L-3 _rc_key: 0x1 / 0x01, 0xa / 0x0a, logIndex 0x0 / 0x00 give one key", k1 is not None and k1 == k2)
 # first start / a database without head_hash: the first step is accepted without a comparison
 m = load(); meta_set(m, head=100); Chain(m, {"A": {"head": 150, "logs": []}}); run_loop(m, until=lambda: meta_get(m, "head") == "150")
 check("1165 no stored hash yet (new database / older version): accepted, hash stored", meta_get(m, "head") == "150" and meta_get(m, "head_hash") == H(150))

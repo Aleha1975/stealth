@@ -78,6 +78,8 @@ ANN_CACHE_BYTES = int(os.environ.get("STEALTH_ANN_CACHE_BYTES", str(16 << 20))) 
 _env_rpc = [u.strip() for u in os.environ.get("STEALTH_RPC", "").split(",") if u.strip()]
 RPCS = _env_rpc or [u for u in [os.environ.get(k) for k in CC["rpc_env"]] + CC["rpcs"] if u]
 RPCS = list(dict.fromkeys(RPCS))                                # одинаковые URL -- не два независимых узла
+if len(RPCS) > 1 and len({urlparse(u).hostname for u in RPCS}) < len(RPCS):          # аудит 1169 I-6: два URL одного хоста -- почти наверняка один и тот же бэкенд, а модель доверия держится на независимости точек
+    print("WARNING: two STEALTH_RPC URLs share one host: they must be independent providers (different backends), otherwise two agreeing endpoints prove nothing", flush=True)
 NEED = min(2, len(RPCS))                                        # сколько точек должны вернуть один и тот же хэш блока (1 -- единственная настроенная, доверенный провайдер)
 def _loopback(u):                                               # аудит 1165 I-2: разбор URL, а не регулярка (http://localhost:80@evil.example/ имеет хост evil.example)
     try: p = urlparse(u); return p.scheme in ("http", "https") and p.hostname in ("127.0.0.1", "localhost", "::1")
@@ -314,8 +316,9 @@ def _rc_key(r, rc, ag):
             if NEED >= 2 and (rc.get("blockHash") or "").lower() != agreed(r["block"], ag)[0]: return None
         logs = rc.get("logs") or []
         if any((lg.get("transactionHash") or "").lower() != tx for lg in logs): return None
-        return json.dumps([tx, (rc.get("blockHash") or "").lower(), rc.get("blockNumber"), rc.get("status"), (rc.get("from") or "").lower(),
-                           [[(lg.get("address") or "").lower(), [str(x).lower() for x in lg.get("topics") or []], (lg.get("data") or "").lower(), lg.get("logIndex")] for lg in logs
+        hx = lambda v: int(v, 16) if isinstance(v, str) else v        # аудит 1169 L-3: "0x1" и "0x01" -- одно число; сравниваем числа, не написание
+        return json.dumps([tx, (rc.get("blockHash") or "").lower(), hx(rc.get("blockNumber")), hx(rc.get("status")), (rc.get("from") or "").lower(),
+                           [[(lg.get("address") or "").lower(), [str(x).lower() for x in lg.get("topics") or []], (lg.get("data") or "").lower(), hx(lg.get("logIndex"))] for lg in logs
                             if (lg.get("topics") or [""])[0].lower() == TRANSFER_T]])
     except Exception: return None            # нет согласия по хэшу блока (или поле не разобралось) -- квитанции не верим, строка дозаполнится позже
 
@@ -565,16 +568,22 @@ def _set_meta(c, **kv):
         c.commit()
 
 
-def find_common(c, head_done, ag):
+_deep_alert = [0.0]
+
+
+def find_common(c, head_done, ag, hh=None):
     """Аудит 1167 L-2: parentHash не сошёлся -- шагаем назад REORG_WIN, 2*REORG_WIN, ... (не ниже START-1), пока сохранённый хэш блока не совпадёт с тем, что отдаёт цепь сейчас (agreed). Возвращает (блок, хэш).
     Совпадения нет в сохранённых (старая БД без bh, расхождение глубже BH_KEEP) -- ALERT и ожидание оператора: после остановки службы `--rewind N` с достаточным N."""
+    if hh and agreed(head_done, ag)[0] == hh: return head_done, hh      # аудит 1169 M-1: сохранённый хэш головы всё ещё согласован -- отката не требуется (ложный parentHash)
     step = REORG_WIN
     while head_done - step >= START - 1:
         with _lock: row = c.execute("SELECT block,hash FROM bh WHERE block<=? AND block>=? ORDER BY block DESC LIMIT 1", (head_done - step, START - 1)).fetchone()
         if not row: break
         if agreed(row[0], ag)[0] == row[1]: return row
         step = max(step * 2, head_done - row[0] + 1)
-    print("ALERT no stored block hash matches the chain (%s): operator action needed, stop the service and run --rewind N with N large enough" % CHAIN, flush=True)
+    if time.time() - _deep_alert[0] >= WAIT_ALERT_S:                # аудит 1169 I-4: раз в WAIT_ALERT_S, как и остальные ALERT (цикл идёт каждые POLL секунд)
+        _deep_alert[0] = time.time()
+        print("ALERT no stored block hash matches the chain (%s): operator action needed, stop the service and run --rewind N with N large enough" % CHAIN, flush=True)
     raise RuntimeError("deep divergence: waiting for the operator")
 
 
@@ -607,9 +616,13 @@ def index_loop():
                 if hh:                                      # цепочка: родитель блока a обязан быть сохранённым блоком head_done (сменился бэкенд / реорг -- не пропускаем, а перечитываем окно)
                     x = _block_at(ep, a)
                     if not x: raise RuntimeError("endpoint cannot return block %d: waiting" % a)
+                    if x[1] != hh and NEED >= 2:                # аудит 1169 M-1: расхождение должно подтвердить ещё одна точка из согласованных (x2 -- её parentHash тоже != hh), иначе не откат, а ожидание
+                        x2 = _block_at(eps[1], a)
+                        if not x2 or x2[1] == hh: raise RuntimeError("endpoints disagree on the parentHash of block %d: waiting" % a)
                     if x[1] != hh:
                         print("parentHash of block %d does not match the stored hash of %d (backend switch or reorg): looking for a stored block that still matches" % (a, head_done), flush=True)
-                        back, bhash = find_common(c, head_done, ag)
+                        back, bhash = find_common(c, head_done, ag, hh)
+                        if back == head_done: raise RuntimeError("parentHash of block %d differs but the stored hash of %d is still agreed: waiting" % (a, head_done))
                         print("re-reading from %d" % (back + 1), flush=True)
                         with _lock:
                             if head_done - back > REORG_WIN:        # глубже окна реконсиляции строки выше точки совпадения она уже не уберёт: убираем здесь, перечитаем

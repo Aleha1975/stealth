@@ -205,3 +205,17 @@ Audit 1165 (indexer, third re-review) -- ONE trust rule instead of pinning / sec
   DEPLOY ORDER  (1) on the host: edit the nginx zones to $st_ipkey (above), nginx -t; (2) stop the indexer, deploy stealth_indexer.py (the DB needs no migration; meta head_hash appears after the first step), start it, watch the log
        for "index error" lines: "no 2 endpoints agree" means the two providers really differ; (3) --backfill-paid once; (4) RH: nothing to configure (one endpoint = stated trust); add a second URL when one exists;
        (5) Base: STEALTH_RPC must hold TWO independent providers (dRPC + publicnode), as in base.env.example.
+
+Audit 1167/1169 (indexer fork recovery, relayer lock and wedge)
+  find_common  The parentHash of block a = head_done+1 differs from the stored hash of head_done (backend switch or reorg). With >= 2 endpoints the mismatch must be confirmed by a SECOND endpoint of the agreed set
+         (its parentHash for block a must also differ); one endpoint saying so alone -> "endpoints disagree on the parentHash ...: waiting", nothing is rolled back or deleted (audit 1169 M-1). Confirmed ->
+         find_common first re-checks that the stored hash of head_done is not still agreed (then nothing to roll back: wait), and otherwise walks back through the bh table (stored block hashes, BH_KEEP blocks):
+         REORG_WIN (100) blocks, then 200, 400, ... (never below START-1), until a stored hash equals the hash the endpoints agree on now. Rows above that block are deleted when it is deeper than the reconcile window
+         (REORG_WIN), epoch is bumped, and the indexer re-reads from there (INSERT OR IGNORE).
+  ALERT + --rewind N  No stored hash matches (a database older than bh, or a divergence deeper than BH_KEEP): "ALERT no stored block hash matches the chain" (at most once per STEALTH_WAIT_ALERT_S), the indexer keeps
+         waiting and head_done does not move. Operator: stop the service, run  stealth_indexer.py --rewind N  with N large enough to reach below the divergence (it bumps epoch), start the service.
+  STEALTH_RELAY_SOLE_KEY  Default off (unset / anything but 1). Off: unwedge never cancels (self-transfer over) a pool transaction at the stuck nonce that is not one of OUR records, and never treats our own record as gone
+         without the double probe; it logs "ALERT wedged nonce ... not in our records". Why: on Base this key is shared with an older relayer, so an unknown transaction at that nonce may be THEIRS; cancelling it would
+         destroy a payment. Set 1 only when this process is the only user of the relayer key: then an unknown transaction, or our record proven gone (allGone, two probes), is replaced by a 0-value self-transfer.
+  Old lock files (pid only)  alive only if argv[0] is node and the first argument that does not start with "-" is exactly the relayer script. Node flags with a SEPARATE value (--require x) are not supported: use --flag=value.
+  RPC independence  STEALTH_RPC with two URLs must be two independent providers (different backends); the indexer warns at start when two URLs share a host (see base.env.example).
