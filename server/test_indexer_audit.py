@@ -55,7 +55,8 @@ class Chain:
         self.eps = eps; self.calls = []; m.RPCS = list(eps); m.NEED = min(2, len(eps))
         def blk(e, n):
             if e.get("fake_high"): return {"number": hex(n), "hash": H(n, "fake"), "parentHash": H(n - 1, "fake")}
-            return {"number": hex(n), "hash": H(n, e.get("salt", "")), "parentHash": H(n - 1, e.get("salt", ""))} if n <= e.get("blocks_to", e["head"]) else None
+            sl = lambda k: e.get("salt", "") if k >= e.get("fork_at", 0) else ""                  # fork_at: the chain's own hashes start there (shared history below)
+            return {"number": hex(n), "hash": H(n, sl(n)), "parentHash": H(n - 1, sl(n - 1))} if n <= e.get("blocks_to", e["head"]) else None
         def rpc1(u, method, params, t):
             e = self.eps[u]; self.calls.append((u, method))
             if e.get("fail"): raise RuntimeError("down")
@@ -71,7 +72,10 @@ class Chain:
             if method == "eth_getLogs":
                 a, b = int(params[0]["fromBlock"], 16), int(params[0]["toBlock"], 16)
                 return [l for l in e["logs"] if a <= int(l["blockNumber"], 16) <= min(b, e["head"])]
-            if method == "eth_getTransactionReceipt": return e.get("receipts", {}).get(params[0])
+            if method == "eth_getTransactionReceipt":
+                rc = e["receipts"].get(params[0]) if "receipts" in e else next((x["receipts"][params[0]] for x in self.eps.values() if x is not e and params[0] in x.get("receipts", {})), None)     # no "receipts" key = an honest replica of the others
+                if rc is None: return None
+                return dict(rc, transactionHash=rc.get("transactionHash", params[0]), logs=[dict(l, transactionHash=l.get("transactionHash", params[0])) for l in rc["logs"]])
             raise RuntimeError("unexpected " + method)
         m.rpc1 = rpc1
 
@@ -199,11 +203,11 @@ try: m.check_logs([mk_log(150, 0, S(1), V3, 5_000_000)], 100, 200, {}); r = Fals
 except RuntimeError: r = True
 check("1165 logs: endpoints that disagree on the block of a log -> not accepted", r)
 
-# ONE configured endpoint (trusted provider): moves by its own word, but parentHash continuity against the stored hash catches a backend switch
-m = load(); A = {"head": 200, "logs": []}; Chain(m, {"A": A})
+# ONE configured endpoint (trusted provider): moves by its own word, but parentHash continuity against the stored hash catches a backend switch (1167 L-2: the walk back stops at a stored hash that still matches)
+m = load(); m.CHUNK0 = 20; A = {"head": 200, "logs": []}; Chain(m, {"A": A})
 run_loop(m, until=lambda: meta_get(m, "head") == "200")
 check("1165 single endpoint: indexes to 200 and stores the hash of block 200", meta_get(m, "head") == "200" and meta_get(m, "head_hash") == H(200))
-A["salt"] = "z"; A["head"] = 400; A["logs"] = [mk_log(150, 0, S(7), V3, 5_000_000)]            # backend switched to another chain: its block 201 has another parent
+A["salt"] = "z"; A["fork_at"] = 131; A["head"] = 400; A["logs"] = [mk_log(150, 0, S(7), V3, 5_000_000)]            # backend switched to a chain that forked at 131: its block 201 has another parent
 for l in A["logs"]: l["blockHash"] = H(150, "z")
 A["receipts"] = {TX(15000): rcpt(150, PAYER, [(PAYER, S(7), 5_000_000)], bh=H(150, "z"))}
 out = io.StringIO(); t0 = time.time()
@@ -211,7 +215,26 @@ with contextlib.redirect_stdout(out):
     while time.time() - t0 < 10 and count(m) < 1: time.sleep(0.05)
     time.sleep(0.3)
 check("1165 single endpoint backend switch: parentHash mismatch is reported", "does not match the stored hash" in out.getvalue())
-check("1165 single endpoint backend switch: the window is re-read (announcement at 150 not skipped) and the chain continues from the new hashes", count(m) == 1 and meta_get(m, "head") == "400" and meta_get(m, "head_hash") == H(400, "z"))
+check("1165/1167 single endpoint backend switch: stepped back to a stored block below the fork, the window is re-read (announcement at 150 not skipped), the chain continues from the new hashes",
+      count(m) == 1 and meta_get(m, "head") == "400" and meta_get(m, "head_hash") == H(400, "z") and "re-reading from 101" in out.getvalue())
+# 1167 L-2: a fork deeper than REORG_WIN: the walk back doubles (100, then 200) until a stored hash matches; rows above the matching block are dropped (the reconcile window cannot reach them) and epoch bumps
+m = load(); m.CHUNK0 = 50; A = {"head": 1000, "logs": []}; Chain(m, {"A": A})
+run_loop(m, until=lambda: meta_get(m, "head") == "1000")
+put(m, 600, 0, S(8), V3, 5_000_000, 5_000_000)
+A["salt"] = "z"; A["fork_at"] = 451; A["head"] = 1200
+out = io.StringIO(); t0 = time.time()
+with contextlib.redirect_stdout(out):
+    while time.time() - t0 < 10 and meta_get(m, "head") != "1200": time.sleep(0.05)
+    time.sleep(0.2)
+check("1167 L-2 deep fork (single endpoint): keeps stepping back until a stored hash matches, then follows the new chain", "re-reading from 201" in out.getvalue() and meta_get(m, "head") == "1200" and meta_get(m, "head_hash") == H(1200, "z"))
+check("1167 L-2 deep fork: the old-fork row above the matching block is dropped and epoch bumped", count(m) == 0 and meta_get(m, "epoch") == "1")
+# no stored hash matches (fork below everything we kept, or a database without bh): ALERT and wait for the operator, head_done does not move
+m = load(); m.CHUNK0 = 50; A = {"head": 300, "logs": []}; Chain(m, {"A": A})
+run_loop(m, until=lambda: meta_get(m, "head") == "300")
+A["salt"] = "z"; A["fork_at"] = 1; A["head"] = 500
+out = io.StringIO()
+with contextlib.redirect_stdout(out): time.sleep(0.8)
+check("1167 L-2 nothing stored matches: ALERT, head_done stays, no re-read from the new chain", "ALERT no stored block hash matches" in out.getvalue() and meta_get(m, "head") == "300")
 # first start / a database without head_hash: the first step is accepted without a comparison
 m = load(); meta_set(m, head=100); Chain(m, {"A": {"head": 150, "logs": []}}); run_loop(m, until=lambda: meta_get(m, "head") == "150")
 check("1165 no stored hash yet (new database / older version): accepted, hash stored", meta_get(m, "head") == "150" and meta_get(m, "head_hash") == H(150))
@@ -328,20 +351,13 @@ m.reconcile(m.db(), 200, 250, "A")
 check("F-4 reconcile: two endpoints agree the log is gone -> deleted", count(m) == 0)
 c = m.db(); check("F-4 reconcile: epoch bumped on removal", c.execute("SELECT v FROM meta WHERE k='epoch'").fetchone()[0] == "1"); c.close()
 put(m, 150, 0, S(1), V3, 5_000_000, 5_000_000)
-ch.eps["B"]["head"] = 100                                # B lags: its empty answer means nothing; A is read again
-ch.eps["A"]["once_fail"] = False
-calls = {"n": 0}; orig = m.rpc1
-def flaky(u, method, params, t):
-    if method == "eth_getLogs" and u == "A":
-        calls["n"] += 1
-        if calls["n"] == 2: raise RuntimeError("second read failed")
-    return orig(u, method, params, t)
-m.rpc1 = flaky
+ch.eps["B"]["head"] = 100                                # B lags: it cannot agree on the hash of block 250, so the window is not read at all (1167 M-2: two agreeing endpoints) -- nothing is deleted
+try: m.reconcile(m.db(), 200, 250, "A"); r = False
+except RuntimeError: r = True
+check("F-4/1167 reconcile: a lagging second endpoint -> the pass waits, nothing deleted", r and count(m) == 1)
+ch.eps["B"]["head"] = 300
 m.reconcile(m.db(), 200, 250, "A")
-check("F-4 reconcile: no second read obtained -> nothing deleted", count(m) == 1)
-m.rpc1 = orig
-m.reconcile(m.db(), 200, 250, "A")
-check("F-4 reconcile: lagging second node ignored, same node read twice agrees -> deleted", count(m) == 0)
+check("F-4 reconcile: both endpoints back and both empty -> deleted", count(m) == 0)
 m.MODE = "safe"; put(m, 150, 0, S(1), V3, 5_000_000, 5_000_000)
 m.reconcile(m.db(), 200, 250, "A", insert_only=True)
 check("F-4 insert_only reconcile never deletes (base)", count(m) == 1)
@@ -529,6 +545,66 @@ ins(1, V3, TOKM, 5_000_000); ins(2, V3, TOKM, 0); ins(3, V3, TOKM, None); ins(4,
 srv, J = serve(m); st, d = J("/announcements?since=0&limit=10")
 check("1165 I-3 verified: token row with a found Transfer = 1; token row with paid 0 = 0; receipt pending = 0; payETH with a parsed receipt = 1; payETH pending = 0; foreign caller = 0; unknown selector = 0",
       [r["verified"] for r in d["rows"]] == [1, 0, 0, 1, 0, 0, 0])
+
+# ---- 1167 M-1 / M-2: contents, not only block identity. Two endpoints: discovery = UNION of their logs; paid (and /known) only from a receipt two endpoints return identically
+def idx_state(logs_a, logs_b, rc_a, rc_b, want_rows=1, secs=None):
+    m = load(); A = {"head": 200, "logs": logs_a, "receipts": rc_a}; B = {"head": 200, "logs": logs_b, "receipts": rc_b}; Chain(m, {"A": A, "B": B})
+    run_loop(m, until=lambda: meta_get(m, "head") == "200" and count(m) >= want_rows)
+    time.sleep(0.3); c = m.db(); rows = c.execute("SELECT stealth,payer,paid FROM ann ORDER BY id").fetchall(); c.close(); return m, rows
+GOOD = rcpt(150, PAYER, [(PAYER, V3, 5_000_000), (V3, S(1), 5_000_000)])
+m, rows = idx_state([mk_log(150, 0, S(1), V3, 5_000_000)], [mk_log(150, 0, S(1), V3, 5_000_000)], {TX(15000): GOOD}, {TX(15000): GOOD})
+check("1167 M-1 honest log and identical receipts from both endpoints: payer and paid set", rows == [(S(1), PAYER, 5_000_000)])
+m, rows = idx_state([mk_log(150, 0, S(1), V3, 5_000_000)], [], {TX(15000): GOOD}, {})
+check("1167 M-1 fabricated log + forged receipt from ONE endpoint: row stored but unverified (payer and paid NULL), not known", rows == [(S(1), None, None)])
+meta_set(m, safe_block=1000); srv, J = serve(m)
+check("1167 M-1 /known refuses the fabricated address", J("/known?addr=" + S(1))[1]["known"] is False)
+bigger = rcpt(150, PAYER, [(PAYER, V3, 5_000_000), (V3, S(1), 5_000_000), (PAYER, S(1), 1)])
+m, rows = idx_state([mk_log(150, 0, S(1), V3, 5_000_000)], [mk_log(150, 0, S(1), V3, 5_000_000)], {TX(15000): GOOD}, {TX(15000): bigger})
+check("1167 M-1 the two endpoints return different receipts (extra Transfer on one): not accepted", rows == [(S(1), None, None)])
+B2 = rcpt(150, PAYER, [(PAYER, V3, 5_000_000), (V3, S(1), 5_000_000)]); B2["transactionHash"] = TX(1)
+m, rows = idx_state([mk_log(150, 0, S(1), V3, 5_000_000)], [mk_log(150, 0, S(1), V3, 5_000_000)], {TX(15000): B2}, {TX(15000): B2})
+check("1167 M-1 receipt whose transactionHash is another tx: rejected by both endpoints", rows == [(S(1), None, None)])
+B3 = dict(GOOD, logs=[dict(l, transactionHash=TX(1)) for l in GOOD["logs"]])
+m, rows = idx_state([mk_log(150, 0, S(1), V3, 5_000_000)], [mk_log(150, 0, S(1), V3, 5_000_000)], {TX(15000): B3}, {TX(15000): B3})
+check("1167 M-1 a Transfer log carrying another transactionHash: rejected", rows == [(S(1), None, None)])
+# fix_rows retries: once the second endpoint confirms the receipt the row gets paid
+m, rows = idx_state([mk_log(150, 0, S(1), V3, 5_000_000)], [], {TX(15000): GOOD}, {})
+meta_set(m, safe_block=1000)
+# second endpoint now returns the receipt (honest confirmation)
+def _confirm(m, rc_b):
+    o = m.rpc1
+    def f(u, method, params, t):
+        if u == "B" and method == "eth_getTransactionReceipt" and params[0] == TX(15000): return dict(rc_b, transactionHash=TX(15000), logs=[dict(l, transactionHash=TX(15000)) for l in rc_b["logs"]])
+        return o(u, method, params, t)
+    m.rpc1 = f
+_confirm(m, GOOD); m._fix["after"] = 0; m.fix_rows(m.db(), "A", 1000); c = m.db(); rows = c.execute("SELECT stealth,payer,paid FROM ann").fetchall(); c.close()
+check("1167 M-1 fix_rows: a second endpoint later confirms the receipt -> paid set", rows == [(S(1), PAYER, 5_000_000)])
+# M-2: one endpoint omits the announcement, the other has it: the union indexes it
+m, rows = idx_state([], [mk_log(150, 0, S(1), V3, 5_000_000)], {TX(15000): GOOD}, {TX(15000): GOOD})
+check("1167 M-2 ingest: a log omitted by one endpoint is still indexed (union), verified by two receipts", rows == [(S(1), PAYER, 5_000_000)])
+m, rows = idx_state([mk_log(150, 0, S(1), V3, 5_000_000), mk_log(160, 1, S(2), V3, 5_000_000)], [mk_log(150, 0, S(1), V3, 5_000_000)], {TX(15000): GOOD}, {TX(15000): GOOD}, want_rows=2)
+check("1167 M-2 ingest: logs seen by both are stored once (dedupe by tx, log_index); the one seen by A only is added", sorted(r[0] for r in rows) == [S(1), S(2)])
+m = load(); m.MODE = "latest"; m.START = 1
+Chain(m, {"A": {"head": 300, "logs": [], "receipts": {TX(15000): GOOD}}, "B": {"head": 300, "logs": [mk_log(150, 0, S(1), V3, 5_000_000)], "receipts": {TX(15000): GOOD}}})
+m.reconcile(m.db(), 200, 250, "A")
+check("1167 M-2 reconcile: the pinned endpoint omits the log, the other has it -> inserted (union of both reads)", count(m) == 1)
+badlog = mk_log(150, 0, S(1), V3, 5_000_000); badlog["blockHash"] = H(150, "other")
+m = load(); Chain(m, {"A": {"head": 300, "logs": []}, "B": {"head": 300, "logs": [badlog]}})
+try: m.reconcile(m.db(), 200, 250, "A"); r = False
+except RuntimeError: r = True
+check("1167 M-2 reconcile: a log from a non-agreed block is still rejected per endpoint", r and count(m) == 0)
+
+# ---- 1167 L-3: RateLimited propagates untouched; multicall availability is not cached as False
+m = load(); Chain(m, {"A": {"head": 5, "logs": []}})
+m._tl.calls = 0; m._take_token = lambda: False
+try: m.mc_available(); r = False
+except m.RateLimited: r = True
+check("1167 L-3 mc_available: RateLimited propagates and nothing is cached", r and m._mc["ok"] is None)
+m._mc.update({"ok": True, "ts": time.time()})
+try: m.balances([S(1)]); r = False
+except m.RateLimited: r = True
+check("1167 L-3 balances: RateLimited propagates; multicall availability is untouched (still True, no per-address fallback)", r and m._mc["ok"] is True)
+m._tl.calls = None
 
 # ---- 1163 I-3: nginx wasm location (text check; nginx is not run here)
 ng = open(os.path.join(HERE, "..", "ops", "nginx-stealth-zec.conf")).read()

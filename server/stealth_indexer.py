@@ -51,6 +51,7 @@ RECONCILE_EVERY = int(os.environ.get("STEALTH_RECONCILE_EVERY", "60"))
 # Нет согласия (точки расходятся / отвечает одна из двух) -- индексатор ЖДЁТ, никогда не идёт по слову одной точки.
 WAIT_ALERT_S = float(os.environ.get("STEALTH_WAIT_ALERT_S", "600"))   # через сколько секунд без продвижения писать ALERT в журнал: 10 мин = перезапуск или ресинк узла; дольше -- уже авария, о которой надо знать
 REORG_WIN = 100                 # блоков: окно реконсиляции (safe - REORG_WIN) и глубина отката head_done, когда parentHash не сошёлся с сохранённым хэшем
+BH_KEEP = 10000                 # блоков: сколько хэшей концов диапазонов держим (та же глубина, что у запасного окна реконсиляции head_done - 10000)
 MAX_SINGLE = int(os.environ.get("STEALTH_MAX_SINGLE", "20"))      # аудит 1163 L-4: адресов на запрос без Multicall3 (2 вызова на адрес); клиент балансы берёт из цепи сам, это страховка
 REQ_MAX_CALLS = int(os.environ.get("STEALTH_REQ_MAX_CALLS", "100"))   # RPC-вызовов (попыток, с переключением) на один запрос API: 2 x MAX_SINGLE + getCode, ещё x2 на переключение запас
 # Аудит 1165 L-2: общее ведро на RPC-вызовы, рождённые API (потолок REQ_MAX_CALLS -- на ОДИН запрос). Ёмкость = REQ_MAX_CALLS (самый тяжёлый законный запрос проходит из полного ведра); скорость 20/с = вдвое выше лимита
@@ -103,6 +104,8 @@ class RateLimited(Exception): pass
 _tb = {"t": time.monotonic(), "n": API_RPC_BURST}; _tb_lock = threading.Lock()
 
 
+# Аудит 1167 L-3 (принято, не меняем): ведро общее на всех -- запросы с кэш-попаданием RPC не трогают и ведро не тратят; пустое ведро даёт клиентам 429, а не сбой индексатора. Выделенной доли под одиночные адреса нет:
+# при ограничении 10 r/s на клиента в nginx это усложнение ради редкого сценария; лимит на клиента и общий потолок остаются на nginx.
 def _take_token():
     """Аудит 1165 L-2: одно общее ведро (скорость API_RPC_RATE, ёмкость API_RPC_BURST) на все RPC-вызовы потоков API."""
     with _tb_lock:
@@ -166,6 +169,7 @@ def init_db():
     c.execute("CREATE INDEX IF NOT EXISTS ann_block ON ann(block)")
     c.execute("CREATE INDEX IF NOT EXISTS ann_stealth ON ann(stealth)")
     c.execute("CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT)")
+    c.execute("CREATE TABLE IF NOT EXISTS bh (block INTEGER PRIMARY KEY, hash TEXT)")        # аудит 1167 L-2: хэши концов обработанных диапазонов (последние BH_KEEP блоков): по ним находим точку, где цепь ещё совпадает
     c.commit(); c.close()
 
 
@@ -299,22 +303,39 @@ def _paid_to(rc, stealth, log_index=None, meta=None):
     return 0
 
 
+def _rc_key(r, rc, ag):
+    """Аудит 1167 M-1: поля квитанции, от которых зависят payer и paid, в сравнимом виде; None -- квитанция не про эту tx / не из согласованного блока.
+    transactionHash квитанции и каждого её лога обязан быть хэшем tx строки, blockNumber -- блоком строки, при >= 2 точках blockHash -- согласованным хэшем этого блока."""
+    try:
+        tx = r["tx"]
+        if not isinstance(rc, dict) or (rc.get("transactionHash") or "").lower() != tx: return None
+        if r.get("block") is not None:
+            if not rc.get("blockNumber") or int(rc["blockNumber"], 16) != r["block"]: return None
+            if NEED >= 2 and (rc.get("blockHash") or "").lower() != agreed(r["block"], ag)[0]: return None
+        logs = rc.get("logs") or []
+        if any((lg.get("transactionHash") or "").lower() != tx for lg in logs): return None
+        return json.dumps([tx, (rc.get("blockHash") or "").lower(), rc.get("blockNumber"), rc.get("status"), (rc.get("from") or "").lower(),
+                           [[(lg.get("address") or "").lower(), [str(x).lower() for x in lg.get("topics") or []], (lg.get("data") or "").lower(), lg.get("logIndex")] for lg in logs
+                            if (lg.get("topics") or [""])[0].lower() == TRANSFER_T]])
+    except Exception: return None            # нет согласия по хэшу блока (или поле не разобралось) -- квитанции не верим, строка дозаполнится позже
+
+
 def receipt_of(r, cache, ep=None, ag=None):
-    """Квитанция tx (один eth_getTransactionReceipt на tx в cache). Сначала закреплённая точка (та же, что дала лог), затем любая. None = не получили ИЛИ квитанция из другого блока
-    (реорг/отстающий узел) -- строка останется с payer/paid NULL и будет дозаполнена fix_rows, а не «навсегда NULL» (аудит 1158 F-4). Аудит 1165 L-1: при >= 2 точках blockHash квитанции обязан
-    равняться согласованному хэшу её блока (по номеру одному подделка проходила бы); из такой квитанции берутся payer и paid, а значит и /known."""
+    """Квитанция tx (в cache по tx). None = не получили / не прошла _rc_key (чужая tx, другой блок, реорг/отстающий узел) -- строка останется с payer/paid NULL и будет дозаполнена fix_rows (аудит 1158 F-4).
+    Аудит 1167 M-1: при >= 2 точках квитанция принимается, только когда ДВЕ разные точки вернули её одинаковой (_rc_key): одна точка paid (а значит /known) выдумать не может, строка, виденная
+    одной точкой, остаётся без paid, пока вторая не подтвердит. Одна настроенная точка -- доверенный провайдер, квитанция как отдана (после тех же проверок tx / блока)."""
     if r["tx"] in cache: return cache[r["tx"]]
-    rc = None
     if ag is None: ag = {}
-    for o in ([ep, None] if ep else [None]):
-        try: rc = rpc("eth_getTransactionReceipt", [r["tx"]], 15, only=o) or None
-        except Exception: rc = None
-        if rc and r.get("block") is not None:
-            try:
-                if not rc.get("blockNumber") or int(rc["blockNumber"], 16) != r["block"]: rc = None
-                elif NEED >= 2 and (rc.get("blockHash") or "").lower() != agreed(r["block"], ag)[0]: rc = None
-            except Exception: rc = None             # нет согласия по хэшу блока (или он не разобрался) -- квитанции не верим, строка дозаполнится позже
-        if rc: break
+    order = ([ep] if ep else []) + [u for u in RPCS if u != ep] if NEED >= 2 else [ep]
+    rc = None; keys = []
+    for o in order:
+        try: x = rpc("eth_getTransactionReceipt", [r["tx"]], 15, only=o) or None
+        except RateLimited: raise
+        except Exception: continue
+        k = _rc_key(r, x, ag) if x else None
+        if k is None: continue
+        if NEED < 2 or k in keys: rc = x; break
+        keys.append(k)
     cache[r["tx"]] = rc
     return rc
 
@@ -407,6 +428,17 @@ def refill_payers():
     print("refill-payers: checked", n, "changed", ch, flush=True)
 
 
+def union_logs(a, b, eps, ag):
+    """Аудит 1167 M-2: логи [a,b] -- ОБЪЕДИНЕНИЕ ответов нескольких согласившихся точек (одна точка не может скрыть объявление), каждый лог проверен check_logs; дубликаты по (tx, logIndex) убраны.
+    Точка из eps не ответила -- исключение (ждём, как и раньше)."""
+    seen = {}
+    for u in eps:
+        logs = rpc("eth_getLogs", [{"address": ANNOUNCER, "fromBlock": hex(a), "toBlock": hex(b)}], only=u)
+        check_logs(logs, a, b, ag)
+        for lg in logs: seen.setdefault((str(lg.get("transactionHash")).lower(), lg.get("logIndex")), lg)
+    return sorted(seen.values(), key=lambda lg: (int(lg["blockNumber"], 16), int(lg["logIndex"], 16)))
+
+
 def fetch_range(a, b, ep=None, ag=None):
     """Все декодированные записи Announcer в [a,b]; getLogs режем пополам, если узел отказывает по размеру. ep -- закреплённая точка. Логи проходят check_logs (аудит 1165)."""
     if ag is None: ag = {}
@@ -442,8 +474,9 @@ def reconcile(c, sf, head_done, ep=None, insert_only=False):
     if a > head_done: return
     # верхняя граница обязательна: иначе строки новее head_done (их уже записал основной цикл за время getLogs) считались бы "пропавшими" и удалялись
     ag = {}
-    fresh = fetch_range(a, head_done, ep, ag)
-    want = {(r["tx"], r["log_index"], r["block"]): r for r in fresh}
+    want = {}
+    for u in (agreed(head_done, ag)[1][:NEED] if NEED >= 2 else [ep]):        # аудит 1167 M-2: объединение чтений двух согласившихся точек, а не одной закреплённой
+        for r in fetch_range(a, head_done, u, ag): want.setdefault((r["tx"], r["log_index"], r["block"]), r)
     with _lock:
         have = {(t, li, bl): i for i, t, li, bl in c.execute("SELECT id,tx,log_index,block FROM ann WHERE block>=? AND block<=?", (a, head_done))}
     gone = {k: i for k, i in have.items() if k not in want}
@@ -532,6 +565,19 @@ def _set_meta(c, **kv):
         c.commit()
 
 
+def find_common(c, head_done, ag):
+    """Аудит 1167 L-2: parentHash не сошёлся -- шагаем назад REORG_WIN, 2*REORG_WIN, ... (не ниже START-1), пока сохранённый хэш блока не совпадёт с тем, что отдаёт цепь сейчас (agreed). Возвращает (блок, хэш).
+    Совпадения нет в сохранённых (старая БД без bh, расхождение глубже BH_KEEP) -- ALERT и ожидание оператора: после остановки службы `--rewind N` с достаточным N."""
+    step = REORG_WIN
+    while head_done - step >= START - 1:
+        with _lock: row = c.execute("SELECT block,hash FROM bh WHERE block<=? AND block>=? ORDER BY block DESC LIMIT 1", (head_done - step, START - 1)).fetchone()
+        if not row: break
+        if agreed(row[0], ag)[0] == row[1]: return row
+        step = max(step * 2, head_done - row[0] + 1)
+    print("ALERT no stored block hash matches the chain (%s): operator action needed, stop the service and run --rewind N with N large enough" % CHAIN, flush=True)
+    raise RuntimeError("deep divergence: waiting for the operator")
+
+
 def index_loop():
     global START, _rot
     c = db()
@@ -557,19 +603,23 @@ def index_loop():
             while head_done < head:
                 a = head_done + 1; b = min(a + chunk - 1, head)
                 hb, eps = agreed(b, ag)                     # хэш блока b подтверждён NEED точками; логи -- с одной из них (точка с другим хэшем в eps не попадает)
-                ep = pin = eps[0]
+                ep = pin = eps[0]; lps = eps[:NEED]
                 if hh:                                      # цепочка: родитель блока a обязан быть сохранённым блоком head_done (сменился бэкенд / реорг -- не пропускаем, а перечитываем окно)
                     x = _block_at(ep, a)
                     if not x: raise RuntimeError("endpoint cannot return block %d: waiting" % a)
                     if x[1] != hh:
-                        back = max(START - 1, head_done - REORG_WIN)
-                        print("parentHash of block %d does not match the stored hash of %d (backend switch or reorg): re-reading from %d" % (a, head_done, back + 1), flush=True)
-                        head_done = back; hh = None; last_rec = 0; deep = True
-                        with _lock: c.execute("INSERT OR REPLACE INTO meta(k,v) VALUES('head',?)", (str(back),)); c.execute("DELETE FROM meta WHERE k='head_hash'"); c.commit()
+                        print("parentHash of block %d does not match the stored hash of %d (backend switch or reorg): looking for a stored block that still matches" % (a, head_done), flush=True)
+                        back, bhash = find_common(c, head_done, ag)
+                        print("re-reading from %d" % (back + 1), flush=True)
+                        with _lock:
+                            if head_done - back > REORG_WIN:        # глубже окна реконсиляции строки выше точки совпадения она уже не уберёт: убираем здесь, перечитаем
+                                c.execute("DELETE FROM ann WHERE block>?", (back,)); _bump_epoch(c, False)
+                            c.execute("INSERT OR REPLACE INTO meta(k,v) VALUES('head',?)", (str(back),)); c.execute("INSERT OR REPLACE INTO meta(k,v) VALUES('head_hash',?)", (bhash,))
+                            c.execute("DELETE FROM bh WHERE block>?", (back,)); c.commit()
+                        head_done = back; hh = bhash; last_rec = 0; deep = True
                         continue
                 try:
-                    logs = rpc("eth_getLogs", [{"address": ANNOUNCER, "fromBlock": hex(a), "toBlock": hex(b)}], only=ep)
-                    check_logs(logs, a, b, ag)
+                    logs = union_logs(a, b, lps, ag)
                 except Exception as e:
                     if chunk > 1000:
                         chunk //= 2; print("getLogs failed, chunk ->", chunk, str(e)[:80], flush=True); continue
@@ -585,6 +635,7 @@ def index_loop():
                 with _lock:
                     c.execute("INSERT OR REPLACE INTO meta(k,v) VALUES('head',?)", (str(b),))
                     c.execute("INSERT OR REPLACE INTO meta(k,v) VALUES('head_hash',?)", (hb,))
+                    c.execute("INSERT OR REPLACE INTO bh(block,hash) VALUES(?,?)", (b, hb)); c.execute("DELETE FROM bh WHERE block<?", (b - BH_KEEP,))
                     c.execute("INSERT OR REPLACE INTO meta(k,v) VALUES('ts',?)", (str(int(time.time())),))
                     c.execute("INSERT OR REPLACE INTO meta(k,v) VALUES('chain_head',?)", (str(head),))
                     c.commit()
@@ -656,6 +707,7 @@ def mc_available():
     if _mc["ok"] is not None and time.time() - _mc["ts"] < 600: return _mc["ok"]
     try:
         _mc["ok"] = len(rpc("eth_getCode", [MULTICALL3, "latest"], 15)) > 4
+    except RateLimited: raise                   # аудит 1167 L-3: пустое ведро -- не «Multicall3 нет»: не кэшируем ok=False на 10 минут
     except Exception:
         _mc["ok"] = False
     _mc["ts"] = time.time(); return _mc["ok"]
@@ -691,6 +743,7 @@ def balances(addrs):
         fresh = None
         if mc_available():
             try: fresh = _fetch_multicall(miss)         # адреса уже проверены строгим hex в do_GET: ошибка здесь -- сбой узла, а не ввод клиента (аудит 1158 F-6)
+            except RateLimited: raise                   # аудит 1167 L-3: не уходим в по-адресный путь (больше вызовов) и не сбрасываем _mc
             except Exception as e:
                 print("multicall failed, fallback per-call:", str(e)[:100], flush=True); _mc["ok"] = None
         if fresh is None: fresh = _fetch_single(miss)
@@ -853,7 +906,7 @@ def rewind(n):
     lo = (START if START is not None else int(st[0]) if st else 0) - 1
     if not r: raise SystemExit("rewind: no head in the database yet")
     new = max(lo, int(r[0]) - n)
-    c.execute("INSERT OR REPLACE INTO meta(k,v) VALUES('head',?)", (str(new),)); c.execute("DELETE FROM meta WHERE k='head_hash'")     # хэша блока new у нас нет: первый шаг его примет без сверки
+    c.execute("INSERT OR REPLACE INTO meta(k,v) VALUES('head',?)", (str(new),)); c.execute("DELETE FROM meta WHERE k='head_hash'"); c.execute("DELETE FROM bh WHERE block>?", (new,))     # хэша блока new у нас нет: первый шаг его примет без сверки
     _bump_epoch(c, False); c.commit()                                                                                                    # аудит 1165 I-5: клиент, считающий по epoch, перечитает; новые id у перечитанных строк он иначе не заметит
     print("rewind: head %s -> %d (rows above stay; the service re-reads from %d and only inserts what is missing)" % (r[0], new, new + 1), flush=True)
 

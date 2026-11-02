@@ -80,6 +80,10 @@ const MAX_REPLACE = Math.min(4, Math.max(1, Number(E.STEALTH_RELAY_MAX_REPLACE |
 const WEDGE_S = Number(E.STEALTH_RELAY_WEDGE_S || 2 * STUCK_S);
 const GAS_PAD_PCT = 125n;                                                                         // запас к оценке газа для резерва
 const MAX_PER_FROM = Math.max(1, Number(E.STEALTH_RELAY_PER_FROM || 3));
+const ALT_MAX = 16;                                                                               // audit 1167 I-4: the record keeps the ORIGINAL hash and the newest ones (MAX_REPLACE per round of the periodic check; a handful of rounds in practice)
+const capAlt = a => a.length > ALT_MAX ? [a[0], ...a.slice(-(ALT_MAX - 1))] : a;
+// audit 1167 L-1: 1 only when this key is used by this process alone. Base shares the key with an older relayer, so a pool transaction that is not in our records may be THEIRS: unwedge then never cancels it (default).
+const SOLE_KEY = E.STEALTH_RELAY_SOLE_KEY === "1";
 const GONE_GAP_MS = Number(E.STEALTH_RELAY_GONE_GAP_MS || 4000);                                // audit 1099 L-3: second "not found" probe this much later
 const FAIL_PER_IP = Number(E.STEALTH_RELAY_FAIL_PER_IP || 30);                                    // audit 1099 M-2: failed requests per network (/64) per hour
 const RPC_BURST = Number(E.STEALTH_RELAY_RPC_BURST || 20), RPC_REFILL_MS = Number(E.STEALTH_RELAY_RPC_REFILL_MS || 10_000);   // audit 1108: per-network token bucket on RPC-costly requests (no global failure state)
@@ -196,7 +200,7 @@ const recMeta = (v) => ({ tx: recTx(v.tx), rsv: typeof v.rsv === "string" && /^\
 export const load = () => {
   let raw; try { raw = fs.readFileSync(STATE_FILE, "utf8"); } catch (e) { if (e && e.code === "ENOENT") return; throw e; }
   const j = JSON.parse(raw); if (!j || typeof j !== "object") throw new Error("state is not an object");
-  for (const [k, v] of Array.isArray(j.unsure) ? j.unsure : []) if (v && HASH_RE.test(v.h) && Date.now() - v.t < DEDUPE_MS) unsure.set(lc(k), { h: v.h, nonce: v.nonce, t: v.t, counted: !!v.counted, alt: (Array.isArray(v.alt) ? v.alt : []).filter(x => HASH_RE.test(x)).slice(0, 4), ...recMeta(v) });   // audit 1108 L-1: survives a restart (also across midnight); 1113 L-1: keys lower-cased
+  for (const [k, v] of Array.isArray(j.unsure) ? j.unsure : []) if (v && HASH_RE.test(v.h) && Date.now() - v.t < DEDUPE_MS) unsure.set(lc(k), { h: v.h, nonce: v.nonce, t: v.t, counted: !!v.counted, alt: (Array.isArray(v.alt) ? v.alt : []).filter(x => HASH_RE.test(x)).slice(0, ALT_MAX), ...recMeta(v) });   // audit 1108 L-1: survives a restart (also across midnight); 1113 L-1: keys lower-cased
   for (const [k, v] of Array.isArray(j.feePaid) ? j.feePaid : []) if (v && HASH_RE.test(v.h) && Date.now() - v.t < DEDUPE_MS) feePaid.set(lc(k), { h: v.h, t: v.t, main: typeof v.main === "string" ? lc(v.main) : null });
   capMap(feePaid, 2000);
   if (j.day === day()) st = { day: j.day, gas: BigInt(j.gas), perFrom: migFrom(j.perFrom), perPayer: migFrom(j.perPayer) };
@@ -217,7 +221,7 @@ export function takeLock(sys = SYS, lockFile = LOCK_FILE) {
       try { fs.linkSync(tmpl, lockFile); return true; }       // link() is atomic: exactly one process creates the lock
       catch (e) {
         if (e.code !== "EEXIST") throw e;
-        let old = ""; try { old = fs.readFileSync(lockFile, "utf8").trim(); } catch {}
+        let old; try { old = fs.readFileSync(lockFile, "utf8").trim(); } catch (e3) { if (e3.code === "ENOENT") continue; return false; }   // audit 1167 I-1: a lock that cannot be read is a live one (never moved on a read error)
         if (old === mine) return true;
         if (old && lockHolderAlive(old, SCRIPT, sys)) return false;
         // audit 1164 L-4: the stale file is MOVED to a name of ours (rename is atomic: only one process gets it), and what was moved is compared with what was judged stale. If another starter had
@@ -555,8 +559,9 @@ async function replaceStuck(w, hash) {
   if (extra > 0n) { if (rolled) { w.d0 = st.day; w.reserve = 0n; } st.gas += extra; w.reserve = (w.reserve ?? 0n) + extra; }   // synchronous with the budget check above (no await in between)
   const undo = () => { if (extra > 0n) { if (st.day === w.d0) adj(w.d0, -extra); w.reserve = keep.reserve; w.d0 = keep.d0; } };
   if (w.ukey) {
-    unsure.set(w.ukey, { h: h2, nonce, tx: pl, t: Date.now(), counted: !!(x && x.counted), alt: [...((x && x.alt) || []), ...(x && x.h !== hash ? [x.h] : []), hash].filter((v, i, a) => a.indexOf(v) === i && v !== h2).slice(-4),
+    unsure.set(w.ukey, { h: h2, nonce, tx: pl, t: Date.now(), counted: !!(x && x.counted), alt: [...((x && x.alt) || []), ...(x && x.h !== hash ? [x.h] : []), hash].filter((v, i, a) => a.indexOf(v) === i && v !== h2),
       rsv: w.reserve === null ? null : w.reserve.toString(), d: w.d0, chg: (x && x.chg) || null });
+    const nu = unsure.get(w.ukey); nu.alt = capAlt(nu.alt);
     if (!(await saveNow())) { if (x) unsure.set(w.ukey, x); else unsure.delete(w.ukey); undo(); throw new Error("state not durable, replacement not sent"); }
   }
   try { await node.sendRawTransaction(rser); }
@@ -637,13 +642,19 @@ export async function unwedge() {
     let found = null, tx = null, rpcErr = null;
     for (const h of [...hs].reverse()) { try { tx = await node.getTransaction(h); if (tx) { found = h; break; } } catch (e) { if (!isNF(e, "TransactionNotFoundError")) rpcErr = e; } }
     if (!found && rpcErr) { log("wedge check: transaction lookup failed, skipping this round", latest, String(rpcErr).slice(0, 80)); return false; }
+    // audit 1167 L-1: no self-transfer over a pool transaction we cannot positively identify as our own record. Nothing of ours found at this nonce: the transaction there is unknown to us (the key may be shared with
+    // an older relayer), so it is left alone unless STEALTH_RELAY_SOLE_KEY=1; and our own record is only treated as gone after the double probe on one endpoint (allGone), never on a single negative lookup.
+    if (!found) {
+      if (!SOLE_KEY) { alertOnce("wedged nonce", latest, "holds a transaction that is not in our records: not touched (STEALTH_RELAY_SOLE_KEY=1 allows a cancel)"); return false; }
+      if (hs.length && !(await allGone(hs))) { log("wedge check: own transaction not proven gone, skipping this round", latest); return false; }
+    }
     wedge.tries++;
     // audit 1164 M-1: a pool transaction is re-sent only from OUR persisted call. One we cannot rebuild (a record of an older version without it, or a transaction we have no record of) is cancelled by a 0-value
     // self-transfer at the same nonce instead: for a record of ours that is acceptable (the authorization stays unused, the client may retry; gas is charged), and the watcher then sees the send as gone.
     const rebuild = !!(found && rec && rec.tx);
     log("ALERT wedged nonce", latest, "age", Math.round((Date.now() - youngest) / 1000), "s", rebuild ? "re-sending the pool transaction" : "filling with a self-transfer");
     if (rebuild) {
-      const hashes = [...new Set([...(rec && rec.alt || []), ...(rec ? [rec.h] : []), found])];
+      const hashes = capAlt([...new Set([...(rec && rec.alt || []), ...(rec ? [rec.h] : []), found])]);
       const w = { hashes: rec ? hashes : [found], tag: "wedge", ukey, d0: rec && Number.isInteger(rec.d) ? rec.d : st.day, reserve: rec ? (rec.rsv == null ? null : BigInt(rec.rsv)) : 0n, nonce: latest, payload: rec.tx, onGone: () => {} };
       w.uncharge = unchargeOf(w, rec && rec.chg);
       let h2 = null; try { h2 = await replaceStuck(w, found); } catch (e) { log("ALERT stuck transaction not replaced: error", latest, String(e).slice(0, 80)); }

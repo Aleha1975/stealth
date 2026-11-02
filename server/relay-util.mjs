@@ -69,7 +69,7 @@ export function lockHolderAlive(content, script, sys) {
   const start = procStart(pid, sys.proc), cmd = sys.proc("/proc/" + pid + "/cmdline");
   if (start === null && cmd === null) return true;                  // no /proc: nothing more can be checked
   if (m[2] !== undefined) return start === m[2];                    // exact process: same pid and same start time
-  return typeof cmd === "string" && cmd.split("\0").some(a => a === script || a.includes(script));   // lock of an older version (pid only): the command line must name this exact script
+  return typeof cmd === "string" && cmd.split("\0")[1] === script;   // lock of an older version (pid only): argv[1] must equal this exact script (audit 1167 I-2: not a substring)
 }
 
 /** Audit 1113 M-3: a small in-memory counter map: LRU (a touched key moves to the back), bounded. */

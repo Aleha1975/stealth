@@ -37,8 +37,8 @@ def row(m, i, stealth, caller, amount):
     c.execute("INSERT OR REPLACE INTO meta(k,v) VALUES('safe_block','1000')"); c.commit(); c.close()
 
 
-def receipt(frm_tx, transfers):
-    return {"from": frm_tx, "logs": [{"address": USDC, "topics": ["0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef", "0x" + "0" * 24 + a[2:], "0x" + "0" * 24 + b[2:]], "data": "0x"} for a, b in transfers]}
+def receipt(frm_tx, transfers, tx):
+    return {"from": frm_tx, "transactionHash": tx, "logs": [{"transactionHash": tx, "address": USDC, "topics": ["0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef", "0x" + "0" * 24 + a[2:], "0x" + "0" * 24 + b[2:]], "data": "0x"} for a, b in transfers]}
 
 
 def serve(m):
@@ -59,7 +59,7 @@ check("known: v2 dust below MIN_KNOWN_USDC refused", J("/known?addr=" + S(4))["k
 check("announcements list the v2 row too", any(r["caller"] == V2 for r in J("/announcements?since=0&limit=10")["rows"]))
 srv.shutdown()
 # 2) payer: v2 payToken moves tokens payer -> stealth directly (tx.from is the payer's own tx); v3 payWithAuthorization via the contract (tx.from = relayer)
-m.rpc = lambda method, params, t=0, **kw: receipt(RELAYER, [(PAYER, V3), (V3, S(2))]) if params[0].endswith("2".rjust(64, "0")) else receipt(PAYER, [(PAYER, S(1))])
+m.rpc = lambda method, params, t=0, **kw: receipt(RELAYER, [(PAYER, V3), (V3, S(2))], params[0]) if params[0].endswith("2".rjust(64, "0")) else receipt(PAYER, [(PAYER, S(1))], params[0])
 cache = {}
 check("payer of a v2 payment (direct transfer)", m.payer_of({"tx": "0x%064x" % 1, "stealth": S(1), "caller": V2}, cache) == PAYER)
 check("payer of a v3 payment (through the contract)", m.payer_of({"tx": "0x%064x" % 2, "stealth": S(2), "caller": V3}, {}) == PAYER)

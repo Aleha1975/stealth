@@ -194,7 +194,7 @@ const priceOf = t => t.maxFeePerGas ?? t.gasPrice;
   node.srv.close(); }
 
 // ---- M-1 (5): a pending nonce we know nothing about (another process on the same key) is replaced by a self-transfer at the market fee
-{ const node = makeNode(); await node.listen(); const e = env(node, "m1e", { STEALTH_RELAY_WEDGE_S: "1" });
+{ const node = makeNode(); await node.listen(); const e = env(node, "m1e", { STEALTH_RELAY_WEDGE_S: "1", STEALTH_RELAY_SOLE_KEY: "1" });      // 1167 L-1: only with SOLE_KEY=1
   const acct = privateKeyToAccount(KEY), ser = await acct.signTransaction({ chainId: CC.id, nonce: 0, gas: 21000n, to: acct.address, value: 0n, type: "eip1559", maxFeePerGas: GWEI * 11n / 10n, maxPriorityFeePerGas: GWEI / 100n });
   await node.rpc("eth_sendRawTransaction", [ser]); node.baseFee = 3n * GWEI;
   const b = run(e, "wedge", { LINGER_MS: "500", WEDGE_CALLS: "6", WEDGE_EVERY_MS: "600" });
@@ -351,10 +351,26 @@ for (const [name, hostile] of [["input", { input: EVIL }], ["target", { to: ATTA
   ok("1164 L-2 lookups failing with a 429: nothing is replaced or filled, the round is skipped and logged", node.sends.length === 1 && /transaction lookup failed, skipping this round/.test(logOf(e)) && !/filling with a self-transfer/.test(logOf(e)), "sends " + node.sends.length);
   node.srv.close(); }
 
+// ---- audit 1167 L-1: a pool transaction we cannot identify as our own record is never cancelled while STEALTH_RELAY_SOLE_KEY is off (the default)
+{ const node = makeNode(); await node.listen(); const e = env(node, "l1k", { STEALTH_RELAY_WEDGE_S: "1" });
+  const acct = privateKeyToAccount(KEY), ser = await acct.signTransaction({ chainId: CC.id, nonce: 0, gas: 21000n, to: acct.address, value: 0n, type: "eip1559", maxFeePerGas: GWEI * 11n / 10n, maxPriorityFeePerGas: GWEI / 100n });
+  await node.rpc("eth_sendRawTransaction", [ser]); node.baseFee = 3n * GWEI;
+  const b = run(e, "wedge", { LINGER_MS: "300", WEDGE_CALLS: "5", WEDGE_EVERY_MS: "500" }); await b.exit;
+  ok("1167 L-1 unknown pool transaction, SOLE_KEY off: no self-transfer, the original stays, ALERT logged", node.sends.length === 1 && node.poolOf(RELAYER).length === 1 && /ALERT wedged nonce 0 holds a transaction that is not in our records/.test(logOf(e)) && !/filling with a self-transfer/.test(logOf(e)), "sends " + node.sends.length);
+  node.srv.close(); }
+// ... and an own record that the node no longer shows (dropped) is not cancelled either without SOLE_KEY (what sits at that nonce now is not ours)
+{ const node = makeNode(); await node.listen(); const e = env(node, "l1g", { STEALTH_RELAY_WEDGE_S: "1" });
+  const a = run(e, "pay", { LINGER_MS: "60000" }); const h0 = (await a.wait("hash"))?.hash; await waitFor(() => stateOf(e)?.unsure.length === 1); a.p.kill("SIGKILL"); await a.exit;
+  const acct = privateKeyToAccount(KEY), ser = await acct.signTransaction({ chainId: CC.id, nonce: 0, gas: 21000n, to: acct.address, value: 0n, type: "eip1559", maxFeePerGas: GWEI * 200n, maxPriorityFeePerGas: GWEI });
+  node.pool.clear(); await node.rpc("eth_sendRawTransaction", [ser]); const n0 = node.sends.length;
+  const b = run(e, "wedge", { LINGER_MS: "300", WEDGE_CALLS: "5", WEDGE_EVERY_MS: "500" }); await b.exit;
+  ok("1167 L-1 own record gone from the node, another transaction at its nonce, SOLE_KEY off: nothing sent", node.sends.length === n0 && !/filling with a self-transfer/.test(logOf(e)), "sends " + node.sends.length);
+  node.srv.close(); }
+
 // ---- audit 1164 L-3: a fill after midnight is charged to the current day and checked against it
 { const src = fs.readFileSync(path.join(HERE, "relayer.mjs"), "utf8"), fn = src.slice(src.indexOf("async function fillNonce"), src.indexOf("async function syncNonce"));
   ok("1164 L-3 fillNonce checks and charges st.day (no day parameter, charge after rolling)", /async function fillNonce\(n, ctl, bumps = 0\)/.test(fn) && /roll\(\); st\.gas \+= cost/.test(fn) && !/d0/.test(fn));
-  const node = makeNode(); await node.listen(); const e = env(node, "l3day", { STEALTH_RELAY_WEDGE_S: "1", STEALTH_RELAY_DAY_MS: "3000" });
+  const node = makeNode(); await node.listen(); const e = env(node, "l3day", { STEALTH_RELAY_WEDGE_S: "1", STEALTH_RELAY_DAY_MS: "3000", STEALTH_RELAY_SOLE_KEY: "1" });
   const acct = privateKeyToAccount(KEY), ser = await acct.signTransaction({ chainId: CC.id, nonce: 0, gas: 21000n, to: acct.address, value: 0n, type: "eip1559", maxFeePerGas: GWEI * 11n / 10n, maxPriorityFeePerGas: GWEI / 100n });
   await node.rpc("eth_sendRawTransaction", [ser]); node.baseFee = 3n * GWEI; await sleep(3200);
   const b = run(e, "wedge", { LINGER_MS: "500", WEDGE_CALLS: "6", WEDGE_EVERY_MS: "600" }); await waitFor(() => node.poolOf(RELAYER).find(t => priceOf(t) > GWEI * 11n / 10n)); node.mining = true; await b.exit;
@@ -394,8 +410,19 @@ for (const [name, hostile] of [["input", { input: EVIL }], ["target", { to: ATTA
   const r1 = t(`console.log("started")`);
   ok("1164 L-1 a lock held by an unrelated LIVE process (pid 1, old format) is taken over", /started/.test(r1.stdout) || (process.platform !== "linux" && r1.status === 1), r1.stderr.slice(0, 200) + " [skipped where there is no /proc]");
   fs.rmSync(lockPath, { force: true });
+  fs.mkdirSync(lockPath); const r2 = t(`console.log("started")`);      // 1167 I-1: a lock that cannot be read (here: not a file) is a live one: refuse to start, never move it
+  ok("1167 I-1 an unreadable lock is treated as alive: the process refuses to start and leaves the lock", !/started/.test(r2.stdout) && r2.status === 1 && fs.existsSync(lockPath));
+  fs.rmSync(lockPath, { recursive: true, force: true });
+  ok("1167 I-2 old lock (pid only): argv[1] must EQUAL the script; an editor or tail with the path as an argument is not the relayer",
+    lockHolderAlive("123", S, { ...alive, proc: fakeProc({ "/proc/123/stat": stat(1), "/proc/123/cmdline": "node\0" + S + "\0" }) }) === true
+    && lockHolderAlive("123", S, { ...alive, proc: fakeProc({ "/proc/123/stat": stat(1), "/proc/123/cmdline": "tail\0-f\0" + S + "\0" }) }) === false
+    && lockHolderAlive("123", S, { ...alive, proc: fakeProc({ "/proc/123/stat": stat(1), "/proc/123/cmdline": "vim\0" + S + ".bak\0" }) }) === false);
   const src = fs.readFileSync(path.join(HERE, "relayer.mjs"), "utf8");
   ok("1164 L-4 the stale lock is moved to a unique name and compared before it is removed (no blind unlink of LOCK_FILE)", /fs\.renameSync\(lockFile, mv\)/.test(src) && /got !== old/.test(src) && !/fs\.unlinkSync\(lockFile\)/.test(src)); }
+
+// ---- audit 1167 I-4: the record keeps the original hash of a long replacement chain (no .slice(-4))
+{ const src = fs.readFileSync(path.join(HERE, "relayer.mjs"), "utf8");
+  ok("1167 I-4 alt is no longer cut to the last 4: capAlt keeps the first (original) hash plus the newest ones; load keeps up to ALT_MAX", !/\.slice\(-4\)/.test(src) && /const capAlt = a => a\.length > ALT_MAX \? \[a\[0\], \.\.\.a\.slice\(-\(ALT_MAX - 1\)\)\] : a/.test(src) && /slice\(0, ALT_MAX\)/.test(src)); }
 
 // ---- audit 1164 I-1: allow-list parsing
 { const dropped = []; const A = parseAllow("9.9.9.9, 2001:db8::1, 2001:0db8:0:0::/64, ::ffff:1.2.3.4, my.host.name, 1.2.3, 999.1.1.1, -, junk", x => dropped.push(x));
