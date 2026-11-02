@@ -66,6 +66,10 @@ DB = os.environ.get("STEALTH_DB", "/opt/stealth/announcements.db")
 PORT = int(os.environ.get("STEALTH_PORT", "3873"))
 MIN_KNOWN_USDC = int(os.environ.get("MIN_KNOWN_USDC", "100000"))     # $0.10: мельче через релеер не выводим
 KNOWN_SAFE = os.environ.get("STEALTH_KNOWN_SAFE", "1") != "0"     # 0 -- ТОЛЬКО лаборатория/форк (у anvil тег safe не движется): /known верит строкам до проиндексированной головы, а не до safe
+# /known на цепи с мягкой финальностью (rh, режим latest): тег safe у узла отстаёт на 10-15 мин (L1-пачки), платёж не вывести. Строке верим через KNOWN_LAG_S секунд после головы индексатора (она и так на CONFIRMATIONS блоков позади latest).
+# Страницы истории и final_block остаются на теге safe. На Base (режим safe) граница -- сам safe. Потеря при откате глубже 2 минут -- газ релеера (дневной потолок бюджета), деньги не уходят: перевод с пустого адреса откатится.
+KNOWN_LAG_S = int(os.environ.get("STEALTH_KNOWN_LAG_S", "120"))
+BLOCK_MS = int(CC.get("block_ms", 2000))
 MAX_META = 128
 CHUNK0 = int(os.environ.get("STEALTH_CHUNK", "50000"))
 POLL = int(os.environ.get("STEALTH_POLL", "20" if MODE == "safe" else "2"))
@@ -663,7 +667,8 @@ def index_loop():
             # safe_block -- до него /known верит строкам; final_block -- после него строку реорг уже не тронет (флаг final, страницы). Без safe (rh, узел не отдал) прежние значения остаются.
             safe_b = head_done if (MODE == "safe" or not KNOWN_SAFE) else (min(sf, head_done) if sf is not None else None)
             fin = head_done if MODE == "safe" else (max(0, safe_b - PAGES_MARGIN) if safe_b is not None else None)       # одна формула и для меты, и для страниц (аудит 1163 I-4)
-            _set_meta(c, safe_block=safe_b, final_block=fin)
+            known_b = safe_b if (MODE == "safe" or not KNOWN_SAFE) else max(-1, head_done - -(-KNOWN_LAG_S * 1000 // BLOCK_MS))
+            _set_meta(c, safe_block=safe_b, final_block=fin, known_block=known_b)
             if pin is None and head_done >= START: pin = agreed(head_done, ag)[1][0]
             if time.time() - last_rec >= RECONCILE_EVERY:
                 reconcile(c, sf, head_done, pin, insert_only=(MODE == "safe" and not deep)); last_rec = time.time(); deep = False
@@ -875,7 +880,7 @@ class H(BaseHTTPRequestHandler):
             if route == "known":
                 addr = one("addr").lower()
                 if not _ADDR.match(addr): return self._json(400, {"error": "addr"})
-                sb = c.execute("SELECT v FROM meta WHERE k='safe_block'").fetchone(); sb = int(sb[0]) if sb else -1       # нет safe-блока -> никого не признаём (закрыто)
+                sb = c.execute("SELECT v FROM meta WHERE k='known_block'").fetchone() or c.execute("SELECT v FROM meta WHERE k='safe_block'").fetchone(); sb = int(sb[0]) if sb else -1       # нет границы -> никого не признаём (закрыто)
                 rows = c.execute("SELECT caller, meta, paid FROM ann WHERE stealth=? AND block<=?", (addr, sb)).fetchall()
                 ok = False
                 for caller, meta, paid in rows:

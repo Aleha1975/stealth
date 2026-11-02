@@ -155,6 +155,24 @@ check("1165 safe tag missing on one of two endpoints -> None (no safe claim)", m
 m = load(); Chain(m, {"A": {"head": 600, "logs": [], "safe": 500}}); m.MODE = "latest"; m.CONF = 20
 check("1165 one configured endpoint: head and safe are its own", m.heads_now() == (580, 500))
 
+# 1171+: /known on rh (mode latest) trusts a row KNOWN_LAG_S after the indexed head, not at the node's safe tag (that lags 10-15 min); on base (mode safe) the boundary is safe itself
+m = load(STEALTH_KNOWN_LAG_S="120"); A = {"head": 5000, "logs": [], "safe": 100}; Chain(m, {"A": A}); m.MODE = "latest"; m.CONF = 20; m.START = 1; m.BLOCK_MS = 100
+lag = -(-m.KNOWN_LAG_S * 1000 // m.BLOCK_MS)
+check("rh known lag: 120 s at 100 ms/block = 1200 blocks", lag == 1200)
+m = load(); Chain(m, {"A": {"head": 5000, "logs": [], "safe": 100}}); m.MODE = "latest"; m.CONF = 20; m.BLOCK_MS = 100
+run_loop(m, until=lambda: meta_get(m, "known_block") is not None)
+kb, sbk, hd = int(meta_get(m, "known_block")), int(meta_get(m, "safe_block")), int(meta_get(m, "head"))
+check("rh: known_block = head - lag (not the node's safe tag); safe_block keeps the safe tag", kb == hd - 1200 and sbk == min(100, hd) and kb > sbk)
+m = load(); Chain(m, {"A": {"head": 5000, "logs": [], "safe": 100}}); m.START = 1
+run_loop(m, until=lambda: meta_get(m, "known_block") is not None)
+check("base (mode safe): known_block = safe_block = indexed head", meta_get(m, "known_block") == meta_get(m, "safe_block") == meta_get(m, "head"))
+m = load(); Chain(m, {"A": {"head": 600, "logs": [], "safe": 500}}); meta_set(m, safe_block=1000, known_block=5)
+pc = m.db(); m.put_row(pc, dict(scheme=1, eph="0x02" + "ab" * 32, meta="0x11a9059cbb" + USDC[2:] + w(5_000_000), view_tag="0x11", log_index=1, block=10, tx=TX(1), stealth=S(1), caller=V3), {}, "A"); pc.execute("UPDATE ann SET paid=5000000, payer=?", (PAYER,)); pc.commit(); pc.close()
+srv0, J0 = serve(m)
+check("/known reads known_block first: row at 10 above known_block 5 -> refused even though safe_block is 1000", J0("/known?addr=" + S(1))[1]["known"] is False)
+meta_set(m, known_block=20)
+check("/known: row at 10 at or below known_block 20 -> known", J0("/known?addr=" + S(1))[1]["known"] is True)
+
 # whole loop, 2 endpoints disagree on the hash -> no advance (and an ALERT after WAIT_ALERT_S); agree later -> the announcement at 150 is found, not skipped
 m = load(); m.WAIT_ALERT_S = 0.3
 A = {"head": 200, "logs": [mk_log(150, 0, S(1), V3, 5_000_000)], "receipts": {TX(15000): rcpt(150, PAYER, [(PAYER, S(1), 5_000_000)])}}
