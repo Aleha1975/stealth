@@ -442,6 +442,7 @@ for (const [name, hostile] of [["input", { input: EVIL }], ["target", { to: ATTA
 // ---- audit 1169 L-2: an old pid-only lock whose process is `node <flags> <script>` is alive
 { const S = "/opt/stealth-base/relayer.mjs", alive = { kill() {} }, stat = n => "1 (node) S " + Array(17).fill("0").join(" ") + " " + n + " 0", fakeProc = f => p => (p in f ? f[p] : null), live = cmd => lockHolderAlive("123", S, { ...alive, proc: fakeProc({ "/proc/123/stat": stat(1), "/proc/123/cmdline": cmd }) });
   ok("1169 L-2 node with flags before the script is alive: --max-old-space-size=256, --dns-result-order=ipv4first, /usr/bin/node", live("node\0--max-old-space-size=256\0" + S + "\0") === true && live("/usr/bin/node\0--dns-result-order=ipv4first\0--no-warnings\0" + S + "\0") === true);
+  ok("1171 L-1 an empty cmdline (zombie) is stale, not a crash", (() => { try { return live("") === false && live("\0") === false; } catch { return false; } })());
   ok("1169 L-2 still stale: other script after flags, tail -f S, vim S.bak, non-node binary running S, node with only flags", live("node\0--no-warnings\0/srv/other.mjs\0") === false && live("tail\0-f\0" + S + "\0") === false && live("vim\0" + S + ".bak\0") === false && live("python3\0" + S + "\0") === false && live("node\0--inspect\0") === false); }
 
 // ---- audit 1164 I-1: allow-list parsing

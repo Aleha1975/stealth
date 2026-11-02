@@ -618,7 +618,7 @@ def index_loop():
                     if not x: raise RuntimeError("endpoint cannot return block %d: waiting" % a)
                     if x[1] != hh and NEED >= 2:                # аудит 1169 M-1: расхождение должно подтвердить ещё одна точка из согласованных (x2 -- её parentHash тоже != hh), иначе не откат, а ожидание
                         x2 = _block_at(eps[1], a)
-                        if not x2 or x2[1] == hh: raise RuntimeError("endpoints disagree on the parentHash of block %d: waiting" % a)
+                        if not x2 or x2[1] != x[1]: raise RuntimeError("endpoints disagree on the parentHash of block %d: waiting" % a)
                     if x[1] != hh:
                         print("parentHash of block %d does not match the stored hash of %d (backend switch or reorg): looking for a stored block that still matches" % (a, head_done), flush=True)
                         back, bhash = find_common(c, head_done, ag, hh)

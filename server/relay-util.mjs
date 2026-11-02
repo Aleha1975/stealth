@@ -71,7 +71,7 @@ export function lockHolderAlive(content, script, sys) {
   if (m[2] !== undefined) return start === m[2];                    // exact process: same pid and same start time
   if (typeof cmd !== "string") return false;                         // lock of an older version (pid only): argv[0] is node and the first non-flag argument is exactly this script (1167 I-2: not a substring; 1169 L-2: node flags before it are fine)
   const argv = cmd.split("\0"); if (argv[argv.length - 1] === "") argv.pop();
-  if (!/^node(js)?$/.test(argv[0].split("/").pop())) return false;
+  if (!argv[0] || !/^node(js)?$/.test(argv[0].split("/").pop())) return false;      // 1171 L-1: an empty cmdline (zombie) is not the relayer
   const first = argv.slice(1).find(a => !a.startsWith("-"));        // flags that take a SEPARATE value (--require x, --max-old-space-size 256) are not supported: write them as --flag=value
   return first === script;
 }

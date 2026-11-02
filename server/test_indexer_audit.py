@@ -56,7 +56,7 @@ class Chain:
         def blk(e, n):
             if e.get("fake_high"): return {"number": hex(n), "hash": H(n, "fake"), "parentHash": H(n - 1, "fake")}
             sl = lambda k: e.get("salt", "") if k >= e.get("fork_at", 0) else ""                  # fork_at: the chain's own hashes start there (shared history below)
-            if e.get("bad_parent") and n >= e["bad_parent"]: return {"number": hex(n), "hash": H(n, sl(n)), "parentHash": H(n - 1, "lie")}          # right block hash, invented parent
+            if e.get("bad_parent") and n >= e["bad_parent"]: return {"number": hex(n), "hash": H(n, sl(n)), "parentHash": H(n - 1, e.get("lie_salt", "lie"))}          # right block hash, invented parent
             return {"number": hex(n), "hash": H(n, sl(n)), "parentHash": H(n - 1, sl(n - 1))} if n <= e.get("blocks_to", e["head"]) else None
         def rpc1(u, method, params, t):
             e = self.eps[u]; self.calls.append((u, method))
@@ -249,6 +249,15 @@ with contextlib.redirect_stdout(out):
     time.sleep(0.2)
 check("1169 M-1 2 endpoints, one lies about parentHash: no rollback, no delete, no epoch bump, the old row stays, indexing reaches 700",
       not fc and count(m) == 1 and meta_get(m, "epoch") is None and meta_get(m, "head") == "700" and meta_get(m, "head_hash") == H(700))
+# 1171 I-1: both endpoints differ from the stored hash but invent DIFFERENT parents (they do not show the same mismatch): no rollback
+m = load(); m.CHUNK0 = 50; A = {"head": 300, "logs": []}; B = {"head": 300, "logs": []}; Chain(m, {"A": A, "B": B})
+run_loop(m, until=lambda: meta_get(m, "head") == "300"); put(m, 150, 0, S(9), V3, 5_000_000, 5_000_000)
+A["bad_parent"] = B["bad_parent"] = 301; A["lie_salt"] = "l1"; B["lie_salt"] = "l2"; A["head"] = B["head"] = 700
+fc = []; _fc = m.find_common; m.find_common = lambda *a: (fc.append(a), _fc(*a))[1]
+out = io.StringIO()
+with contextlib.redirect_stdout(out):
+    time.sleep(1.5)
+check("1171 I-1 two endpoints with different invented parents: no rollback, no delete, the old row stays, head does not move", not fc and count(m) == 1 and meta_get(m, "epoch") is None and meta_get(m, "head") == "300")
 # both of them agree the parent differs (a real fork seen by both): the walk back still happens
 m = load(); m.CHUNK0 = 50; A = {"head": 300, "logs": []}; B = {"head": 300, "logs": []}; Chain(m, {"A": A, "B": B})
 run_loop(m, until=lambda: meta_get(m, "head") == "300")
@@ -647,4 +656,5 @@ wl = code[code.index("location ~ \\.wasm$"):]
 check("I-3 no include mime.types / outer types{} (no duplicate-extension warning)", "include mime.types" not in code and code.count("types {") == 1)
 check("I-3 the .wasm location serves application/wasm via empty types{} + default_type", "types { }" in wl and "default_type application/wasm" in wl)
 
-print("%d passed, %d failed" % (ok, fail)); sys.exit(1 if fail else 0)
+print("%d passed, %d failed" % (ok, fail), flush=True)
+os._exit(1 if fail else 0)      # the indexer threads of the fakes are daemons: a normal interpreter exit can abort (Python 3.9, exit 134) after all checks passed
