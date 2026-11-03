@@ -292,10 +292,18 @@ export const LOG_SPAN = 2_000_000, PAY_FROM_BLOCK = { rh: 100_761_230, base: 31_
 // Audit 1181 L-3: the highest tip any endpoint has reported is carried across failovers, and an endpoint whose tip is lower (or below b0, a block the indexer has already seen) is lagging: its answer is dropped and the next
 // endpoint is asked. The transaction count is read AT the tip block the logs were read to, so one count is one snapshot. If that form errors the count FAILS (no fallback to "latest"): "latest" is exactly the
 // unpinned read a lagging backend behind the URL could answer with an older state, and a count that cannot be made is safer than one that may be low.
-// Audit 1181 I-2: the number of getLogs windows is capped. MAX_WINDOWS = 200 windows of LOG_SPAN is 400M blocks, over 3 years of a 4 blocks/s chain from its first block: no honest tip needs more, and a bogus tip such as 2^53 would otherwise mean billions of requests.
-export const MAX_WINDOWS = 200;
-export const makeCountPriorHops = (chain, fetchFn = fetch) => async (stealth, fromBlock) => {
+// Audit 1181 I-2: the number of getLogs windows is capped. A bogus tip such as 2^53 would otherwise mean billions of requests.
+// Audit 1182 I-4: MAX_WINDOWS = 2000 windows of LOG_SPAN is 4 billion blocks: 13 years of rh (104 ms blocks) from its first block, so no honest tip reaches it, and a bogus tip such as 0x1fffffffffffff is still refused (200 was only 2.5 years at rh's rate).
+export const MAX_WINDOWS = 2000;
+// Audit 1182 L-3: the same-origin indexer's chain_head (best effort, short timeout; null = unknown, then only the checks below apply) is a head the RPC endpoints do not control.
+export const INDEXER_HEAD_MS = 3000;      // the count must not wait on a slow indexer: it is only a cross-check
+export const indexerHeadOf = async (chain, fetchFn = fetch) => {
+  try { const r = await fetchFn(chain.api + "/head", { cache: "no-store", signal: AbortSignal.timeout(INDEXER_HEAD_MS) }), d = await r.json(), h = d && d.chain_head; return r.ok && Number.isSafeInteger(h) && h > 0 ? h : null; } catch { return null; }
+};
+const LAG_MS = 60000;      // an endpoint more than a minute of blocks (chain.block_ms) behind the indexer's head is limited (next endpoint)
+export const makeCountPriorHops = (chain, fetchFn = fetch, indexerHead = indexerHeadOf) => async (stealth, fromBlock) => {
   let maxTip = 0;
+  const ih = await Promise.resolve(indexerHead(chain)).catch(() => null), floor = Number.isSafeInteger(ih) && ih > 0 && chain.block_ms > 0 ? ih - Math.ceil(LAG_MS / chain.block_ms) : 0;
   const countOn = async url => {
     const hex = await rpcRetry(fetchFn, url, "eth_blockNumber", []); if (typeof hex !== "string" || !/^0x[0-9a-fA-F]+$/.test(hex)) throw new Error("unexpected block number");      // 1180 L-1: null / "" / non-hex is an error, never tip 0
     const tip = Number(BigInt(hex)); if (!Number.isSafeInteger(tip)) throw new Error("unexpected block number");
@@ -303,6 +311,7 @@ export const makeCountPriorHops = (chain, fetchFn = fetch) => async (stealth, fr
     if ((tip - start) / LOG_SPAN > MAX_WINDOWS) throw Object.assign(new Error("implausible block number " + tip), { limited: true });      // not remembered in maxTip: a bogus tip must not make the honest endpoints look lagging
     if (known && tip < fromBlock) throw Object.assign(new Error("rpc is behind the address's first block"), { limited: true });
     if (tip < maxTip) throw Object.assign(new Error("rpc is behind another endpoint"), { limited: true });
+    if (tip < floor) throw Object.assign(new Error("rpc is behind the indexer's head"), { limited: true });
     maxTip = Math.max(maxTip, tip);
     let n = 0;
     for (let a = start; a <= tip; a += LOG_SPAN) {
@@ -310,7 +319,8 @@ export const makeCountPriorHops = (chain, fetchFn = fetch) => async (stealth, fr
       if (!Array.isArray(r)) throw new Error("unexpected logs answer"); n += r.length;
     }
     if (chain.eth) {      // an ETH hop spends the address with a plain transaction, no AuthorizationUsed: the address's own transaction count joins the count, so a hop of either kind never reuses the counter (hop wallet) of the other. It can only over-count too.
-      const c = await rpcRetry(fetchFn, url, "eth_getTransactionCount", [stealth, "0x" + tip.toString(16)]); if (typeof c !== "string" || !/^0x[0-9a-fA-F]{1,16}$/.test(c)) throw new Error("unexpected transaction count"); n += Number(BigInt(c));
+      // audit 1182 I-1: a backend that does not have the state at the just-read tip (a load balancer behind one URL) is a lagging endpoint: the next one is asked. NEVER "latest".
+      const c = await rpcRetry(fetchFn, url, "eth_getTransactionCount", [stealth, "0x" + tip.toString(16)]).catch(e => { throw !e.limited && /header not found|missing trie node|block not found|unknown block/i.test(e.message) ? Object.assign(e, { limited: true }) : e; }); if (typeof c !== "string" || !/^0x[0-9a-fA-F]{1,16}$/.test(c)) throw new Error("unexpected transaction count"); n += Number(BigInt(c));
     }
     const hex2 = await rpcRetry(fetchFn, url, "eth_blockNumber", []);      // the same endpoint's head must not have gone backwards (a load balancer behind one URL, a node resyncing): then the answers above are not trustworthy
     if (typeof hex2 !== "string" || !/^0x[0-9a-fA-F]+$/.test(hex2)) throw new Error("unexpected block number");
@@ -336,17 +346,16 @@ export function idbStore(name = "stealth-zec-hop") {
   return { get: k => run("readonly", s => s.get(k)), put: (k, v) => run("readwrite", s => s.put(v, k)), add: (k, v) => open().then(db => new Promise((res, rej) => { const t = db.transaction("hops", "readwrite"), q = t.objectStore("hops").add(v, k); q.onerror = ev => { ev.preventDefault(); rej(q.error && q.error.name === "ConstraintError" ? Object.assign(new Error("record exists"), { code: "EXISTS" }) : q.error); }; t.oncomplete = () => res(); t.onabort = () => rej(t.error || new Error("storage write aborted")); })), keys: () => run("readonly", s => s.getAllKeys()) };
 }
 export const memStore = () => { const m = new Map(); return { get: async k => m.get(k) && structuredClone(m.get(k)), put: async (k, v) => void m.set(k, structuredClone(v)), add: async (k, v) => { if (m.has(k)) throw Object.assign(new Error("record exists"), { code: "EXISTS" }); m.set(k, structuredClone(v)); }, keys: async () => [...m.keys()] }; };
-/** Latest hop record of a stealth address on `chainKey`, or null. rh / no chain: every "<stealth>#<n>" key, exactly as before. Another chain: its own "<chain>:<stealth>#<n>" keys plus the legacy-key records
- *  that THIS chain made before 1181 (st.chain === chainKey); a legacy record of another chain (an rh hop of the same address) is not this chain's. Highest n wins; at an equal n the chain-keyed record. */
+/** Latest hop record of a stealth address on `chainKey`, or null. rh / no chain: the "<stealth>#<n>" keys, exactly as before, except a record that names another chain (audit 1182 L-1: st.chain not "rh", a
+ *  Base-labelled legacy record) is ignored, so it can never block the rh page. Another chain: ONLY its own "<chain>:<stealth>#<n>" keys (1182 L-1: no legacy-key record is read on a non-rh chain). Highest n wins. */
 export async function findHop(store, stealth, chainKey) {
   const d = derivKey(chainKey), lp = stealth.toLowerCase() + "#", all = await store.keys(), nOf = (k, p) => Number(k.slice(p.length));
-  const cands = all.filter(k => k.startsWith(lp)).map(k => ({ k, n: nOf(k, lp), own: false }));
-  if (!d) { cands.sort((a, b) => a.n - b.n); const top = cands[cands.length - 1]; return top ? { key: top.k, rec: await store.get(top.k) } : null; }
-  const cp = d + ":" + lp, rows = [];
-  for (const c of cands) { const rec = await store.get(c.k); if (rec && rec.st && rec.st.chain === d && !rec.st.deriv) rows.push({ key: c.k, n: c.n, own: false, rec }); }
-  for (const k of all.filter(k => k.startsWith(cp))) rows.push({ key: k, n: nOf(k, cp), own: true, rec: null });
-  rows.sort((a, b) => a.n - b.n || (a.own ? 1 : 0) - (b.own ? 1 : 0));
-  const top = rows[rows.length - 1]; return top ? { key: top.key, rec: top.rec || await store.get(top.key) } : null;
+  if (!d) {
+    const cands = all.filter(k => k.startsWith(lp)).map(k => ({ k, n: nOf(k, lp) })).sort((a, b) => b.n - a.n);
+    for (const c of cands) { const rec = await store.get(c.k); if (!(rec && rec.st && rec.st.chain && rec.st.chain !== LEGACY_DERIV)) return { key: c.k, rec }; }      // highest n first; a record without st.chain is an old rh one and still counts
+    return null;
+  }
+  const cp = d + ":" + lp, top = all.filter(k => k.startsWith(cp)).map(k => ({ k, n: nOf(k, cp) })).sort((a, b) => a.n - b.n).pop(); return top ? { key: top.k, rec: await store.get(top.k) } : null;
 }
 /** Is there spendable ZEC on the transparent addresses of hop wallet n (the same scanAccts x SCAN_INDEXES addresses the Return flow sweeps)? Anything unreadable counts as "yes" through the thrown error. */
 async function hopHoldsZec(ctx, n, rec = null) {
@@ -848,7 +857,7 @@ export const LOST_N = 4, LOST_MAX_N = 8, LOST_MIN_AGE = 100;      // LOST_MIN_AG
 const nsUnder = async (store, p) => (await store.keys()).filter(k => k.startsWith(p) && /^[0-9]+$/.test(k.slice(p.length))).map(k => Number(k.slice(p.length)));
 /** The n of the local records of the wallets derived for `chainKey` (rh / none: the legacy "<stealth>#<n>" keys, as before; another chain: its "<chain>:<stealth>#<n>" keys). */
 export const localNs = async (store, stealth, chainKey) => { const d = derivKey(chainKey); return nsUnder(store, (d ? d + ":" : "") + stealth.toLowerCase() + "#"); };
-/** Every local record n of this stealth that counts against a new hop on `chainKey`: its own keys AND the legacy keys (an rh record of the same address, or this chain's pre-1181 hop). */
+/** Every local record n of this stealth that counts against a new hop on `chainKey`: its own keys AND the legacy keys (an rh record of the same address). Only ever raises n. */
 export const localNsAll = async (store, stealth, chainKey) => [...await localNs(store, stealth, chainKey), ...(derivKey(chainKey) ? await localNs(store, stealth) : [])];
 /** The hop wallets n to look at: the newest LOST_MAX_N below `before` (default: the prior hop count, LOST_N when unknown), without the ones that have a local record. 1136 F-2: lo..top-1 is the range
  *  looked at and capped (lo > 0) says older wallets exist below it; asking again with before = lo reaches them. -> { ns, lo, top, capped, maxLocal } */
@@ -856,13 +865,11 @@ export const lostRange = (priorHops, local, before = null) => {
   const ok = x => Number.isInteger(x) && x >= 0, top = ok(before) ? before : ok(priorHops) ? priorHops : LOST_N, lo = Math.max(0, top - LOST_MAX_N), all = []; for (let n = lo; n < top; n++) all.push(n);
   return { ns: all.filter(n => !local.includes(n)), lo, top, capped: lo > 0, unknown: !ok(before) && !ok(priorHops), maxLocal: local.length ? Math.max(...local) : -1 };      // 1181 L-5: unknown = the count was not read, so LOST_N is a guess and more wallets may exist
 };
-/** 1181 M-1: lostRange plus the wallets of the OTHER derivation. On rh / no chain this is lostRange (targets = ns with the legacy derivation). On another chain the chain-derived wallets come from lostRange (its local records are the
- *  "<chain>:" keys) and, on the first pass only (no `before`), the legacy-derived wallets n < min(LOST_N, prior hops): the one hop made on Base before the chain entered the derivation, if any, sits there. A legacy wallet that has
- *  a legacy-key record is left alone like any wallet with a record. -> lostRange's fields + targets: [{ n, deriv }] */
-export const lostPlan = (priorHops, localOwn, before = null, chainKey, localLegacy = []) => {
-  const d = derivKey(chainKey), rg = lostRange(priorHops, localOwn, before), targets = rg.ns.map(n => ({ n, deriv: d }));
-  if (d && !(Number.isInteger(before) && before >= 0)) { const top = Number.isInteger(priorHops) && priorHops >= 0 ? Math.min(priorHops, LOST_N) : LOST_N; for (let n = 0; n < top; n++) if (!localLegacy.includes(n)) targets.push({ n, deriv: undefined }); }
-  return { ...rg, targets };
+/** 1181 M-1: lostRange plus the derivation of the chain: targets = [{ n, deriv }], deriv = the chain's (undefined on rh / no chain, so rh scans exactly as before). 1182 L-1: a non-rh chain looks at its own
+ *  chain-derived wallets ONLY; the one legacy-derived hop made on Base before 1181 was a completed test hop (nothing to recover), and its wallet equals an rh hop wallet of the address (audit/stealthpay-v3-residuals.md). */
+export const lostPlan = (priorHops, localOwn, before = null, chainKey) => {
+  const d = derivKey(chainKey), rg = lostRange(priorHops, localOwn, before);
+  return { ...rg, targets: rg.ns.map(n => ({ n, deriv: d })) };
 };
 /** M-1 (1133): is any output of the finding too young to be sure no hop on another device is still working on it? An unconfirmed output, an unknown tip or an unknown height all count as young. */
 /** The age facts of one set of outputs (heights from the proxy): oldest confirmed, newest (0 when any is unconfirmed), any in the mempool. */
@@ -874,7 +881,7 @@ export const lostContinueAcct = found => found.length && found.every(x => x.acco
 export const firstBlock = (rows, stealth) => { const bs = rows.filter(r => r.stealth.toLowerCase() === stealth.toLowerCase() && r.block > 0).map(r => r.block); return bs.length ? Math.min(...bs) : null; };
 export async function findLostFunds(ctx) {
   const ZR = await import("./zec-return.js"), sleep = ctx.sleep || sleepMs, gap = ctx.gapMs ?? 150, accts = ctx.accts || scanAccts(null);
-  const ck = ctx.chain && ctx.chain.key, { targets, lo, top, capped, unknown, maxLocal } = lostPlan(ctx.priorHops, await localNs(ctx.store, ctx.stealth, ck), ctx.before, ck, derivKey(ck) ? await localNs(ctx.store, ctx.stealth) : []);      // priorHops (AuthorizationUsed count of the address) bounds n when known: no authorization, no hop
+  const ck = ctx.chain && ctx.chain.key, { targets, lo, top, capped, unknown, maxLocal } = lostPlan(ctx.priorHops, await localNs(ctx.store, ctx.stealth, ck), ctx.before, ck);      // priorHops (AuthorizationUsed count of the address) bounds n when known: no authorization, no hop
   if (!targets.length && maxLocal >= 0) return { skipped: "record", lo, top, capped, unknown, maxLocal };
   let best = null, truncated = false;
   try {
@@ -895,10 +902,9 @@ export async function findLostFunds(ctx) {
  *  A hop at SHIELD that goes on with the ZEC found in `account` (recipient required, a valid address). Return needs no record at all: it works from the keys (1136 F-4).
  *  1133 M-2: the check and the write are one step: under ctx.lock(fn) when given (the app's hop lock; it returns undefined when another tab holds it), and the write is store.add (fails on an existing key).
  *  -> { key, created, reason? } (created false: a record exists for this n, or a NEWER one does and findHop would hide this one; a record below n is harmless: findHop takes the new, higher key) */
-export async function adoptLostHop(ctx, { n, account = 0, birthday = null, zats = 0n, recipient = null, chain, dest, now = Date.now(), asset, deriv }) {
+export async function adoptLostHop(ctx, { n, account = 0, birthday = null, zats = 0n, recipient = null, chain, dest, now = Date.now(), asset }) {
   if (!isAddr(recipient)) throw new Error("enter a valid recipient address");
   const st = newState({ stealth: ctx.stealth, chain, dest, recipient, amount: 0n, n, mode: DEFAULT_MODE, now, asset });
-  if (derivKey(deriv)) st.deriv = derivKey(deriv); else delete st.deriv;      // 1181 M-1: the record is the wallet that was FOUND: legacy unless the finding says otherwise (on Base the pre-1181 hop), never the chain's default
   const key = recKey(ctx.stealth, n, st.deriv);      // asset: the payout coin of the rebuilt hop (a lost record cannot say; the caller derives it from the payment)
   Object.assign(st, { rebuilt: true, zecFound: zats.toString(), stepAt: now, relayed: true });
   if (Number.isInteger(birthday)) st.birthday = Math.max(ZC.orchardActivation, birthday); Object.assign(st, { step: "SHIELD", attempt: account, tSeenHeight: null });

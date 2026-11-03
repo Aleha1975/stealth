@@ -10,6 +10,7 @@ export const CHAINS = {
     explorer: "https://basescan.org", explorerName: "Basescan",
     stealthPay: "0xC07f54984AbDa1EF76DaB6F602270B76a04E916d",   // v3, Base block 53408013, Sourcify exact match. v2 0xc1b372731c1ee68ee89f212a05cb8ac9a7929f76: its payments are still scanned and withdrawn (neither depends on this address)
     rpc: "https://mainnet.base.org",
+    block_ms: 2000,                                      // block time in ms (the measured value of server/chains.json): zec-hop.js treats an RPC tip more than 60 s of blocks behind the indexer head as lagging (audit 1182 L-3)
     rpcs: ["https://mainnet.base.org", "https://base-rpc.publicnode.com"],   // read fail-over order (zec-hop.js rpcCall); rpc stays the primary for everything else
     api: "/stealth-api/base",                            // nginx: /stealth-api/base/ -> Base v3 indexer :3893 / relayer :3894 (server/deploy/stealth-base.conf). The prod web copy keeps "/stealth-api" (v2, :3873/:3874)
     privateWithdraw: true,                               // withdraw through NEAR Intents 1Click (web/private-withdraw.js)
@@ -22,6 +23,7 @@ export const CHAINS = {
     explorer: "https://robinhoodchain.blockscout.com", explorerName: "Blockscout",
     stealthPay: "0x6f488f9036519b9eb0f3db98b76c2c1b02b08ac7",   // v3, deployed 2026-10-29, Sourcify exact match
     rpc: "https://rpc.mainnet.chain.robinhood.com",
+    block_ms: 104,                                       // measured (server/chains.json), see base
     rpcs: ["https://rpc.mainnet.chain.robinhood.com"],
     api: "/stealth-api/rh",                              // nginx: /stealth-api/rh/ -> RH indexer :3883 / relayer :3884
     privateWithdraw: true,

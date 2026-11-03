@@ -334,7 +334,7 @@ async function lostShielded(k, f, hit, line) {
   if (!self.crossOriginIsolated) throw new Error("This page cannot run the Zcash wallet here (it is not cross-origin isolated).");
   const HM = await hopMod(), base = await hopCtx(HM, f, hit, {}); let cnt = null; try { cnt = await base.countPriorHops(f.stealth, f.b0); } catch {}
   if (cnt === 0) { line.textContent = "No private transfer was ever started from this address."; return; }
-  const bt = Number.isInteger(f.b0) && f.b0 > 0 ? await blockTimeSec(f.b0) : null, prev = lost.get(k) || {}, rg = HM.lostPlan(cnt, await HM.localNs(base.store, f.stealth, C.key), (prev.top != null ? prev : lostNone.get(k) || {}).top, C.key, await HM.localNs(base.store, f.stealth)); let best = null;      // 1133 I-4: the note cannot predate the FIRST payment to this address; 1181 L-4: that is b0 (the earliest announcement of the address), not the block of whichever row survived the merge
+  const bt = Number.isInteger(f.b0) && f.b0 > 0 ? await blockTimeSec(f.b0) : null, prev = lost.get(k) || {}, rg = HM.lostPlan(cnt, await HM.localNs(base.store, f.stealth, C.key), (prev.top != null ? prev : lostNone.get(k) || {}).top, C.key); let best = null;      // 1133 I-4: the note cannot predate the FIRST payment to this address; 1181 L-4: that is b0 (the earliest announcement of the address), not the block of whichever row survived the merge
   for (const { n, deriv } of rg.targets) {      // 1133 L-4: every wallet is looked at (bounded by LOST_MAX_N) and the richest wins; transparent ZEC already found counts for its own wallet
     line.textContent = "Syncing the Zcash wallet to look for shielded ZEC (hop wallet " + (n + 1) + ")… this takes a few minutes. Keep this tab open.";
     const rows = await HM.hopSummary({ ...base, n, deriv, blockTimeSec: bt, nAccts: HM.scanAccts(null) }, null), row = rows.filter(x => x.orchard >= HM.HOLD_DUST).sort((a, b) => (b.orchard > a.orchard ? 1 : -1))[0];
@@ -369,7 +369,7 @@ async function lostContinue(k, l, to, line) {
   let birthday, account, zats = l.total;
   if (l.shielded) { if (l.found.length) throw new Error("ZEC also sits on the transparent addresses: press Return money first."); birthday = Number.isFinite(l.shielded.blockTimeSec) ? HM.birthdayFromTime(l.shielded.blockTimeSec, await ZR.getTip(ZC.lightwalletd)) : ZC.orchardActivation; account = l.shielded.account; }      // 1181 L-4: no b0 = the Orchard activation, never a later guess
   else { account = HM.lostContinueAcct(l.found); if (account == null) throw new Error("The ZEC is on several accounts: press Return money first, it sweeps all of them."); zats = l.found.reduce((s, x) => s + x.value, 0n); const hs = l.found.map(x => x.height).filter(x => x > 0); birthday = (hs.length ? Math.min(...hs) : (await ZR.getTip(ZC.lightwalletd)) - 5000) - 10; }
-  const r = await HM.adoptLostHop(ctx, { n: l.n, deriv: l.deriv, account, birthday, zats, recipient: to, chain: C, dest: C, asset });
+  const r = await HM.adoptLostHop(ctx, { n: l.n, account, birthday, zats, recipient: to, chain: C, dest: C, asset });
   if (!r.created) throw NOT_ADOPTED(r);      // 1133 L-1: never run on another record's recipient
   lost.delete(k); renderHops(); render(); await runHop(l.f, l.hit, null, { interactive: true });
 }

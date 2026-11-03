@@ -6,6 +6,9 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"; HOST="${1:-root@46.224.
 # audit 1181 I-3: a dirty web/ (modified, STAGED or untracked files: `git diff --quiet` sees neither of the last two) is refused; FORCE_DIRTY=1 deploys it anyway under a "-<time>" version
 DIRTY="$(git -C "$ROOT" status --porcelain -- web)"
 if [ -n "$DIRTY" ] && [ "${FORCE_DIRTY:-0}" != 1 ]; then echo "web/ has uncommitted changes (commit them, or FORCE_DIRTY=1 to deploy them anyway): refusing to deploy"; echo "$DIRTY" | head -10; exit 1; fi
+# audit 1182 L-4: `git status --porcelain` does not list git-ignored files, but rsync ships them: any ignored path under web/ other than the wasm build files that .gitignore names (web/vendor/webzjs/*, covered by the SHA256SUMS manifest below) is refused, FORCE_DIRTY or not
+IGN="$(git -C "$ROOT" status --porcelain --ignored -- web | grep '^!! ' | grep -v -E '^!! web/vendor/webzjs/(package\.json|snippets/|webzjs_wallet\.d\.ts|webzjs_wallet\.js|webzjs_wallet_bg\.wasm|webzjs_wallet_bg\.wasm\.d\.ts)$' || true)"
+if [ -n "$IGN" ]; then echo "web/ holds git-ignored files that would be shipped (remove them): refusing to deploy"; echo "$IGN" | head -10; exit 1; fi
 V="$(git -C "$ROOT" rev-parse --short HEAD)$([ -z "$DIRTY" ] || echo "-$(date +%s)")"
 TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
 # the wallet wasm receives the seed phrase: ship only files that match the committed hashes (web/vendor/webzjs/SHA256SUMS)

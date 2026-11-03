@@ -95,6 +95,15 @@ if shutil.which("rsync") and shutil.which("git"):
     check("1181 L-6 web/vendor/webzjs itself a symlink -> refused before the copy", r.returncode != 0 and not shipped and "webzjs is a symlink" in r.stdout, r.stdout)
     d4, g4 = scratch(); open(os.path.join(d4, "web", "vendor", "webzjs", "SHA256SUMS"), "a").write("this line is not a checksum\n"); g4("add", "-A"); g4("commit", "-q", "-m", "bad"); r, shipped = deploy(d4)
     check("1181 I-3 a malformed manifest line is an error (--strict), not a skipped line", r.returncode != 0 and not shipped, r.stdout + r.stderr)
+    # audit 1182 L-4: git-ignored files under web/ are shipped by rsync but invisible to `git status --porcelain`
+    def ign(d): open(os.path.join(d, ".gitignore"), "w").write("node_modules/\nweb/vendor/webzjs/package.json\n")
+    for script in ("deploy_prod.sh", "deploy_lab.sh"):
+        d7, g7 = scratch(ign); os.makedirs(os.path.join(d7, "web", "node_modules")); open(os.path.join(d7, "web", "node_modules", "x.js"), "w").write("evil\n"); r, shipped = deploy(d7, script=script)
+        check("1182 L-4 %s: an ignored web/node_modules file -> refused, nothing shipped, the path is named" % script, r.returncode != 0 and not shipped and "git-ignored" in r.stdout and "web/node_modules/" in r.stdout, r.stdout + r.stderr)
+        r, shipped = deploy(d7, script=script, env={"FORCE_DIRTY": "1"}); check("1182 L-4 ...FORCE_DIRTY does not override it", r.returncode != 0 and not shipped and "git-ignored" in r.stdout)
+        d8, g8 = scratch(ign); open(os.path.join(d8, "web", "vendor", "webzjs", "package.json"), "w").write("{}\n"); r, shipped = deploy(d8, script=script)
+        check("1182 L-4 %s: an ignored file of the expected wasm set (web/vendor/webzjs/package.json) passes THIS gate (the manifest gate judges it)" % script, "git-ignored" not in r.stdout, r.stdout)
+    d9, g9 = scratch(ign); r, shipped = deploy(d9); check("1182 L-4 a clean tree with an ignore file still ships", r.returncode == 0 and shipped, r.stdout + r.stderr)
     d5, g5 = scratch(); r, shipped = deploy(d5, script="deploy_lab.sh"); check("1181 deploy_lab.sh passes the same gates when clean", r.returncode == 0 and shipped, r.stdout + r.stderr)
     d6, g6 = scratch(lambda d: os.symlink("a.js", os.path.join(d, "web", "ln.js"))); r, shipped = deploy(d6, script="deploy_lab.sh"); check("1181 L-6 deploy_lab.sh refuses a symlink too", r.returncode != 0 and not shipped)
 

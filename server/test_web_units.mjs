@@ -735,22 +735,47 @@ print(json.dumps({"eth": m._real_payer(eth_rc, st), "none": m._real_payer({"from
   // audit 1181: L-3 lagging endpoints, I-2 window cap, I-1 production wrapper
   { const [E1, E2] = base.rpcs, hx = n => "0x" + n.toString(16);
     const mkAns = (heads, o = {}) => { const calls = [], f = async (u, i) => { const b = JSON.parse(i.body); calls.push({ u, m: b.method, p: b.params }); const k = calls.filter(c => c.u === u && c.m === "eth_blockNumber").length;
-      if (o.fail && o.fail(u, b, k)) return lim; if (b.method === "eth_blockNumber") return okR(hx(typeof heads[u] === "function" ? heads[u](k) : heads[u])); if (b.method === "eth_getTransactionCount") return o.pinnedErr ? { ok: true, status: 200, json: async () => ({ error: { code: -32000, message: "header not found" } }) } : okR("0x1"); return okR([{}]); }; return { calls, f }; };
+      if (o.fail && o.fail(u, b, k)) return lim; if (b.method === "eth_blockNumber") return okR(hx(typeof heads[u] === "function" ? heads[u](k) : heads[u])); if (b.method === "eth_getTransactionCount") { const pe = o.pinnedErr && o.pinnedErr(u); return pe ? { ok: true, status: 200, json: async () => ({ error: { code: -32000, message: pe } }) } : okR("0x1"); } return okR([{}]); }; return { calls, f }; };
     { const { calls, f } = mkAns({ [E1]: TIP, [E2]: TIP - 3 }, { fail: (u, b) => u === E1 && b.method === "eth_getLogs" }), e = await HZ.makeCountPriorHops(base, f)(ST).then(() => null, e => e.message);
       t("1181 L-3 the endpoint that reported the higher tip is rate limited; the failover endpoint reports a LOWER tip -> its answer is rejected (the highest tip seen is kept), the count throws", /behind another endpoint/.test(e) && !calls.some(c => c.u === E2 && c.m === "eth_getLogs")); }
     { const { calls, f } = mkAns({ [E1]: TIP, [E2]: TIP + 2 }, { fail: (u, b) => u === E1 && b.method === "eth_getLogs" }), n = await HZ.makeCountPriorHops(base, f)(ST);
       t("1181 L-3 ...a failover endpoint with an equal or higher tip is accepted", n > 0 && calls.some(c => c.u === E2 && c.m === "eth_getLogs")); }
     { const { calls, f } = mkAns({ [E1]: TIP, [E2]: TIP }), n = await HZ.makeCountPriorHops({ ...base, eth: { assetId: "x" } }, f)(ST), c = calls.find(c => c.m === "eth_getTransactionCount");
       t("1181 L-3 the transaction count is read AT the pinned tip block, not 'latest'", c && c.p[1] === hx(TIP) && c.p[0] === ST && n > 0); }
-    { const { calls, f } = mkAns({ [E1]: TIP, [E2]: TIP }, { pinnedErr: true }), e = await HZ.makeCountPriorHops({ ...base, eth: { assetId: "x" } }, f)(ST).then(() => null, e => e.message);
-      t("1181 L-3 a pinned-block error is FINAL: no fallback to 'latest', no failover, the count throws", /failed/.test(e) && !calls.some(c => c.m === "eth_getTransactionCount" && c.p[1] === "latest") && calls.filter(c => c.m === "eth_getTransactionCount").length === 1 && calls.every(c => c.u === E1)); }
+    { const { calls, f } = mkAns({ [E1]: TIP, [E2]: TIP }, { pinnedErr: () => "execution reverted" }), e = await HZ.makeCountPriorHops({ ...base, eth: { assetId: "x" } }, f)(ST).then(() => null, e => e.message);
+      t("1181 L-3 an unlisted pinned-block error is FINAL: no fallback to 'latest', no failover, the count throws", /failed/.test(e) && !calls.some(c => c.m === "eth_getTransactionCount" && c.p[1] === "latest") && calls.filter(c => c.m === "eth_getTransactionCount").length === 1 && calls.every(c => c.u === E1)); }
     { const { calls, f } = mkAns({ [E1]: 2 ** 52, [E2]: TIP }), n = await HZ.makeCountPriorHops(base, f)(ST);
       t("1181 I-2 an implausible tip (2^52 -> billions of windows) makes no getLogs call, moves to the next endpoint, and does not poison the highest tip", n > 0 && !calls.some(c => c.u === E1 && c.m === "eth_getLogs") && calls.some(c => c.u === E2 && c.m === "eth_getLogs")); }
     { const { calls, f } = mkAns({ [E1]: 2 ** 52, [E2]: 2 ** 52 }), e = await HZ.makeCountPriorHops(base, f)(ST).then(() => null, e => e.message);
       t("1181 I-2 every endpoint implausible -> throws, zero getLogs calls", /implausible/.test(e) && !calls.some(c => c.m === "eth_getLogs")); }
     { const edge = 31_700_000 + HZ.MAX_WINDOWS * HZ.LOG_SPAN, ok1 = mkAns({ [E1]: edge, [E2]: edge }), bad = mkAns({ [E1]: edge + 1, [E2]: edge + 1 });
       const n = await HZ.makeCountPriorHops(base, ok1.f)(ST), e = await HZ.makeCountPriorHops(base, bad.f)(ST).then(() => null, e => e.message);
-      t("1181 I-2 exactly MAX_WINDOWS (200) windows is fine, one more is refused", n === ok1.calls.filter(c => c.m === "eth_getLogs").length && HZ.MAX_WINDOWS === 200 && /implausible/.test(e) && !bad.calls.some(c => c.m === "eth_getLogs")); }
+      t("1182 I-4 exactly MAX_WINDOWS (2000, ~4 billion blocks) windows is fine, one more is refused", n === ok1.calls.filter(c => c.m === "eth_getLogs").length && HZ.MAX_WINDOWS === 2000 && /implausible/.test(e) && !bad.calls.some(c => c.m === "eth_getLogs")); }
+    { const { calls, f } = mkAns({ [E1]: 0x1fffffffffffff, [E2]: 0x1fffffffffffff }), e = await HZ.makeCountPriorHops(base, f)(ST).then(() => null, e => e.message);
+      t("1182 I-4 a bogus 0x1fffffffffffff tip is still refused with no getLogs call; 13 years of rh blocks (104 ms) from its start stay under the cap", /implausible/.test(e) && !calls.some(c => c.m === "eth_getLogs") && (13 * 365.25 * 86400 * 1000 / 104) / HZ.LOG_SPAN < HZ.MAX_WINDOWS); }
+    // 1182 I-1: a node that lacks the state at the just-read tip is a lagging endpoint: next endpoint, never "latest"
+    for (const msg of ["header not found", "missing trie node abc", "block not found", "unknown block"]) {
+      const { calls, f } = mkAns({ [E1]: TIP, [E2]: TIP }, { pinnedErr: u => u === E1 ? msg : null }), n = await HZ.makeCountPriorHops({ ...base, eth: { assetId: "x" } }, f)(ST);
+      t("1182 I-1 pinned-block error '" + msg + "' -> limited: the count restarts on the next endpoint and succeeds, never 'latest'", n > 0 && calls.some(c => c.u === E2 && c.m === "eth_getTransactionCount" && c.p[1] === hx(TIP)) && !calls.some(c => c.p && c.p[1] === "latest")); }
+    { const { calls, f } = mkAns({ [E1]: TIP, [E2]: TIP }, { pinnedErr: () => "header not found" }), e = await HZ.makeCountPriorHops({ ...base, eth: { assetId: "x" } }, f)(ST).then(() => null, e => e.message);
+      t("1182 I-1 ...and when every endpoint lacks the state the count throws (fail closed, no 'latest')", /header not found/.test(e) && !calls.some(c => c.p && c.p[1] === "latest")); }
+    // 1182 L-3: the indexer's chain_head is an independent head
+    { const bm = { ...base, block_ms: 2000 }, lag = Math.ceil(60000 / 2000), IH = TIP + 5000;
+      { const { calls, f } = mkAns({ [E1]: TIP, [E2]: IH }), n = await HZ.makeCountPriorHops(bm, f, async () => IH)(ST);
+        t("1182 L-3 a stale first endpoint (tip below indexer head - ceil(60000/block_ms)) is rejected; the next, current endpoint answers", n > 0 && !calls.some(c => c.u === E1 && c.m === "eth_getLogs") && calls.some(c => c.u === E2 && c.m === "eth_getLogs")); }
+      { const { calls, f } = mkAns({ [E1]: IH - lag, [E2]: IH }), n = await HZ.makeCountPriorHops(bm, f, async () => IH)(ST);
+        t("1182 L-3 a tip exactly at the floor (indexer head - " + lag + ") is accepted", n > 0 && calls.some(c => c.u === E1 && c.m === "eth_getLogs")); }
+      { const { calls, f } = mkAns({ [E1]: TIP, [E2]: TIP + 1 }), e = await HZ.makeCountPriorHops(bm, f, async () => IH)(ST).then(() => null, e => e.message);
+        t("1182 L-3 every endpoint stale against the indexer head -> the count throws (fail closed), no getLogs", /indexer/.test(e) && !calls.some(c => c.m === "eth_getLogs")); }
+      for (const [label, ihf] of [["null", async () => null], ["a throw", async () => { throw new Error("x"); }], ["junk", async () => "abc"], ["zero", async () => 0]]) {
+        const { calls, f } = mkAns({ [E1]: TIP, [E2]: IH }), n = await HZ.makeCountPriorHops(bm, f, ihf)(ST);
+        t("1182 L-3 indexer head unknown (" + label + ") -> the old behaviour: the first endpoint answers", n > 0 && calls.some(c => c.u === E1 && c.m === "eth_getLogs")); }
+      { const { calls, f } = mkAns({ [E1]: TIP, [E2]: IH }), n = await HZ.makeCountPriorHops({ ...base, block_ms: undefined }, f, async () => IH)(ST);
+        t("1182 L-3 a chain without block_ms gets no indexer check", n > 0 && calls.some(c => c.u === E1 && c.m === "eth_getLogs")); }
+      const ok1 = async (j, st = 200) => HZ.indexerHeadOf({ api: "/x" }, async (u, i) => { if (!/\/head$/.test(u) || !i.signal) throw new Error("bad call"); return { ok: st === 200, status: st, json: async () => j }; });
+      t("1182 L-3 indexerHeadOf reads chain_head from <api>/head with a timeout signal; bad shapes / errors / HTTP errors -> null", await ok1({ chain_head: 123 }) === 123 && await ok1({ chain_head: null }) === null && await ok1({ chain_head: "9" }) === null && await ok1({ chain_head: 5 }, 500) === null && await HZ.indexerHeadOf({ api: "/x" }, async () => { throw new Error("net"); }) === null);
+      const ch = fs.readFileSync(new URL("../web/chains.js", import.meta.url), "utf8"), cj = JSON.parse(fs.readFileSync(new URL("./chains.json", import.meta.url), "utf8"));
+      t("1182 L-3 web/chains.js block_ms matches the measured value in server/chains.json (rh 104, base 2000)", /block_ms: 104,/.test(ch.slice(ch.indexOf("  rh: {"))) && /block_ms: 2000,/.test(ch.slice(ch.indexOf("  base: {"), ch.indexOf("  rh: {"))) && JSON.stringify(Object.values(cj).map(c => c.block_ms).sort()) === JSON.stringify([104, 2000])); }
     { const { f } = mkAns({ [E1]: TIP, [E2]: TIP }), n1 = await HZ.makeCountPriorHops(base, f)(ST, TIP - 100), n2 = await HZ.makeCountPriorHops(base, f)(ST, TIP);
       t("1181 L-3 a tip equal to b0 is fine (only a lower tip is lagging)", n1 > 0 && n2 > 0); }
     // I-1: the REAL chainRpc wrapper of app.js (extracted), with a fake fetch, feeding rpcOnce

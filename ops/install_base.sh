@@ -5,7 +5,7 @@
 # It NEVER stops, restarts, disables, reloads or rewrites the live Base units (stealth-indexer.service, stealth-relayer.service on 3873/3874, code in /opt/stealth), the RH units
 # (stealth-*-rh.service, /opt/stealth-rh) or any other product's unit, and refuses a systemctl action or a write outside its own paths. It never edits /opt/mprhedged/exec/.env
 # and never writes, copies or prints a secret: you create /opt/stealth-base/base.env yourself (README_ops.txt, "Base v3"); the script only checks it and compares the key line with the
-# live relayer's file (yes/no, never the value). Every file it replaces is first copied to /var/backups/stealth-base/<time>/. nginx -t runs before every reload; a failing test (or any failed write) puts back exactly the files THIS run changed and deletes only the ones it created.
+# live relayer's file (yes/no, never the value). Every file it replaces is first copied to /var/backups/stealth-base/<time>/. nginx -t runs before every reload; a failing test (or any failed write) of the nginx files puts back exactly the nginx files THIS run changed and deletes only the ones it created.
 # Usage:  ops/install_base.sh [--apply] [--src <repo>/server] [--no-start] [--add-include]
 #   --add-include  (with --apply) inserts `include /etc/nginx/snippets/stealth-base.conf;` into the app.deepyield.ai vhost right after the RH include (backup first, written whole via a temp file + mv, nginx -t, undo on failure)
 set -euo pipefail

@@ -675,7 +675,7 @@ def index_loop():
             if rf is not None:
                 rfi = _rf_valid(rf, head_done)
                 if rfi is None:                             # аудит 1181 L-2: битое или вне [START, head_done+1] значение ЗАМЕНЯЕТСЯ широким окном (а не стирается: иначе следующий проход открыл бы /known без сверки)
-                    rfi = max(START, head_done - BH_KEEP)
+                    rfi = START                         # аудит 1182 I-3: точное окно (долгий первый проход), а не последние BH_KEEP блоков: строки брошенной ветки старше них не остались бы
                     with _lock: c.execute("INSERT OR REPLACE INTO meta(k,v) VALUES('reconcile_from',?)", (str(rfi),)); c.commit()
                     if time.time() - rf_alert_t >= WAIT_ALERT_S:
                         rf_alert_t = time.time(); print("ALERT bad reconcile_from %r replaced by %d; /known stays closed until a reconcile from there completes" % (str(rf)[:40], rfi), flush=True)
@@ -961,8 +961,8 @@ def rewind(n):
     old_rf = c.execute("SELECT v FROM meta WHERE k='reconcile_from'").fetchone()
     keep = new + 1
     if old_rf:                                                                                                                            # аудит 1180 L-3: второй --rewind не теряет диапазон первого (берётся меньшее)
-        ov = _rf_valid(old_rf[0], int(r[0]), lo + 1)                                                                                      # аудит 1181 L-2: битое / вне [START, старая голова + 1] значение НЕ отбрасывается, а заменяется широким окном max(START, голова - BH_KEEP)
-        keep = min(ov if ov is not None else max(lo + 1, int(r[0]) - BH_KEEP), new + 1)
+        ov = _rf_valid(old_rf[0], int(r[0]), lo + 1)                                                                                      # аудит 1181 L-2: битое / вне [START, старая голова + 1] значение НЕ отбрасывается, а заменяется точным окном от START (аудит 1182 I-3)
+        keep = min(ov if ov is not None else lo + 1, new + 1)
     c.execute("INSERT OR REPLACE INTO meta(k,v) VALUES('reconcile_from',?)", (str(keep),))                                               # аудит 1179 F4: первая реконсиляция покрывает от новой головы; расходуется один раз
     _bump_epoch(c, False); c.commit()                                                                                                    # аудит 1165 I-5: клиент, считающий по epoch, перечитает; новые id у перечитанных строк он иначе не заметит
     print("rewind: head %s -> %d (rows above stay; the service re-reads from %d and only inserts what is missing)" % (r[0], new, new + 1), flush=True)

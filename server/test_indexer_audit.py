@@ -363,13 +363,13 @@ check("1179 F4 a second rewind before the loop runs keeps the marker at the lowe
 meta_set(m, head=900); m.rewind(100)
 check("1180 L-3 a rewind to a HIGHER point keeps the lower pending reconcile_from (min)", meta_get(m, "reconcile_from") == "401")
 c = m.db(); c.execute("INSERT OR REPLACE INTO meta(k,v) VALUES('reconcile_from','junk')"); c.commit(); c.close(); meta_set(m, head=900); m.rewind(100)
-check("1181 L-2 rewind over a corrupt old reconcile_from REPLACES it with the wide window max(START, old head - BH_KEEP), capped by the new point (never just the new one)", meta_get(m, "reconcile_from") == "1")
+check("1181 L-2 rewind over a corrupt old reconcile_from REPLACES it with START (1182 I-3: exact, long first pass), capped by the new point (never just the new one)", meta_get(m, "reconcile_from") == "1")
 meta_set(m, head=50000); c = m.db(); c.execute("INSERT OR REPLACE INTO meta(k,v) VALUES('reconcile_from','junk')"); c.commit(); c.close(); m.rewind(100)
-check("1181 L-2 ...with a high head the wide window starts BH_KEEP below the old head, and the rewind point is not lower than that", meta_get(m, "reconcile_from") == str(50000 - m.BH_KEEP))
+check("1182 I-3 ...with a high head the replacement is still START, not head - BH_KEEP (rows of an abandoned branch older than that would stay)", meta_get(m, "reconcile_from") == "1")
 c = m.db(); c.execute("INSERT OR REPLACE INTO meta(k,v) VALUES('reconcile_from','99999999')"); c.commit(); c.close(); meta_set(m, head=50000); m.rewind(100)
-check("1181 L-2 rewind over an out-of-range (above old head + 1) reconcile_from is replaced the same way", meta_get(m, "reconcile_from") == str(50000 - m.BH_KEEP))
+check("1181 L-2 rewind over an out-of-range (above old head + 1) reconcile_from is replaced the same way (START)", meta_get(m, "reconcile_from") == "1")
 c = m.db(); c.execute("INSERT OR REPLACE INTO meta(k,v) VALUES('reconcile_from','-5')"); c.commit(); c.close(); meta_set(m, head=50000); m.rewind(100)
-check("1181 L-2 rewind over a value below START is replaced too", meta_get(m, "reconcile_from") == str(50000 - m.BH_KEEP))
+check("1181 L-2 rewind over a value below START is replaced too (START)", meta_get(m, "reconcile_from") == "1")
 c = m.db(); c.execute("INSERT OR REPLACE INTO meta(k,v) VALUES('reconcile_from','49000')"); c.commit(); c.close(); meta_set(m, head=50000); m.rewind(100)
 check("1181 L-2 a valid old value is still just min(old, new + 1)", meta_get(m, "reconcile_from") == "49000")
 # (a) a reconcile that returns False (window start above head_done) must not reopen /known while reconcile_from is pending
@@ -436,7 +436,9 @@ for bad in ("junk", "99999999", "-4", "0"):
     m = load(); Chain(m, {"A": {"head": 600, "logs": [], "safe": 590}}); m.START = 5
     meta_set(m, head=100, head_hash=H(100), reconcile_from=bad); m.reconcile = lambda *a, **k: m.REC_NO_SECOND; seen = {}
     run_loop(m, secs=0.8)
-    check("1181 L-2 reconcile_from %r (outside [START, head_done+1]) is replaced by max(START, head_done - BH_KEEP) = 5, not deleted, /known stays closed" % bad, meta_get(m, "reconcile_from") == "5" and meta_get(m, "known_block") is None)
+    check("1181 L-2 reconcile_from %r (outside [START, head_done+1]) is replaced by START = 5, not deleted, /known stays closed" % bad, meta_get(m, "reconcile_from") == "5" and meta_get(m, "known_block") is None)
+m = load(); Chain(m, {"A": {"head": 600, "logs": [], "safe": 590}}); m.START = 5; m.BH_KEEP = 20; meta_set(m, head=100, head_hash=H(100), reconcile_from="junk"); m.reconcile = lambda *a, **k: m.REC_NO_SECOND; run_loop(m, secs=0.8)
+check("1182 I-3 a corrupt reconcile_from is replaced by START (5), NOT head_done - BH_KEEP (80): the first pass is exact", meta_get(m, "reconcile_from") == "5")
 m = load(); Chain(m, {"A": {"head": 600, "logs": [], "safe": 590}}); m.START = 5; meta_set(m, head=100, head_hash=H(100), reconcile_from=101); m.reconcile = lambda *a, **k: m.REC_NOT_REACHED
 run_loop(m, secs=0.6); check("1181 L-2 head_done + 1 is a valid value and is kept as it is", meta_get(m, "reconcile_from") == "101")
 m = load(); m.START = 5

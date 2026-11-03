@@ -1223,40 +1223,43 @@ const tAddrOf = async (n, a, i = 0) => ZRm.deriveT(await H.mnemonicSeed(await H.
     const seedOf = async (n, d) => Buffer.from(await H.mnemonicSeed(await H.mnemonicFor(PRIV, words, n, d))).toString("hex");
     off = 0; seedLog.length = 0; const rb = await H.runHop(bctx(wb, sB, { stopAt: undefined }));
     ok("1181 M-1 resuming the base hop signs with the wallet it started with (chain-derived n=0), not the legacy n=0 one", seedLog.length > 0 && seedLog.every(x => x === seedOfB0) && seedOfB0 !== await seedOf(0, undefined), rb.step + " " + rb.err);
-    // a legacy base record (made before 1181: legacy key, st.chain base, no deriv) resumes with the LEGACY wallet, and is found on base but not on rh's behalf
+    // audit 1182 L-1: a legacy-key record that names Base (the pre-1181 test hop, or an adopted one) is NOT read on Base and never blocks rh
     const sL = H.memStore(), legacyW = wrap(makeWorld()); off = 0; mnLog.length = 0;
-    await H.startHop(mkCtx(legacyW, sL, { chain: rh, dest: base, stopAt: "DEPOSIT_IN" })); const lrec = await sL.get(STEALTH + "#0"); lrec.st.chain = "base"; await sL.put(STEALTH + "#0", lrec);      // forge the pre-1181 base record from a legacy one
-    const legacyMn = mnLog[0]; seedLog.length = 0; off = 0; const rl = await H.runHop(bctx(legacyW, sL, { stopAt: undefined }));
-    ok("1181 M-1 a pre-1181 Base record (legacy key, no deriv) is still found on base and resumes with the LEGACY wallet", (await H.findHop(sL, STEALTH, "base")).key === STEALTH + "#0" && seedLog.length > 0 && seedLog.every(x => x === seedOfL0) && H.derivOf(lrec.st) === undefined, rl.step + " " + rl.err);
-    // a new base hop with that legacy record present gets n >= 1 and a chain-derived wallet
-    mnLog.length = 0; const done = await sL.get(STEALTH + "#0"); done.st.step = "DONE"; await sL.put(STEALTH + "#0", done); const nb = await H.startHop(bctx(wrap(makeWorld()), sL));
-    ok("1181 M-1 after a finished legacy base hop the next base hop is n=1 with deriv base (key 'base:...#1')", nb.n === 1 && nb.deriv === "base" && (await sL.keys()).includes("base:" + STEALTH + "#1") && mnLog[0] !== legacyMn); }
-  // lost funds: rh scans exactly as before; base scans the chain-derived wallets AND the legacy ones n < min(LOST_N, prior hops)
+    await H.startHop(mkCtx(legacyW, sL, { chain: rh, dest: base, stopAt: "DEPOSIT_IN" })); const lrec = await sL.get(STEALTH + "#0"); lrec.st.chain = "base"; await sL.put(STEALTH + "#0", lrec);      // forge a Base-labelled record under the legacy key
+    ok("1182 L-1 findHop on rh ignores a legacy-key record whose st.chain is base; on base it is not read either", (await H.findHop(sL, STEALTH, "rh")) === null && (await H.findHop(sL, STEALTH)) === null && (await H.findHop(sL, STEALTH, "base")) === null);
+    off = 0; const rs = await H.startHop(mkCtx(wrap(makeWorld()), sL, { chain: rh, dest: base, stopAt: "DEPOSIT_IN" }));
+    ok("1182 L-1 a Base-labelled legacy-key record does not block rh startHop (unfinished step, no 'resume it first'); the rh hop reuses n=0 only because the record is ignored, key unchanged", rs.n === 0 && !rs.deriv);
+    const sL2 = H.memStore(); await sL2.put(STEALTH + "#0", { st: { v: 2, n: 0, step: "WAIT_T", chain: "rh" }, db: null }); await sL2.put(STEALTH + "#1", { st: { v: 2, n: 1, step: "WAIT_T", chain: "base" }, db: null });
+    ok("1182 L-1 rh findHop skips the Base-labelled top and returns the highest rh record; an old record without st.chain still counts as rh", (await H.findHop(sL2, STEALTH, "rh")).key === STEALTH + "#0" && (await (async () => { await sL2.put(STEALTH + "#2", { st: { v: 2, n: 2, step: "DONE" }, db: null }); return (await H.findHop(sL2, STEALTH)).key; })()) === STEALTH + "#2");
+    // a new base hop with a legacy-key record present still gets n >= 1 (localNsAll counts it) and a chain-derived wallet
+    mnLog.length = 0; const nb = await H.startHop(bctx(wrap(makeWorld()), sL));
+    ok("1182 L-1 a new base hop next to a legacy-key record is n=1 with deriv base (key 'base:...#1')", nb.n === 1 && nb.deriv === "base" && (await sL.keys()).includes("base:" + STEALTH + "#1")); }
+  // lost funds: rh scans exactly as before; base scans the chain-derived wallets ONLY (audit 1182 L-1: no legacy targets)
   { const ZRm = await import("../web/zec-return.js"), tAt = async (n, deriv) => ZRm.deriveT(await H.mnemonicSeed(await H.mnemonicFor(PRIV, words, n, deriv)), ZRm.tPath(0, 0)).addr;
     const asked = []; const gu = map => async addr => { asked.push(addr); return map[addr] || []; }, hu = [{ txid: "11".repeat(32), n: 0, value: 5_000_000n, height: 3_500_100 }];
     const lb = { ...base0, chain: base }, a0 = await tAt(0, undefined), b0 = await tAt(0, "base"), b1 = await tAt(1, "base");
     asked.length = 0; await H.findLostFunds({ ...lb, store: H.memStore(), priorHops: 2, getUtxos: gu({}) });
-    ok("1181 M-1 base lost-funds scan asks the chain-derived wallets 0-1 AND the legacy wallets 0-1", asked.includes(a0) && asked.includes(b0) && asked.includes(b1) && asked.includes(await tAt(1, undefined)) && !asked.includes(await tAt(2, undefined)));
+    ok("1182 L-1 base lost-funds scan asks the chain-derived wallets 0-1 and NO legacy wallet", !asked.includes(a0) && asked.includes(b0) && asked.includes(b1) && !asked.includes(await tAt(1, undefined)) && !asked.includes(await tAt(2, "base")));
     const fl = await H.findLostFunds({ ...lb, store: H.memStore(), priorHops: 1, getUtxos: gu({ [a0]: hu }) });
-    ok("1181 M-1 ZEC on the LEGACY wallet 0 is found on base, and the finding says legacy (no deriv)", fl.found.length === 1 && fl.found[0].n === 0 && fl.found[0].deriv === undefined && fl.total === 5_000_000n);
+    ok("1182 L-1 ZEC on the LEGACY wallet 0 is NOT looked for on base (it equals the rh wallet 0 of the address)", fl.found.length === 0);
     const fc = await H.findLostFunds({ ...lb, store: H.memStore(), priorHops: 1, getUtxos: gu({ [b0]: hu }) });
     ok("1181 M-1 ZEC on the chain-derived wallet 0 is found on base, and the finding carries deriv base", fc.found.length === 1 && fc.found[0].deriv === "base");
     const fr = await H.findLostFunds({ ...base0, chain: rh, store: H.memStore(), priorHops: 1, getUtxos: gu({ [b0]: hu }) });
     ok("1181 M-1 on rh the base-derived wallet is never asked (rh scans exactly as before)", fr.found.length === 0); asked.length = 0; await H.findLostFunds({ ...base0, chain: rh, store: H.memStore(), priorHops: 2, getUtxos: gu({}) });
     ok("1181 M-1 rh asks exactly the legacy wallets 0-1, nothing else", [a0, await tAt(1)].every(x => asked.includes(x)) && !asked.includes(b0) && !asked.includes(b1));
-    // local records are per derivation: a legacy record leaves the legacy wallet alone but not the chain wallet
+    // local records are per derivation: a legacy-key record does not cover the chain wallet
     const sRec = H.memStore(); await sRec.put(STEALTH + "#0", { st: { v: 2, n: 0, step: "DONE", chain: "base" }, db: null }); asked.length = 0; await H.findLostFunds({ ...lb, store: sRec, priorHops: 1, getUtxos: gu({}) });
-    ok("1181 M-1 a legacy-key record covers the legacy wallet 0 only; the chain-derived wallet 0 is still looked at", !asked.includes(a0) && asked.includes(b0));
+    ok("1181 M-1 a legacy-key record does not cover the chain-derived wallet 0 (still looked at)", !asked.includes(a0) && asked.includes(b0));
     const sRec2 = H.memStore(); await sRec2.put("base:" + STEALTH + "#0", { st: { v: 2, n: 0, step: "DONE", chain: "base", deriv: "base" }, db: null }); asked.length = 0; await H.findLostFunds({ ...lb, store: sRec2, priorHops: 1, getUtxos: gu({}) });
-    ok("1181 M-1 a chain-keyed record covers the chain-derived wallet 0 only; the legacy wallet 0 is still looked at", !asked.includes(b0) && asked.includes(a0));
+    ok("1181 M-1 a chain-keyed record covers the chain-derived wallet 0; no legacy wallet is looked at", !asked.includes(b0) && !asked.includes(a0));
     asked.length = 0; await H.findLostFunds({ ...lb, store: H.memStore(), priorHops: 1, before: 3, getUtxos: gu({}) });
     ok("1181 M-1 'older wallets' (before) asks no legacy wallets again", !asked.includes(a0));
     asked.length = 0; await H.findLostFunds({ ...lb, store: H.memStore(), priorHops: 0, getUtxos: gu({}) });
     ok("1181 M-1 no prior hops -> nothing asked on base at all", asked.length === 0);
-    const pl = H.lostPlan(null, [], null, "base", []); ok("1181 M-1 lostPlan with an unknown count: LOST_N chain wallets + LOST_N legacy wallets", pl.targets.length === 2 * H.LOST_N && pl.unknown === true);
+    const pl = H.lostPlan(null, [], null, "base"); ok("1182 L-1 lostPlan with an unknown count: LOST_N chain wallets, no legacy target (non-rh plan has no deriv-undefined target)", pl.targets.length === H.LOST_N && pl.unknown === true && pl.targets.every(t => t.deriv === "base") && H.lostPlan(3, [], null, "base").targets.every(t => t.deriv === "base") && H.lostPlan(3, [], null, "rh").targets.length === 3 && H.lostPlan(3, [], null, "rh").targets.every(t => t.deriv === undefined));
     // adopting a find: the record is the wallet that was found
     const sA = H.memStore(), ad = await H.adoptLostHop({ store: sA, stealth: STEALTH }, { n: 0, deriv: undefined, recipient: A, chain: base, dest: base }), sB2 = H.memStore(), ad2 = await H.adoptLostHop({ store: sB2, stealth: STEALTH }, { n: 0, deriv: "base", recipient: A, chain: base, dest: base });
-    ok("1181 M-1 adoptLostHop: a legacy find on base is stored under the legacy key without deriv; a chain-derived find under 'base:...' with deriv", ad.created && ad.key === STEALTH + "#0" && !(await sA.get(ad.key)).st.deriv && ad2.created && ad2.key === "base:" + STEALTH + "#0" && (await sB2.get(ad2.key)).st.deriv === "base");
+    ok("1182 L-1 adoptLostHop on base always stores the chain-keyed record with deriv (a stray deriv:undefined in the call cannot make a legacy key); rh stays legacy", ad.created && ad.key === "base:" + STEALTH + "#0" && (await sA.get(ad.key)).st.deriv === "base" && ad2.created && ad2.key === "base:" + STEALTH + "#0" && (await sB2.get(ad2.key)).st.deriv === "base");
     // unknown count (L-5)
     ok("1181 L-5 an unknown count is reported as unknown (the range is a guess), a known one is not", (await H.findLostFunds({ ...base0, chain: rh, store: H.memStore(), getUtxos: gu({}) })).unknown === true && (await H.findLostFunds({ ...base0, chain: rh, store: H.memStore(), priorHops: 2, getUtxos: gu({}) })).unknown === false && H.lostRange(null, []).unknown === true && H.lostRange(3, []).unknown === false && H.lostRange(null, [], 5).unknown === false); }
   // scrubFinished keeps deriv
