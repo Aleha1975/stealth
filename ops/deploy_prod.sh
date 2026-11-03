@@ -26,6 +26,13 @@ unlisted() { # extra find args: files of the current dir (webzjs/ pruned) that S
 # same gate for the other vendored code that handles keys (noble.js, bip39 wordlist, zec-hash.js; audit 1179 F7): manifest in web/vendor/SHA256SUMS, paths relative to web/vendor
 ( cd "$SRC/vendor" && sumcheck && [ -z "$(unlisted)" ] ) || { echo "web/vendor does not match SHA256SUMS (or holds an unlisted file): refusing to deploy"; exit 1; }
 rsync -a --exclude vendor/webzjs --exclude .DS_Store --exclude blueprint --exclude selftest.html --exclude selftest.js --exclude erc5564_vectors.json "$SRC/" "$OUT/"
+# PROD_FEE_OFF=1: ship this build with the service fee switched OFF (empty appFeeRecipient) while the lab (and the repo) keep it ON, until the fee has passed its audit and a live transfer.
+if [ "${PROD_FEE_OFF:-0}" = 1 ]; then
+  grep -q 'appFeeRecipient: "[a-z0-9._-]*" }' "$OUT/chains.js" || { echo "PROD_FEE_OFF: cannot find the appFeeRecipient line in chains.js"; exit 1; }
+  perl -pi -e 's/appFeeRecipient: "[a-z0-9._-]*" \}/appFeeRecipient: "" }/' "$OUT/chains.js"
+  grep -q 'appFeeRecipient: "" }' "$OUT/chains.js" || { echo "PROD_FEE_OFF: the fee is still on after the edit"; exit 1; }
+  echo "PROD_FEE_OFF: service fee switched off in this build"
+fi
 # html: src="./x.js" href="./x.css"; js: from "./x.js", import("./x.js")
 find "$OUT" -maxdepth 1 \( -name '*.html' -o -name '*.js' \) -print0 | xargs -0 perl -pi -e 's#((?:src|href)="\./[\w.-]+\.(?:js|css))"#$1?v='"$V"'"#g; s#((?:from |import\()\s*"\./[\w.-]+\.js)"#$1?v='"$V"'"#g'
 rsync -az "$OUT/" "$HOST:$DEST"
