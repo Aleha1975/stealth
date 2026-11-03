@@ -241,3 +241,7 @@ Audit 1181 (notes)
   resolving it first. install_rh.sh has no guard_path (audit 1181 I-5). Some writes (install -d of the nginx cache dir, chown of the sanctions dirs) bypass the guard by design.
 - deploy_prod.sh / deploy_lab.sh refuse a web/ with uncommitted, staged or untracked files unless FORCE_DIRTY=1, refuse symlinks and special files in the copy, and run the manifest check with --strict. The manifests are still read from the working tree,
   not from git HEAD (audit 1181 I-3, partly open: the top-level web/*.js code is not hashed).
+- Service fee in the deploy (audit 1184 F1): deploy_prod.sh ships the build with the fee OFF (empty appFeeRecipient) unless PROD_FEE_ON=1, and always prints "service fee: OFF" or "service fee: ON, recipient <account>". deploy_lab.sh ships the repo value unchanged.
+  Both scripts also refuse tracked web/ files flagged assume-unchanged or skip-worktree and scan untracked files with --untracked-files=all (audit 1183 L-5); a .DS_Store is not counted as a git-ignored file (1183 I-7).
+- Preflight reads of the pay flow (one-time-address used check, USDC allowance and balance, paymentNonce) go to the two public endpoints of chains.js first and to the wallet's own RPC only when both fail (audit 1184 F5):
+  a forged answer can at worst make the transaction revert on-chain (wasted gas, or relayer gas on payGasless), never move funds; the contract re-checks all four on submission.

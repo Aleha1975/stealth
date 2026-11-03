@@ -27,16 +27,16 @@ ok("other key, other counter -> other mnemonic", mn !== await H.mnemonicFor("0x"
 ok("seed = BIP39 PBKDF2", Buffer.from(await H.mnemonicSeed(mn)).equals(Buffer.from(await mnemonicToSeed(mn))));
 ok("word list hash check passes / fails", (await H.loadWords(async () => ({ text: async () => words.join("\n") + "\n" }))).length === 2048 && await H.loadWords(async () => ({ text: async () => "x" })).then(() => false, () => true));
 
-const NOFEE = { fastBps: 20, maxBps: 30, appFeeRecipient: "" }, rin = H.reqIn({ chain: rh, amount: 5_000_000n, tAddr: T, stealth: STEALTH, dry: true, now: 0, fees: NOFEE }), rout = H.reqOut({ dest: base, amount: 400000n, recipient: A, refundT: T, dry: true, now: 0 });
+const NOFEE = { fastBps: 20, maxBps: 30, appFeeRecipient: "" }, rin = H.reqIn({ chain: rh, amount: 5_000_000n, tAddr: T, stealth: STEALTH, dry: true, now: 0, fees: NOFEE, route: "max" }), rout = H.reqOut({ dest: base, amount: 400000n, recipient: A, refundT: T, dry: true, now: 0 });
 ok("in request", rin.originAsset === rh.oneClick.assetId && rin.destinationAsset === "nep141:zec.omft.near" && rin.recipient === T && rin.refundTo === STEALTH && rin.amount === "5000000" && rin.dry === true && rin.refundType === "ORIGIN_CHAIN" && rin.recipientType === "DESTINATION_CHAIN");
 ok("out request", rout.originAsset === "nep141:zec.omft.near" && rout.destinationAsset === base.oneClick.assetId && rout.recipient === A && rout.refundTo === T);
 const same = buildQuoteRequest({ from: rh, to: { oneClick: { assetId: "x" } }, amount: 1n, recipient: A, refundTo: A, dry: true, now: 0 });
 ok("same field set as the existing builder", Object.keys(same).join() === Object.keys(rin).join());
-{ const PROD = H.reqIn({ chain: rh, amount: 5_000_000n, tAddr: T, stealth: STEALTH, dry: true, now: 0 }), PF = H.reqIn({ chain: rh, amount: 5_000_000n, tAddr: T, stealth: STEALTH, dry: true, now: 0, route: "fast" });
+{ const PROD = H.reqIn({ chain: rh, amount: 5_000_000n, tAddr: T, stealth: STEALTH, dry: true, now: 0, route: "max" }), PF = H.reqIn({ chain: rh, amount: 5_000_000n, tAddr: T, stealth: STEALTH, dry: true, now: 0, route: "fast" });
   ok("production fee: the first leg carries appFees as its last field (Maximum 30, Private fast 20), the field set is the old one plus appFees", Object.keys(PROD).join() === Object.keys(rin).join() + ",appFees" && PROD.appFees[0].fee === 30 && PF.appFees[0].fee === 20 && PROD.appFees[0].recipient === "loop_hole.near" && !("appFees" in rout)); }
 const bad = f => { try { f(); return false; } catch { return true; } };
-ok("bad addresses refused", bad(() => H.reqIn({ chain: rh, amount: 1n, tAddr: A, stealth: STEALTH })) && bad(() => H.reqIn({ chain: rh, amount: 1n, tAddr: T, stealth: T })) && bad(() => H.reqOut({ dest: base, amount: 1n, recipient: A, refundT: A }))
-  && bad(() => H.reqOut({ dest: base, amount: 1n, recipient: T, refundT: T })) && bad(() => H.reqIn({ chain: rh, amount: 0n, tAddr: T, stealth: STEALTH })));
+ok("bad addresses refused", bad(() => H.reqIn({ chain: rh, amount: 1n, tAddr: A, stealth: STEALTH, route: "max" })) && bad(() => H.reqIn({ chain: rh, amount: 1n, tAddr: T, stealth: T, route: "max" })) && bad(() => H.reqOut({ dest: base, amount: 1n, recipient: A, refundT: A }))
+  && bad(() => H.reqOut({ dest: base, amount: 1n, recipient: T, refundT: T })) && bad(() => H.reqIn({ chain: rh, amount: 0n, tAddr: T, stealth: STEALTH, route: "max" })));
 ok("amount math", H.outAmount(500000n) === 480000n && H.outAmount(150000n) === 0n && H.outAmount(ZC.minIn + 20000n) === ZC.minIn && H.outAmount(ZC.minIn + 19999n) === 0n && H.outAmount(500000n, 40000n) === 460000n);
 ok("size check", !H.okSize(100000n) && H.okSize(ZC.minIn + 60000n) && !H.okSize(ZC.minIn + 59999n));
 ok("delay 2..10 min", H.delayMs(() => 0) === 120000 && H.delayMs(() => 0.999999) < 600000 && H.delayMs(() => 0.999999) > 599000);
@@ -331,7 +331,7 @@ for (const [name, tk] of [["no txKnown available", undefined], ["txKnown cannot 
   ok("M4 makeCountPriorHops = number of AuthorizationUsed logs of the stealth address on the token", n === 4 && c.method === "eth_getLogs" && c.params[0].address === rh.token.address && c.params[0].topics[0] === sig && H.AUTH_USED_TOPIC === sig && c.params[0].topics[1] === "0x" + "0".repeat(24) + STEALTH.slice(2)); }
 
 // ---------- M-5 nothing shared between the legs ----------
-{ const r1 = H.reqIn({ chain: rh, amount: 5_000_000n, tAddr: T, stealth: STEALTH, dry: true, now: 0, rand: () => 0.1, fees: { fastBps: 20, maxBps: 30, appFeeRecipient: "" } }), r2 = H.reqOut({ dest: base, amount: 400000n, recipient: A, refundT: "t1" + "2".repeat(33), dry: true, now: 0, rand: () => 0.9 });
+{ const r1 = H.reqIn({ chain: rh, amount: 5_000_000n, tAddr: T, stealth: STEALTH, dry: true, now: 0, rand: () => 0.1, fees: { fastBps: 20, maxBps: 30, appFeeRecipient: "" }, route: "max" }), r2 = H.reqOut({ dest: base, amount: 400000n, recipient: A, refundT: "t1" + "2".repeat(33), dry: true, now: 0, rand: () => 0.9 });
   const sh = H.sharedFields(r1, r2).map(x => x.split("=")[0]), forbidden = /referral|appFee|userId|session|token|affiliate|clientId|memo|correlation/i;
   ok("M5 the two requests share only protocol constants; no referral/appFees/user/session field exists", sh.every(k => H.CONSTANT_FIELDS.has(k)) && ![...Object.keys(r1), ...Object.keys(r2)].some(k => forbidden.test(k)) && r1.refundTo !== r2.refundTo && r1.recipient !== r2.recipient && r1.deadline !== r2.deadline, sh.join());
   const w = makeWorld(), s = H.memStore(); off = 0; const logIn = [], logOut = [];
@@ -976,10 +976,10 @@ const tAddrOf = async (n, a, i = 0) => ZRm.deriveT(await H.mnemonicSeed(await H.
   const ectx = (w, c, s, o = {}) => mkCtx(w, s, { stealth: SE, chain: rh, dest: rh, asset: "ETH", amount: ETHV, eth: ethApi(c), waitReceipt: (h, expect) => CR.waitFinal(c.rpc, h, { expect, sleep: nos, tries: 5, everyMs: 0 }), balance: async () => c.balOf(SE), ...o });
   const rec = async s => (await H.findHop(s, SE)).rec;
   // --- pure: requests, state, scrub
-  const rin = H.reqIn({ chain: rh, amount: ETHV, tAddr: T, stealth: SE, dry: true, now: 0, asset: "ETH" }), rout = H.reqOut({ dest: rh, amount: 400000n, recipient: A, refundT: T, dry: true, now: 0, asset: "ETH" });
+  const rin = H.reqIn({ chain: rh, amount: ETHV, tAddr: T, stealth: SE, dry: true, now: 0, asset: "ETH", route: "max" }), rout = H.reqOut({ dest: rh, amount: 400000n, recipient: A, refundT: T, dry: true, now: 0, asset: "ETH" });
   ok("ETH in-request: origin is hood ETH, destination ZEC, refund to the stealth address; out-request: ZEC to hood ETH", rin.originAsset === "nep141:hood.omft.near" && rin.destinationAsset === ZC.assetId && rin.refundTo === SE && rin.amount === ETHV.toString() && rout.originAsset === ZC.assetId && rout.destinationAsset === "nep141:hood.omft.near");
-  ok("the stablecoin requests are unchanged (no asset = USDG in, USDC out)", H.reqIn({ chain: rh, amount: 5_000_000n, tAddr: T, stealth: SE, dry: true, now: 0 }).originAsset === rh.oneClick.assetId && H.reqOut({ dest: base, amount: 400000n, recipient: A, refundT: T, dry: true, now: 0 }).destinationAsset === base.oneClick.assetId);
-  ok("ETH requests are refused on a chain without the ETH route", (() => { try { H.reqIn({ chain: base, amount: 1n, tAddr: T, stealth: SE, asset: "ETH" }); return false; } catch { return true; } })() && (() => { try { H.reqOut({ dest: base, amount: 1n, recipient: A, refundT: T, asset: "ETH" }); return false; } catch { return true; } })());
+  ok("the stablecoin requests are unchanged (no asset = USDG in, USDC out)", H.reqIn({ chain: rh, amount: 5_000_000n, tAddr: T, stealth: SE, dry: true, now: 0, route: "max" }).originAsset === rh.oneClick.assetId && H.reqOut({ dest: base, amount: 400000n, recipient: A, refundT: T, dry: true, now: 0 }).destinationAsset === base.oneClick.assetId);
+  ok("ETH requests are refused on a chain without the ETH route", (() => { try { H.reqIn({ chain: base, amount: 1n, tAddr: T, stealth: SE, asset: "ETH", route: "max" }); return false; } catch { return true; } })() && (() => { try { H.reqOut({ dest: base, amount: 1n, recipient: A, refundT: T, asset: "ETH" }); return false; } catch { return true; } })());
   ok("newState: asset is stored for ETH only, a stablecoin state keeps exactly its old shape", H.newState({ stealth: SE, chain: rh, dest: rh, recipient: A, amount: 1n, asset: "ETH", now: 1 }).asset === "ETH" && !("asset" in H.newState({ stealth: SE, chain: rh, dest: rh, recipient: A, amount: 1n, now: 1 })) && !("asset" in H.newState({ stealth: SE, chain: rh, dest: rh, recipient: A, amount: 1n, asset: "TOKEN", now: 1 })));
   // --- happy path
   { const { w, c } = mkEth(), s = H.memStore(); off = 0; const st = await H.startHop(ectx(w, c, s)), r = await rec(s);
@@ -1232,12 +1232,12 @@ const tAddrOf = async (n, a, i = 0) => ZRm.deriveT(await H.mnemonicSeed(await H.
     await H.startHop(mkCtx(legacyW, sL, { chain: rh, dest: base, stopAt: "DEPOSIT_IN" })); const lrec = await sL.get(STEALTH + "#0"); lrec.st.chain = "base"; await sL.put(STEALTH + "#0", lrec);      // forge a Base-labelled record under the legacy key
     ok("1182 L-1 findHop on rh ignores a legacy-key record whose st.chain is base; on base it is not read either", (await H.findHop(sL, STEALTH, "rh")) === null && (await H.findHop(sL, STEALTH)) === null && (await H.findHop(sL, STEALTH, "base")) === null);
     off = 0; const rs = await H.startHop(mkCtx(wrap(makeWorld()), sL, { chain: rh, dest: base, stopAt: "DEPOSIT_IN" }));
-    ok("1182 L-1 a Base-labelled legacy-key record does not block rh startHop (unfinished step, no 'resume it first'); the rh hop reuses n=0 only because the record is ignored, key unchanged", rs.n === 0 && !rs.deriv);
+    ok("1182 L-1 a Base-labelled legacy-key record does not block rh startHop (unfinished step, no 'resume it first'); 1183 L-3: the new rh hop takes n=1 and the foreign-labelled record at #0 is NOT overwritten", rs.n === 1 && !rs.deriv && (await sL.get(STEALTH + "#0")).st.chain === "base" && (await sL.get(STEALTH + "#0")).st.step === lrec.st.step && (await sL.get(STEALTH + "#1")).st.chain === "rh");
     const sL2 = H.memStore(); await sL2.put(STEALTH + "#0", { st: { v: 2, n: 0, step: "WAIT_T", chain: "rh" }, db: null }); await sL2.put(STEALTH + "#1", { st: { v: 2, n: 1, step: "WAIT_T", chain: "base" }, db: null });
     ok("1182 L-1 rh findHop skips the Base-labelled top and returns the highest rh record; an old record without st.chain still counts as rh", (await H.findHop(sL2, STEALTH, "rh")).key === STEALTH + "#0" && (await (async () => { await sL2.put(STEALTH + "#2", { st: { v: 2, n: 2, step: "DONE" }, db: null }); return (await H.findHop(sL2, STEALTH)).key; })()) === STEALTH + "#2");
     // a new base hop with a legacy-key record present still gets n >= 1 (localNsAll counts it) and a chain-derived wallet
     mnLog.length = 0; const nb = await H.startHop(bctx(wrap(makeWorld()), sL));
-    ok("1182 L-1 a new base hop next to a legacy-key record is n=1 with deriv base (key 'base:...#1')", nb.n === 1 && nb.deriv === "base" && (await sL.keys()).includes("base:" + STEALTH + "#1")); }
+    ok("1182 L-1 a new base hop next to a legacy-key record is n=1 with deriv base (key 'base:...#1')", nb.n === 2 && nb.deriv === "base" && (await sL.keys()).includes("base:" + STEALTH + "#2")); }
   // lost funds: rh scans exactly as before; base scans the chain-derived wallets ONLY (audit 1182 L-1: no legacy targets)
   { const ZRm = await import("../web/zec-return.js"), tAt = async (n, deriv) => ZRm.deriveT(await H.mnemonicSeed(await H.mnemonicFor(PRIV, words, n, deriv)), ZRm.tPath(0, 0)).addr;
     const asked = []; const gu = map => async addr => { asked.push(addr); return map[addr] || []; }, hu = [{ txid: "11".repeat(32), n: 0, value: 5_000_000n, height: 3_500_100 }];
@@ -1272,5 +1272,63 @@ const tAddrOf = async (n, a, i = 0) => ZRm.deriveT(await H.mnemonicSeed(await H.
   const srcA = fs.readFileSync(path.join(WEB, "app.js"), "utf8");
   ok("1181 M-1 app.js: every findHop / scrubFinished call names the chain; lostSeen is keyed chain|stealth (rh also reads the old bare key)", (srcA.match(/HM\.findHop\(/g) || []).length === (srcA.match(/HM\.findHop\([^)]*(\(\))?[^)]*, C\.key\)/g) || []).length && /kk\(k\) \{ return C\.key \+ "\|" \+ k; \}/.test(srcA) && /C\.key === "rh" \? Number\(o\[k\]\)/.test(srcA) && /HM\.scrubFinished\(ctx\.store, f\.stealth, C\.key\)/.test(srcA));
   ok("1181 M-1 app.js: the return/sweep paths derive the wallet from the record's own deriv", (srcA.match(/HM\.derivOf\(/g) || []).length >= 2 && /st: \{ n: l\.n, \.\.\.\(l\.deriv/.test(srcA) && /deriv: l\.deriv/.test(srcA)); }
+
+// ---------------- audit 1184 F2 / 1183 L-3: localNs, lostRange, lostPlan and startHop are chain-aware like findHop ----------------
+{ const ZRm = await import("../web/zec-return.js"), tAt = async (n, deriv) => ZRm.deriveT(await H.mnemonicSeed(await H.mnemonicFor(PRIV, words, n, deriv)), ZRm.tPath(0, 0)).addr;
+  const base0 = { stealth: STEALTH, priv: PRIV, words, sleep: async () => {}, gapMs: 0 }, foreign = () => ({ st: { v: 2, n: 0, step: "DONE", chain: "base", stealth: STEALTH }, db: null }), own = () => ({ st: { v: 2, n: 0, step: "DONE", chain: "rh", stealth: STEALTH }, db: null });
+  const asked = [], gu = async addr => { asked.push(addr); return []; };
+  { const s = H.memStore(); await s.put(STEALTH + "#0", foreign());
+    ok("1184 F2 localNs on rh does not count a record that names another chain; localNsAll still does (it only raises n)", JSON.stringify(await H.localNs(s, STEALTH, "rh")) === "[]" && JSON.stringify(await H.localNs(s, STEALTH)) === "[]" && JSON.stringify(await H.localNsAll(s, STEALTH, "rh")) === "[0]" && JSON.stringify(await H.localNsAll(s, STEALTH, "base")) === "[0]");
+    asked.length = 0; const r = await H.findLostFunds({ ...base0, chain: rh, store: s, priorHops: 1, getUtxos: gu });
+    ok("1184 F2 rh findLostFunds still scans slot 0 when a foreign-labelled record occupies the key", !r.skipped && asked.includes(await tAt(0, undefined)) && r.maxLocal === -1, JSON.stringify(r.skipped));
+    const before = JSON.stringify(await s.get(STEALTH + "#0")), st = await H.startHop({ ...mkCtx(wrap0(), s, { chain: rh, dest: base, stopAt: "DEPOSIT_IN" }) });
+    ok("1184 F2 / 1183 L-3 startHop on rh never overwrites the foreign-labelled record: the hop takes n=1, the record is byte-identical", st.n === 1 && JSON.stringify(await s.get(STEALTH + "#0")) === before && (await s.keys()).includes(STEALTH + "#1")); }
+  { const s = H.memStore(); await s.put(STEALTH + "#0", own());
+    asked.length = 0; const r = await H.findLostFunds({ ...base0, chain: rh, store: s, priorHops: 1, getUtxos: gu });
+    ok("1184 F2 an rh record (no chain label or chain rh) still covers its slot: skipped 'record', nothing asked", r.skipped === "record" && asked.length === 0);
+    const s2 = H.memStore(); const o2 = own(); delete o2.st.chain; await s2.put(STEALTH + "#0", o2); asked.length = 0; const r2 = await H.findLostFunds({ ...base0, chain: rh, store: s2, priorHops: 1, getUtxos: gu });
+    ok("1184 F2 ...also an old rh record without st.chain", r2.skipped === "record" && asked.length === 0);
+    const s3 = H.memStore(); await s3.put(STEALTH + "#0", { db: null }); asked.length = 0; const r3 = await H.findLostFunds({ ...base0, chain: rh, store: s3, priorHops: 1, getUtxos: gu });
+    ok("1183 I-6 a record without st covers nothing (scanned), and findHop skips it on rh and on base", !r3.skipped && asked.length > 0 && (await H.findHop(s3, STEALTH, "rh")) === null && (await H.findHop(s3, STEALTH)) === null);
+    const s4 = H.memStore(); await s4.put("base:" + STEALTH + "#0", { db: null }); await s4.put("base:" + STEALTH + "#1", { st: { v: 2, n: 1, step: "DONE", chain: "base" }, db: null }); await s4.put("base:" + STEALTH + "#2", { db: null });
+    ok("1183 I-6 on base findHop skips st-less records (highest with st wins) and localNs counts only records with st", (await H.findHop(s4, STEALTH, "base")).key === "base:" + STEALTH + "#1" && JSON.stringify(await H.localNs(s4, STEALTH, "base")) === "[1]"); }
+  { const real = H.memStore(); await real.put(STEALTH + "#0", foreign()); const hidden = { get: real.get, put: real.put, add: real.add, keys: async () => (await real.keys()).filter(k => k !== STEALTH + "#0") };      // a record this scan cannot see (another tab wrote it meanwhile)
+    const st = await H.startHop(mkCtx(wrap0(), hidden, { chain: rh, dest: base, stopAt: "DEPOSIT_IN" }));
+    ok("1183 L-3 a key taken meanwhile: store.add answers EXISTS and the hop moves to n+1 instead of overwriting", st.n === 1 && (await real.get(STEALTH + "#0")).st.chain === "base" && (await real.get(STEALTH + "#1")).st.n === 1); }
+  { const puts = []; const s = H.memStore(), noAdd = { get: s.get, put: async (k, v) => { puts.push(k); return s.put(k, v); }, keys: s.keys };
+    const st = await H.startHop(mkCtx(wrap0(), noAdd, { chain: rh, dest: base, stopAt: "DEPOSIT_IN" })); ok("1183 L-3 a store without add still works (put)", st.n === 0 && puts[0] === STEALTH + "#0"); }
+  { const always = { get: async () => undefined, put: async () => {}, add: async () => { throw Object.assign(new Error("record exists"), { code: "EXISTS" }); }, keys: async () => [] };
+    const e = await H.startHop(mkCtx(wrap0(), always, { chain: rh, dest: base, stopAt: "DEPOSIT_IN" })).then(() => null, e => e); ok("1183 L-3 a store that answers EXISTS for every key ends in an error, not a loop", e && e.code === "EXISTS"); }
+  function wrap0() { off = 0; return makeWorld(); }
+}
+
+// ---------------- audit 1183 L-1 / L-2 / I-3: the fee and the preview are snapshotted at Confirm ----------------
+{ const PWm = await import("../web/private-withdraw.js"), CH = await import("../web/chains.js"), hopOf = (o = {}) => ({ ...H.newState({ stealth: STEALTH, chain: rh, dest: base, recipient: A, amount: 5_000_000n, ...o }) });
+  const run = async (st, extra = {}) => { off = 0; const w = makeWorld(), s = H.memStore(); await s.put(H.recKey(STEALTH, 0), { st, db: null }); const r = await H.runHop(mkCtx(w, s, { stopAt: "DEPOSIT_IN", ...extra })); return { w, r, s }; };
+  { off = 0; const w = makeWorld(), s = H.memStore(), st = await H.startHop(mkCtx(w, s, { stopAt: "DEPOSIT_IN", previewZec: "10000000" })), rec = (await s.get(STEALTH + "#0")).st;
+    ok("1183 L-1 startHop snapshots the Maximum fee (30 bps, the live config) in the record, and the first real quote carries exactly that", rec.feeBps === 30 && w.quotes[0].appFees.length === 1 && w.quotes[0].appFees[0].fee === 30 && w.quotes[0].appFees[0].recipient === CH.privateFee.appFeeRecipient);
+    ok("1183 L-2 startHop stores the preview's first-leg ZEC (string) in the record", rec.previewZec === "10000000" && typeof rec.previewZec === "string"); }
+  { const keep = { ...CH.privateFee }; try {
+      let x = await run(hopOf({ feeBps: 20 })); ok("1183 L-1 a snapshot of 20 bps is requested at 20 although the live config says 30 (never a fee the user did not see)", x.w.quotes[0].appFees[0].fee === 20 && x.r.step !== "FAILED");
+      x = await run(hopOf({ feeBps: null })); ok("1183 L-1 a snapshot of null (fee off at Confirm) requests NO fee although the live config has one", !("appFees" in x.w.quotes[0]) && x.r.inQuote && !("feeBps" in x.r.inQuote));
+      const old = hopOf(); delete old.feeBps; x = await run(old); ok("1183 L-1 an older record without feeBps resumes with NO fee", !("appFees" in x.w.quotes[0]));
+      CH.privateFee.maxBps = 90; x = await run(hopOf({ feeBps: 30 })); ok("1183 L-1 the live rate changed after Confirm (30 -> 90): the quote still asks 30", x.w.quotes[0].appFees[0].fee === 30);
+      CH.privateFee.appFeeRecipient = ""; x = await run(hopOf({ feeBps: 30 })); ok("1183 L-1 the fee switched off after Confirm: no fee is asked (and none is charged)", !("appFees" in x.w.quotes[0]));
+      Object.assign(CH.privateFee, keep); CH.privateFee.maxBps = 30;
+      const sn = h => h.feeBps; CH.privateFee.appFeeRecipient = ""; ok("1183 L-1 newState with the fee off at that moment records feeBps null", sn(H.newState({ stealth: STEALTH, chain: rh, dest: base, recipient: A, amount: 1n })) === null);
+      Object.assign(CH.privateFee, keep); ok("1183 L-1 newState with the fee on records 30", sn(H.newState({ stealth: STEALTH, chain: rh, dest: base, recipient: A, amount: 1n })) === 30);
+      x = await run(hopOf({ feeBps: 5000 })); ok("1183 L-1 a corrupt snapshot (5000 bps) is refused by appFeesOf: no quote is requested", x.w.quotes.length === 0 && x.r.step === "QUOTE_IN");
+    } finally { Object.assign(CH.privateFee, keep); } }
+  { const q = PWm.buildQuoteRequest({ from: rh, to: base, amount: 5_000_000n, recipient: A, refundTo: STEALTH, dry: true, route: "fast" });
+    ok("1183 L-1 Private fast takes its rate from the module constant only (20 bps), whatever a hop record says; reqIn needs the route (1183 I-3)", q.appFees[0].fee === 20 && H.reqIn({ chain: rh, amount: 5_000_000n, tAddr: T, stealth: STEALTH, dry: true, route: "fast" }).appFees[0].fee === 20 && (() => { try { H.reqIn({ chain: rh, amount: 5_000_000n, tAddr: T, stealth: STEALTH, dry: true }); return false; } catch (e) { return /route/.test(e.message); } })()); }
+  { let x = await run(hopOf({ previewZec: "11000000" }));      // the fake world delivers 10,000,000 zatoshi for 5,000,000 in: 9.1% under this preview
+    ok("1183 L-2 a first-leg quote more than QUOTE_TOL under the preview halts with nothing signed or relayed", x.r.step === "QUOTE_IN" && x.r.halted === true && /less Zcash than the preview/.test(x.r.err) && x.w.relays === 0 && !x.r.auth && !x.r.inQuote, x.r.step + " " + x.r.err);
+    x = await run(hopOf({ previewZec: "10100000" })); ok("1183 L-2 a quote 1% under the preview is within QUOTE_TOL and goes on", x.r.step === "DEPOSIT_IN" && !x.r.err, x.r.step + " " + x.r.err);
+    x = await run(hopOf({ previewZec: "10204081" })); ok("1183 L-2 the boundary: exactly 2% under passes, one zatoshi more does not", x.r.step === "DEPOSIT_IN");
+    x = await run(hopOf({ previewZec: "10204083" })); ok("1183 L-2 ...(the 2% line itself)", x.r.step === "QUOTE_IN" && /less Zcash/.test(x.r.err));
+    const old = hopOf(); ok("1183 L-2 a record without previewZec skips the check", !("previewZec" in old) && (await run(old)).r.step === "DEPOSIT_IN");
+    ok("1183 L-2 newState keeps only a positive digits-only previewZec", !("previewZec" in hopOf({ previewZec: "abc" })) && !("previewZec" in hopOf({ previewZec: "0" })) && hopOf({ previewZec: 5n }).previewZec === "5"); }
+  { const ap = fs.readFileSync(path.join(WEB, "app.js"), "utf8"); ok("1183 L-2 app.js keeps the preview's ZEC in pv and passes it to the hop", /pv = \{ key, loss, zec \}/.test(ap) && /previewZec: pv\.zec\.toString\(\)/.test(ap)); }
+}
 Date.now = realNow;
 console.log(fails ? fails + " FAILED" : "all passed"); process.exit(fails ? 1 : 0);

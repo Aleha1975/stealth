@@ -72,6 +72,7 @@ KNOWN_LAG_S = int(os.environ.get("STEALTH_KNOWN_LAG_S", "120"))
 BLOCK_MS = int(CC.get("block_ms", 2000))
 MAX_META = 128
 CHUNK0 = int(os.environ.get("STEALTH_CHUNK", "50000"))
+RF_SLICE = CHUNK0               # аудит 1183 L-4: длинная сверка от reconcile_from идёт ломтями по одному окну индексации (то же число блоков, что основной цикл уже читает за раз); прогресс сохраняется после каждого ломтя
 POLL = int(os.environ.get("STEALTH_POLL", "20" if MODE == "safe" else "2"))
 CACHE_TTL = float(os.environ.get("STEALTH_BAL_TTL", "15"))
 MAX_ADDRS = 100
@@ -476,29 +477,30 @@ def _bump_epoch(c, commit=True):
 REC_DONE, REC_NO_SECOND, REC_NOT_REACHED = "done", "second-read-missing", "window-not-reached"      # аудит 1181 L-1: три исхода reconcile; границы доверия открывает только REC_DONE
 
 
-def reconcile(c, sf, head_done, ep=None, insert_only=False, frm=None):
+def reconcile(c, sf, head_done, ep=None, insert_only=False, frm=None, to=None):
     """Реорг-страж (rh): перечитать (safe-REORG_WIN .. head_done], убрать строки, которых в цепи больше нет (или они в другом блоке), добавить новые.
     Аудит 1158 F-4: удаляем ТОЛЬКО то, чего нет в двух чтениях (закреплённая точка + другая, чья голова покрывает окно; нет другой -- та же ещё раз); короткий/отстающий ответ строки не стирает.
     insert_only (base, режим safe: реорга ниже safe нет) -- только добавляем пропущенное.
     frm (аудит 1179 F4: после --rewind) -- окно начинается не позже этого блока, чтобы строки брошенной ветки выше новой головы тоже сверялись. Аудит 1181 L-1: возвращает REC_DONE (проход полный), REC_NO_SECOND (были строки на удаление, но второго чтения не получили -- ничего не удалено) или REC_NOT_REACHED (окно начинается выше head_done); только REC_DONE считается чистым."""
     a = max(START, (sf or head_done - 10000) - REORG_WIN)
-    if frm is not None: a = max(START, min(a, frm))
-    if a > head_done: return REC_NOT_REACHED
+    if frm is not None: a = max(START, min(a, frm)) if to is None else max(START, frm)
+    hi = head_done if to is None else min(to, head_done)      # аудит 1183 L-4: to -- верхняя граница ломтя (нижний ломоть длинной сверки); без to окно идёт до головы, как раньше
+    if a > hi: return REC_NOT_REACHED
     # верхняя граница обязательна: иначе строки новее head_done (их уже записал основной цикл за время getLogs) считались бы "пропавшими" и удалялись
     ag = {}
     want = {}
     for u in (agreed(head_done, ag)[1][:NEED] if NEED >= 2 else [ep]):        # аудит 1167 M-2: объединение чтений двух согласившихся точек, а не одной закреплённой
-        for r in fetch_range(a, head_done, u, ag): want.setdefault((r["tx"], r["log_index"], r["block"]), r)
+        for r in fetch_range(a, hi, u, ag): want.setdefault((r["tx"], r["log_index"], r["block"]), r)
     with _lock:
-        have = {(t, li, bl): i for i, t, li, bl in c.execute("SELECT id,tx,log_index,block FROM ann WHERE block>=? AND block<=?", (a, head_done))}
+        have = {(t, li, bl): i for i, t, li, bl in c.execute("SELECT id,tx,log_index,block FROM ann WHERE block>=? AND block<=?", (a, hi))}
     gone = {k: i for k, i in have.items() if k not in want}; no_second = False
     if gone and not insert_only:
         second = [u for u in RPCS if u != ep]
         for u in second + [ep]:
             if u is None: continue
             try:
-                if u != ep and latest_head(u) < head_done: continue          # у этой точки голова не покрывает окно -- её «нет» ничего не значит
-                want2 = {(r["tx"], r["log_index"], r["block"]) for r in fetch_range(a, head_done, u, ag)}
+                if u != ep and latest_head(u) < hi: continue          # у этой точки голова не покрывает окно -- её «нет» ничего не значит
+                want2 = {(r["tx"], r["log_index"], r["block"]) for r in fetch_range(a, hi, u, ag)}
             except Exception: continue
             gone = {k: i for k, i in gone.items() if k not in want2}; break
         else: gone = {}; no_second = True                                    # второго чтения не получили -> не удаляем, и проход НЕ полный (1181 L-1)
@@ -614,7 +616,7 @@ def index_loop():
     hh = _meta_get(c, "head_hash")                          # хэш блока head_done (нет -- первый запуск или БД старше этого поля: первый шаг его принимает без сверки)
     chunk = CHUNK0
     last_rec = 0; deep = False; pin = None                  # pin -- точка, согласившаяся с последним хэшем: логи, квитанции, реконсиляция идут через неё
-    ok_t = alert_t = time.time(); rf_alert_t = 0.0
+    ok_t = alert_t = time.time(); rf_alert_t = rf_prog_t = 0.0
     while True:
         try:
             head, sf = heads_now()                          # кандидат; двигаемся к нему только по согласованным хэшам блоков (agreed)
@@ -680,7 +682,15 @@ def index_loop():
                     if time.time() - rf_alert_t >= WAIT_ALERT_S:
                         rf_alert_t = time.time(); print("ALERT bad reconcile_from %r replaced by %d; /known stays closed until a reconcile from there completes" % (str(rf)[:40], rfi), flush=True)
                 if pin is None and head_done >= START: pin = agreed(head_done, ag)[1][0]
-                res = reconcile(c, sf, head_done, pin, insert_only=False, frm=rfi)
+                res = REC_DONE
+                while rfi <= head_done:                     # аудит 1183 L-4: ломти; reconcile_from сдвигается только после завершённого ломтя (сбой в ломте k -- следующий проход начнёт с k), граница закрыта до последнего
+                    last_slice = rfi + RF_SLICE > head_done
+                    res = reconcile(c, sf, head_done, pin, insert_only=False, frm=rfi, to=None if last_slice else rfi + RF_SLICE - 1)      # последний ломоть -- прежнее окно до головы
+                    if res != REC_DONE or last_slice: break
+                    rfi += RF_SLICE
+                    with _lock: c.execute("INSERT OR REPLACE INTO meta(k,v) VALUES('reconcile_from',?)", (str(rfi),)); c.commit()
+                    if time.time() - rf_prog_t >= WAIT_ALERT_S:
+                        rf_prog_t = time.time(); print("reconcile progress: blocks up to %d checked, %d to go; /known stays closed until it completes" % (rfi - 1, head_done - rfi + 1), flush=True)
                 if res == REC_DONE:
                     with _lock: c.execute("DELETE FROM meta WHERE k='reconcile_from'"); c.commit()
                     last_rec = time.time()

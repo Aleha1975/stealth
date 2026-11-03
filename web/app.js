@@ -638,11 +638,11 @@ async function privateWithdraw(to, value, hit, asset = "TOKEN") {
     qt.appendChild(c1); qt.appendChild(c2); qt.appendChild(c3); box.appendChild(qt); feeNote(box, "max"); if (asset === "ETH") box.appendChild(el("div", "note", "Not included: the network fee of the first transfer, about " + fmtEth(ethFeeFor.get(wd.stealth.toLowerCase()) || 0n) + " " + NAT + ", paid by the stealth address from its own ETH.")); box.appendChild(el("div", "note", "Takes about " + HM.etaLabel(mode) + " · keep this tab open (it can be resumed if you close it)"));
     box.appendChild(el("div", "note", "Pressing Confirm private transfer accepts this total cost (about " + pct + "% Fee, " + dfmt(out) + " " + D.symbol + " out). The payouts are checked against it; the real rate can differ a little, and if a payout quote ends up clearly worse you are asked to review it in this tab."));
     if (loss > HM.MAX_LOSS) box.appendChild(el("div", "note", "Zcash fees are mostly fixed, so this route is expensive on small amounts. " + (asset === "ETH" ? "It is usually cheaper for larger amounts; Private fast is usually cheaper below that." : "It is usually cheaper from a few tens of " + TOK.symbol + "; Private fast is usually cheaper below that.")));
-    box.hidden = false; pv = { key, loss }; $("btn-wd").textContent = "Confirm private transfer";
+    box.hidden = false; pv = { key, loss, zec }; $("btn-wd").textContent = "Confirm private transfer";
     say("pay-hint", "Check the quote, then confirm.", "warn"); return;
   }
   $("btn-wd").disabled = true; $("withdraw").hidden = true;
-  try { await runHop(wd, hit, { recipient: to, amount: value, dest, mode, approvedLoss: pv.loss, asset }); } finally { $("btn-wd").disabled = false; pvReset(); }
+  try { await runHop(wd, hit, { recipient: to, amount: value, dest, mode, approvedLoss: pv.loss, previewZec: pv.zec.toString(), asset }); } finally { $("btn-wd").disabled = false; pvReset(); }
 }
 
 // ---- route "private, fast": NEAR Intents only (web/private-withdraw.js runFast). The record (no recipient in it) is kept in localStorage while a part is open, so a closed tab can still follow the swaps.

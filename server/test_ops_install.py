@@ -61,12 +61,12 @@ with tempfile.TemporaryDirectory() as d:
 for f in ("deploy_prod.sh", "deploy_lab.sh"):
     t = rd(os.path.join(OPS, f))
     check(f + " refuses a symlink or special file in the copy (find -type l / not f not d) and a symlinked web/vendor/webzjs before copying", r'find "$SRC" \( -type l -o ! -type f ! -type d \)' in t and '[ -L "$ROOT/web/vendor/webzjs" ]' in t and t.index('[ -L "$ROOT/web/vendor/webzjs" ]') < t.index('rsync -a --exclude .DS_Store "$ROOT/web/"') < t.index('find "$SRC" \\('))
-    check(f + " refuses a dirty web/ (git status --porcelain: staged and untracked too) unless FORCE_DIRTY=1; sumcheck uses --strict", 'status --porcelain -- web' in t and 'FORCE_DIRTY' in t and t.count("-c --quiet --strict") == 2 and 'diff --quiet ||' not in t)
+    check(f + " refuses a dirty web/ (git status --porcelain: staged and untracked too) unless FORCE_DIRTY=1; sumcheck uses --strict", 'status --porcelain --untracked-files=all -- web' in t and 'FORCE_DIRTY' in t and t.count("-c --quiet --strict") == 2 and 'diff --quiet ||' not in t)
 # behaviour on a scratch repo: copy of the script into <root>/ops, a git repo with a clean web/
 def scratch(extra=None):
     d = tempfile.mkdtemp(); os.makedirs(os.path.join(d, "ops")); os.makedirs(os.path.join(d, "web", "vendor", "webzjs"))
     for f in ("deploy_prod.sh", "deploy_lab.sh"): shutil.copy(os.path.join(OPS, f), os.path.join(d, "ops", f))
-    open(os.path.join(d, "web", "a.js"), "w").write("x\n"); open(os.path.join(d, "web", "vendor", "webzjs", "w.js"), "w").write("w\n"); open(os.path.join(d, "web", "vendor", "n.js"), "w").write("n\n")
+    open(os.path.join(d, "web", "a.js"), "w").write("x\n"); open(os.path.join(d, "web", "chains.js"), "w").write('export const privateFee = { fastBps: 20, maxBps: 30, appFeeRecipient: "loop_hole.near" };\n'); open(os.path.join(d, "web", "vendor", "webzjs", "w.js"), "w").write("w\n"); open(os.path.join(d, "web", "vendor", "n.js"), "w").write("n\n")
     sh = lambda p, *fs: subprocess.run(["shasum", "-a", "256", *fs], cwd=p, capture_output=True, text=True).stdout
     open(os.path.join(d, "web", "vendor", "webzjs", "SHA256SUMS"), "w").write(sh(os.path.join(d, "web", "vendor", "webzjs"), "w.js"))
     open(os.path.join(d, "web", "vendor", "SHA256SUMS"), "w").write(sh(os.path.join(d, "web", "vendor"), "n.js"))
@@ -104,6 +104,22 @@ if shutil.which("rsync") and shutil.which("git"):
         d8, g8 = scratch(ign); open(os.path.join(d8, "web", "vendor", "webzjs", "package.json"), "w").write("{}\n"); r, shipped = deploy(d8, script=script)
         check("1182 L-4 %s: an ignored file of the expected wasm set (web/vendor/webzjs/package.json) passes THIS gate (the manifest gate judges it)" % script, "git-ignored" not in r.stdout, r.stdout)
     d9, g9 = scratch(ign); r, shipped = deploy(d9); check("1182 L-4 a clean tree with an ignore file still ships", r.returncode == 0 and shipped, r.stdout + r.stderr)
+    # audit 1184 F1: prod ships the fee OFF unless PROD_FEE_ON=1, the state is always printed; lab keeps the repo value
+    d10, g10 = scratch(); r, shipped = deploy(d10); check("1184 F1 deploy_prod.sh default: fee OFF, and the line says so", r.returncode == 0 and "service fee: OFF" in r.stdout and "service fee: ON" not in r.stdout, r.stdout + r.stderr)
+    r, shipped = deploy(d10, env={"PROD_FEE_ON": "1"}); check("1184 F1 PROD_FEE_ON=1: fee ON, the line names the recipient", r.returncode == 0 and "service fee: ON, recipient loop_hole.near" in r.stdout, r.stdout + r.stderr)
+    r, shipped = deploy(d10, env={"PROD_FEE_OFF": "1"}); check("1184 F1 the old PROD_FEE_OFF flag is gone (no effect, still OFF by default)", r.returncode == 0 and "service fee: OFF" in r.stdout and "PROD_FEE_OFF" not in rd(os.path.join(OPS, "deploy_prod.sh")))
+    d11, g11 = scratch(lambda d: open(os.path.join(d, "web", "chains.js"), "w").write("export const x = 1;\n")); r, shipped = deploy(d11); check("1184 F1 no appFeeRecipient line in chains.js -> refused, nothing shipped", r.returncode != 0 and not shipped, r.stdout)
+    d12, g12 = scratch(); r, shipped = deploy(d12, script="deploy_lab.sh"); check("1184 F1 deploy_lab.sh prints no fee line and is unchanged", r.returncode == 0 and "service fee" not in r.stdout)
+    # audit 1183 L-5: hidden local edits and untracked files in a collapsed dir
+    for script in ("deploy_prod.sh", "deploy_lab.sh"):
+        for flag in ("--assume-unchanged", "--skip-worktree"):
+            d13, g13 = scratch(); subprocess.run(["git", "update-index", flag, "web/a.js"], cwd=d13); open(os.path.join(d13, "web", "a.js"), "a").write("hidden\n")
+            r, shipped = deploy(d13, script=script); check("1183 L-5 %s: a file flagged %s -> refused, nothing shipped" % (script, flag), r.returncode != 0 and not shipped and "assume-unchanged or skip-worktree" in r.stdout and "web/a.js" in r.stdout, r.stdout + r.stderr)
+            r, shipped = deploy(d13, script=script, env={"FORCE_DIRTY": "1"}); check("1183 L-5 ...FORCE_DIRTY does not override it", r.returncode != 0 and not shipped)
+        d14, g14 = scratch(); os.makedirs(os.path.join(d14, "web", "sub")); open(os.path.join(d14, "web", "sub", "n.js"), "w").write("n"); r, shipped = deploy(d14, script=script)
+        check("1183 L-5 %s: an untracked file in a new directory is named by its own path" % script, r.returncode != 0 and "web/sub/n.js" in r.stdout, r.stdout)
+        d15, g15 = scratch(ign); open(os.path.join(d15, ".gitignore"), "a").write(".DS_Store\n"); open(os.path.join(d15, "web", ".DS_Store"), "w").write("x"); os.makedirs(os.path.join(d15, "web", "vendor", "z")); open(os.path.join(d15, "web", "vendor", "z", ".DS_Store"), "w").write("x")
+        r, shipped = deploy(d15, script=script); check("1183 I-7 %s: an ignored .DS_Store (top level or nested) does not trip the ignored-file gate" % script, "git-ignored" not in r.stdout and r.returncode == 0, r.stdout + r.stderr)
     d5, g5 = scratch(); r, shipped = deploy(d5, script="deploy_lab.sh"); check("1181 deploy_lab.sh passes the same gates when clean", r.returncode == 0 and shipped, r.stdout + r.stderr)
     d6, g6 = scratch(lambda d: os.symlink("a.js", os.path.join(d, "web", "ln.js"))); r, shipped = deploy(d6, script="deploy_lab.sh"); check("1181 L-6 deploy_lab.sh refuses a symlink too", r.returncode != 0 and not shipped)
 

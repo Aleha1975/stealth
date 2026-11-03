@@ -4,11 +4,14 @@
 set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"; HOST="${1:-root@46.224.154.72}"; DEST="${2:-/var/www/stealth-zec/}"
 # audit 1181 I-3: a dirty web/ (modified, STAGED or untracked files: `git diff --quiet` sees neither of the last two) is refused; FORCE_DIRTY=1 deploys it anyway under a "-<time>" version
-DIRTY="$(git -C "$ROOT" status --porcelain -- web)"
+DIRTY="$(git -C "$ROOT" status --porcelain --untracked-files=all -- web)"
 if [ -n "$DIRTY" ] && [ "${FORCE_DIRTY:-0}" != 1 ]; then echo "web/ has uncommitted changes (commit them, or FORCE_DIRTY=1 to deploy them anyway): refusing to deploy"; echo "$DIRTY" | head -10; exit 1; fi
 # audit 1182 L-4: `git status --porcelain` does not list git-ignored files, but rsync ships them: any ignored path under web/ other than the wasm build files that .gitignore names (web/vendor/webzjs/*, covered by the SHA256SUMS manifest below) is refused, FORCE_DIRTY or not
-IGN="$(git -C "$ROOT" status --porcelain --ignored -- web | grep '^!! ' | grep -v -E '^!! web/vendor/webzjs/(package\.json|snippets/|webzjs_wallet\.d\.ts|webzjs_wallet\.js|webzjs_wallet_bg\.wasm|webzjs_wallet_bg\.wasm\.d\.ts)$' || true)"
+IGN="$(git -C "$ROOT" status --porcelain --ignored --untracked-files=all -- web | grep '^!! ' | grep -v -E -e '^!! (.*/)?\.DS_Store$' -e '^!! web/vendor/webzjs/(package\.json|snippets/|webzjs_wallet\.d\.ts|webzjs_wallet\.js|webzjs_wallet_bg\.wasm|webzjs_wallet_bg\.wasm\.d\.ts)$' || true)"
 if [ -n "$IGN" ]; then echo "web/ holds git-ignored files that would be shipped (remove them): refusing to deploy"; echo "$IGN" | head -10; exit 1; fi
+# audit 1183 L-5: a tracked file flagged assume-unchanged (lowercase) or skip-worktree (S) hides its local edits from `git status`, but rsync ships them: refused, FORCE_DIRTY or not
+HID="$(git -C "$ROOT" ls-files -v -- web | grep -E '^[a-zS] ' || true)"
+if [ -n "$HID" ]; then echo "web/ holds files flagged assume-unchanged or skip-worktree (git update-index --no-assume-unchanged / --no-skip-worktree): refusing to deploy"; echo "$HID" | head -10; exit 1; fi
 V="$(git -C "$ROOT" rev-parse --short HEAD)$([ -z "$DIRTY" ] || echo "-$(date +%s)")"
 TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
 # the wallet wasm receives the seed phrase: ship only files that match the committed hashes (web/vendor/webzjs/SHA256SUMS)
@@ -26,13 +29,14 @@ unlisted() { # extra find args: files of the current dir (webzjs/ pruned) that S
 # same gate for the other vendored code that handles keys (noble.js, bip39 wordlist, zec-hash.js; audit 1179 F7): manifest in web/vendor/SHA256SUMS, paths relative to web/vendor
 ( cd "$SRC/vendor" && sumcheck && [ -z "$(unlisted)" ] ) || { echo "web/vendor does not match SHA256SUMS (or holds an unlisted file): refusing to deploy"; exit 1; }
 rsync -a --exclude vendor/webzjs --exclude .DS_Store --exclude blueprint --exclude selftest.html --exclude selftest.js --exclude erc5564_vectors.json "$SRC/" "$OUT/"
-# PROD_FEE_OFF=1: ship this build with the service fee switched OFF (empty appFeeRecipient) while the lab (and the repo) keep it ON, until the fee has passed its audit and a live transfer.
-if [ "${PROD_FEE_OFF:-0}" = 1 ]; then
-  grep -q 'appFeeRecipient: "[a-z0-9._-]*" }' "$OUT/chains.js" || { echo "PROD_FEE_OFF: cannot find the appFeeRecipient line in chains.js"; exit 1; }
+# audit 1184 F1: the production build ships with the service fee OFF (empty appFeeRecipient) unless PROD_FEE_ON=1; the lab (and the repo) keep the value of the repo. The resulting state is always printed.
+grep -q 'appFeeRecipient: "[a-z0-9._-]*" }' "$OUT/chains.js" || { echo "cannot find the appFeeRecipient line in chains.js"; exit 1; }
+if [ "${PROD_FEE_ON:-0}" != 1 ]; then
   perl -pi -e 's/appFeeRecipient: "[a-z0-9._-]*" \}/appFeeRecipient: "" }/' "$OUT/chains.js"
-  grep -q 'appFeeRecipient: "" }' "$OUT/chains.js" || { echo "PROD_FEE_OFF: the fee is still on after the edit"; exit 1; }
-  echo "PROD_FEE_OFF: service fee switched off in this build"
+  grep -q 'appFeeRecipient: "" }' "$OUT/chains.js" || { echo "service fee: the fee is still on after the edit"; exit 1; }
 fi
+FEE="$(sed -n 's/.*appFeeRecipient: "\([a-z0-9._-]*\)" }.*/\1/p' "$OUT/chains.js" | head -1)"
+if [ -n "$FEE" ]; then echo "service fee: ON, recipient $FEE"; else echo "service fee: OFF"; fi
 # html: src="./x.js" href="./x.css"; js: from "./x.js", import("./x.js")
 find "$OUT" -maxdepth 1 \( -name '*.html' -o -name '*.js' \) -print0 | xargs -0 perl -pi -e 's#((?:src|href)="\./[\w.-]+\.(?:js|css))"#$1?v='"$V"'"#g; s#((?:from |import\()\s*"\./[\w.-]+\.js)"#$1?v='"$V"'"#g'
 rsync -az "$OUT/" "$HOST:$DEST"

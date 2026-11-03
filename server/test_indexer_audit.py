@@ -431,6 +431,24 @@ m.fetch_range = real_fr; m.reconcile = real_rec
 t0 = time.time()
 while time.time() - t0 < 10 and meta_get(m, "reconcile_from") is not None: time.sleep(0.05)
 check("1181 L-1 the second read is back: the pass completes, the fork row is gone, the marker is consumed and the boundary opens", meta_get(m, "reconcile_from") is None and count(m) == 0 and meta_get(m, "known_block") is not None)
+# ---- audit 1183 L-4: a long reconcile_from runs in slices and keeps its progress; a failure in slice 3 resumes from slice 3
+m = load(); Chain(m, {"A": {"head": 450, "logs": [], "safe": 440}, "B": {"head": 450, "logs": [], "safe": 440}}); m.START = 1; m.MODE = "latest"; m.RF_SLICE = 100; m.WAIT_ALERT_S = 3600
+meta_set(m, head=450, head_hash=H(450), reconcile_from="1"); put(m, 130, 0, S(1), V3, 5_000_000, 5_000_000)      # a fork row in slice 2, gone from the chain
+real_rec = m.reconcile; calls = []; broken = [True]
+def rec_sliced(c, sf, hd, ep=None, insert_only=False, frm=None, to=None):
+    if frm is not None: calls.append((frm, to))
+    if frm == 201 and broken[0]: return m.REC_NO_SECOND                      # slice 3 cannot complete
+    return real_rec(c, sf, hd, ep, insert_only=insert_only, frm=frm, to=to)
+m.reconcile = rec_sliced; buf = io.StringIO()
+with contextlib.redirect_stdout(buf): run_loop(m, secs=1.2)
+out = buf.getvalue()
+check("1183 L-4 slices 1 and 2 completed in order, slice 3 failed: reconcile_from is 201 (progress kept), no boundary is written, the fork row of slice 2 is already gone", calls[:3] == [(1, 100), (101, 200), (201, 300)] and meta_get(m, "reconcile_from") == "201" and all(meta_get(m, k) is None for k in ("known_block", "safe_block", "final_block")) and count(m) == 0)
+check("1183 L-4 the next passes retry from slice 3, never from the start", all(c[0] >= 201 for c in calls[2:]) and len(calls) >= 3)
+check("1183 L-4 progress is logged at most once per WAIT_ALERT_S without ALERT; the failure is an ALERT naming slice 3's start", out.count("reconcile progress: blocks up to 100 checked") == 1 and out.count("reconcile progress") == 1 and "ALERT reconcile progress" not in out and out.count("ALERT reconcile from 201 incomplete") == 1)
+broken[0] = False; calls.clear(); t0 = time.time()
+while time.time() - t0 < 10 and not (meta_get(m, "reconcile_from") is None and meta_get(m, "known_block") is not None): time.sleep(0.05)      # the loop thread of run_loop is still running
+check("1183 L-4 once slice 3 can complete the rest runs from 201 (the last slice has no upper bound: the usual window to the head), the marker is consumed and the boundary opens", calls[:3] == [(201, 300), (301, 400), (401, None)] and meta_get(m, "reconcile_from") is None and meta_get(m, "known_block") is not None)
+check("1183 L-4 reconcile(to=) reads only its slice: a row outside [frm, to] is not touched", (lambda mm: (put(mm, 50, 0, S(2), V3, 5_000_000, 5_000_000), put(mm, 150, 0, S(3), V3, 5_000_000, 5_000_000), Chain(mm, {"A": {"head": 300, "logs": []}, "B": {"head": 300, "logs": []}}), setattr(mm, "START", 1), mm.reconcile(mm.db(), 290, 300, "A", frm=100, to=199), count(mm))[-1] == 1)(load()))
 # L-2 loop: out-of-range / corrupt values are replaced, the replacement reconciles, nothing is silently dropped
 for bad in ("junk", "99999999", "-4", "0"):
     m = load(); Chain(m, {"A": {"head": 600, "logs": [], "safe": 590}}); m.START = 5
