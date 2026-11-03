@@ -197,4 +197,16 @@ if shutil.which("nginx") is None or True:
     check("1181 M-2 install_rh.sh: -t fails -> the outdated RH snippet is restored, the zones file the run created is removed, the unrelated file untouched, exit != 0", r.returncode != 0 and same(e, rhs) and not os.path.exists(rhz) and same(e, e["other"]) and r.stdout.count("[undo]") == 2, r.stdout + r.stderr)
 sums = rd(os.path.join(HERE, "..", "web", "vendor", "SHA256SUMS")).split("\n")
 check("vendor manifest paths are relative to web/vendor and exist", all(os.path.exists(os.path.join(HERE, "..", "web", "vendor", l.split(None, 1)[1].strip())) for l in sums if l.strip()) and any("noble.js" in l for l in sums) and any("bip39-english.txt" in l for l in sums))
+
+# the ignored-file allowlist must accept files INSIDE web/vendor/webzjs/snippets/ (git lists them one by one with --untracked-files=all; a deploy was refused once because only the directory was allowed)
+import re as _re
+for _name in ("deploy_prod.sh", "deploy_lab.sh"):
+    _src = open(os.path.join(HERE, "..", "ops", _name)).read()
+    _m = _re.search(r"-e '(\^!! web/vendor/webzjs/\([^']*\)\$)'", _src)
+    _ok = bool(_m)
+    if _ok:
+        _rx = _re.compile(_m.group(1))
+        _ok = bool(_rx.match("!! web/vendor/webzjs/snippets/wasm_thread-8ee53d0673203880/src/wasm32/js/module_worker_start.js")) and bool(_rx.match("!! web/vendor/webzjs/webzjs_wallet_bg.wasm")) and not _rx.match("!! web/node_modules/x.js") and not _rx.match("!! web/vendor/webzjs/evil.js")
+    check("1184 deploy gate allowlist (%s): files inside snippets/ and the wasm build files pass, anything else is refused" % _name, _ok)
+
 print("%d passed, %d failed" % (ok, fail)); sys.exit(1 if fail else 0)

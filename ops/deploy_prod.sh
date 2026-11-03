@@ -7,7 +7,7 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"; HOST="${1:-root@46.224.
 DIRTY="$(git -C "$ROOT" status --porcelain --untracked-files=all -- web)"
 if [ -n "$DIRTY" ] && [ "${FORCE_DIRTY:-0}" != 1 ]; then echo "web/ has uncommitted changes (commit them, or FORCE_DIRTY=1 to deploy them anyway): refusing to deploy"; echo "$DIRTY" | head -10; exit 1; fi
 # audit 1182 L-4: `git status --porcelain` does not list git-ignored files, but rsync ships them: any ignored path under web/ other than the wasm build files that .gitignore names (web/vendor/webzjs/*, covered by the SHA256SUMS manifest below) is refused, FORCE_DIRTY or not
-IGN="$(git -C "$ROOT" status --porcelain --ignored --untracked-files=all -- web | grep '^!! ' | grep -v -E -e '^!! (.*/)?\.DS_Store$' -e '^!! web/vendor/webzjs/(package\.json|snippets/|webzjs_wallet\.d\.ts|webzjs_wallet\.js|webzjs_wallet_bg\.wasm|webzjs_wallet_bg\.wasm\.d\.ts)$' || true)"
+IGN="$(git -C "$ROOT" status --porcelain --ignored --untracked-files=all -- web | grep '^!! ' | grep -v -E -e '^!! (.*/)?\.DS_Store$' -e '^!! web/vendor/webzjs/(package\.json|snippets/.*|webzjs_wallet\.d\.ts|webzjs_wallet\.js|webzjs_wallet_bg\.wasm|webzjs_wallet_bg\.wasm\.d\.ts)$' || true)"
 if [ -n "$IGN" ]; then echo "web/ holds git-ignored files that would be shipped (remove them): refusing to deploy"; echo "$IGN" | head -10; exit 1; fi
 # audit 1183 L-5: a tracked file flagged assume-unchanged (lowercase) or skip-worktree (S) hides its local edits from `git status`, but rsync ships them: refused, FORCE_DIRTY or not
 HID="$(git -C "$ROOT" ls-files -v -- web | grep -E '^[a-zS] ' || true)"
