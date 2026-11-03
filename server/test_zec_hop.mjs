@@ -614,8 +614,8 @@ const tAddrOf = async (n, a, i = 0) => ZRm.deriveT(await H.mnemonicSeed(await H.
   ok("1129 F-4 ... but never after a shield of ours went out (shieldDone): then it keeps waiting for the shielded balance and Halts honestly", st5.step === "SHIELD" && /taking too long/.test(st5.err) && /Continue|Return/.test(st5.err), st5.step + " " + st5.err); }
 { // E: F-2 honest text, F-3 ETA, I-2 dust, I-3 preview
   const src = fs.readFileSync(path.join(WEB, "app.js"), "utf8");
-  ok("1129 F-2 the max route note no longer promises random times for both payouts", /a few minutes apart/.test(src) && !/paid out in 2 parts at random times/.test(src));
-  ok("31.10 the max route note says the second payout does NOT wait for the first swap, and no longer says 'one after the other' or 'as soon as the first has been sent'", /not when the first swap has finished/.test(src) && !/one after the other/.test(src.slice(src.indexOf("const ROUTE_NOTE"), src.indexOf("function setRoutes"))) && !/as soon as the first has been sent/.test(src));
+  ok("1129 F-2 the max route note makes no promise of random times", !/random times/.test(src.slice(src.indexOf("const ROUTE_NOTE = {"), src.indexOf("function setRoutes"))));
+  ok("max route note: the owner's minimal text, keep this tab open, no timing claims", /max: "Keep this tab open\."/.test(src) && !/one after the other|as soon as the first has been sent|a few minutes apart/.test(src.slice(src.indexOf("const ROUTE_NOTE = {"), src.indexOf("function setRoutes"))));
   ok("31.10 the max route label stays within the owner's limit of 40 min", H.etaRangeMin("max")[1] <= 40);
   ok("1129 I-2 dust below the fee floor does not count as ZEC held; a real amount does", !H.holdsZec([{ transparent: 3000n, orchard: 5000n }]) && H.holdsZec([{ transparent: 0n, orchard: H.HOLD_DUST }]) && H.HOLD_DUST === 10_000n);
   const zec = 600_000n; ok("1129 I-3 preview out-amount reserves one fee per payout part (max = 2 parts)", H.previewOut(zec) === H.outAmount(zec - H.SHIELD_FEE) - 20000n && H.previewOut(zec, "fast") === H.outAmount(zec - H.SHIELD_FEE) - 20000n && H.previewOut(zec, "private") < H.previewOut(zec)); }

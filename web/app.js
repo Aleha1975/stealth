@@ -522,11 +522,11 @@ function openWithdraw(i, asset = "TOKEN") {
 }
 // route select: std / fast / max. `HM` (the hop module) is only known once it has loaded; without it "max" is not offered.
 const ROUTE_NOTE = {
-  std: "Gasless, straight from the stealth address to the recipient. Anyone can see that link on-chain.",
-  fast: "No Zcash: NEAR Intents swaps the money in 1–2 parts at random times. The link is broken by the swap, not by cryptography: someone who sees both sides and matches amounts and times can still connect them.",
-  max: "Through the Zcash shielded pool and back, paid out in 2 parts a few minutes apart: the second is sent about one block after the first (as soon as its change has confirmed, or at its planned time if that is later), not when the first swap has finished, so the gap between them is short and not random. Both swaps then finish on their own. Keep this tab open; it can be resumed if you close it.",
+  std: "Gasless, straight to the recipient.",
+  fast: "Matching amounts and times can still link both sides.",
+  max: "Keep this tab open.",
 };
-const ROUTE_NOTE_ETH_STD = "Straight from the stealth address to the recipient, as a normal transaction: the address pays its own network fee from this ETH (no relayer). Anyone can see that link on-chain.";
+const ROUTE_NOTE_ETH_STD = "A normal transaction; the address pays its own network fee from this ETH.";
 function setRoutes(HM) {
   const sel = $("wd-route"), prev = sel.value, priv = !$("wd-priv-wrap").hidden; sel.textContent = "";
   const add = (v, t) => { const o = el("option", null, t); o.value = v; sel.appendChild(o); };

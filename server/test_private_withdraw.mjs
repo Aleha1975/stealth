@@ -479,7 +479,7 @@ try {
   ok("UI: payout chain list = this chain only", (await R.eval("[...document.querySelectorAll('#wd-dest option')].map(o => o.value).join()")) === "rh");
   const pickRoute = v => R.eval(`(() => { const s = document.getElementById('wd-route'); s.value = ${JSON.stringify(v)}; s.dispatchEvent(new Event('change', { bubbles: true })); return true; })()`);
   ok("UI: standard shows its note and the Send button, fast opens the panel with the honest line and the Preview button", /Send without gas/.test(await R.text("btn-wd")) && (await R.eval("document.getElementById('wd-priv-opts').hidden")));
-  await pickRoute("fast"); ok("UI: fast: options panel opens, button says Preview, the note says the link is broken by the swap, not by cryptography", !(await R.eval("document.getElementById('wd-priv-opts').hidden")) && /Preview/.test(await R.text("btn-wd")) && /not by cryptography/.test(await R.text("wd-route-note")));
+  await pickRoute("fast"); ok("UI: fast: options panel opens, button says Preview, the note says matching amounts and times can still link both sides (no overclaim)", !(await R.eval("document.getElementById('wd-priv-opts').hidden")) && /Preview/.test(await R.text("btn-wd")) && /can still link both sides/.test(await R.text("wd-route-note")));
   const q0 = mock.quotes.length;
   await R.type("wd-to", recvA); await R.click("#btn-wd");
   await until(async () => await hintBad(), "guard: key wallet", 8000, 100);
