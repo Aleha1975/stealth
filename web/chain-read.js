@@ -9,6 +9,14 @@ export const topic = sig => "0x" + hexOf(keccak_256(enc(sig)));
 export const TRANSFER_TOPIC = topic("Transfer(address,address,uint256)");
 export const PAID_TOPIC = topic("Paid(address,address,uint256)");           // StealthPay: Paid(stealthAddress indexed, token indexed, amount)
 export const AUTH_USED_TOPIC = topic("AuthorizationUsed(address,bytes32)");   // EIP-3009: AuthorizationUsed(authorizer indexed, nonce indexed)
+/** One row per stealth address (a verified one wins), but b0 = the EARLIEST block over every announcement of that address seen in the scan, verified or not, never the kept row's block alone:
+ *  the hop counter scan starts there, so an undercount is impossible. Block 0 / unreadable = unknown (b0 null -> the scan falls back to the chain's pay-contract start). */
+export const foldRow = (rows, byStealth, rec) => {
+  const sk = rec.stealth.toLowerCase(), at = byStealth.get(sk), b = Number(rec.block), blk = Number.isInteger(b) && b > 0 ? b : null;
+  if (at === undefined) { rec.b0 = blk; byStealth.set(sk, rows.length); rows.push(rec); return; }
+  const p = rows[at], seen = [p.b0, blk].filter(x => x != null), b0 = seen.length ? Math.min(...seen) : null;
+  if (rec.v && !p.v) rows[at] = rec; rows[at].b0 = b0;
+};
 export const FETCH_TIMEOUT_MS = 15000;
 export const timeoutSignal = (ms = FETCH_TIMEOUT_MS) => {     // 1101 L-5: no chain/API fetch may hang forever. 1109 I-3: old browsers (no AbortSignal.timeout) get an AbortController + timer instead of no timeout at all
   if (typeof AbortSignal !== "undefined" && AbortSignal.timeout) return AbortSignal.timeout(ms);

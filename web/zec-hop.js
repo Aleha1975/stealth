@@ -266,14 +266,16 @@ export const makeAuthUsed = (chain, fetchFn = fetch) => async (authorizer, nonce
   const r = await rpcCall(fetchFn, chain.rpcs || chain.rpc, "eth_call", [{ to: chain.token.address, data: AUTH_STATE_SELECTOR + pad32(authorizer) + pad32(nonce) }, "latest"]);
   if (!/^0x[0-9a-fA-F]{1,64}$/.test(r)) throw new Error("unexpected authorizationState answer"); return BigInt(r) !== 0n;
 };
-/** ctx.countPriorHops(stealth) -> number of AuthorizationUsed events of this stealth address on the token (every private withdraw spends exactly one). Counts every EIP-3009 use of the address, so it
+/** ctx.countPriorHops(stealth, b0?) -> number of AuthorizationUsed events of this stealth address on the token (every private withdraw spends exactly one). Counts every EIP-3009 use of the address, so it
  *  can only over-count (e.g. after a public withdraw), which skips a counter value but never reuses one. Same answer on every device. */
 // RPCs cap eth_getLogs at 10M blocks per call; a stealth address cannot authorize anything before the pay contract existed, so scan from there in windows.
 export const LOG_SPAN = 2_000_000, PAY_FROM_BLOCK = { rh: 100_761_230, base: 31_700_000 };   // base: the Announcer era start (our indexer's), so the scan is ~11 windows instead of ~27 from block 0
-export const makeCountPriorHops = (chain, fetchFn = fetch) => async stealth => {
+// fromBlock = the address's earliest announcement block (b0), when known: it cannot authorize anything before its owner learned of it. The 100-block margin covers an indexer block that lags the true one. Unknown -> the old start.
+// (A recent b0 makes one short window: an address < ~28 h old on Base, 2 s blocks, stays under publicnode's 50k-block getLogs cap.)
+export const makeCountPriorHops = (chain, fetchFn = fetch) => async (stealth, fromBlock) => {
   const tip = Number(await rpcCall(fetchFn, chain.rpcs || chain.rpc, "eth_blockNumber", [])); if (!Number.isFinite(tip)) throw new Error("unexpected block number");
   let n = 0;
-  for (let a = PAY_FROM_BLOCK[chain.key] || 0; a <= tip; a += LOG_SPAN) {
+  for (let a = Math.min(tip, Number.isInteger(fromBlock) && fromBlock >= 0 ? Math.max(0, fromBlock - 100) : PAY_FROM_BLOCK[chain.key] || 0); a <= tip; a += LOG_SPAN) {
     const r = await rpcCall(fetchFn, chain.rpcs || chain.rpc, "eth_getLogs", [{ address: chain.token.address, fromBlock: "0x" + a.toString(16), toBlock: "0x" + Math.min(tip, a + LOG_SPAN - 1).toString(16), topics: [AUTH_USED_TOPIC, "0x" + pad32(stealth)] }]);
     if (!Array.isArray(r)) throw new Error("unexpected logs answer"); n += r.length;
   }
@@ -321,7 +323,7 @@ export async function startHop(ctx) {
       throw Object.assign(new Error("Finish or return the earlier transfer first: it still holds ZEC. Press Return money on its card."), { code: "EARLIER_HOP" }); }
   }
   const local = old ? old.rec.st.n + 1 : 0;                                   // the IndexedDB counter is only a cache (M-4): the chain's count wins when it is higher; if it cannot be read we do not start
-  let chainN = 0; if (ctx.countPriorHops) { try { chainN = await ctx.countPriorHops(ctx.stealth); } catch (e) { throw new Error("could not read this address's earlier hops from the chain (" + e.message + "); nothing was started"); }
+  let chainN = 0; if (ctx.countPriorHops) { try { chainN = await ctx.countPriorHops(ctx.stealth, ctx.b0); } catch (e) { throw new Error("could not read this address's earlier hops from the chain (" + e.message + "); nothing was started"); }
     if (!Number.isInteger(chainN) || chainN < 0) throw new Error("bad hop count from the chain"); }
   const n = Math.max(local, chainN), st = newState({ ...ctx, n });
   if (Number.isFinite(ctx.approvedLoss) && ctx.approvedLoss >= 0 && ctx.approvedLoss < 1) st.approvedLoss = ctx.approvedLoss;      // 1138 L-3: the preview's total cost the user accepted by pressing Confirm

@@ -5,7 +5,7 @@ import { CHAINS, pickChain, chainOfMeta, addChainParams, appFeesOf, assetOf, ass
 import * as ETH from "./eth-send.js";
 import * as PW from "./private-withdraw.js";
 import { hopCard, hopView, statusLine } from "./hop-card.js";
-import { getBalances, fetchBatch, authorizationUsed, waitFinal, hasTransfer, hasPaid, hasAuthUsed, recentLogs, logSpanSince, timeoutSignal, TRANSFER_TOPIC, PAID_TOPIC, AUTH_USED_TOPIC, ETH_TOKEN } from "./chain-read.js";
+import { foldRow, getBalances, fetchBatch, authorizationUsed, waitFinal, hasTransfer, hasPaid, hasAuthUsed, recentLogs, logSpanSince, timeoutSignal, TRANSFER_TOPIC, PAID_TOPIC, AUTH_USED_TOPIC, ETH_TOKEN } from "./chain-read.js";
 
 const C = pickChain(), TOK = C.token, SYM = TOK.symbol, NAT = C.native.symbol;
 const USDC = TOK.address, STEALTHPAY = C.stealthPay, CHAIN_HEX = C.chainHex, API = C.api || "/stealth-api";
@@ -185,8 +185,8 @@ async function scan() {
       const hit = checkAnnouncement(k, eph, md.viewTag);          // view-tag filter first, full check only on a tag match
       if (!hit || hit.stealth.toLowerCase() !== stealth.toLowerCase()) continue;
       // 1159 M-1: v = the indexer saw our StealthPay announce it and parsed the receipt (history page field 8 / API "verified"); anything else (an old page, a forged Announcer call) stays unverified. One row per stealth address: a verified one wins
-      const rec = { stealth: hit.stealth, tx, block: Number(block) || 0, token: md.token, amount: md.amount, payer: isAddr(payer) ? payer : null, eph, legacy, v: v === 1 || v === true, acct: A }, sk = hit.stealth.toLowerCase(), at = byStealth.get(sk);
-      if (at === undefined) { byStealth.set(sk, mine.length); mine.push(rec); } else if (rec.v && !mine[at].v) mine[at] = rec;
+      const rec = { stealth: hit.stealth, tx, block: Number(block) || 0, token: md.token, amount: md.amount, payer: isAddr(payer) ? payer : null, eph, legacy, v: v === 1 || v === true, acct: A };
+      foldRow(mine, byStealth, rec);      // b0 = earliest block of any announcement of this address (history pages, tail, unverified too)
       return;
     }
   };
@@ -277,7 +277,7 @@ async function checkLost() {
       const k = f.stealth.toLowerCase(); if (f.legacy || !isEmpty(f) || (hops.get(k) || {}).running || lost.has(k) || lostNone.has(k) || lostSeen.fresh(k)) continue;
       const hit = hitOf(f); if (!hit || hit.stealth.toLowerCase() !== k) continue;
       const ctx = { store, stealth: f.stealth, priv: hit.stealthPriv, words: await HM.loadWords(), getUtxos: HM.makeGetUtxos(), sleep };
-      let cnt = null; try { cnt = await HM.makeCountPriorHops(C, chainRpc)(f.stealth); } catch {}
+      let cnt = null; try { cnt = await HM.makeCountPriorHops(C, chainRpc)(f.stealth, f.b0); } catch {}
       if (cnt === 0) { lostSeen.mark(k); continue; }       // no authorization was ever spent from this address: no hop can exist
       if (cnt != null) ctx.priorHops = cnt;
       done++; const res = await HM.findLostFunds(ctx);
@@ -330,7 +330,7 @@ const blockTimeSec = async n => { const b = await rpcOne("eth_getBlockByNumber",
 // shielded ZEC needs a wallet sync (minutes), so it only runs on this button
 async function lostShielded(k, f, hit, line) {
   if (!self.crossOriginIsolated) throw new Error("This page cannot run the Zcash wallet here (it is not cross-origin isolated).");
-  const HM = await hopMod(), base = await hopCtx(HM, f, hit, {}); let cnt = null; try { cnt = await base.countPriorHops(f.stealth); } catch {}
+  const HM = await hopMod(), base = await hopCtx(HM, f, hit, {}); let cnt = null; try { cnt = await base.countPriorHops(f.stealth, f.b0); } catch {}
   if (cnt === 0) { line.textContent = "No private transfer was ever started from this address."; return; }
   const bt = await blockTimeSec(HM.firstBlock(found, f.stealth) || f.block), prev = lost.get(k) || {}, rg = HM.lostRange(cnt, await HM.localNs(base.store, f.stealth), (prev.top != null ? prev : lostNone.get(k) || {}).top); let best = null;      // 1133 I-4: the note cannot predate the FIRST payment to this address
   for (const n of rg.ns) {      // 1133 L-4: every wallet is looked at (bounded by LOST_MAX_N) and the richest wins; transparent ZEC already found counts for its own wallet
@@ -551,7 +551,7 @@ const chainRpc = async (u, init, allowWallet = false) => { try { const r = await
 const confirmRebuiltQuote = q => { const dec = Number.isInteger(q.destDecimals) ? q.destDecimals : TOK.decimals, sym = q.destSymbol || SYM, f = v => dec > 6 ? fmtUnits(v, dec, 6) : (Number(v) / 10 ** dec).toFixed(2); return confirm("Found on the transfer wallet: " + zecText(q.zecFound) + " ZEC.\nThis payout sends " + zecText(q.amount) + " ZEC" + (q.zatsLeft > q.amount ? " (of " + zecText(q.zatsLeft) + " ZEC still to send)" : "") + " and pays out about " + f(q.amountOut) + " " + sym + " (≈ " + (Number(q.amountOut) / 10 ** dec / (Number(q.amount) / 1e8)).toFixed(dec > 6 ? 6 : 2) + " " + sym + " per ZEC) to " + q.recipient + ".\nThe network fee and swap fee are inside that figure. Pay out at this quote?"); };
 const confirmHopLoss = q => { const dec = Number.isInteger(q.destDecimals) ? q.destDecimals : TOK.decimals, sym = q.destSymbol || SYM, f = v => dec > 6 ? fmtUnits(v, dec, 6) : (Number(v) / 10 ** dec).toFixed(2), total = Number(q.amountOut) * Number(q.zatsLeft) / Number(q.amount);      // 1138 L-2: the PAYOUT token, not the connected chain's
   return confirm("This quote is worse than the " + (q.cap * 100).toFixed(1) + "% limit: the whole transfer would lose about " + (q.loss * 100).toFixed(1) + "%" + (q.approved != null ? " (you approved about " + (q.approved * 100).toFixed(1) + "% on the preview)" : "") + ".\nStill to send: " + zecText(q.zatsLeft) + " ZEC. This payout: about " + f(q.amountOut) + " " + sym + " to " + q.recipient + "; about " + f(BigInt(Math.floor(total))) + " " + sym + " in total if later payouts get this rate (an estimate).\nThe fees on a small transfer are mostly fixed. Pay out at this quote? Cancel keeps the ZEC shielded."); };
-const hopCtx = async (HM, f, hit, o) => ({ eth: ethApi(f, hit.stealthPriv), getUtxos: HM.makeGetUtxos(), authUsed: HM.makeAuthUsed(C, chainRpc), countPriorHops: HM.makeCountPriorHops(C, chainRpc), txKnown: HM.makeTxKnown(), store: HM.idbStore(), stealth: f.stealth, priv: hit.stealthPriv, chain: C, api: API, words: await HM.loadWords(), loadZjs: HM.sharedZjs, waitReceipt, randomNonce: randomBytes32,
+const hopCtx = async (HM, f, hit, o) => ({ eth: ethApi(f, hit.stealthPriv), getUtxos: HM.makeGetUtxos(), authUsed: HM.makeAuthUsed(C, chainRpc), countPriorHops: HM.makeCountPriorHops(C, chainRpc), txKnown: HM.makeTxKnown(), store: HM.idbStore(), stealth: f.stealth, b0: f.b0, priv: hit.stealthPriv, chain: C, api: API, words: await HM.loadWords(), loadZjs: HM.sharedZjs, waitReceipt, randomNonce: randomBytes32,
   confirmQuote: q => confirmRebuiltQuote(q), confirmLoss: q => confirmHopLoss(q), balance: async () => (await getBalances(rpcBatch, USDC, [f.stealth])).get(f.stealth.toLowerCase()).usdc, onProgress: (s, m) => hopProgress(f, s, m), ...o });
 // the chain's public RPC, plain: the node's own error is kept (chainRpc/rpcOne turn it into "did not answer"), e.rpc = true when the node ANSWERED with an error (a refused transaction), unset on a network failure. Reads and sends of a stealth key's ETH transactions; never the wallet's provider.
 const ethRpc = async (method, params) => {
