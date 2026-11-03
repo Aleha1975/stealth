@@ -611,7 +611,7 @@ def index_loop():
     hh = _meta_get(c, "head_hash")                          # хэш блока head_done (нет -- первый запуск или БД старше этого поля: первый шаг его принимает без сверки)
     chunk = CHUNK0
     last_rec = 0; deep = False; pin = None                  # pin -- точка, согласившаяся с последним хэшем: логи, квитанции, реконсиляция идут через неё
-    ok_t = alert_t = time.time()
+    ok_t = alert_t = time.time(); rf_alert_t = 0.0
     while True:
         try:
             head, sf = heads_now()                          # кандидат; двигаемся к нему только по согласованным хэшам блоков (agreed)
@@ -668,16 +668,26 @@ def index_loop():
                 c.execute("INSERT OR REPLACE INTO meta(k,v) VALUES('ts',?)", (str(int(time.time())),))
                 c.execute("INSERT OR REPLACE INTO meta(k,v) VALUES('chain_head',?)", (str(head),)); c.commit()
             rf = _meta_get(c, "reconcile_from")             # аудит 1179 F1/F4: после --rewind границы стёрты, строки брошенной ветки сверяются ДО того, как границы появятся снова
+            clean = True                                    # аудит 1180 L-3: границы пишутся только если reconcile_from нет или сверка до него дошла до конца
             if rf is not None:
-                if pin is None and head_done >= START: pin = agreed(head_done, ag)[1][0]
-                if reconcile(c, sf, head_done, pin, insert_only=False, frm=int(rf)):
+                try: rfi = int(rf)
+                except ValueError: rfi = None
+                if rfi is None:                             # битое значение не должно вешать цикл навсегда: ключ убираем, /known остаётся закрытым до следующего чистого прохода
                     with _lock: c.execute("DELETE FROM meta WHERE k='reconcile_from'"); c.commit()
-                    last_rec = time.time()
+                    clean = False
+                    if time.time() - rf_alert_t >= WAIT_ALERT_S:
+                        rf_alert_t = time.time(); print("ALERT corrupt reconcile_from %r dropped; /known stays closed until the next clean pass" % str(rf)[:40], flush=True)
+                else:
+                    if pin is None and head_done >= START: pin = agreed(head_done, ag)[1][0]
+                    if reconcile(c, sf, head_done, pin, insert_only=False, frm=rfi):
+                        with _lock: c.execute("DELETE FROM meta WHERE k='reconcile_from'"); c.commit()
+                        last_rec = time.time()
+                    else: clean = False
             # safe_block -- до него /known верит строкам; final_block -- после него строку реорг уже не тронет (флаг final, страницы). Без safe (rh, узел не отдал) прежние значения остаются.
             safe_b = head_done if (MODE == "safe" or not KNOWN_SAFE) else (min(sf, head_done) if sf is not None else None)
             fin = head_done if MODE == "safe" else (max(0, safe_b - PAGES_MARGIN) if safe_b is not None else None)       # одна формула и для меты, и для страниц (аудит 1163 I-4)
             known_b = safe_b if (MODE == "safe" or not KNOWN_SAFE) else max(-1, head_done - -(-KNOWN_LAG_S * 1000 // BLOCK_MS))
-            _set_meta(c, safe_block=safe_b, final_block=fin, known_block=known_b)
+            if clean: _set_meta(c, safe_block=safe_b, final_block=fin, known_block=known_b)
             if pin is None and head_done >= START: pin = agreed(head_done, ag)[1][0]
             if time.time() - last_rec >= RECONCILE_EVERY:
                 reconcile(c, sf, head_done, pin, insert_only=(MODE == "safe" and not deep)); last_rec = time.time(); deep = False
@@ -935,7 +945,10 @@ def rewind(n):
     new = max(lo, int(r[0]) - n)
     c.execute("INSERT OR REPLACE INTO meta(k,v) VALUES('head',?)", (str(new),)); c.execute("DELETE FROM meta WHERE k='head_hash'"); c.execute("DELETE FROM bh WHERE block>?", (new,))     # хэша блока new у нас нет: первый шаг его примет без сверки
     c.execute("DELETE FROM meta WHERE k IN ('known_block','safe_block','final_block')")                                                  # аудит 1179 F1: граница доверия закрыта (/known -- никого), пока полный проход заново её не посчитает
-    c.execute("INSERT OR REPLACE INTO meta(k,v) VALUES('reconcile_from',?)", (str(new + 1),))                                            # аудит 1179 F4: первая реконсиляция покрывает от новой головы; расходуется один раз
+    old_rf = c.execute("SELECT v FROM meta WHERE k='reconcile_from'").fetchone()
+    try: keep = min(int(old_rf[0]), new + 1) if old_rf else new + 1                                                                      # аудит 1180 L-3: второй --rewind не теряет диапазон первого (берётся меньшее); битое старое значение заменяется новым
+    except ValueError: keep = new + 1
+    c.execute("INSERT OR REPLACE INTO meta(k,v) VALUES('reconcile_from',?)", (str(keep),))                                               # аудит 1179 F4: первая реконсиляция покрывает от новой головы; расходуется один раз
     _bump_epoch(c, False); c.commit()                                                                                                    # аудит 1165 I-5: клиент, считающий по epoch, перечитает; новые id у перечитанных строк он иначе не заметит
     print("rewind: head %s -> %d (rows above stay; the service re-reads from %d and only inserts what is missing)" % (r[0], new, new + 1), flush=True)
 

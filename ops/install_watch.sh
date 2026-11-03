@@ -19,7 +19,7 @@ TS="$(date -u +%Y%m%d-%H%M%S)"; BK=/var/backups/stealth-watch/$TS
 say() { printf '%s %s\n' "$([ $APPLY = 1 ] && echo '[do] ' || echo '[dry]')" "$*"; }
 ok()  { printf '[ok]  %s\n' "$*"; }
 die() { printf '[FAIL] %s\n' "$*" >&2; exit 1; }
-run() { say "$*"; [ $APPLY = 1 ] && "$@" || true; }
+run() { say "$*"; if [ $APPLY = 1 ]; then "$@"; fi; }      # audit 1180 L-2: a failing command under --apply stops the script (set -e)
 soft() { if [ $APPLY = 1 ]; then die "$*"; else echo "[warn] (dry run continues) $*"; fi; }
 need() { command -v "$1" >/dev/null || soft "missing command: $1"; }
 guard_unit() { local b; for b in $LIVE_UNITS; do [ "$1" = "$b" ] && die "refusing to touch live unit $b"; done; case " $UNITS $ENABLE " in *" $1 "*) ;; *) die "unit $1 is not one of: $UNITS $ENABLE";; esac; }

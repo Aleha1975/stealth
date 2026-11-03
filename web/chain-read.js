@@ -10,11 +10,12 @@ export const TRANSFER_TOPIC = topic("Transfer(address,address,uint256)");
 export const PAID_TOPIC = topic("Paid(address,address,uint256)");           // StealthPay: Paid(stealthAddress indexed, token indexed, amount)
 export const AUTH_USED_TOPIC = topic("AuthorizationUsed(address,bytes32)");   // EIP-3009: AuthorizationUsed(authorizer indexed, nonce indexed)
 /** One row per stealth address (a verified one wins), but b0 = the EARLIEST block over every announcement of that address seen in the scan, verified or not, never the kept row's block alone:
- *  the hop counter scan starts there, so an undercount is impossible. Block 0 / unreadable = unknown (b0 null -> the scan falls back to the chain's pay-contract start). */
+ *  the hop counter scan starts there, so an undercount is impossible. Block 0 / unreadable = unknown (b0 null -> the scan falls back to the chain's pay-contract start); unknown is ABSORBING (audit 1180 M-1):
+ *  once any row of the address has an unknown block b0 stays null, a later known block never replaces it. */
 export const foldRow = (rows, byStealth, rec) => {
   const sk = rec.stealth.toLowerCase(), at = byStealth.get(sk), b = Number(rec.block), blk = Number.isInteger(b) && b > 0 ? b : null;
   if (at === undefined) { rec.b0 = blk; byStealth.set(sk, rows.length); rows.push(rec); return; }
-  const p = rows[at], seen = [p.b0, blk].filter(x => x != null), b0 = seen.length ? Math.min(...seen) : null;
+  const p = rows[at], b0 = p.b0 == null || blk == null ? null : Math.min(p.b0, blk);
   if (rec.v && !p.v) rows[at] = rec; rows[at].b0 = b0;
 };
 export const FETCH_TIMEOUT_MS = 15000;

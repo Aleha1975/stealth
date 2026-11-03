@@ -360,6 +360,29 @@ check("1179 F4 rows are still indexed from the new head (head moved on)", int(me
 m = load(); Chain(m, {"A": {"head": 600, "logs": [], "safe": 500}}); m.START = 1; meta_set(m, head=700)
 m.rewind(200); m.rewind(100)
 check("1179 F4 a second rewind before the loop runs keeps the marker at the lowest block", meta_get(m, "reconcile_from") == "401")
+meta_set(m, head=900); m.rewind(100)
+check("1180 L-3 a rewind to a HIGHER point keeps the lower pending reconcile_from (min)", meta_get(m, "reconcile_from") == "401")
+c = m.db(); c.execute("INSERT OR REPLACE INTO meta(k,v) VALUES('reconcile_from','junk')"); c.commit(); c.close(); meta_set(m, head=900); m.rewind(100)
+check("1180 L-3 rewind over a corrupt old reconcile_from replaces it with the new one", meta_get(m, "reconcile_from") == "801")
+# (a) a reconcile that returns False (window start above head_done) must not reopen /known while reconcile_from is pending
+m = load(); Chain(m, {"A": {"head": 600, "logs": [], "safe": 590}}); m.START = 1
+meta_set(m, head=100, head_hash=H(100)); c = m.db(); c.execute("INSERT OR REPLACE INTO meta(k,v) VALUES('reconcile_from','5000')"); c.commit(); c.close()
+m.reconcile = lambda *a, **k: False
+run_loop(m, secs=1.0)
+check("1180 L-3a reconcile returned False: reconcile_from stays and no known/safe/final boundary is written", meta_get(m, "reconcile_from") == "5000" and all(meta_get(m, k) is None for k in ("known_block", "safe_block", "final_block")))
+# (c) a corrupt reconcile_from does not stall the loop: ALERT once, key dropped, /known closed on that pass, opened by the next clean one
+import io, contextlib
+m = load(); Chain(m, {"A": {"head": 600, "logs": [], "safe": 590}}); m.START = 1
+meta_set(m, head=100, head_hash=H(100)); c = m.db(); c.execute("INSERT OR REPLACE INTO meta(k,v) VALUES('reconcile_from','not-a-number')"); c.commit(); c.close()
+seen = []; _real_set = m._set_meta
+def spy(*a, **k): seen.append(meta_get(m, "reconcile_from")); return _real_set(*a, **k)
+m._set_meta = spy
+buf = io.StringIO()
+with contextlib.redirect_stdout(buf):
+    run_loop(m, until=lambda: meta_get(m, "known_block") is not None, limit=15)
+out = buf.getvalue()
+check("1180 L-3c a corrupt reconcile_from is dropped, the loop goes on (no stall) and later opens the boundary", meta_get(m, "reconcile_from") is None and meta_get(m, "known_block") is not None)
+check("1180 L-3c exactly one ALERT for the corrupt value, and the boundary was never written while it was still there", out.count("ALERT corrupt reconcile_from") == 1 and all(x is None for x in seen))
 
 # ---- F-3 / F-4: receipts, paid, known gate, retraction signal
 m = load()

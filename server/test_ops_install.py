@@ -36,7 +36,26 @@ check("install_watch.sh dry run exits 0", subprocess.run(["bash", os.path.join(O
 for f in ("deploy_prod.sh", "deploy_lab.sh"):
     t = rd(os.path.join(OPS, f))
     check(f + " checksum gate is if/then/else, no A && B || C", "if command -v sha256sum >/dev/null; then" in t and not re.search(r"sha256sum >/dev/null && sha256sum", t))
-    check(f + " also checks web/vendor/SHA256SUMS", '"$ROOT/web/vendor" && sumcheck' in t)
+    check(f + " also checks web/vendor/SHA256SUMS", '"$SRC/vendor" && sumcheck' in t)
+# audit 1180 L-2: a failing command under --apply must stop the script
+for f in ("install_watch.sh", "install_rh.sh", "install_base.sh"):
+    t = rd(os.path.join(OPS, f)); line = [l for l in t.split("\n") if l.startswith("run()")][0]
+    check(f + " run() uses if/then (a failing command stops under set -e), no A && B || true", 'if [ $APPLY = 1 ]; then "$@"; fi;' in line and "|| true" not in line and "set -e" in t)
+# audit 1180 L-4: copy first, check the copy, ship the copy; unlisted vendor files refuse the deploy
+for f in ("deploy_prod.sh", "deploy_lab.sh"):
+    t = rd(os.path.join(OPS, f))
+    check(f + " copies web/ before the check and checks and ships the copy", t.index('rsync -a --exclude .DS_Store "$ROOT/web/" "$SRC/"') < t.index('cd "$SRC/vendor/webzjs"') < t.index('cd "$SRC/vendor" &&') and '"$SRC/" "$OUT/"' in t and '"$SRC/vendor/webzjs/"' in t and '"$ROOT/web/' not in t.split('"$SRC/"', 1)[1])
+    check(f + " refuses unlisted files in web/vendor and web/vendor/webzjs", t.count("unlisted") >= 3 and "holds an unlisted file" in t)
+# the unlisted() idiom itself, on a scratch tree
+import tempfile, shutil
+with tempfile.TemporaryDirectory() as d:
+    idiom = [l for l in rd(os.path.join(OPS, "deploy_prod.sh")).split("\n") if "comm -23" in l][0].strip().rstrip("}").rstrip().rstrip(";")
+    def run_unlisted(extra=""):
+        return subprocess.run(["bash", "-c", "unlisted() { " + idiom + "; }\ncd " + d + " && unlisted " + extra], capture_output=True, text=True).stdout.strip()
+    open(os.path.join(d, "a.js"), "w").write("x"); open(os.path.join(d, "SHA256SUMS"), "w").write("0  a.js\n"); os.makedirs(os.path.join(d, "webzjs"))
+    check("unlisted(): nothing unlisted -> empty", run_unlisted() == "")
+    open(os.path.join(d, "evil.js"), "w").write("x"); check("unlisted(): an extra file is reported", run_unlisted() == "evil.js")
+    os.remove(os.path.join(d, "evil.js")); os.symlink("a.js", os.path.join(d, "ln.js")); check("unlisted(): a symlink is reported too", run_unlisted() == "ln.js")
 sums = rd(os.path.join(HERE, "..", "web", "vendor", "SHA256SUMS")).split("\n")
 check("vendor manifest paths are relative to web/vendor and exist", all(os.path.exists(os.path.join(HERE, "..", "web", "vendor", l.split(None, 1)[1].strip())) for l in sums if l.strip()) and any("noble.js" in l for l in sums) and any("bip39-english.txt" in l for l in sums))
 print("%d passed, %d failed" % (ok, fail)); sys.exit(1 if fail else 0)

@@ -226,3 +226,7 @@ Audit 1167/1169 (indexer fork recovery, relayer lock and wedge)
   RPC independence  STEALTH_RPC with two URLs must be two independent providers (different backends); the indexer warns at start when two URLs share a host (see base.env.example).
 
 Known-gate lag on Robinhood (02.11.2026): /known trusts a row once it is STEALTH_KNOWN_LAG_S (default 120) seconds behind the indexed head (meta key known_block); the node's safe tag moves in L1-batch jumps and lagged 10-15 min, which made a fresh payment unwithdrawable (relayer: "not a stealth address paid through Stealth"). safe_block and final_block (history pages) still follow the safe tag. Base is unchanged (known_block = safe_block). Bounded risk: a reorg deeper than the lag costs relayer gas (daily budget); the transfer from an empty address reverts, no funds leave.
+
+Audit 1180 (notes)
+  I-3  On failover the Base fallback RPC (base-rpc.publicnode.com, also in the CSP) learns the user's stealth address and IP from the hop counter reads (eth_getLogs / eth_getTransactionCount); mainnet.base.org already did.
+  I-4  The legacy stealth-sanctions.timer (non-template) is no longer managed by any installer and stays orphaned on a host that had it: systemctl disable --now stealth-sanctions.timer, if present (the live templates are stealth-sanctions@rh / @base).

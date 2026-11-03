@@ -240,7 +240,7 @@ export function projectedLoss({ amountIn, inDec, outDec, paidOut, rate, zatsLeft
 export const previewLoss = ({ value, out, inDec, outDec }) => projectedLoss({ amountIn: value, inDec, outDec, paidOut: out, rate: 0, zatsLeft: 0 });
 
 // ---------------------------------------------------------------- chain reads (M-1, M-4) and lightwalletd (M-2); all injectable in ctx
-// Public RPCs answer 429 / 503 / -32005 / -32011 ("request limit reached", per IP) under load. Only those, and network errors, count as "rate limited / unavailable": retry the same endpoint with backoff
+// Public RPCs answer 429 / 502 / 503 / 504 / -32005 / -32011 ("request limit reached", per IP) under load. Only those (-32005 only when its message is not a result-size or range error), and network errors, count as "rate limited / unavailable": retry the same endpoint with backoff
 // (3 tries, 400 ms then 1.2 s: long enough for a per-second limit to clear, short enough that a dead endpoint costs ~1.6 s before the next one), then fail over to the next endpoint of chain.rpcs.
 // Any other answer (a real revert, bad params, a malformed reply) is final: no retry, no failover. If every endpoint is limited the last error is thrown (fail closed).
 export let RPC_RETRY = { tries: 3, base: 400 };
@@ -248,13 +248,17 @@ const rpcOnce = async (fetchFn, url, method, params) => {
   const limited = m => Object.assign(new Error("rpc " + method + " failed: " + m), { limited: true });
   let r, j; try { r = await fetchFn(url, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ jsonrpc: "2.0", id: 1, method, params }) }); j = await r.json().catch(() => ({})); } catch (e) { throw limited((e && e.message) || "network error"); }
   const code = j && j.error && j.error.code, msg = (j && j.error && j.error.message) || r.status;
-  if (r.status === 429 || r.status === 503 || code === -32005 || code === -32011) throw limited(msg);
+  if (r.status === 429 || r.status === 502 || r.status === 503 || r.status === 504 || (code === -32005 && !/more than|results|range/i.test(String(msg))) || code === -32011) throw limited(msg);      // audit 1180 I-2: 502/504 are gateway outages; -32005 "query returned more than N results" is a size error, not a rate limit
   if (!r.ok || j.error || j.result === undefined) throw new Error("rpc " + method + " failed: " + msg); return j.result;
 };
-const rpcCall = async (fetchFn, urls, method, params) => {
-  let last; for (const url of [].concat(urls)) for (let i = 1; i <= RPC_RETRY.tries; i++) {
+const rpcRetry = async (fetchFn, url, method, params) => {      // one endpoint, with backoff; throws the last limited error (e.limited) or the first final one
+  let last; for (let i = 1; i <= RPC_RETRY.tries; i++) {
     try { return await rpcOnce(fetchFn, url, method, params); } catch (e) { if (!e.limited) throw e; last = e; if (i < RPC_RETRY.tries) await sleepMs(RPC_RETRY.base * 3 ** (i - 1)); }
   }
+  throw last;
+};
+const rpcCall = async (fetchFn, urls, method, params) => {
+  let last; for (const url of [].concat(urls)) { try { return await rpcRetry(fetchFn, url, method, params); } catch (e) { if (!e.limited) throw e; last = e; } }
   throw last;
 };
 export const setRpcRetry = o => { RPC_RETRY = o; };
@@ -272,17 +276,29 @@ export const makeAuthUsed = (chain, fetchFn = fetch) => async (authorizer, nonce
 export const LOG_SPAN = 2_000_000, PAY_FROM_BLOCK = { rh: 100_761_230, base: 31_700_000 };   // base: the Announcer era start (our indexer's), so the scan is ~11 windows instead of ~27 from block 0
 // fromBlock = the address's earliest announcement block (b0), when known: it cannot authorize anything before its owner learned of it. The 100-block margin covers an indexer block that lags the true one. Unknown -> the old start.
 // (A recent b0 makes one short window: an address < ~28 h old on Base, 2 s blocks, stays under publicnode's 50k-block getLogs cap.)
+// Audit 1180 M-2 (accepted trust assumption, audit/stealthpay-v3-residuals.md): b0 comes from the indexer, the same component that finds the payments, and only narrows the scan. It is never the whole answer:
+// startHop takes max(IndexedDB counter + 1, this count), so the local hop records of this device always count too. Residual: an indexer gap, or a key used on another device before this indexer saw the address.
+// Audit 1180 M-3: ONE endpoint answers the whole count (head, every getLogs window, transaction count). If it is limited/unavailable, or its head later turns out lower than the tip it reported first, the count restarts
+// from scratch on the next endpoint; answers of two endpoints are never mixed. If every endpoint fails the last error is thrown.
 export const makeCountPriorHops = (chain, fetchFn = fetch) => async (stealth, fromBlock) => {
-  const tip = Number(await rpcCall(fetchFn, chain.rpcs || chain.rpc, "eth_blockNumber", [])); if (!Number.isFinite(tip)) throw new Error("unexpected block number");
-  let n = 0;
-  for (let a = Math.min(tip, Number.isInteger(fromBlock) && fromBlock >= 0 ? Math.max(0, fromBlock - 100) : PAY_FROM_BLOCK[chain.key] || 0); a <= tip; a += LOG_SPAN) {
-    const r = await rpcCall(fetchFn, chain.rpcs || chain.rpc, "eth_getLogs", [{ address: chain.token.address, fromBlock: "0x" + a.toString(16), toBlock: "0x" + Math.min(tip, a + LOG_SPAN - 1).toString(16), topics: [AUTH_USED_TOPIC, "0x" + pad32(stealth)] }]);
-    if (!Array.isArray(r)) throw new Error("unexpected logs answer"); n += r.length;
-  }
-  if (chain.eth) {      // an ETH hop spends the address with a plain transaction, no AuthorizationUsed: the address's own transaction count joins the count, so a hop of either kind never reuses the counter (hop wallet) of the other. It can only over-count too.
-    const c = await rpcCall(fetchFn, chain.rpcs || chain.rpc, "eth_getTransactionCount", [stealth, "latest"]); if (!/^0x[0-9a-fA-F]{1,16}$/.test(c)) throw new Error("unexpected transaction count"); n += Number(BigInt(c));
-  }
-  return n;
+  const countOn = async url => {
+    const hex = await rpcRetry(fetchFn, url, "eth_blockNumber", []); if (typeof hex !== "string" || !/^0x[0-9a-fA-F]+$/.test(hex)) throw new Error("unexpected block number");      // 1180 L-1: null / "" / non-hex is an error, never tip 0
+    const tip = Number(BigInt(hex)); if (!Number.isSafeInteger(tip)) throw new Error("unexpected block number");
+    let n = 0;
+    for (let a = Math.min(tip, Number.isInteger(fromBlock) && fromBlock >= 0 ? Math.max(0, fromBlock - 100) : PAY_FROM_BLOCK[chain.key] || 0); a <= tip; a += LOG_SPAN) {
+      const r = await rpcRetry(fetchFn, url, "eth_getLogs", [{ address: chain.token.address, fromBlock: "0x" + a.toString(16), toBlock: "0x" + Math.min(tip, a + LOG_SPAN - 1).toString(16), topics: [AUTH_USED_TOPIC, "0x" + pad32(stealth)] }]);
+      if (!Array.isArray(r)) throw new Error("unexpected logs answer"); n += r.length;
+    }
+    if (chain.eth) {      // an ETH hop spends the address with a plain transaction, no AuthorizationUsed: the address's own transaction count joins the count, so a hop of either kind never reuses the counter (hop wallet) of the other. It can only over-count too.
+      const c = await rpcRetry(fetchFn, url, "eth_getTransactionCount", [stealth, "latest"]); if (typeof c !== "string" || !/^0x[0-9a-fA-F]{1,16}$/.test(c)) throw new Error("unexpected transaction count"); n += Number(BigInt(c));
+    }
+    const hex2 = await rpcRetry(fetchFn, url, "eth_blockNumber", []);      // the same endpoint's head must not have gone backwards (a load balancer behind one URL, a node resyncing): then the answers above are not trustworthy
+    if (typeof hex2 !== "string" || !/^0x[0-9a-fA-F]+$/.test(hex2)) throw new Error("unexpected block number");
+    if (BigInt(hex2) < BigInt(hex)) throw Object.assign(new Error("rpc head went backwards"), { limited: true });
+    return n;
+  };
+  let last; for (const url of [].concat(chain.rpcs || chain.rpc)) { try { return await countOn(url); } catch (e) { if (!e.limited) throw e; last = e; } }
+  throw last;
 };
 /** ctx.txKnown(txid) -> true / false (lightwalletd GetTransaction through the gRPC-web proxy, like zec-return.js); throws when it cannot tell. */
 /** UTXOs of a t-address straight from lightwalletd (one cheap call, no wallet sync): [{ value, height }]. Times out after 20 s so a hung proxy cannot freeze the wait loop. */

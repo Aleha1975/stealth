@@ -21,3 +21,9 @@ The contract does not reject it; both legs reach the address and the `Paid` even
 - I-4 the build uses `evm_version = cancun`; confirmed supported on Robinhood Chain by the live deployment and by the identical bytecode. Check again before deploying the same build to a new chain.
 - I-5 `ephemeralPubKey` is checked for length and prefix only, not for curve membership; it is used off chain only. Our client always derives a valid point.
 - I-6 the C2 guarantee (payWithAuthorization cannot be redirected) depends on the token implementing EIP-3009 as specified (R3, accepted).
+
+## Hop counter start block b0 trusts the indexer (audit 1180 M-2, accepted)
+The hop-wallet counter scan (`makeCountPriorHops`, web/zec-hop.js) starts 100 blocks before b0, the earliest announcement block of the stealth address in what the client's scan received (history pages and tail from our indexer, `foldRow` in web/chain-read.js; an unknown block makes b0 null = the safe full start). b0 therefore comes from the same component that finds the payments, and an address cannot authorize anything before its owner learned of it only as far as that view is complete.
+- The local IndexedDB hop records are always merged: `startHop` uses `max(local record n + 1, chain count)`, so hops made on this device are never lost to a late b0.
+- Residual: an indexer gap or outage, announcements before the indexer's start block, a lying indexer, or the same key used on another device/client before this indexer saw the address can give a b0 later than the first real use, and the count is then below the truth (a hop-wallet counter can be reused). No new network dependency was added to close it.
+- The local records store only a creation TIME (`startedAt`, see `newState`), not a block, so b0 is not compared with them; mapping a time to a block would need another trusted source.
