@@ -1,13 +1,16 @@
-Install notes (NOT done; files only)
-  useradd --system --home /opt/stealth --shell /usr/sbin/nologin stealth   (if absent)
-  install -d -o stealth -g stealth -m 750 /opt/stealth/data-rh /opt/stealth/data-watch
-  /opt/stealth/{stealth_indexer.py,relayer.mjs,relay-util.mjs,sanctions/,chains.json,stealth_watch.py,node_modules->symlink,package.json} readable by user stealth
-  install -m 600 -o stealth -g stealth rh.env /opt/stealth/rh.env ; watch.env likewise
-  cp stealth-*.service stealth-watch.timer /etc/systemd/system/ ; systemctl daemon-reload
-  systemctl enable --now stealth-indexer-rh stealth-relayer-rh stealth-watch.timer
+Install notes (NOT done; files only). Production layout on the app server (audit 1179 F2):
+  /opt/stealth        live Base v2 code (stealth-indexer / stealth-relayer, 3873/3874): never overwritten by any script of this repo
+  /opt/stealth-rh     RH stack: rh.env (chmod 600, owner stealth), code, data in /opt/stealth-rh/data, sanctions in /opt/stealth-rh/sanctions
+  /opt/stealth-base   Base v3 stack (ops/install_base.sh): base.env, data in /opt/stealth-base/data, sanctions in /opt/stealth-base/sanctions
+  /opt/stealth-watch  watchdog (ops/install_watch.sh): stealth_watch.py, chains.json, watch.env (chmod 600), data/watch_state.json
+  Watchdog and OFAC refresh: ops/install_watch.sh [--apply] (dry run by default) installs stealth-watch.service/.timer and stealth-sanctions@.service/.timer, enables stealth-watch.timer, stealth-sanctions@rh.timer and
+    stealth-sanctions@base.timer, chowns the two sanctions directories to stealth, runs the first refresh. watch.env is created WITHOUT Telegram lines: add TG_BOT_TOKEN / TG_CHAT_ID by hand (chmod 600).
+  ops/install_rh.sh is the LEGACY installer (writes into /opt/stealth); its --apply refuses while /opt/stealth-rh exists. Update the RH stack by hand: copy the files, then restart stealth-indexer-rh / stealth-relayer-rh.
+  The *-rh.service units in this directory still show the legacy /opt/stealth paths: on the host the installed copies point to /opt/stealth-rh; compare before copying (diff against /etc/systemd/system).
   nginx: zones into http{} (see header of stealth-rh.conf), the locations into the app.deepyield.ai server{}; nginx -t && systemctl reload nginx
-  Base units keep running untouched on 3873/3874; RH uses 3883/3884 and /opt/stealth/data-rh.
-  Watchdog log of RH relayer = /opt/stealth/data-rh/relayer.rh.log (set STEALTH_RELAY_LOG above).
+  Base units keep running untouched on 3873/3874; RH uses 3883/3884 and /opt/stealth-rh/data.
+  Watchdog log of RH relayer = /opt/stealth-rh/data/relayer.rh.log (set STEALTH_RELAY_LOG above).
+  Gas budget: the shared daily gas budget (GAS_BUDGET_WEI_PER_DAY, per chain) is the only bound on reverted relays (a stale or reorged /known answer, many fresh addresses; audit 1179 F3). Watch the watchdog ALERT / 'reverted' lines.
 
 Allow-list for trusted test clients (audit 1108; empty = off, NOT set in any committed config)
   STEALTH_RELAY_ALLOW_KEYS=<trusted host IP>       (comma-separated IPv4 addresses or IPv6 addresses / /64 keys: an IPv6 entry covers its whole /64; put it in rh.env / relayer.env on the host only)
@@ -107,8 +110,8 @@ Base v3 (StealthPay 0xC07f54984AbDa1EF76DaB6F602270B76a04E916d, block 53408013) 
    - Funds: the v2 contract holds no user money (payToken moves tokens straight to the stealth address). Funds sit at the stealth addresses; withdrawal is USDC transferWithAuthorization from the stealth address, independent of either StealthPay.
    - Cut-over is per web copy: an open old page keeps using v2 API and v2 contract until reloaded. Keep the v2 stack running while old pages may exist.
    - The pages cache in the browser is keyed chain|page|version (not by API): a rebuilt database with the same version would be served stale pages. Do not delete /opt/stealth-base/data after users have scanned; if you must, bump the manifest version.
-   - Not installed by this script (not installed for RH on the host either): stealth-watch.timer and stealth-sanctions.timer. If the watchdog is added later, append base=http://127.0.0.1:3893|http://127.0.0.1:3894|/opt/stealth-base/data/relayer.base.log|0.0003 to STEALTH_WATCH_CHAINS.
-     The sanctions list in /opt/stealth-base/sanctions/evm.json is the repo copy; refresh it before launch.
+   - Not installed by this script: the watchdog and the OFAC refresh timers; ops/install_watch.sh does it (stealth-watch.timer, stealth-sanctions@base.timer, stealth-sanctions@rh.timer). The base chain line in watch.env.example is already there.
+     The sanctions list in /opt/stealth-base/sanctions/evm.json is the repo copy until the first refresh.
    - install_rh.sh does not copy relay-util.mjs (current relayer.mjs imports it); install_base.sh does. Re-running install_rh.sh --apply on a fresh host would fail for that reason.
 
 Audit 1158 (indexer + nginx isolation conf) -- what changes on deploy

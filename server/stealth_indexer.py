@@ -473,12 +473,14 @@ def _bump_epoch(c, commit=True):
     else: c.execute("INSERT OR REPLACE INTO meta(k,v) VALUES('epoch',?)", (str(int(_meta_get(c, "epoch") or 0) + 1),))
 
 
-def reconcile(c, sf, head_done, ep=None, insert_only=False):
+def reconcile(c, sf, head_done, ep=None, insert_only=False, frm=None):
     """Реорг-страж (rh): перечитать (safe-REORG_WIN .. head_done], убрать строки, которых в цепи больше нет (или они в другом блоке), добавить новые.
     Аудит 1158 F-4: удаляем ТОЛЬКО то, чего нет в двух чтениях (закреплённая точка + другая, чья голова покрывает окно; нет другой -- та же ещё раз); короткий/отстающий ответ строки не стирает.
-    insert_only (base, режим safe: реорга ниже safe нет) -- только добавляем пропущенное."""
+    insert_only (base, режим safe: реорга ниже safe нет) -- только добавляем пропущенное.
+    frm (аудит 1179 F4: после --rewind) -- окно начинается не позже этого блока, чтобы строки брошенной ветки выше новой головы тоже сверялись. Возвращает True, если проход дошёл до конца (окно ещё не достигнуто -- False)."""
     a = max(START, (sf or head_done - 10000) - REORG_WIN)
-    if a > head_done: return
+    if frm is not None: a = max(START, min(a, frm))
+    if a > head_done: return False
     # верхняя граница обязательна: иначе строки новее head_done (их уже записал основной цикл за время getLogs) считались бы "пропавшими" и удалялись
     ag = {}
     want = {}
@@ -507,6 +509,7 @@ def reconcile(c, sf, head_done, ep=None, insert_only=False):
     if new:
         with _lock: c.commit()
         print("reconcile: added", len(new), "rows", flush=True)
+    return True
 
 
 def _atomic(path, data):
@@ -620,7 +623,7 @@ def index_loop():
                 if hh:                                      # цепочка: родитель блока a обязан быть сохранённым блоком head_done (сменился бэкенд / реорг -- не пропускаем, а перечитываем окно)
                     x = _block_at(ep, a)
                     if not x: raise RuntimeError("endpoint cannot return block %d: waiting" % a)
-                    if x[1] != hh and NEED >= 2:                # аудит 1169 M-1: расхождение должно подтвердить ещё одна точка из согласованных (x2 -- её parentHash тоже != hh), иначе не откат, а ожидание
+                    if x[1] != hh and NEED >= 2:                # аудит 1169 M-1: расхождение должно подтвердить ещё одна точка из согласованных (аудит 1179 F6: x2 должна показать ТОТ ЖЕ parentHash, что и первая точка, -- осознанно, покрыто тестом), иначе не откат, а ожидание
                         x2 = _block_at(eps[1], a)
                         if not x2 or x2[1] != x[1]: raise RuntimeError("endpoints disagree on the parentHash of block %d: waiting" % a)
                     if x[1] != hh:
@@ -664,6 +667,12 @@ def index_loop():
             with _lock:                                     # метка свежести и когда догнали (иначе lag/ts стоят, пока нет новых блоков)
                 c.execute("INSERT OR REPLACE INTO meta(k,v) VALUES('ts',?)", (str(int(time.time())),))
                 c.execute("INSERT OR REPLACE INTO meta(k,v) VALUES('chain_head',?)", (str(head),)); c.commit()
+            rf = _meta_get(c, "reconcile_from")             # аудит 1179 F1/F4: после --rewind границы стёрты, строки брошенной ветки сверяются ДО того, как границы появятся снова
+            if rf is not None:
+                if pin is None and head_done >= START: pin = agreed(head_done, ag)[1][0]
+                if reconcile(c, sf, head_done, pin, insert_only=False, frm=int(rf)):
+                    with _lock: c.execute("DELETE FROM meta WHERE k='reconcile_from'"); c.commit()
+                    last_rec = time.time()
             # safe_block -- до него /known верит строкам; final_block -- после него строку реорг уже не тронет (флаг final, страницы). Без safe (rh, узел не отдал) прежние значения остаются.
             safe_b = head_done if (MODE == "safe" or not KNOWN_SAFE) else (min(sf, head_done) if sf is not None else None)
             fin = head_done if MODE == "safe" else (max(0, safe_b - PAGES_MARGIN) if safe_b is not None else None)       # одна формула и для меты, и для страниц (аудит 1163 I-4)
@@ -919,12 +928,14 @@ class H(BaseHTTPRequestHandler):
 
 
 def rewind(n):
-    """Аудит 1163 M-1 / 1165 I-5: оператор отодвигает голову индекса на n блоков (СЛУЖБА ОСТАНОВЛЕНА: иначе цикл перезапишет значение своим). Строки выше остаются, перечитывание вставляет только недостающее (INSERT OR IGNORE по (tx, log_index))."""
+    """Аудит 1163 M-1 / 1165 I-5: оператор отодвигает голову индекса на n блоков (СЛУЖБА ОСТАНОВЛЕНА: иначе цикл перезапишет значение своим). Строки выше остаются, перечитывание вставляет только недостающее (INSERT OR IGNORE по (tx, log_index)), а первая реконсиляция сверяет их с цепью и убирает ушедшие (reconcile_from)."""
     c = db(); r = c.execute("SELECT v FROM meta WHERE k='head'").fetchone(); st = c.execute("SELECT v FROM meta WHERE k='start'").fetchone()
     lo = (START if START is not None else int(st[0]) if st else 0) - 1
     if not r: raise SystemExit("rewind: no head in the database yet")
     new = max(lo, int(r[0]) - n)
     c.execute("INSERT OR REPLACE INTO meta(k,v) VALUES('head',?)", (str(new),)); c.execute("DELETE FROM meta WHERE k='head_hash'"); c.execute("DELETE FROM bh WHERE block>?", (new,))     # хэша блока new у нас нет: первый шаг его примет без сверки
+    c.execute("DELETE FROM meta WHERE k IN ('known_block','safe_block','final_block')")                                                  # аудит 1179 F1: граница доверия закрыта (/known -- никого), пока полный проход заново её не посчитает
+    c.execute("INSERT OR REPLACE INTO meta(k,v) VALUES('reconcile_from',?)", (str(new + 1),))                                            # аудит 1179 F4: первая реконсиляция покрывает от новой головы; расходуется один раз
     _bump_epoch(c, False); c.commit()                                                                                                    # аудит 1165 I-5: клиент, считающий по epoch, перечитает; новые id у перечитанных строк он иначе не заметит
     print("rewind: head %s -> %d (rows above stay; the service re-reads from %d and only inserts what is missing)" % (r[0], new, new + 1), flush=True)
 

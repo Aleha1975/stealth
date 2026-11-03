@@ -343,6 +343,24 @@ meta_set(m, head=500)
 r0 = subprocess.run([sys.executable, "-B", os.path.join(HERE, "stealth_indexer.py"), "--rewind", "5"], env=env, capture_output=True, text=True)
 check("M-1 rewind CLI works", r0.returncode == 0 and "rewind: head 500 -> 495" in r0.stdout)
 
+# ---- 1179 F1/F4: rewind closes the trust boundary and the first reconcile covers the abandoned fork above the new head
+m = load(); Chain(m, {"A": {"head": 600, "logs": [], "safe": 590}}); m.START = 1
+meta_set(m, head=700, head_hash=H(700), safe_block=690, known_block=690, final_block=680)
+put(m, 550, 0, S(1), V3, 5_000_000, 5_000_000)                           # a row of the abandoned fork: the chain (fake) has no such log
+srv1, J1 = serve(m)
+check("1179 F1 before rewind: the row at 550 below known_block 690 is known", J1("/known?addr=" + S(1))[1]["known"] is True)
+m.rewind(200)
+check("1179 F1 rewind deletes known_block, safe_block and final_block", all(meta_get(m, k) is None for k in ("known_block", "safe_block", "final_block")))
+check("1179 F1 after rewind /known answers nobody (also no fallback to a stale safe_block)", J1("/known?addr=" + S(1))[1]["known"] is False)
+check("1179 F4 rewind leaves the row and asks for a reconcile from the new head + 1", count(m) == 1 and meta_get(m, "reconcile_from") == "501")
+run_loop(m, until=lambda: meta_get(m, "known_block") is not None and meta_get(m, "reconcile_from") is None)
+check("1179 F4 the loop reconciled once: the fork row above the new head is gone (base insert_only would have kept it), the marker is consumed", count(m) == 0 and meta_get(m, "reconcile_from") is None)
+check("1179 F1 the next full pass recomputed the boundary", meta_get(m, "known_block") is not None and meta_get(m, "safe_block") is not None and meta_get(m, "final_block") is not None)
+check("1179 F4 rows are still indexed from the new head (head moved on)", int(meta_get(m, "head")) >= 500)
+m = load(); Chain(m, {"A": {"head": 600, "logs": [], "safe": 500}}); m.START = 1; meta_set(m, head=700)
+m.rewind(200); m.rewind(100)
+check("1179 F4 a second rewind before the loop runs keeps the marker at the lowest block", meta_get(m, "reconcile_from") == "401")
+
 # ---- F-3 / F-4: receipts, paid, known gate, retraction signal
 m = load()
 ch = Chain(m, {"A": {"head": 500, "logs": [], "receipts": {}}})

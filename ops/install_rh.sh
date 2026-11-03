@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Install the Robinhood Chain stealth stack (indexer :3883, relayer :3884, watchdog, sanctions refresh) on the app server.
+# Install the Robinhood Chain stealth stack (indexer :3883, relayer :3884) into /opt/stealth: a LEGACY layout. The watchdog and the OFAC refresh timers are installed by ops/install_watch.sh.
+# On the production host the live RH stack lives in /opt/stealth-rh (rh.env, data in /opt/stealth-rh/data) and /opt/stealth is the live Base code: --apply therefore REFUSES when /opt/stealth-rh exists (audit 1179 F2).
 # DEFAULT = DRY RUN: prints every action and runs only read-only checks. Pass --apply (as root) to execute.
 # Idempotent: every step checks current state and skips when already done. It NEVER stops, restarts, disables or rewrites the Base
 # units (stealth-indexer.service, stealth-relayer.service on 3873/3874) and refuses any systemctl action on a name not in RH_UNITS.
@@ -9,7 +10,7 @@ set -euo pipefail
 APPLY=0; START=1; SRC="$(cd "$(dirname "${BASH_SOURCE[0]}")/../server" && pwd)"
 while [ $# -gt 0 ]; do case "$1" in --apply) APPLY=1;; --no-start) START=0;; --src) SRC="$2"; shift;; -h|--help) sed -n 2,9p "$0"; exit 0;; *) echo "unknown arg $1"; exit 2;; esac; shift; done
 OPT=/opt/stealth; D="$SRC/deploy"; ENVF=$OPT/rh.env
-RH_UNITS="stealth-indexer-rh.service stealth-relayer-rh.service stealth-watch.service stealth-watch.timer stealth-sanctions.service stealth-sanctions.timer"
+RH_UNITS="stealth-indexer-rh.service stealth-relayer-rh.service"
 BASE_UNITS="stealth-indexer.service stealth-relayer.service"
 say() { printf '%s %s\n' "$([ $APPLY = 1 ] && echo '[do] ' || echo '[dry]')" "$*"; }
 ok()  { printf '[ok]  %s\n' "$*"; }
@@ -19,6 +20,10 @@ guard_unit() { local b; for b in $BASE_UNITS; do [ "$1" = "$b" ] && die "refusin
 soft() { if [ $APPLY = 1 ]; then die "$*"; else echo "[warn] (dry run continues) $*"; fi; }
 need() { command -v "$1" >/dev/null || soft "missing command: $1"; }
 [ $APPLY = 1 ] && [ "$(id -u)" != 0 ] && die "--apply needs root"
+if [ -d /opt/stealth-rh ]; then
+  if [ $APPLY = 1 ]; then die "/opt/stealth-rh exists: the live RH stack is there, and this script writes to $OPT (the live Base code). Refusing. Update RH by hand from server/deploy; the watchdog and sanctions timers: ops/install_watch.sh"; fi
+  echo "[warn] /opt/stealth-rh exists: --apply would refuse (this script targets the legacy $OPT layout)"
+fi
 for c in node python3 nginx systemctl install diff; do need $c; done
 [ -d "$D" ] || die "no deploy dir $D"
 echo "mode: $([ $APPLY = 1 ] && echo APPLY || echo 'DRY RUN (nothing is changed)'); source: $SRC"
@@ -43,7 +48,7 @@ fi
 
 # 2. user and directories
 if id stealth >/dev/null 2>&1; then ok "user stealth"; else run useradd --system --home $OPT --shell /usr/sbin/nologin stealth; fi
-for d in $OPT/data-rh $OPT/data-watch; do [ -d $d ] && ok "dir $d" || run install -d -o stealth -g stealth -m 750 $d; done
+for d in $OPT/data-rh; do [ -d $d ] && ok "dir $d" || run install -d -o stealth -g stealth -m 750 $d; done
 [ -d $OPT/sanctions ] && ok "dir $OPT/sanctions" || run install -d -o stealth -g stealth -m 755 $OPT/sanctions
 
 # 3. code (shared files: Base units pick up new code only at THEIR next restart, which this script never triggers)
@@ -51,20 +56,19 @@ sync_file() { # src dst mode owner
   if [ -f "$2" ] && cmp -s "$1" "$2"; then ok "up to date $2"; else
     [ -f "$2" ] && say "update $2 (diff follows)" && { diff -u "$2" "$1" | head -20 || true; }
     run install -m "$3" -o "$4" -g "$4" "$1" "$2"; fi; }
-for f in relayer.mjs chains.json stealth_indexer.py stealth_watch.py erc5564_ref.py; do [ -f "$SRC/$f" ] && sync_file "$SRC/$f" $OPT/$f 644 root; done
+for f in relayer.mjs chains.json stealth_indexer.py erc5564_ref.py; do [ -f "$SRC/$f" ] && sync_file "$SRC/$f" $OPT/$f 644 root; done
 sync_file "$SRC/sanctions/screen.mjs" $OPT/sanctions/screen.mjs 644 root
 sync_file "$SRC/sanctions/update.py"  $OPT/sanctions/update.py  755 root
 # evm.json: never overwrite a newer list with the repo copy
-if [ -f $OPT/sanctions/evm.json ]; then ok "evm.json present (kept; refreshed by stealth-sanctions.timer)"; else run install -m 644 -o stealth -g stealth "$SRC/sanctions/evm.json" $OPT/sanctions/evm.json; fi
+if [ -f $OPT/sanctions/evm.json ]; then ok "evm.json present (kept; refreshed by stealth-sanctions@rh.timer, ops/install_watch.sh)"; else run install -m 644 -o stealth -g stealth "$SRC/sanctions/evm.json" $OPT/sanctions/evm.json; fi
 
 # 4. systemd units
 CH=0
-for f in stealth-indexer-rh.service stealth-relayer-rh.service stealth-watch.service stealth-watch.timer stealth-sanctions.service stealth-sanctions.timer; do
+for f in $RH_UNITS; do
   guard_unit $f
   if [ -f /etc/systemd/system/$f ] && cmp -s "$D/$f" /etc/systemd/system/$f; then ok "unit $f"; else run install -m 644 "$D/$f" /etc/systemd/system/$f; CH=1; fi
 done
 [ $CH = 1 ] && run systemctl daemon-reload
-if [ -f $OPT/watch.env ]; then ok "watch.env present"; else echo "[warn] $OPT/watch.env missing: create from $D/watch.env.example (watchdog will run without Telegram)"; fi
 
 # 5. nginx (zones, snippet, include check, nginx -t; reload only after a passing test)
 ZONES=/etc/nginx/conf.d/stealth-rh-zones.conf; SNIP=/etc/nginx/snippets/stealth-rh.conf
@@ -88,7 +92,7 @@ if [ $APPLY = 1 ]; then nginx -t && ok "nginx -t" || die "nginx -t failed: NOT r
 
 # 6. start RH units only
 if [ $START = 1 ]; then
-  for u in stealth-indexer-rh.service stealth-relayer-rh.service stealth-watch.timer stealth-sanctions.timer; do
+  for u in $RH_UNITS; do
     guard_unit $u
     systemctl is-active --quiet $u && ok "$u already active" || run systemctl enable --now $u
   done
