@@ -5,20 +5,21 @@
 # It NEVER stops, restarts, disables, reloads or rewrites the live Base units (stealth-indexer.service, stealth-relayer.service on 3873/3874, code in /opt/stealth), the RH units
 # (stealth-*-rh.service, /opt/stealth-rh) or any other product's unit, and refuses a systemctl action or a write outside its own paths. It never edits /opt/mprhedged/exec/.env
 # and never writes, copies or prints a secret: you create /opt/stealth-base/base.env yourself (README_ops.txt, "Base v3"); the script only checks it and compares the key line with the
-# live relayer's file (yes/no, never the value). Every file it replaces is first copied to /var/backups/stealth-base/<time>/. nginx -t runs before every reload; a failing test restores the backup.
+# live relayer's file (yes/no, never the value). Every file it replaces is first copied to /var/backups/stealth-base/<time>/. nginx -t runs before every reload; a failing test (or any failed write) puts back exactly the files THIS run changed and deletes only the ones it created.
 # Usage:  ops/install_base.sh [--apply] [--src <repo>/server] [--no-start] [--add-include]
-#   --add-include  (with --apply) inserts `include /etc/nginx/snippets/stealth-base.conf;` into the app.deepyield.ai vhost right after the RH include (backup first, nginx -t, restore on failure)
+#   --add-include  (with --apply) inserts `include /etc/nginx/snippets/stealth-base.conf;` into the app.deepyield.ai vhost right after the RH include (backup first, written whole via a temp file + mv, nginx -t, undo on failure)
 set -euo pipefail
 APPLY=0; START=1; INCLUDE=0; SRC="$(cd "$(dirname "${BASH_SOURCE[0]}")/../server" && pwd)"
 while [ $# -gt 0 ]; do case "$1" in --apply) APPLY=1;; --no-start) START=0;; --add-include) INCLUDE=1;; --src) SRC="$2"; shift;; -h|--help) sed -n 2,12p "$0"; exit 0;; *) echo "unknown arg $1"; exit 2;; esac; shift; done
 OPT=/opt/stealth-base; DATA=$OPT/data; D="$SRC/deploy"; ENVF=$OPT/base.env
 OLDKEY=/opt/stealth/relayer.env                      # the live Base relayer's key file: read by the operator's one-liner, only compared (never shown) here
-VHOST=/etc/nginx/sites-enabled/app-deepyield; RH_SNIP=/etc/nginx/snippets/stealth-rh.conf
+NGX="${STEALTH_NGINX_DIR:-/etc/nginx}"; NGX_CACHE="${STEALTH_NGINX_CACHE:-/var/cache/nginx}"      # the two overrides exist for the offline test (server/test_ops_install.py); production uses the defaults
+VHOST=$NGX/sites-enabled/app-deepyield; RH_SNIP=$NGX/snippets/stealth-rh.conf
 NEW_UNITS="stealth-indexer-base.service stealth-relayer-base.service"
 OLD_UNITS="stealth-indexer.service stealth-relayer.service stealth-indexer-rh.service stealth-relayer-rh.service stealth-watch.service stealth-watch.timer stealth-sanctions.service stealth-sanctions.timer"
 SP3=0xC07f54984AbDa1EF76DaB6F602270B76a04E916d; SP2=0xc1b372731c1ee68ee89f212a05cb8ac9a7929f76
 IDX_PORT=3893; REL_PORT=3894
-TS="$(date -u +%Y%m%d-%H%M%S)"; BK=/var/backups/stealth-base/$TS
+TS="$(date -u +%Y%m%d-%H%M%S)"; BK="${STEALTH_BACKUP_DIR:-/var/backups/stealth-base}/$TS"
 say() { printf '%s %s\n' "$([ $APPLY = 1 ] && echo '[do] ' || echo '[dry]')" "$*"; }
 ok()  { printf '[ok]  %s\n' "$*"; }
 die() { printf '[FAIL] %s\n' "$*" >&2; exit 1; }
@@ -26,7 +27,7 @@ run() { say "$*"; if [ $APPLY = 1 ]; then "$@"; fi; }      # audit 1180 L-2: a f
 soft() { if [ $APPLY = 1 ]; then die "$*"; else echo "[warn] (dry run continues) $*"; fi; }
 need() { command -v "$1" >/dev/null || soft "missing command: $1"; }
 guard_unit() { local b; for b in $OLD_UNITS; do [ "$1" = "$b" ] && die "refusing to touch live unit $b"; done; case " $NEW_UNITS " in *" $1 "*) ;; *) die "unit $1 is not one of: $NEW_UNITS";; esac; }
-guard_path() { case "$1" in $OPT/*|/etc/systemd/system/stealth-indexer-base.service|/etc/systemd/system/stealth-relayer-base.service|/etc/nginx/snippets/stealth-base.conf|/etc/nginx/conf.d/stealth-base-zones.conf|$VHOST) ;; *) die "refusing to write $1 (outside the Base v3 paths)";; esac; }
+guard_path() { case "$1" in $OPT/*|/etc/systemd/system/stealth-indexer-base.service|/etc/systemd/system/stealth-relayer-base.service|$NGX/snippets/stealth-base.conf|$NGX/conf.d/stealth-base-zones.conf|$VHOST) ;; *) die "refusing to write $1 (outside the Base v3 paths)";; esac; }
 backup() { # file: copy an existing file to the backup dir before it is replaced
   [ -f "$1" ] || return 0; say "backup $1 -> $BK$1"; [ $APPLY = 1 ] && { mkdir -p "$BK$(dirname "$1")" && cp -p "$1" "$BK$1"; } || true; }
 put() { # src dst mode owner : install with guard and backup
@@ -102,43 +103,66 @@ for f in $NEW_UNITS; do
 done
 [ $CH = 1 ] && run systemctl daemon-reload
 
-# 6. nginx: own zones, snippet, include; reload only after a passing nginx -t, restore on failure
-ZONES=/etc/nginx/conf.d/stealth-base-zones.conf; SNIP=/etc/nginx/snippets/stealth-base.conf
+# 6. nginx: own zones, snippet, include; reload only after a passing nginx -t; a failure puts back what THIS run changed
+# audit 1181 M-2: UNDO lists exactly the files this run wrote ("restore:<path>" = it existed and its backup is in $BK, "remove:<path>" = this run created it). The rollback touches nothing else: a file the run did not
+# write (zones already defined, snippet already up to date) is never restored over and never deleted. It runs from an EXIT trap, so ANY failure after the first write (a failing install, awk, mv, nginx -t) undoes the
+# writes; and it is written so that no single failed step cuts it short (every step is an `if`, none relies on set -e).
+UNDO=(); NGX_GUARD=0
+track() { # path : call BEFORE writing a file in the nginx section. Takes the backup and refuses (real run) when it is not there, so the undo can always restore
+  guard_path "$1"; backup "$1"; [ $APPLY = 1 ] || return 0
+  if [ -f "$1" ]; then [ -f "$BK$1" ] || die "no backup of $1 in $BK: refusing to change it"; UNDO+=("restore:$1"); else UNDO+=("remove:$1"); fi; NGX_GUARD=1; }
+rollback() {
+  [ "$NGX_GUARD" = 1 ] || return 0; NGX_GUARD=0
+  local i e p; i=${#UNDO[@]}
+  while [ $i -gt 0 ]; do i=$((i - 1)); e="${UNDO[$i]}"; p="${e#*:}"
+    case "${e%%:*}" in
+      restore) if cat "$BK$p" > "$p"; then echo "[undo] restored $p from $BK"; else echo "[FAIL] could not restore $p: copy $BK$p back by hand" >&2; fi;;
+      remove) if rm -f "$p"; then echo "[undo] removed $p (this run created it)"; else echo "[FAIL] could not remove $p" >&2; fi;;
+    esac
+  done; }
+trap 'rc=$?; if [ $rc != 0 ]; then rollback; fi' EXIT
+ZONES=$NGX/conf.d/stealth-base-zones.conf; SNIP=$NGX/snippets/stealth-base.conf
 NGX_CH=0
-if nginx -T 2>/dev/null | grep -q 'zone=st_bip_read'; then ok "nginx zones st_bip_* already defined"
-  nginx -T 2>/dev/null | grep 'zone=st_bip_' | grep -q 'binary_remote_addr' && echo "[todo] the st_bip_* zones still key on \$binary_remote_addr: switch them to \$st_ipkey (map: $D/stealth-ipkey-map.conf; README_ops.txt, audit 1165 L-2)"
+# the whole running config once (audit 1181 L-8: grepping `nginx -T | grep -q` under pipefail reads "not found" when grep -q closes the pipe early and nginx dies of SIGPIPE; here grep reads a variable)
+if NGXT="$(nginx -T 2>/dev/null)"; then :; else NGXT=""; soft "nginx -T failed: cannot tell which zones are defined"; fi
+cfg_without() { awk -v f="$1:" '/^# configuration file /{skip=($4==f)} !skip' <<<"$NGXT"; }      # the dump without the section of file $1: a file about to be replaced must not count as "already defined"
+if grep -q 'zone=st_bip_read' <<<"$NGXT"; then ok "nginx zones st_bip_* already defined"
+  if grep 'zone=st_bip_' <<<"$NGXT" | grep -q 'binary_remote_addr'; then echo "[todo] the st_bip_* zones still key on \$binary_remote_addr: switch them to \$st_ipkey (map: $D/stealth-ipkey-map.conf; README_ops.txt, audit 1165 L-2)"; fi
 else
   say "write $ZONES (limit_req/limit_conn zones st_bip_*; the st_tail cache path comes from the RH zones file)"
   if [ $APPLY = 1 ]; then
-    grep -rq 'keys_zone=st_tail' /etc/nginx 2>/dev/null && TAIL="" || TAIL='proxy_cache_path /var/cache/nginx/stealth_tail levels=1 keys_zone=st_tail:2m max_size=64m inactive=1m use_temp_path=off;'
-    install -d /var/cache/nginx; guard_path $ZONES; backup $ZONES
-    nginx -T 2>/dev/null | grep -q 'map $remote_addr $st_ipkey' && MAP="" || MAP="$(cat "$D/stealth-ipkey-map.conf")"       # audit 1165 L-2: one IPv6 /64 = one client; the map is defined once per host (the RH installer writes the same one)
-    printf '%s\n' "$MAP" 'limit_req_zone $st_ipkey zone=st_bip_read:10m rate=10r/s;' 'limit_req_zone $st_ipkey zone=st_bip_post:10m rate=10r/m;' 'limit_conn_zone $st_ipkey zone=st_bip_conn:10m;' "$TAIL" > $ZONES
+    OTHERS="$(cfg_without "$ZONES")"
+    if grep -q 'keys_zone=st_tail' <<<"$OTHERS"; then TAIL=""; else TAIL='proxy_cache_path /var/cache/nginx/stealth_tail levels=1 keys_zone=st_tail:2m max_size=64m inactive=1m use_temp_path=off;'; fi
+    if grep -q 'map $remote_addr $st_ipkey' <<<"$OTHERS"; then MAP=""; else MAP="$(cat "$D/stealth-ipkey-map.conf")"; fi       # audit 1165 L-2: one IPv6 /64 = one client; the map is defined once per host (the RH installer writes the same one)
+    install -d "$NGX_CACHE"; track "$ZONES"
+    ZT="$(mktemp "$ZONES.XXXXXX")"      # same directory, then mv: nginx never reads a half-written zones file (the name does not end in .conf, so conf.d/*.conf does not pick up a leftover)
+    if printf '%s\n' "$MAP" 'limit_req_zone $st_ipkey zone=st_bip_read:10m rate=10r/s;' 'limit_req_zone $st_ipkey zone=st_bip_post:10m rate=10r/m;' 'limit_conn_zone $st_ipkey zone=st_bip_conn:10m;' "$TAIL" > "$ZT" && chmod 644 "$ZT" && mv -f "$ZT" "$ZONES"; then :; else rm -f "$ZT"; die "could not write $ZONES"; fi
   fi
   NGX_CH=1
 fi
-if [ -f $SNIP ] && cmp -s "$D/stealth-base.conf" $SNIP; then ok "snippet $SNIP"; else put "$D/stealth-base.conf" $SNIP 644 root; NGX_CH=1; fi
-INC='include /etc/nginx/snippets/stealth-base.conf;'
-if grep -rqs 'snippets/stealth-base.conf' /etc/nginx/sites-enabled /etc/nginx/conf.d 2>/dev/null; then ok "snippet is included"; elif [ $INCLUDE = 1 ]; then
+if [ -f $SNIP ] && cmp -s "$D/stealth-base.conf" $SNIP; then ok "snippet $SNIP"; else
+  guard_path $SNIP; if [ $APPLY = 1 ]; then track $SNIP; else backup $SNIP; fi; run install -D -m 644 -o root -g root "$D/stealth-base.conf" $SNIP; NGX_CH=1; fi
+INC="include $NGX/snippets/stealth-base.conf;"; ANCHOR="include $NGX/snippets/stealth-rh.conf;"      # ONE anchor string for the check and for the insert (fixed-string match both times)
+if grep -rqs 'snippets/stealth-base.conf' $NGX/sites-enabled $NGX/conf.d 2>/dev/null; then ok "snippet is included"; elif [ $INCLUDE = 1 ]; then
   [ -f "$VHOST" ] && [ ! -L "$VHOST" ] || soft "$VHOST is missing or a symlink: add the include by hand"
-  grep -q "snippets/stealth-rh.conf" "$VHOST" 2>/dev/null || soft "no RH include line in $VHOST to anchor on: add the include by hand"
+  grep -qF -- "$ANCHOR" "$VHOST" 2>/dev/null || soft "no line '$ANCHOR' in $VHOST to anchor on: add the include by hand"
   say "insert '$INC' after the RH include in $VHOST"
   if [ $APPLY = 1 ]; then
-    guard_path $VHOST; backup $VHOST; T="$(mktemp)"
-    awk -v inc="    $INC" '{print} /include \/etc\/nginx\/snippets\/stealth-rh.conf;/ && !d {print inc; d=1}' "$VHOST" > "$T" && cat "$T" > "$VHOST"; rm -f "$T"; NGX_CH=1
+    track $VHOST
+    # a dot-file in the vhost's own directory (nginx's `include sites-enabled/*` does not match dot-files, so a leftover is never loaded), then mv: the vhost is replaced whole or not at all
+    VT="$(mktemp "$(dirname "$VHOST")/.$(basename "$VHOST").XXXXXX")"      # cp -p first (below): the temp file carries the vhost's mode and owner, the awk output only replaces its content
+    if cp -p "$VHOST" "$VT" && awk -v inc="    $INC" -v anchor="$ANCHOR" '{print} index($0, anchor) && !d {print inc; d=1} END {exit !d}' "$VHOST" > "$VT" && grep -qF -- "$INC" "$VT" && mv -f "$VT" "$VHOST"; then NGX_CH=1; else rm -f "$VT"; die "could not insert the include into $VHOST (anchor not found, or the write failed)"; fi
   fi
 else
   echo "[todo] add this line INSIDE the server{} of app.deepyield.ai, right after the RH include (or re-run with --add-include):"
   echo "         $INC"
 fi
 if [ $APPLY = 1 ]; then
-  if nginx -t >/dev/null 2>&1; then ok "nginx -t"; else
-    nginx -t 2>&1 | tail -5
-    [ -f "$BK$VHOST" ] && cat "$BK$VHOST" > "$VHOST" && echo "[undo] restored $VHOST from $BK"
-    for z in "$SNIP" "$ZONES"; do if [ -f "$BK$z" ]; then cat "$BK$z" > "$z"; else rm -f "$z"; fi; done
-    die "nginx -t failed: restored the backup, NOT reloading"
+  if NGT="$(nginx -t 2>&1)"; then ok "nginx -t"; NGX_GUARD=0; else
+    printf '%s\n' "$NGT" | tail -5 || true
+    die "nginx -t failed: the files this run changed are put back (see [undo] lines), NOT reloading"      # the EXIT trap runs the rollback
   fi
-else say "nginx -t (then reload only if it passes; restore the backup if not)"; fi
+else say "nginx -t (then reload only if it passes; the files this run changed are put back if not)"; fi
 
 # 7. start the two new units only; nginx reload only if this run changed nginx files
 if [ $START = 1 ]; then
@@ -149,7 +173,11 @@ if [ $START = 1 ]; then
     else run systemctl enable --now $u; fi
   done
 fi
-if [ $NGX_CH = 1 ]; then say "systemctl reload nginx (after the passing nginx -t)"; [ $APPLY = 1 ] && nginx -t >/dev/null 2>&1 && systemctl reload nginx && ok "nginx reloaded"; fi
+if [ $NGX_CH = 1 ]; then say "systemctl reload nginx (after the passing nginx -t)"
+  if [ $APPLY = 1 ]; then      # audit 1181 L-7: explicit; a failing test or reload is an error, never a silent skip. The config on disk already passed nginx -t at step 6, so nothing is rolled back here
+    if nginx -t >/dev/null 2>&1; then if systemctl reload nginx; then ok "nginx reloaded"; else die "systemctl reload nginx failed (the config on disk passes nginx -t): check journalctl -u nginx"; fi; else die "nginx -t failed before the reload: NOT reloading"; fi
+  fi
+fi
 
 # 8. smoke tests (real run only)
 if [ $APPLY = 1 ] && [ $START = 1 ]; then

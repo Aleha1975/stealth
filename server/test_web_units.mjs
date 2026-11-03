@@ -688,11 +688,11 @@ print(json.dumps({"eth": m._real_payer(eth_rc, st), "none": m._real_payer({"from
   { const rh = CHAINS.rh, { calls, f } = mk((u, b) => b.method === "eth_blockNumber" ? okR("0x" + (100_761_230 + 5).toString(16)) : okR(b.method === "eth_getTransactionCount" ? "0x0" : [{}])); await HZ.makeCountPriorHops(rh, f)(ST); const logs = calls.filter(c => c.m === "eth_getLogs");
     t("RH unchanged: one endpoint, scan from 100_761_230", HZ.PAY_FROM_BLOCK.rh === 100_761_230 && rh.rpcs.length === 1 && rh.rpcs[0] === rh.rpc && base.rpcs[0] === base.rpc && parseInt(logs[0].p.fromBlock, 16) === 100_761_230); }
   { const run = async (chain, tip, b0) => { const { calls, f } = mk((u, b) => b.method === "eth_blockNumber" ? okR("0x" + tip.toString(16)) : okR(b.method === "eth_getTransactionCount" ? "0x0" : [])); await HZ.makeCountPriorHops(chain, f)(ST, b0); return calls.filter(c => c.m === "eth_getLogs").map(c => [parseInt(c.p.fromBlock, 16), parseInt(c.p.toBlock, 16)]); };
-    const fresh = await run(base, TIP, TIP - 500), far = await run(base, TIP, 40_000_000), none = await run(base, TIP), bad = await Promise.all([null, -5, 1.5, "40000000", NaN].map(x => run(base, TIP, x))), top = await run(base, TIP, TIP + 9_000), small = await run(base, TIP, 50);
+    const fresh = await run(base, TIP, TIP - 500), far = await run(base, TIP, 40_000_000), none = await run(base, TIP), bad = await Promise.all([null, -5, 1.5, "40000000", NaN].map(x => run(base, TIP, x))), top = await run(base, TIP, TIP + 9_000).then(() => null, e => e), small = await run(base, TIP, 50);
     t("b0 near the tip: exactly 1 getLogs call, from b0 - 100 (under publicnode's 50k cap)", fresh.length === 1 && fresh[0][0] === TIP - 600 && fresh[0][1] === TIP && fresh[0][1] - fresh[0][0] < 50_000);
     t("b0 far back (40M): windows from 40M - 100, none beyond the tip", far[0][0] === 40_000_000 - 100 && far.length === Math.ceil((TIP - 39_999_900 + 1) / HZ.LOG_SPAN) && far.at(-1)[1] === TIP);
     t("no b0 (or an unusable one): the old start, 31_700_000", none[0][0] === 31_700_000 && bad.every(w => w[0][0] === 31_700_000));
-    t("b0 above the tip is clamped to the tip (one window, never zero windows); b0 < 100 starts at 0", top.length === 1 && top[0][0] === TIP && small[0][0] === 0);
+    t("1181 L-3 b0 above the tip: the endpoint is behind a block the indexer has seen -> limited (not clamped to a one-block scan that returns 0); b0 < 100 starts at 0", top && top.limited === true && /behind/.test(top.message) && small[0][0] === 0);
     const rhc = CHAINS.rh, rt = 100_761_230 + 3_000_000, rhb = await run(rhc, rt, rt - 10), rhn = await run(rhc, rt); t("RH: b0 narrows the scan, no b0 keeps the pay-contract start", rhb.length === 1 && rhb[0][0] === rt - 110 && rhn[0][0] === 100_761_230); }
   { const rows = [], by = new Map(), A1 = "0x" + "Ab".repeat(20), r = (block, v, tx) => ({ stealth: A1, block, v, tx }); CR.foldRow(rows, by, r(300, false, "e")); CR.foldRow(rows, by, r(500, true, "l")); CR.foldRow(rows, by, r(900, false, "x")); CR.foldRow(rows, by, { stealth: A1.toLowerCase(), block: 0, v: false });
     t("dedupe keeps the EARLIEST block: an unverified earlier row + a later verified row -> the verified row, b0 = the earlier block (the block-0 row folded last makes it unknown, 1180 M-1)", rows.length === 1 && rows[0].tx === "l" && rows[0].v && rows[0].b0 === null);
@@ -732,5 +732,56 @@ print(json.dumps({"eth": m._real_payer(eth_rc, st), "none": m._real_payer({"from
   for (const msg of ["query returned more than 10000 results", "block range is too wide", "too many results"]) { const { calls, f } = mk((u, b) => b.method === "eth_blockNumber" ? undefined : { ok: true, status: 200, json: async () => ({ error: { code: -32005, message: msg } }) }), e = await HZ.makeCountPriorHops(base, f)(ST).then(() => null, e => e.message);
     t("1180 I-2 -32005 '" + msg + "' is final (no retry, no fail-over)", /failed/.test(e) && calls.length === 2 && calls.every(c => c.u === base.rpcs[0])); }
   { const { calls, f } = mk((u, b) => b.method === "eth_blockNumber" ? undefined : u === base.rpcs[0] ? { ok: true, status: 200, json: async () => ({ error: { code: -32005, message: "rate limit exceeded" } }) } : okR([{}])), n = await HZ.makeCountPriorHops(base, f)(ST); t("1180 I-2 -32005 'rate limit exceeded' is still a rate limit (retry, then fail over)", n >= 1 && calls.some(c => c.u === base.rpcs[1]) && calls.filter(c => c.u === base.rpcs[0] && c.m === "eth_getLogs").length === 3); }
+  // audit 1181: L-3 lagging endpoints, I-2 window cap, I-1 production wrapper
+  { const [E1, E2] = base.rpcs, hx = n => "0x" + n.toString(16);
+    const mkAns = (heads, o = {}) => { const calls = [], f = async (u, i) => { const b = JSON.parse(i.body); calls.push({ u, m: b.method, p: b.params }); const k = calls.filter(c => c.u === u && c.m === "eth_blockNumber").length;
+      if (o.fail && o.fail(u, b, k)) return lim; if (b.method === "eth_blockNumber") return okR(hx(typeof heads[u] === "function" ? heads[u](k) : heads[u])); if (b.method === "eth_getTransactionCount") return o.pinnedErr ? { ok: true, status: 200, json: async () => ({ error: { code: -32000, message: "header not found" } }) } : okR("0x1"); return okR([{}]); }; return { calls, f }; };
+    { const { calls, f } = mkAns({ [E1]: TIP, [E2]: TIP - 3 }, { fail: (u, b) => u === E1 && b.method === "eth_getLogs" }), e = await HZ.makeCountPriorHops(base, f)(ST).then(() => null, e => e.message);
+      t("1181 L-3 the endpoint that reported the higher tip is rate limited; the failover endpoint reports a LOWER tip -> its answer is rejected (the highest tip seen is kept), the count throws", /behind another endpoint/.test(e) && !calls.some(c => c.u === E2 && c.m === "eth_getLogs")); }
+    { const { calls, f } = mkAns({ [E1]: TIP, [E2]: TIP + 2 }, { fail: (u, b) => u === E1 && b.method === "eth_getLogs" }), n = await HZ.makeCountPriorHops(base, f)(ST);
+      t("1181 L-3 ...a failover endpoint with an equal or higher tip is accepted", n > 0 && calls.some(c => c.u === E2 && c.m === "eth_getLogs")); }
+    { const { calls, f } = mkAns({ [E1]: TIP, [E2]: TIP }), n = await HZ.makeCountPriorHops({ ...base, eth: { assetId: "x" } }, f)(ST), c = calls.find(c => c.m === "eth_getTransactionCount");
+      t("1181 L-3 the transaction count is read AT the pinned tip block, not 'latest'", c && c.p[1] === hx(TIP) && c.p[0] === ST && n > 0); }
+    { const { calls, f } = mkAns({ [E1]: TIP, [E2]: TIP }, { pinnedErr: true }), e = await HZ.makeCountPriorHops({ ...base, eth: { assetId: "x" } }, f)(ST).then(() => null, e => e.message);
+      t("1181 L-3 a pinned-block error is FINAL: no fallback to 'latest', no failover, the count throws", /failed/.test(e) && !calls.some(c => c.m === "eth_getTransactionCount" && c.p[1] === "latest") && calls.filter(c => c.m === "eth_getTransactionCount").length === 1 && calls.every(c => c.u === E1)); }
+    { const { calls, f } = mkAns({ [E1]: 2 ** 52, [E2]: TIP }), n = await HZ.makeCountPriorHops(base, f)(ST);
+      t("1181 I-2 an implausible tip (2^52 -> billions of windows) makes no getLogs call, moves to the next endpoint, and does not poison the highest tip", n > 0 && !calls.some(c => c.u === E1 && c.m === "eth_getLogs") && calls.some(c => c.u === E2 && c.m === "eth_getLogs")); }
+    { const { calls, f } = mkAns({ [E1]: 2 ** 52, [E2]: 2 ** 52 }), e = await HZ.makeCountPriorHops(base, f)(ST).then(() => null, e => e.message);
+      t("1181 I-2 every endpoint implausible -> throws, zero getLogs calls", /implausible/.test(e) && !calls.some(c => c.m === "eth_getLogs")); }
+    { const edge = 31_700_000 + HZ.MAX_WINDOWS * HZ.LOG_SPAN, ok1 = mkAns({ [E1]: edge, [E2]: edge }), bad = mkAns({ [E1]: edge + 1, [E2]: edge + 1 });
+      const n = await HZ.makeCountPriorHops(base, ok1.f)(ST), e = await HZ.makeCountPriorHops(base, bad.f)(ST).then(() => null, e => e.message);
+      t("1181 I-2 exactly MAX_WINDOWS (200) windows is fine, one more is refused", n === ok1.calls.filter(c => c.m === "eth_getLogs").length && HZ.MAX_WINDOWS === 200 && /implausible/.test(e) && !bad.calls.some(c => c.m === "eth_getLogs")); }
+    { const { f } = mkAns({ [E1]: TIP, [E2]: TIP }), n1 = await HZ.makeCountPriorHops(base, f)(ST, TIP - 100), n2 = await HZ.makeCountPriorHops(base, f)(ST, TIP);
+      t("1181 L-3 a tip equal to b0 is fine (only a lower tip is lagging)", n1 > 0 && n2 > 0); }
+    // I-1: the REAL chainRpc wrapper of app.js (extracted), with a fake fetch, feeding rpcOnce
+    { const app = fs.readFileSync(new URL("../web/app.js", import.meta.url), "utf8"), a = app.indexOf("const chainRpc = async"), src = app.slice(a, app.indexOf("\n", app.indexOf("throw new Error(\"the chain RPC did not answer\"); };", a)) + 1);
+      const mkRpc = answer => { const log = []; const fakeFetch = async (u, init) => { log.push(u); return answer(u, init); }, walletRpc = async () => ({ ok: true, json: async () => ({ result: "0xwallet" }) });
+        return { log, chainRpc: new Function("fetch", "timeoutSignal", "walletRpc", src + "; return chainRpc;")(fakeFetch, () => undefined, walletRpc) }; };
+      const resp = (status, body) => ({ ok: status >= 200 && status < 300, status, json: async () => body, clone() { return this; } });
+      { const { log, chainRpc } = mkRpc((u, i) => { const b = JSON.parse(i.body); return resp(200, b.method === "eth_blockNumber" ? { result: hx(TIP) } : { error: { code: -32005, message: "query returned more than 10000 results" } }); });
+        const e = await HZ.makeCountPriorHops(base, chainRpc)(ST).then(() => null, e => e.message);
+        t("1181 I-1 through the real chainRpc: a JSON-RPC size error (-32005 'more than') is FINAL on the first endpoint (no retries, no failover), as in the unit tests", /failed/.test(e) && log.length === 2 && log.every(u => u === E1)); }
+      { let k = 0; const { log, chainRpc } = mkRpc((u, i) => { const b = JSON.parse(i.body); if (b.method === "eth_blockNumber") return resp(200, { result: hx(TIP) }); return ++k === 1 ? resp(502, {}) : resp(200, { result: [{}] }); });
+        const n = await HZ.makeCountPriorHops(base, chainRpc)(ST);
+        t("1181 I-1 through the real chainRpc: HTTP 502 is a gateway outage -> retried on the same endpoint and recovers", n >= 1 && log.every(u => u === E1)); }
+      { const { log, chainRpc } = mkRpc((u, i) => resp(429, {})), e = await HZ.makeCountPriorHops(base, chainRpc)(ST).then(() => null, e => e.message);
+        t("1181 I-1 through the real chainRpc: HTTP 429 everywhere -> retried, failed over to the second endpoint, then throws", e !== null && log.includes(E2) && log.filter(u => u === E1).length === 3); }
+      { const { chainRpc } = mkRpc(() => { throw new TypeError("fetch failed"); }); const e = await chainRpc(E1, { method: "POST", body: "{}" }).then(() => null, e => e.message); t("1181 I-1 a network failure is still thrown as 'did not answer'", /did not answer/.test(e)); }
+      { const { chainRpc } = mkRpc(() => resp(500, { error: { message: "x" } })); const r = await chainRpc(E1, { method: "POST", body: "{}" }, true); t("1181 I-1 the wallet fallback (domain separator, allowWallet) keeps the old rule: no usable result -> the wallet answers", (await r.json()).result === "0xwallet");
+        const rr = await chainRpc(E1, { method: "POST", body: "{}" }); t("1181 I-1 without allowWallet the 500 answer is passed through untouched", rr.status === 500); }
+      { const rp = app.slice(app.indexOf("const rpcOne = async"), app.indexOf("\n", app.indexOf("const rpcOne = async")));
+        const run1 = ans => new Function("chainRpc", "C", rp + "\n; return rpcOne;")(async () => ans, { rpc: "x" })("m", []);
+        t("1181 I-1 rpcOne keeps its rule: a non-ok / error / no-result answer is 'did not answer', a result is returned", await run1(resp(200, { result: "0x1" })) === "0x1" && await run1(resp(500, { result: "0x1" })).then(() => false, e => /did not answer/.test(e.message)) && await run1(resp(200, { error: { message: "e" } })).then(() => false, e => /did not answer/.test(e.message))); } }
+  }
   HZ.setRpcRetry(prev); }
+// audit 1181 M-1: the lost-funds "checked" mark is per chain and address
+{ const app = fs.readFileSync(new URL("../web/app.js", import.meta.url), "utf8"), src = app.slice(app.indexOf("const lost = new Map()"), app.indexOf("const lostNone = new Map()"));
+  const mk = key => { const st = {}, ls = { getItem: k => st[k] ?? null, setItem: (k, v) => { st[k] = v; } }; return { st, L: new Function("localStorage", "C", src + "\n; return lostSeen;")(ls, { key }) }; };
+  const A = "0x" + "ab".repeat(20), r = mk("rh"), b = mk("base");
+  r.L.mark(A); t("1181 M-1 a mark on rh is stored under 'rh|<stealth>'", Object.keys(JSON.parse(r.st["stealth-lost-checked"])).join() === "rh|" + A && r.L.fresh(A));
+  b.st["stealth-lost-checked"] = r.st["stealth-lost-checked"]; t("1181 M-1 the mark made on rh does NOT hide the address on base", !b.L.fresh(A));
+  b.L.mark(A); r.st["stealth-lost-checked"] = b.st["stealth-lost-checked"]; t("1181 M-1 ...and a mark on base does not hide it on rh (only its own chain's)", Object.keys(JSON.parse(b.st["stealth-lost-checked"])).sort().join() === ["base|" + A, "rh|" + A].sort().join());
+  const old = mk("rh"), oldB = mk("base"); old.st["stealth-lost-checked"] = JSON.stringify({ [A]: Date.now() }); oldB.st["stealth-lost-checked"] = old.st["stealth-lost-checked"];
+  t("1181 M-1 an old bare-address mark still counts on rh (no re-check after the update) but not on base", old.L.fresh(A) && !oldB.L.fresh(A));
+  old.L.unmark(A); t("1181 M-1 unmark on rh clears both forms", !old.L.fresh(A) && Object.keys(JSON.parse(old.st["stealth-lost-checked"])).length === 0); }
 console.log(fail ? "FAILED " + fail : "all passed"); process.exit(fail ? 1 : 0);

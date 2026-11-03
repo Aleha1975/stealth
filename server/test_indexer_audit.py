@@ -363,13 +363,21 @@ check("1179 F4 a second rewind before the loop runs keeps the marker at the lowe
 meta_set(m, head=900); m.rewind(100)
 check("1180 L-3 a rewind to a HIGHER point keeps the lower pending reconcile_from (min)", meta_get(m, "reconcile_from") == "401")
 c = m.db(); c.execute("INSERT OR REPLACE INTO meta(k,v) VALUES('reconcile_from','junk')"); c.commit(); c.close(); meta_set(m, head=900); m.rewind(100)
-check("1180 L-3 rewind over a corrupt old reconcile_from replaces it with the new one", meta_get(m, "reconcile_from") == "801")
+check("1181 L-2 rewind over a corrupt old reconcile_from REPLACES it with the wide window max(START, old head - BH_KEEP), capped by the new point (never just the new one)", meta_get(m, "reconcile_from") == "1")
+meta_set(m, head=50000); c = m.db(); c.execute("INSERT OR REPLACE INTO meta(k,v) VALUES('reconcile_from','junk')"); c.commit(); c.close(); m.rewind(100)
+check("1181 L-2 ...with a high head the wide window starts BH_KEEP below the old head, and the rewind point is not lower than that", meta_get(m, "reconcile_from") == str(50000 - m.BH_KEEP))
+c = m.db(); c.execute("INSERT OR REPLACE INTO meta(k,v) VALUES('reconcile_from','99999999')"); c.commit(); c.close(); meta_set(m, head=50000); m.rewind(100)
+check("1181 L-2 rewind over an out-of-range (above old head + 1) reconcile_from is replaced the same way", meta_get(m, "reconcile_from") == str(50000 - m.BH_KEEP))
+c = m.db(); c.execute("INSERT OR REPLACE INTO meta(k,v) VALUES('reconcile_from','-5')"); c.commit(); c.close(); meta_set(m, head=50000); m.rewind(100)
+check("1181 L-2 rewind over a value below START is replaced too", meta_get(m, "reconcile_from") == str(50000 - m.BH_KEEP))
+c = m.db(); c.execute("INSERT OR REPLACE INTO meta(k,v) VALUES('reconcile_from','49000')"); c.commit(); c.close(); meta_set(m, head=50000); m.rewind(100)
+check("1181 L-2 a valid old value is still just min(old, new + 1)", meta_get(m, "reconcile_from") == "49000")
 # (a) a reconcile that returns False (window start above head_done) must not reopen /known while reconcile_from is pending
 m = load(); Chain(m, {"A": {"head": 600, "logs": [], "safe": 590}}); m.START = 1
 meta_set(m, head=100, head_hash=H(100)); c = m.db(); c.execute("INSERT OR REPLACE INTO meta(k,v) VALUES('reconcile_from','5000')"); c.commit(); c.close()
 m.reconcile = lambda *a, **k: False
 run_loop(m, secs=1.0)
-check("1180 L-3a reconcile returned False: reconcile_from stays and no known/safe/final boundary is written", meta_get(m, "reconcile_from") == "5000" and all(meta_get(m, k) is None for k in ("known_block", "safe_block", "final_block")))
+check("1180 L-3a reconcile returned False: reconcile_from stays (an out-of-range 5000 is replaced by the wide window, not dropped) and no known/safe/final boundary is written", meta_get(m, "reconcile_from") == "1" and all(meta_get(m, k) is None for k in ("known_block", "safe_block", "final_block")))
 # (c) a corrupt reconcile_from does not stall the loop: ALERT once, key dropped, /known closed on that pass, opened by the next clean one
 import io, contextlib
 m = load(); Chain(m, {"A": {"head": 600, "logs": [], "safe": 590}}); m.START = 1
@@ -381,8 +389,58 @@ buf = io.StringIO()
 with contextlib.redirect_stdout(buf):
     run_loop(m, until=lambda: meta_get(m, "known_block") is not None, limit=15)
 out = buf.getvalue()
-check("1180 L-3c a corrupt reconcile_from is dropped, the loop goes on (no stall) and later opens the boundary", meta_get(m, "reconcile_from") is None and meta_get(m, "known_block") is not None)
-check("1180 L-3c exactly one ALERT for the corrupt value, and the boundary was never written while it was still there", out.count("ALERT corrupt reconcile_from") == 1 and all(x is None for x in seen))
+check("1181 L-2 a corrupt reconcile_from is replaced by the wide window, reconciled from there, consumed only after that reconcile is complete, and then the boundary opens", meta_get(m, "reconcile_from") is None and meta_get(m, "known_block") is not None)
+check("1181 L-2 exactly one ALERT for the bad value, and the boundary was never written while the marker was still there", out.count("ALERT bad reconcile_from") == 1 and all(x is None for x in seen))
+
+
+# ---- audit 1181 L-1: reconcile has three outcomes; /known opens only after a COMPLETE pass
+m = load(); m.MODE = "latest"; m.START = 1
+put(m, 150, 0, S(1), V3, 5_000_000, 5_000_000)
+ch = Chain(m, {"A": {"head": 300, "logs": []}, "B": {"head": 300, "logs": []}})
+real_fr = m.fetch_range; nfr = [0]
+def only_first_reads(*a, **k):                                   # the first read (one call per agreed endpoint) answers, every later one (the second read) fails
+    nfr[0] += 1
+    if nfr[0] > m.NEED: raise RuntimeError("second read down")
+    return real_fr(*a, **k)
+m.fetch_range = only_first_reads
+r1 = m.reconcile(m.db(), 200, 250, "A")
+check("1181 L-1 rows to delete but no second read -> REC_NO_SECOND, nothing deleted", r1 == m.REC_NO_SECOND and count(m) == 1)
+m.fetch_range = real_fr
+r2 = m.reconcile(m.db(), 200, 250, "A")
+check("1181 L-1 two reads agree -> REC_DONE and the row is deleted", r2 == m.REC_DONE and count(m) == 0)
+check("1181 L-1 a window above head_done -> REC_NOT_REACHED", m.reconcile(m.db(), 9000, 250, "A", frm=9000) == m.REC_NOT_REACHED and len({m.REC_DONE, m.REC_NO_SECOND, m.REC_NOT_REACHED}) == 3)
+put(m, 150, 0, S(1), V3, 5_000_000, 5_000_000); nfr[0] = 0; m.fetch_range = only_first_reads
+check("1181 L-1 insert_only never needs a second read -> REC_DONE", m.reconcile(m.db(), 200, 250, "A", insert_only=True) == m.REC_DONE); m.fetch_range = real_fr
+# the loop: a --rewind whose second read is missing keeps reconcile_from, writes no boundary, ALERTs once; when the second read returns, the pass completes and the boundary opens
+m = load(); Chain(m, {"A": {"head": 600, "logs": [], "safe": 590}, "B": {"head": 600, "logs": [], "safe": 590}}); m.START = 1; m.MODE = "latest"
+meta_set(m, head=700, head_hash=H(700)); put(m, 550, 0, S(1), V3, 5_000_000, 5_000_000); m.rewind(200)
+real_fr = m.fetch_range; real_rec = m.reconcile; seen_u = {}; nfr = [0]
+def only_first_reads2(a, b, u, *r, **k):                         # within one reconcile every endpoint answers once (the first read); a second read of the same endpoint fails
+    nfr[0] += 1; seen_u[u] = seen_u.get(u, 0) + 1
+    if seen_u[u] > 1: raise RuntimeError("second read down")
+    return real_fr(a, b, u, *r, **k)
+def rec_reset(*a, **k): seen_u.clear(); return real_rec(*a, **k)
+m.reconcile = rec_reset
+m.fetch_range = only_first_reads2; m.WAIT_ALERT_S = 3600
+buf = io.StringIO()
+with contextlib.redirect_stdout(buf): run_loop(m, secs=1.2)
+out = buf.getvalue()
+check("1181 L-1 second read missing: reconcile_from stays, no known/safe/final boundary, the fork row is NOT deleted", meta_get(m, "reconcile_from") == "501" and all(meta_get(m, k) is None for k in ("known_block", "safe_block", "final_block")) and count(m) == 1)
+check("1181 L-1 ...and exactly one ALERT per WAIT_ALERT_S for the incomplete reconcile", out.count("ALERT reconcile from 501 incomplete (second-read-missing)") == 1)
+m.fetch_range = real_fr; m.reconcile = real_rec
+t0 = time.time()
+while time.time() - t0 < 10 and meta_get(m, "reconcile_from") is not None: time.sleep(0.05)
+check("1181 L-1 the second read is back: the pass completes, the fork row is gone, the marker is consumed and the boundary opens", meta_get(m, "reconcile_from") is None and count(m) == 0 and meta_get(m, "known_block") is not None)
+# L-2 loop: out-of-range / corrupt values are replaced, the replacement reconciles, nothing is silently dropped
+for bad in ("junk", "99999999", "-4", "0"):
+    m = load(); Chain(m, {"A": {"head": 600, "logs": [], "safe": 590}}); m.START = 5
+    meta_set(m, head=100, head_hash=H(100), reconcile_from=bad); m.reconcile = lambda *a, **k: m.REC_NO_SECOND; seen = {}
+    run_loop(m, secs=0.8)
+    check("1181 L-2 reconcile_from %r (outside [START, head_done+1]) is replaced by max(START, head_done - BH_KEEP) = 5, not deleted, /known stays closed" % bad, meta_get(m, "reconcile_from") == "5" and meta_get(m, "known_block") is None)
+m = load(); Chain(m, {"A": {"head": 600, "logs": [], "safe": 590}}); m.START = 5; meta_set(m, head=100, head_hash=H(100), reconcile_from=101); m.reconcile = lambda *a, **k: m.REC_NOT_REACHED
+run_loop(m, secs=0.6); check("1181 L-2 head_done + 1 is a valid value and is kept as it is", meta_get(m, "reconcile_from") == "101")
+m = load(); m.START = 5
+check("1181 L-2 _rf_valid: accepts [START, head_done+1] only", [m._rf_valid(v, 100) for v in ("5", "101", "50", 7)] == [5, 101, 50, 7] and [m._rf_valid(v, 100) for v in ("4", "102", "x", None, "1.5", "")] == [None] * 6)
 
 # ---- F-3 / F-4: receipts, paid, known gate, retraction signal
 m = load()

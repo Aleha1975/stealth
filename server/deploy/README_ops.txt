@@ -230,3 +230,14 @@ Known-gate lag on Robinhood (02.11.2026): /known trusts a row once it is STEALTH
 Audit 1180 (notes)
   I-3  On failover the Base fallback RPC (base-rpc.publicnode.com, also in the CSP) learns the user's stealth address and IP from the hop counter reads (eth_getLogs / eth_getTransactionCount); mainnet.base.org already did.
   I-4  The legacy stealth-sanctions.timer (non-template) is no longer managed by any installer and stays orphaned on a host that had it: systemctl disable --now stealth-sanctions.timer, if present (the live templates are stealth-sanctions@rh / @base).
+
+Audit 1181 (notes)
+- Hop wallet derivation (M-1): the chain is part of the derivation for every chain except Robinhood ("rh" keeps the legacy tag, so every existing RH hop and its recovery is unchanged). A hop on another chain uses tag stealth-zec-hop/v1:<chain>[:n],
+  its local record key is "<chain>:<stealth>#<n>" and the record carries deriv:"<chain>"; a record without deriv is legacy and always re-derives the legacy wallet. The only Base hop made before this (legacy key, no deriv) is still found, resumed and scanned
+  (lost-funds scans on Base ask the chain-derived wallets and the legacy wallets n < min(4, prior hops)).
+- Lab and prod share ONE browser origin (the lab lives under /stealth-zec/lab/ of the same host): IndexedDB (hop records), localStorage and the cookies are shared between them, and the prod-only exclusions (blueprint, selftest, test vectors)
+  are served from the lab path anyway. Do not use the lab with real keys expecting it to be isolated from prod. (audit 1181 I-4; deploy_*.sh also run without --delete, so a file removed from web/ stays on the server until removed there by hand.)
+- install_*.sh guard_path matches the path TEXT only ($OPT/* also matches $OPT/../x); every destination is a literal in the scripts today, so nothing is exploitable, but do not pass a variable destination to put()/track() without
+  resolving it first. install_rh.sh has no guard_path (audit 1181 I-5). Some writes (install -d of the nginx cache dir, chown of the sanctions dirs) bypass the guard by design.
+- deploy_prod.sh / deploy_lab.sh refuse a web/ with uncommitted, staged or untracked files unless FORCE_DIRTY=1, refuse symlinks and special files in the copy, and run the manifest check with --strict. The manifests are still read from the working tree,
+  not from git HEAD (audit 1181 I-3, partly open: the top-level web/*.js code is not hashed).

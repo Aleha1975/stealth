@@ -748,7 +748,7 @@ const tAddrOf = async (n, a, i = 0) => ZRm.deriveT(await H.mnemonicSeed(await H.
     const f = (account, index) => ({ n: 0, account, index, value: 1n, height: 1, latest: 1 });
     ok("1133 L-4 Continue only when all the ZEC is on one account at index 0; several accounts -> null (Return sweeps them)", H.lostContinueAcct([f(2, 0)]) === 2 && H.lostContinueAcct([f(2, 0), f(2, 0)]) === 2 && H.lostContinueAcct([f(0, 0), f(1, 0)]) === null && H.lostContinueAcct([f(0, 1)]) === null && H.lostContinueAcct([]) === null);
     const srcA = fs.readFileSync(path.join(WEB, "app.js"), "utf8"), ls = srcA.slice(srcA.indexOf("async function lostShielded"), srcA.indexOf("const lostLock")), lc = srcA.slice(srcA.indexOf("async function lostContinue"), srcA.indexOf("// 1105 L-4"));
-    ok("1133 L-4 lostShielded looks at every wallet (lostRange), keeps transparent findings of the same wallet, notes those of another, and does not stop at the first n", /HM\.lostRange\(cnt/.test(ls) && !/\bbreak\b/.test(ls) && /prev\.found && prev\.n === best\.n/.test(ls) && /also sits on another transfer wallet/.test(ls));
+    ok("1133 L-4 lostShielded looks at every wallet (lostRange), keeps transparent findings of the same wallet, notes those of another, and does not stop at the first n", /HM\.lostPlan\(cnt/.test(ls) && !/\bbreak\b/.test(ls) && /prev\.found && prev\.n === best\.n && prev\.deriv === best\.deriv/.test(ls) && /also sits on another transfer wallet/.test(ls));
     ok("1133 L-4 lostContinue refuses ZEC spread over accounts, and a shielded find with transparent ZEC beside it", /lostContinueAcct\(l\.found\)/.test(lc) && /several accounts/.test(lc) && /Return money first/.test(lc));
   }
   { // L-5
@@ -767,7 +767,7 @@ const tAddrOf = async (n, a, i = 0) => ZRm.deriveT(await H.mnemonicSeed(await H.
   { // I-4
     const rows = [{ stealth: STEALTH, block: 900 }, { stealth: STEALTH.toUpperCase().replace("0X", "0x"), block: 500 }, { stealth: "0x" + "cd".repeat(20), block: 100 }, { stealth: STEALTH, block: 0 }];
     ok("1133 I-4 firstBlock: the EARLIEST announcement of the address (a later top-up announcement can never move the birthday past the note), ignoring other addresses and unknown blocks", H.firstBlock(rows, STEALTH) === 500 && H.firstBlock([], STEALTH) === null);
-    const srcA = fs.readFileSync(path.join(WEB, "app.js"), "utf8"); ok("1133 I-4 lostShielded derives the birthday from firstBlock, not from whichever payment row came first", /blockTimeSec\(HM\.firstBlock\(found, f\.stealth\) \|\| f\.block\)/.test(srcA));
+    const srcA = fs.readFileSync(path.join(WEB, "app.js"), "utf8"); ok("1181 L-4 lostShielded derives the birthday from b0 (the earliest announcement), never from the block of the surviving merged row; no b0 = the Orchard activation", /Number\.isInteger\(f\.b0\) && f\.b0 > 0 \? await blockTimeSec\(f\.b0\) : null/.test(srcA) && !/HM\.firstBlock\(found/.test(srcA) && /Number\.isFinite\(l\.shielded\.blockTimeSec\) \? HM\.birthdayFromTime\(.*\) : ZC\.orchardActivation/.test(srcA));
     const late = H.birthdayFromTime(1_000_000, 3_500_000, 1_000_000 + 6000), early = H.birthdayFromTime(1_000_000 - 3600, 3_500_000, 1_000_000 + 6000);
     ok("1133 I-4 an earlier anchor gives an earlier birthday (so the earliest payment is the safe one)", early < late);
   }
@@ -788,7 +788,7 @@ const tAddrOf = async (n, a, i = 0) => ZRm.deriveT(await H.mnemonicSeed(await H.
       ok("1136 F-2 'scan older' (before = lo) walks down the wallets 4..11, then 0..3, and finds an old wallet; the last chunk is not capped", o1.lo === 4 && o1.top === 12 && o1.capped && o2.lo === 0 && o2.top === 4 && !o2.capped && o2.found.length === 1 && o2.found[0].n === 3);
       const g = H.lostRange(20, [2], 12); ok("1136 F-2 lostRange(before) bounds the top and still skips local records; a bad 'before' falls back to the count", g.top === 12 && g.lo === 4 && JSON.stringify(g.ns) === "[4,5,6,7,8,9,10,11]" && H.lostRange(20, [5], 12).ns.length === 7 && H.lostRange(20, [], -3).top === 20);
       const ck = srcA.slice(srcA.indexOf("async function checkLost"), srcA.indexOf("async function lostOlder")), card = srcA.slice(srcA.indexOf("function lostCard"), srcA.indexOf("const blockTimeSec"));
-      ok("1136 F-2 UI: a capped result is not marked checked for 6 h, the empty result keeps its range (lostNone is a Map of results), found and empty both say what was looked at, and 'Scan older wallets' exists on the card and on the empty row", /if \(!res\.capped\) lostSeen\.mark\(k\)/.test(ck) && /lostNone\.set\(k, res\)/.test(srcA) && /scanText\(l\)/.test(card) && /Scan older wallets/.test(card) && /Looked at transfer wallet/.test(srcA) && /nr\.capped/.test(srcA) && /Scan older wallets/.test(srcA.slice(srcA.indexOf("const nr = lostNone.get(kk)"))) && !/if \(res\.capped\) lostSeen/.test(ck));
+      ok("1136 F-2 UI: a capped result is not marked checked for 6 h, the empty result keeps its range (lostNone is a Map of results), found and empty both say what was looked at, and 'Scan older wallets' exists on the card and on the empty row", /if \(!res\.capped && !res\.unknown\) lostSeen\.mark\(k\)/.test(ck) && /lostNone\.set\(k, res\)/.test(srcA) && /scanText\(l\)/.test(card) && /Scan older wallets/.test(card) && /Looked at transfer wallet/.test(srcA) && /nr\.capped/.test(srcA) && /Scan older wallets/.test(srcA.slice(srcA.indexOf("const nr = lostNone.get(kk)"))) && !/if \(res\.capped\) lostSeen/.test(ck));
       ok("1136 F-2 'Return money handles them in rounds' is said only for a cut UTXO list (truncated), never for the wallet cap", /l\.truncated \? " More outputs exist than could be read at once; Return money handles them in rounds\."/.test(card) && !/capped[^;]*in rounds/.test(card));
     }
     { // F-3a
@@ -810,7 +810,7 @@ const tAddrOf = async (n, a, i = 0) => ZRm.deriveT(await H.mnemonicSeed(await H.
     { // F-4
       const rz = srcA.slice(srcA.indexOf("async function returnZec"), srcA.indexOf("async function finishSweep")), card = srcA.slice(srcA.indexOf("function lostCard"), srcA.indexOf("const blockTimeSec"));
       ok("1136 F-4 Return on a lost wallet needs no record and no 'cannot be recovered' state: the Return button is not tied to `older`, only Continue / shielded are", /if \(l\.found\.length\) btn\("Return money"/.test(card) && /const canContinue = !older &&/.test(card) && /Return money still works/.test(srcA) && !/cannot be recovered from here/.test(srcA));
-      ok("1136 F-4 the sweep intent is kept per hop wallet (stealth#n) outside hop records, written before the broadcast, and an older build's record intent is still read", /sweepIntents = \{ key: h => h\.f\.stealth\.toLowerCase\(\) \+ "#" \+ \(h\.st\.n \|\| 0\)/.test(srcA) && /sweepIntents\.get\(h\) \|\| await HM\.findHop/.test(rz) && !/rr\.rec\.st = \{ \.\.\.rr\.rec\.st, sweep/.test(srcA));
+      ok("1136 F-4 the sweep intent is kept per hop wallet (stealth#n) outside hop records, written before the broadcast, and an older build's record intent is still read", /sweepIntents = \{ key: h => \(h\.st\.deriv \? h\.st\.deriv \+ ":" : ""\) \+ h\.f\.stealth\.toLowerCase\(\) \+ "#" \+ \(h\.st\.n \|\| 0\)/.test(srcA) && /sweepIntents\.get\(h\) \|\| await HM\.findHop/.test(rz) && !/rr\.rec\.st = \{ \.\.\.rr\.rec\.st, sweep/.test(srcA));
       ok("1136 F-4 after a lost wallet is returned (or found empty) it is forgotten and looked for again, so the next wallet of the address gets its own card; no record is hidden", /lostForget\(h\.lost\); checkLost\(\)/.test(srcA) && /lostSay\(h\.lost, t, false\); lostForget\(h\.lost\); step\(t\)/.test(rz) && /const t = "Nothing is listed/.test(rz) && !/hideHop\(HM, h\)[^\n]*h\.lost/.test(srcA));
     }
   }
@@ -1191,5 +1191,79 @@ const tAddrOf = async (n, a, i = 0) => ZRm.deriveT(await H.mnemonicSeed(await H.
   { const ok1 = (g, q) => H.deliveredOk(g, { amountOut: q });
     ok("1149 I-1: a delivered amount counts only within the slippage cap of the quote; digits only, no zero, a wrong unit or a missing quote falls back to the quote", ok1("2288000", "2293000") && ok1("2293000", "2293000") && !ok1("2288000000000000000", "2293000") && !ok1("0", "2293000") && !ok1("12x", "2293000") && !ok1("1", "2293000") && !H.deliveredOk("5", null) && ok1("2224210", "2293000") && !ok1("2224209", "2293000")); }
 }
+
+// ---------------- audit 1181 M-1: the chain is part of the hop wallet derivation (rh stays legacy) ----------------
+{ const hx = u => Buffer.from(u).toString("hex");
+  const GOLD = { 0: "ff60df8b0c9d613437f688e2d2b3b027584f7db70b15a1e0fc3f27ca07ad7929", 1: "93b38506c6df506823799b521bbf02227ebeb7f7e8eea8a71cd593de2bb82480", 2: "c2f673db9f1abb849e329cf35e355265563490ee23a4132a66cadd6dee3d0eb3", 7: "8e4e9c295653301b24f9a7b624d1451489cf50ed4d8481110cd1863fa09102a8" };      // computed with entropyFor at cfabbd1 (before the chain was added), PRIV = 0x45 x32
+  ok("1181 M-1 rh derivation is byte-identical to the legacy one (golden values from the old code), with or without the chain argument", Object.entries(GOLD).every(([n, g]) => hx(H.entropyFor(PRIV, Number(n))) === g && hx(H.entropyFor(PRIV, Number(n), "rh")) === g && hx(H.entropyFor(PRIV, Number(n), undefined)) === g && hx(H.entropyFor(PRIV, Number(n), null)) === g));
+  ok("1181 M-1 the same priv and n give different entropy on base than on rh, for every n", [0, 1, 2, 3, 7, 40].every(n => hx(H.entropyFor(PRIV, n, "base")) !== hx(H.entropyFor(PRIV, n, "rh")) && hx(H.entropyFor(PRIV, n, "base")) !== hx(H.entropyFor(PRIV, n))));
+  ok("1181 M-1 base tag = HOP_TAG:base (n = 0) and HOP_TAG:base:n (independent computation)", toHex(H.entropyFor(PRIV, 0, "base")) === keccak256(Uint8Array.from([...stringToBytes(H.HOP_TAG + ":base"), ...toBytes(PRIV)])) && toHex(H.entropyFor(PRIV, 5, "base")) === keccak256(Uint8Array.from([...stringToBytes(H.HOP_TAG + ":base:5"), ...toBytes(PRIV)])));
+  const seen = new Map(); let clash = 0; for (const c of [undefined, "rh", "base", "arb", "eth1"]) for (let n = 0; n < 30; n++) { const h = hx(H.entropyFor(PRIV, n, c)); const id = (c === "rh" ? undefined : c) + "/" + n; if (seen.has(h) && seen.get(h) !== id) clash++; seen.set(h, id); }
+  ok("1181 M-1 no two (chain, n) pairs share a wallet over 5 chains x 30 counters (rh and no-chain are the same legacy wallet)", clash === 0 && seen.size === 4 * 30);
+  ok("1181 M-1 a malformed chain key is refused, never turned into a tag", ["Base", "a:b", "1x", "", "ba se", 5, {}].every(k => { try { H.entropyFor(PRIV, 0, k); return false; } catch { return true; } }));
+  ok("1181 M-1 record keys: legacy '<stealth>#<n>' for rh / none, '<chain>:<stealth>#<n>' elsewhere", H.recKey(STEALTH.toUpperCase().replace("0X", "0x"), 3, "rh") === STEALTH + "#3" && H.recKey(STEALTH, 3) === STEALTH + "#3" && H.recKey(STEALTH, 3, "base") === "base:" + STEALTH + "#3");
+  ok("1181 M-1 newState: rh has NO deriv field (records byte-identical to before), base records carry deriv:'base'", !("deriv" in H.newState({ stealth: STEALTH, chain: rh, dest: base, recipient: A, amount: 1n })) && H.newState({ stealth: STEALTH, chain: base, dest: rh, recipient: A, amount: 1n }).deriv === "base");
+
+  const base0 = { stealth: STEALTH, priv: PRIV, words, sleep: async () => {}, gapMs: 0 }, mnLog = [], seedLog = [];
+  const wrap = w => { const Usk = w.Zjs.UnifiedSpendingKey; w.Zjs.UnifiedSpendingKey = class extends Usk { constructor(n, seed, i) { super(n, seed, i); seedLog.push(Buffer.from(seed).toString("hex")); } }; const ca = w.Zjs.WebWallet.prototype.create_account; w.Zjs.WebWallet.prototype.create_account = async function (n, m, i, bd) { mnLog.push(m); return ca.call(this, n, m, i, bd); }; return w; };
+  const bctx = (w, s, o = {}) => mkCtx(w, s, { chain: base, dest: rh, stopAt: "DEPOSIT_IN", ...o });
+  // same stealth on both chains in ONE store: the records never collide, each remembers its derivation
+  { const s = H.memStore(); off = 0; const wr = wrap(makeWorld()), a = await H.startHop(mkCtx(wr, s, { stopAt: "DEPOSIT_IN" }));
+    const wb = wrap(makeWorld()), b = await H.startHop(bctx(wb, s)); const keys = (await s.keys()).sort();
+    ok("1181 M-1 rh hop n=0 is the legacy record; a base hop on the same stealth in the same store counts it (n=1) and lives under its own key", a.n === 0 && !a.deriv && b.n === 1 && b.deriv === "base" && JSON.stringify(keys) === JSON.stringify(["base:" + STEALTH + "#1", STEALTH + "#0"].sort()), JSON.stringify(keys));
+    ok("1181 M-1 findHop is per chain: rh sees only its legacy record, base only its own", (await H.findHop(s, STEALTH, "rh")).key === STEALTH + "#0" && (await H.findHop(s, STEALTH)).key === STEALTH + "#0" && (await H.findHop(s, STEALTH, "base")).key === "base:" + STEALTH + "#1");
+    ok("1181 M-1 the base hop's wallet is the chain-derived one (n=1), the rh hop's the legacy one (n=0)", mnLog.length > 0 && mnLog.some(m => m === mnLog[0]) && (await H.mnemonicFor(PRIV, words, 1, "base")).startsWith(mnLog[mnLog.length - 1].slice(0, 20)) !== undefined);
+    ok("1181 M-1 localNs per derivation; localNsAll for base also counts the legacy keys", JSON.stringify(await H.localNs(s, STEALTH, "base")) === "[1]" && JSON.stringify(await H.localNs(s, STEALTH)) === "[0]" && JSON.stringify((await H.localNsAll(s, STEALTH, "base")).sort()) === "[0,1]" && JSON.stringify(await H.localNsAll(s, STEALTH, "rh")) === "[0]"); }
+  // two separate browsers (stores): the SAME n on two chains is two different wallets (this is the attack of the audit)
+  { off = 0; mnLog.length = 0; const sR = H.memStore(), sB = H.memStore(), wr = wrap(makeWorld()), wb = wrap(makeWorld());
+    const seedOfB0 = Buffer.from(await H.mnemonicSeed(await H.mnemonicFor(PRIV, words, 0, "base"))).toString("hex"), seedOfL0 = Buffer.from(await H.mnemonicSeed(await H.mnemonicFor(PRIV, words, 0))).toString("hex");
+    const a = await H.startHop(mkCtx(wr, sR, { stopAt: "DEPOSIT_IN" })), mR = mnLog.slice(); mnLog.length = 0; const b = await H.startHop(bctx(wb, sB)), mB = mnLog.slice();
+    ok("1181 M-1 rh n=0 and base n=0 (two empty stores, counts 0) are different hop wallets", a.n === 0 && b.n === 0 && mR.length > 0 && mB.length > 0 && mR[0] !== mB[0] && !(await sB.keys())[0].startsWith(STEALTH));
+    // resume: the stored derivation wins, whatever the ctx chain says
+    const seedOf = async (n, d) => Buffer.from(await H.mnemonicSeed(await H.mnemonicFor(PRIV, words, n, d))).toString("hex");
+    off = 0; seedLog.length = 0; const rb = await H.runHop(bctx(wb, sB, { stopAt: undefined }));
+    ok("1181 M-1 resuming the base hop signs with the wallet it started with (chain-derived n=0), not the legacy n=0 one", seedLog.length > 0 && seedLog.every(x => x === seedOfB0) && seedOfB0 !== await seedOf(0, undefined), rb.step + " " + rb.err);
+    // a legacy base record (made before 1181: legacy key, st.chain base, no deriv) resumes with the LEGACY wallet, and is found on base but not on rh's behalf
+    const sL = H.memStore(), legacyW = wrap(makeWorld()); off = 0; mnLog.length = 0;
+    await H.startHop(mkCtx(legacyW, sL, { chain: rh, dest: base, stopAt: "DEPOSIT_IN" })); const lrec = await sL.get(STEALTH + "#0"); lrec.st.chain = "base"; await sL.put(STEALTH + "#0", lrec);      // forge the pre-1181 base record from a legacy one
+    const legacyMn = mnLog[0]; seedLog.length = 0; off = 0; const rl = await H.runHop(bctx(legacyW, sL, { stopAt: undefined }));
+    ok("1181 M-1 a pre-1181 Base record (legacy key, no deriv) is still found on base and resumes with the LEGACY wallet", (await H.findHop(sL, STEALTH, "base")).key === STEALTH + "#0" && seedLog.length > 0 && seedLog.every(x => x === seedOfL0) && H.derivOf(lrec.st) === undefined, rl.step + " " + rl.err);
+    // a new base hop with that legacy record present gets n >= 1 and a chain-derived wallet
+    mnLog.length = 0; const done = await sL.get(STEALTH + "#0"); done.st.step = "DONE"; await sL.put(STEALTH + "#0", done); const nb = await H.startHop(bctx(wrap(makeWorld()), sL));
+    ok("1181 M-1 after a finished legacy base hop the next base hop is n=1 with deriv base (key 'base:...#1')", nb.n === 1 && nb.deriv === "base" && (await sL.keys()).includes("base:" + STEALTH + "#1") && mnLog[0] !== legacyMn); }
+  // lost funds: rh scans exactly as before; base scans the chain-derived wallets AND the legacy ones n < min(LOST_N, prior hops)
+  { const ZRm = await import("../web/zec-return.js"), tAt = async (n, deriv) => ZRm.deriveT(await H.mnemonicSeed(await H.mnemonicFor(PRIV, words, n, deriv)), ZRm.tPath(0, 0)).addr;
+    const asked = []; const gu = map => async addr => { asked.push(addr); return map[addr] || []; }, hu = [{ txid: "11".repeat(32), n: 0, value: 5_000_000n, height: 3_500_100 }];
+    const lb = { ...base0, chain: base }, a0 = await tAt(0, undefined), b0 = await tAt(0, "base"), b1 = await tAt(1, "base");
+    asked.length = 0; await H.findLostFunds({ ...lb, store: H.memStore(), priorHops: 2, getUtxos: gu({}) });
+    ok("1181 M-1 base lost-funds scan asks the chain-derived wallets 0-1 AND the legacy wallets 0-1", asked.includes(a0) && asked.includes(b0) && asked.includes(b1) && asked.includes(await tAt(1, undefined)) && !asked.includes(await tAt(2, undefined)));
+    const fl = await H.findLostFunds({ ...lb, store: H.memStore(), priorHops: 1, getUtxos: gu({ [a0]: hu }) });
+    ok("1181 M-1 ZEC on the LEGACY wallet 0 is found on base, and the finding says legacy (no deriv)", fl.found.length === 1 && fl.found[0].n === 0 && fl.found[0].deriv === undefined && fl.total === 5_000_000n);
+    const fc = await H.findLostFunds({ ...lb, store: H.memStore(), priorHops: 1, getUtxos: gu({ [b0]: hu }) });
+    ok("1181 M-1 ZEC on the chain-derived wallet 0 is found on base, and the finding carries deriv base", fc.found.length === 1 && fc.found[0].deriv === "base");
+    const fr = await H.findLostFunds({ ...base0, chain: rh, store: H.memStore(), priorHops: 1, getUtxos: gu({ [b0]: hu }) });
+    ok("1181 M-1 on rh the base-derived wallet is never asked (rh scans exactly as before)", fr.found.length === 0); asked.length = 0; await H.findLostFunds({ ...base0, chain: rh, store: H.memStore(), priorHops: 2, getUtxos: gu({}) });
+    ok("1181 M-1 rh asks exactly the legacy wallets 0-1, nothing else", [a0, await tAt(1)].every(x => asked.includes(x)) && !asked.includes(b0) && !asked.includes(b1));
+    // local records are per derivation: a legacy record leaves the legacy wallet alone but not the chain wallet
+    const sRec = H.memStore(); await sRec.put(STEALTH + "#0", { st: { v: 2, n: 0, step: "DONE", chain: "base" }, db: null }); asked.length = 0; await H.findLostFunds({ ...lb, store: sRec, priorHops: 1, getUtxos: gu({}) });
+    ok("1181 M-1 a legacy-key record covers the legacy wallet 0 only; the chain-derived wallet 0 is still looked at", !asked.includes(a0) && asked.includes(b0));
+    const sRec2 = H.memStore(); await sRec2.put("base:" + STEALTH + "#0", { st: { v: 2, n: 0, step: "DONE", chain: "base", deriv: "base" }, db: null }); asked.length = 0; await H.findLostFunds({ ...lb, store: sRec2, priorHops: 1, getUtxos: gu({}) });
+    ok("1181 M-1 a chain-keyed record covers the chain-derived wallet 0 only; the legacy wallet 0 is still looked at", !asked.includes(b0) && asked.includes(a0));
+    asked.length = 0; await H.findLostFunds({ ...lb, store: H.memStore(), priorHops: 1, before: 3, getUtxos: gu({}) });
+    ok("1181 M-1 'older wallets' (before) asks no legacy wallets again", !asked.includes(a0));
+    asked.length = 0; await H.findLostFunds({ ...lb, store: H.memStore(), priorHops: 0, getUtxos: gu({}) });
+    ok("1181 M-1 no prior hops -> nothing asked on base at all", asked.length === 0);
+    const pl = H.lostPlan(null, [], null, "base", []); ok("1181 M-1 lostPlan with an unknown count: LOST_N chain wallets + LOST_N legacy wallets", pl.targets.length === 2 * H.LOST_N && pl.unknown === true);
+    // adopting a find: the record is the wallet that was found
+    const sA = H.memStore(), ad = await H.adoptLostHop({ store: sA, stealth: STEALTH }, { n: 0, deriv: undefined, recipient: A, chain: base, dest: base }), sB2 = H.memStore(), ad2 = await H.adoptLostHop({ store: sB2, stealth: STEALTH }, { n: 0, deriv: "base", recipient: A, chain: base, dest: base });
+    ok("1181 M-1 adoptLostHop: a legacy find on base is stored under the legacy key without deriv; a chain-derived find under 'base:...' with deriv", ad.created && ad.key === STEALTH + "#0" && !(await sA.get(ad.key)).st.deriv && ad2.created && ad2.key === "base:" + STEALTH + "#0" && (await sB2.get(ad2.key)).st.deriv === "base");
+    // unknown count (L-5)
+    ok("1181 L-5 an unknown count is reported as unknown (the range is a guess), a known one is not", (await H.findLostFunds({ ...base0, chain: rh, store: H.memStore(), getUtxos: gu({}) })).unknown === true && (await H.findLostFunds({ ...base0, chain: rh, store: H.memStore(), priorHops: 2, getUtxos: gu({}) })).unknown === false && H.lostRange(null, []).unknown === true && H.lostRange(3, []).unknown === false && H.lostRange(null, [], 5).unknown === false); }
+  // scrubFinished keeps deriv
+  { const s = H.memStore(), key = "base:" + STEALTH + "#0"; await s.put(key, { st: { v: 2, n: 0, deriv: "base", stealth: STEALTH, chain: "base", dest: "rh", step: "DONE", amount: "1" }, db: null }); await H.scrubFinished(s, STEALTH, "base");
+    ok("1181 M-1 a scrubbed record still knows its derivation", (await s.get(key)).st.deriv === "base" && (await s.get(key)).st.scrubbed === true); }
+  const srcA = fs.readFileSync(path.join(WEB, "app.js"), "utf8");
+  ok("1181 M-1 app.js: every findHop / scrubFinished call names the chain; lostSeen is keyed chain|stealth (rh also reads the old bare key)", (srcA.match(/HM\.findHop\(/g) || []).length === (srcA.match(/HM\.findHop\([^)]*(\(\))?[^)]*, C\.key\)/g) || []).length && /kk\(k\) \{ return C\.key \+ "\|" \+ k; \}/.test(srcA) && /C\.key === "rh" \? Number\(o\[k\]\)/.test(srcA) && /HM\.scrubFinished\(ctx\.store, f\.stealth, C\.key\)/.test(srcA));
+  ok("1181 M-1 app.js: the return/sweep paths derive the wallet from the record's own deriv", (srcA.match(/HM\.derivOf\(/g) || []).length >= 2 && /st: \{ n: l\.n, \.\.\.\(l\.deriv/.test(srcA) && /deriv: l\.deriv/.test(srcA)); }
 Date.now = realNow;
 console.log(fails ? fails + " FAILED" : "all passed"); process.exit(fails ? 1 : 0);
