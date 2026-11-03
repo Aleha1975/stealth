@@ -240,34 +240,45 @@ export function projectedLoss({ amountIn, inDec, outDec, paidOut, rate, zatsLeft
 export const previewLoss = ({ value, out, inDec, outDec }) => projectedLoss({ amountIn: value, inDec, outDec, paidOut: out, rate: 0, zatsLeft: 0 });
 
 // ---------------------------------------------------------------- chain reads (M-1, M-4) and lightwalletd (M-2); all injectable in ctx
-// Public RPCs (and wallets in front of them) answer 429 / "client error" under load: retry with backoff before giving up.
-export let RPC_RETRY = { tries: 4, base: 1500 };
-const rpcCall = (fetchFn, url, method, params) => retry(async () => {
-  const r = await fetchFn(url, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ jsonrpc: "2.0", id: 1, method, params }) });
-  const j = await r.json().catch(() => ({})); if (!r.ok || j.error || j.result === undefined) throw new Error("rpc " + method + " failed: " + ((j.error && j.error.message) || r.status)); return j.result;
-}, RPC_RETRY);
+// Public RPCs answer 429 / 503 / -32005 / -32011 ("request limit reached", per IP) under load. Only those, and network errors, count as "rate limited / unavailable": retry the same endpoint with backoff
+// (3 tries, 400 ms then 1.2 s: long enough for a per-second limit to clear, short enough that a dead endpoint costs ~1.6 s before the next one), then fail over to the next endpoint of chain.rpcs.
+// Any other answer (a real revert, bad params, a malformed reply) is final: no retry, no failover. If every endpoint is limited the last error is thrown (fail closed).
+export let RPC_RETRY = { tries: 3, base: 400 };
+const rpcOnce = async (fetchFn, url, method, params) => {
+  const limited = m => Object.assign(new Error("rpc " + method + " failed: " + m), { limited: true });
+  let r, j; try { r = await fetchFn(url, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ jsonrpc: "2.0", id: 1, method, params }) }); j = await r.json().catch(() => ({})); } catch (e) { throw limited((e && e.message) || "network error"); }
+  const code = j && j.error && j.error.code, msg = (j && j.error && j.error.message) || r.status;
+  if (r.status === 429 || r.status === 503 || code === -32005 || code === -32011) throw limited(msg);
+  if (!r.ok || j.error || j.result === undefined) throw new Error("rpc " + method + " failed: " + msg); return j.result;
+};
+const rpcCall = async (fetchFn, urls, method, params) => {
+  let last; for (const url of [].concat(urls)) for (let i = 1; i <= RPC_RETRY.tries; i++) {
+    try { return await rpcOnce(fetchFn, url, method, params); } catch (e) { if (!e.limited) throw e; last = e; if (i < RPC_RETRY.tries) await sleepMs(RPC_RETRY.base * 3 ** (i - 1)); }
+  }
+  throw last;
+};
 export const setRpcRetry = o => { RPC_RETRY = o; };
 const pad32 = h => String(h).replace(/^0x/, "").toLowerCase().padStart(64, "0");
 export const AUTH_STATE_SELECTOR = "0xe94a0102";                      // authorizationState(address,bytes32) of EIP-3009
 export const AUTH_USED_TOPIC = hex(keccak(enc("AuthorizationUsed(address,bytes32)")));
 /** ctx.authUsed(authorizer, nonce) -> bool: has this EIP-3009 nonce been consumed on chain (USDG authorizationState view call)? */
 export const makeAuthUsed = (chain, fetchFn = fetch) => async (authorizer, nonce) => {
-  const r = await rpcCall(fetchFn, chain.rpc, "eth_call", [{ to: chain.token.address, data: AUTH_STATE_SELECTOR + pad32(authorizer) + pad32(nonce) }, "latest"]);
+  const r = await rpcCall(fetchFn, chain.rpcs || chain.rpc, "eth_call", [{ to: chain.token.address, data: AUTH_STATE_SELECTOR + pad32(authorizer) + pad32(nonce) }, "latest"]);
   if (!/^0x[0-9a-fA-F]{1,64}$/.test(r)) throw new Error("unexpected authorizationState answer"); return BigInt(r) !== 0n;
 };
 /** ctx.countPriorHops(stealth) -> number of AuthorizationUsed events of this stealth address on the token (every private withdraw spends exactly one). Counts every EIP-3009 use of the address, so it
  *  can only over-count (e.g. after a public withdraw), which skips a counter value but never reuses one. Same answer on every device. */
 // RPCs cap eth_getLogs at 10M blocks per call; a stealth address cannot authorize anything before the pay contract existed, so scan from there in windows.
-export const LOG_SPAN = 2_000_000, PAY_FROM_BLOCK = { rh: 100_761_230 };
+export const LOG_SPAN = 2_000_000, PAY_FROM_BLOCK = { rh: 100_761_230, base: 31_700_000 };   // base: the Announcer era start (our indexer's), so the scan is ~11 windows instead of ~27 from block 0
 export const makeCountPriorHops = (chain, fetchFn = fetch) => async stealth => {
-  const tip = Number(await rpcCall(fetchFn, chain.rpc, "eth_blockNumber", [])); if (!Number.isFinite(tip)) throw new Error("unexpected block number");
+  const tip = Number(await rpcCall(fetchFn, chain.rpcs || chain.rpc, "eth_blockNumber", [])); if (!Number.isFinite(tip)) throw new Error("unexpected block number");
   let n = 0;
   for (let a = PAY_FROM_BLOCK[chain.key] || 0; a <= tip; a += LOG_SPAN) {
-    const r = await rpcCall(fetchFn, chain.rpc, "eth_getLogs", [{ address: chain.token.address, fromBlock: "0x" + a.toString(16), toBlock: "0x" + Math.min(tip, a + LOG_SPAN - 1).toString(16), topics: [AUTH_USED_TOPIC, "0x" + pad32(stealth)] }]);
+    const r = await rpcCall(fetchFn, chain.rpcs || chain.rpc, "eth_getLogs", [{ address: chain.token.address, fromBlock: "0x" + a.toString(16), toBlock: "0x" + Math.min(tip, a + LOG_SPAN - 1).toString(16), topics: [AUTH_USED_TOPIC, "0x" + pad32(stealth)] }]);
     if (!Array.isArray(r)) throw new Error("unexpected logs answer"); n += r.length;
   }
   if (chain.eth) {      // an ETH hop spends the address with a plain transaction, no AuthorizationUsed: the address's own transaction count joins the count, so a hop of either kind never reuses the counter (hop wallet) of the other. It can only over-count too.
-    const c = await rpcCall(fetchFn, chain.rpc, "eth_getTransactionCount", [stealth, "latest"]); if (!/^0x[0-9a-fA-F]{1,16}$/.test(c)) throw new Error("unexpected transaction count"); n += Number(BigInt(c));
+    const c = await rpcCall(fetchFn, chain.rpcs || chain.rpc, "eth_getTransactionCount", [stealth, "latest"]); if (!/^0x[0-9a-fA-F]{1,16}$/.test(c)) throw new Error("unexpected transaction count"); n += Number(BigInt(c));
   }
   return n;
 };

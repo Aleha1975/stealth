@@ -669,4 +669,24 @@ print(json.dumps({"eth": m._real_payer(eth_rc, st), "none": m._real_payer({"from
   t("nextStep: keys derived -> Copy link pulses, keys hint hidden", run("0xabc", {}, false) === "copy-link|nohint");
   t("nextStep: link copied -> nothing pulses", run("0xabc", {}, true) === "|nohint");
 }
+// Base log scan: window start, rate-limit retry and fail-over of the read RPCs (fail closed)
+{ const HZ = await import("../web/zec-hop.js"), ST = "0x" + "ab".repeat(20), TIP = 53_400_000, base = CHAINS.base, prev = HZ.RPC_RETRY; HZ.setRpcRetry({ tries: 3, base: 1 });
+  const lim = { ok: true, status: 200, json: async () => ({ error: { code: -32011, message: "request limit reached" } }) }, okR = r => ({ ok: true, status: 200, json: async () => ({ result: r }) });
+  const mk = (onCall) => { const calls = []; return { calls, f: async (u, i) => { const b = JSON.parse(i.body); calls.push({ u, m: b.method, p: b.params[0] }); const r = onCall(u, b, calls); return r === undefined && b.method === "eth_blockNumber" ? okR("0x" + TIP.toString(16)) : r; } }; };
+  { const { calls, f } = mk((u, b) => b.method === "eth_blockNumber" ? undefined : okR([{}, {}])), n = await HZ.makeCountPriorHops(base, f)(ST), logs = calls.filter(c => c.m === "eth_getLogs");
+    t("base scan starts at 31_700_000 and needs <= 12 windows (not ~27 from block 0)", HZ.PAY_FROM_BLOCK.base === 31_700_000 && parseInt(logs[0].p.fromBlock, 16) === 31_700_000 && logs.length <= 12 && logs.length === Math.ceil((TIP - 31_700_000 + 1) / HZ.LOG_SPAN) && n === 2 * logs.length); }
+  { const { calls, f } = mk((u, b) => u === base.rpcs[0] ? lim : b.method === "eth_blockNumber" ? undefined : okR([{}])), n = await HZ.makeCountPriorHops(base, f)(ST);
+    t("-32011 on endpoint 1 (retried, then fail-over) -> endpoint 2 answers, count is right", n === calls.filter(c => c.m === "eth_getLogs" && c.u === base.rpcs[1]).length && calls.some(c => c.u === base.rpcs[1]) && calls.filter(c => c.u === base.rpcs[0] && c.m === "eth_blockNumber").length === 3); }
+  { const { calls, f } = mk(() => lim), e = await HZ.makeCountPriorHops(base, f)(ST).then(() => null, e => e.message);
+    t("every endpoint rate limited -> throws (fail closed), each tried 3 times", /request limit reached/.test(e) && calls.length === 6 && calls.filter(c => c.u === base.rpcs[1]).length === 3); }
+  for (const bad of [{ code: -32602, message: "Invalid params" }, { code: -32000, message: "execution reverted" }]) { const { calls, f } = mk((u, b) => b.method === "eth_blockNumber" ? undefined : { ok: true, status: 200, json: async () => ({ error: bad }) }), e = await HZ.makeCountPriorHops(base, f)(ST).then(() => null, e => e.message);
+    t("JSON-RPC error " + bad.code + " is final: no retry, no fail-over", /failed/.test(e) && calls.length === 2 && calls.every(c => c.u === base.rpcs[0])); }
+  { let k = 0; const { calls, f } = mk((u, b) => b.method === "eth_blockNumber" ? undefined : ++k === 1 ? { ok: false, status: 503, json: async () => ({}) } : okR([{}])), n = await HZ.makeCountPriorHops(base, f)(ST);
+    t("HTTP 503 is retried on the same endpoint and recovers", n >= 1 && calls.every(c => c.u === base.rpcs[0]) && calls.filter(c => c.m === "eth_getLogs").length === Math.ceil((TIP - 31_700_000 + 1) / HZ.LOG_SPAN) + 1); }
+  { const { calls, f } = mk(u => { throw new TypeError("fetch failed"); }), e = await HZ.makeCountPriorHops(base, f)(ST).then(() => null, e => e.message);
+    t("network errors fail over, then throw", /fetch failed/.test(e) && calls.some(c => c.u === base.rpcs[1])); }
+  { const rh = CHAINS.rh, { calls, f } = mk((u, b) => b.method === "eth_blockNumber" ? okR("0x" + (100_761_230 + 5).toString(16)) : okR(b.method === "eth_getTransactionCount" ? "0x0" : [{}])); await HZ.makeCountPriorHops(rh, f)(ST); const logs = calls.filter(c => c.m === "eth_getLogs");
+    t("RH unchanged: one endpoint, scan from 100_761_230", HZ.PAY_FROM_BLOCK.rh === 100_761_230 && rh.rpcs.length === 1 && rh.rpcs[0] === rh.rpc && base.rpcs[0] === base.rpc && parseInt(logs[0].p.fromBlock, 16) === 100_761_230); }
+  t("CSP connect-src lists every read endpoint", Object.values(CHAINS).every(c => c.rpcs.every(u => fs.readFileSync(new URL("../web/app.html", import.meta.url), "utf8").includes(u))));
+  HZ.setRpcRetry(prev); }
 console.log(fail ? "FAILED " + fail : "all passed"); process.exit(fail ? 1 : 0);
