@@ -27,11 +27,13 @@ ok("other key, other counter -> other mnemonic", mn !== await H.mnemonicFor("0x"
 ok("seed = BIP39 PBKDF2", Buffer.from(await H.mnemonicSeed(mn)).equals(Buffer.from(await mnemonicToSeed(mn))));
 ok("word list hash check passes / fails", (await H.loadWords(async () => ({ text: async () => words.join("\n") + "\n" }))).length === 2048 && await H.loadWords(async () => ({ text: async () => "x" })).then(() => false, () => true));
 
-const rin = H.reqIn({ chain: rh, amount: 5_000_000n, tAddr: T, stealth: STEALTH, dry: true, now: 0 }), rout = H.reqOut({ dest: base, amount: 400000n, recipient: A, refundT: T, dry: true, now: 0 });
+const NOFEE = { fastBps: 20, maxBps: 30, appFeeRecipient: "" }, rin = H.reqIn({ chain: rh, amount: 5_000_000n, tAddr: T, stealth: STEALTH, dry: true, now: 0, fees: NOFEE }), rout = H.reqOut({ dest: base, amount: 400000n, recipient: A, refundT: T, dry: true, now: 0 });
 ok("in request", rin.originAsset === rh.oneClick.assetId && rin.destinationAsset === "nep141:zec.omft.near" && rin.recipient === T && rin.refundTo === STEALTH && rin.amount === "5000000" && rin.dry === true && rin.refundType === "ORIGIN_CHAIN" && rin.recipientType === "DESTINATION_CHAIN");
 ok("out request", rout.originAsset === "nep141:zec.omft.near" && rout.destinationAsset === base.oneClick.assetId && rout.recipient === A && rout.refundTo === T);
 const same = buildQuoteRequest({ from: rh, to: { oneClick: { assetId: "x" } }, amount: 1n, recipient: A, refundTo: A, dry: true, now: 0 });
 ok("same field set as the existing builder", Object.keys(same).join() === Object.keys(rin).join());
+{ const PROD = H.reqIn({ chain: rh, amount: 5_000_000n, tAddr: T, stealth: STEALTH, dry: true, now: 0 }), PF = H.reqIn({ chain: rh, amount: 5_000_000n, tAddr: T, stealth: STEALTH, dry: true, now: 0, route: "fast" });
+  ok("production fee: the first leg carries appFees as its last field (Maximum 30, Private fast 20), the field set is the old one plus appFees", Object.keys(PROD).join() === Object.keys(rin).join() + ",appFees" && PROD.appFees[0].fee === 30 && PF.appFees[0].fee === 20 && PROD.appFees[0].recipient === "loop_hole.near" && !("appFees" in rout)); }
 const bad = f => { try { f(); return false; } catch { return true; } };
 ok("bad addresses refused", bad(() => H.reqIn({ chain: rh, amount: 1n, tAddr: A, stealth: STEALTH })) && bad(() => H.reqIn({ chain: rh, amount: 1n, tAddr: T, stealth: T })) && bad(() => H.reqOut({ dest: base, amount: 1n, recipient: A, refundT: A }))
   && bad(() => H.reqOut({ dest: base, amount: 1n, recipient: T, refundT: T })) && bad(() => H.reqIn({ chain: rh, amount: 0n, tAddr: T, stealth: STEALTH })));
@@ -329,7 +331,7 @@ for (const [name, tk] of [["no txKnown available", undefined], ["txKnown cannot 
   ok("M4 makeCountPriorHops = number of AuthorizationUsed logs of the stealth address on the token", n === 4 && c.method === "eth_getLogs" && c.params[0].address === rh.token.address && c.params[0].topics[0] === sig && H.AUTH_USED_TOPIC === sig && c.params[0].topics[1] === "0x" + "0".repeat(24) + STEALTH.slice(2)); }
 
 // ---------- M-5 nothing shared between the legs ----------
-{ const r1 = H.reqIn({ chain: rh, amount: 5_000_000n, tAddr: T, stealth: STEALTH, dry: true, now: 0, rand: () => 0.1 }), r2 = H.reqOut({ dest: base, amount: 400000n, recipient: A, refundT: "t1" + "2".repeat(33), dry: true, now: 0, rand: () => 0.9 });
+{ const r1 = H.reqIn({ chain: rh, amount: 5_000_000n, tAddr: T, stealth: STEALTH, dry: true, now: 0, rand: () => 0.1, fees: { fastBps: 20, maxBps: 30, appFeeRecipient: "" } }), r2 = H.reqOut({ dest: base, amount: 400000n, recipient: A, refundT: "t1" + "2".repeat(33), dry: true, now: 0, rand: () => 0.9 });
   const sh = H.sharedFields(r1, r2).map(x => x.split("=")[0]), forbidden = /referral|appFee|userId|session|token|affiliate|clientId|memo|correlation/i;
   ok("M5 the two requests share only protocol constants; no referral/appFees/user/session field exists", sh.every(k => H.CONSTANT_FIELDS.has(k)) && ![...Object.keys(r1), ...Object.keys(r2)].some(k => forbidden.test(k)) && r1.refundTo !== r2.refundTo && r1.recipient !== r2.recipient && r1.deadline !== r2.deadline, sh.join());
   const w = makeWorld(), s = H.memStore(); off = 0; const logIn = [], logOut = [];
@@ -989,7 +991,9 @@ const tAddrOf = async (n, a, i = 0) => ZRm.deriveT(await H.mnemonicSeed(await H.
     ok("the stealth address paid its own gas (balance fell by the amount plus the real gas), nothing else left it", c.balOf(SE) === 10n ** 18n - ETHV - 21000n * c.gasPrice * 2n && w.delivered > 0n);
     ok("loss figures on the ETH path use 18 decimals: no false halt at ~1% loss, payouts arrived in ETH", st.step === "DONE" && w.delivered > ETHV * 90n / 100n && w.delivered < ETHV);
     const v = Cd.hopView({ st: r.st }, Date.now());
-    ok("the finished card speaks ETH with 18-decimal amounts, not USDG with 6", /^Sent 0\.03 ETH · received 0\.02\d+ ETH · cost 0\.000\d+ ETH \(\d+\.\d%\)$/.test(v.sum) && /ETH/.test(v.title) && !/USDG/.test(JSON.stringify(v)), v.sum + " | " + v.title);
+    ok("the finished card speaks ETH with 18-decimal amounts, not USDG with 6", /^Sent 0\.03 ETH · received 0\.02\d+ ETH · cost 0\.000\d+ ETH \(\d+\.\d%\) · Loophole fee 0\.3%$/.test(v.sum) && /ETH/.test(v.title) && !/USDG/.test(JSON.stringify(v)), v.sum + " | " + v.title);
+    { const { feeBps, ...q0 } = r.st.inQuote, v0 = Cd.hopView({ st: { ...r.st, inQuote: q0 } }, Date.now());
+      ok("the same card with the fee off for that transfer has no fee text", feeBps === 30 && /^Sent 0\.03 ETH · received 0\.02\d+ ETH · cost 0\.000\d+ ETH \(\d+\.\d%\)$/.test(v0.sum), v0.sum); }
     const sc = await H.scrubFinished(s, SE), r2 = await rec(s);
     ok("a scrubbed finished ETH record still says ETH (the card keeps its coin)", sc && r2.st.asset === "ETH" && Cd.hopView({ st: r2.st }, Date.now()).title.includes("ETH")); }
   // --- resume from every step with a brand-new ctx: still exactly one deposit

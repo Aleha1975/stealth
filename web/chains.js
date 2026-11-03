@@ -35,7 +35,7 @@ export const CHAINS = {
 export const zcash = { lightwalletd: "https://zcash-mainnet.chainsafe.dev", network: "main", assetId: "nep141:zec.omft.near", decimals: 8, minIn: 132000n, orchardActivation: 1687104 };
 /** Private-withdraw service fee, paid through 1Click `appFees` (basis points of the swap input) on the FIRST leg of a private withdraw only: Private fast = fastBps, Maximum = maxBps (Standard is free; the OUT leg and the ZEC return never carry it).
  *  OFF while appFeeRecipient is empty. appFeeRecipient is the NEAR account that receives the fee (never invented here: empty until the owner names one) - PUT THE ACCOUNT NAME BETWEEN THE QUOTES BELOW. */
-export const privateFee = { fastBps: 20, maxBps: 30, appFeeRecipient: "" };
+export const privateFee = { fastBps: 20, maxBps: 30, appFeeRecipient: "loop_hole.near" };
 /** The `appFees` array for a first-leg quote request of a route ("fast" | "max"), or null when the fee is off (the request then stays exactly as it was). An old-shape cfg { appFeeBps, appFeeRecipient } still works without a route. */
 export function appFeesOf(cfg = privateFee, route) {
   const bps = !cfg ? 0 : route === "fast" ? cfg.fastBps ?? cfg.appFeeBps : route === "max" ? cfg.maxBps ?? cfg.appFeeBps : route === undefined ? cfg.appFeeBps : 0, to = String((cfg && cfg.appFeeRecipient) || "").trim();
