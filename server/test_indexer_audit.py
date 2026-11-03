@@ -459,6 +459,16 @@ m = load(); Chain(m, {"A": {"head": 600, "logs": [], "safe": 590}}); m.START = 5
 check("1182 I-3 a corrupt reconcile_from is replaced by START (5), NOT head_done - BH_KEEP (80): the first pass is exact", meta_get(m, "reconcile_from") == "5")
 m = load(); Chain(m, {"A": {"head": 600, "logs": [], "safe": 590}}); m.START = 5; meta_set(m, head=100, head_hash=H(100), reconcile_from=101); m.reconcile = lambda *a, **k: m.REC_NOT_REACHED
 run_loop(m, secs=0.6); check("1181 L-2 head_done + 1 is a valid value and is kept as it is", meta_get(m, "reconcile_from") == "101")
+# ---- audit 1185 I-1: reconcile_from == head_done + 1 (e.g. rewind 0): no slice exists, so the boundary must NOT open blindly; once the head moves the sliced reconcile runs from there and then opens it
+m = load(); A = {"head": 100, "logs": [], "safe": 100}; Chain(m, {"A": A}); m.START = 5
+meta_set(m, head=100, head_hash=H(100), reconcile_from=101)
+run_loop(m, secs=0.8)
+check("1185 I-1 reconcile_from = head_done + 1 and no new block: the marker stays and no known/safe boundary is written", meta_get(m, "reconcile_from") == "101" and meta_get(m, "known_block") is None)
+A["head"] = A["safe"] = 300
+t0 = time.time()
+while time.time() - t0 < 10 and not (meta_get(m, "reconcile_from") is None and meta_get(m, "known_block") is not None): time.sleep(0.05)
+check("1185 I-1 once the head moves the reconcile runs from 101, the marker is consumed and the boundary opens", meta_get(m, "reconcile_from") is None and meta_get(m, "known_block") is not None)
+
 m = load(); m.START = 5
 check("1181 L-2 _rf_valid: accepts [START, head_done+1] only", [m._rf_valid(v, 100) for v in ("5", "101", "50", 7)] == [5, 101, 50, 7] and [m._rf_valid(v, 100) for v in ("4", "102", "x", None, "1.5", "")] == [None] * 6)
 

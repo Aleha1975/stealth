@@ -627,7 +627,7 @@ export async function runHop(ctx) {
                 // audit 1183 L-1: the fee is the one the user saw at Confirm (st.feeBps, null / absent = none), never the live config; only the recipient is read from it
         const tIn = await taddr(0), req = reqIn({ chain: ctx.chain, amount: BigInt(st.amount), tAddr: tIn, stealth: st.stealth, dry: st.dry, rand: ctx.rand, asset: st.asset, route: "max", fees: st.feeBps ? { maxBps: st.feeBps, appFeeRecipient: privateFee.appFeeRecipient } : null });
         const info = quoteInfoOf(await PW.requestQuote({ base, fetchFn: fIn, req }), req);
-        if (st.previewZec && Number(info.amountOut) < Number(st.previewZec) * (1 - QUOTE_TOL)) throw new Halt("the quote delivers clearly less Zcash than the preview showed (" + info.amountOut + " against " + st.previewZec + " zatoshi); nothing was sent. Start the transfer again to see a new quote");      // audit 1183 L-2
+        if (st.previewZec && Number(info.amountOut) < Number(st.previewZec) * (1 - QUOTE_TOL)) throw new Halt("the quote delivers clearly less Zcash than the preview showed (" + info.amountOut + " against " + st.previewZec + " zatoshi); nothing was sent. Press Continue to ask for a new quote, or dismiss this transfer");      // audit 1183 L-2
         if (!okSize(BigInt(info.amountOut))) throw new Halt("too small for the Zcash route: it would deliver only " + info.amountOut + " zatoshi; nothing was sent");
         st.tIn = tIn; st.inQuote = info; await save();
       }

@@ -682,7 +682,7 @@ def index_loop():
                     if time.time() - rf_alert_t >= WAIT_ALERT_S:
                         rf_alert_t = time.time(); print("ALERT bad reconcile_from %r replaced by %d; /known stays closed until a reconcile from there completes" % (str(rf)[:40], rfi), flush=True)
                 if pin is None and head_done >= START: pin = agreed(head_done, ag)[1][0]
-                res = REC_DONE
+                res = REC_NOT_REACHED if rfi > head_done else REC_DONE          # аудит 1185 I-1: окно начинается выше головы (rewind 0) -- ломтей нет, boundary не открываем вслепую, обычный reconcile ниже выполнит окно sf-REORG_WIN
                 while rfi <= head_done:                     # аудит 1183 L-4: ломти; reconcile_from сдвигается только после завершённого ломтя (сбой в ломте k -- следующий проход начнёт с k), граница закрыта до последнего
                     last_slice = rfi + RF_SLICE > head_done
                     res = reconcile(c, sf, head_done, pin, insert_only=False, frm=rfi, to=None if last_slice else rfi + RF_SLICE - 1)      # последний ломоть -- прежнее окно до головы
