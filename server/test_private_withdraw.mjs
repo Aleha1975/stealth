@@ -148,7 +148,7 @@ function startSite(SP, pagesDir) {
   const rd = f => fs.readFileSync(path.join(WEB, f), "utf8");
   const patch = (txt, from, to, what) => { if (!txt.includes(from)) throw new Error("patch target missing: " + what); return txt.split(from).join(to); };
   const patched = {
-    "chains.js": patch(patch(rd("chains.js"), 'stealthPay: "0x6f488f9036519b9eb0f3db98b76c2c1b02b08ac7",', `stealthPay: "${SP}",`, "rh stealthPay"), 'rpc: "https://rpc.mainnet.chain.robinhood.com",', `rpc: "${RPC}",`, "rh rpc"),
+    "chains.js": patch(patch(rd("chains.js"), 'stealthPay: "0x6f488f9036519b9eb0f3db98b76c2c1b02b08ac7",', `stealthPay: "${SP}",`, "rh stealthPay"), 'rpc: "https://rpc.mainnet.chain.robinhood.com",', `rpc: "${RPC}",`, "rh rpc").replace('rpcs: ["https://rpc.mainnet.chain.robinhood.com"],', `rpcs: ["${RPC}"],`),   // the page reads through chain.rpcs
     "private-withdraw.js": patch(rd("private-withdraw.js"), 'export const ONECLICK = "https://1click.chaindefuser.com";', `export const ONECLICK = "${MOCK}";`, "ONECLICK constant"),
     "app.html": patch(patch(rd("app.html"), "https://1click.chaindefuser.com", MOCK, "CSP connect-src 1click"), "https://rpc.mainnet.chain.robinhood.com", RPC, "CSP connect-src rpc"),
   };

@@ -554,6 +554,15 @@ const chainRpc = async (u, init, allowWallet = false) => {
   if (r && !allowWallet) return r;      // 1181 I-1: every HTTP answer (429, 502, a JSON-RPC error) goes to the caller as it is: zec-hop.js rpcOnce classifies it (rate limit: retry and fail over; anything else: final), exactly as in its unit tests. Only a network failure is thrown here (rpcOnce counts that as limited too)
   if (r && r.ok) { const j = await r.clone().json().catch(() => null); if (j && j.result !== undefined) return r; }      // the wallet-fallback path (domain separator only) keeps the old rule: an answer with a result, else the wallet
   if (allowWallet) return walletRpc(u, init); throw new Error("the chain RPC did not answer"); };
+// the page reads chain state itself (retry + fail-over over chain.rpcs, as makeCountPriorHops does); the wallet's own RPC answers only when every direct endpoint failed AND the caller allows it (a read that names no stealth address). Signing and sending stay on the wallet.
+const readChain = async (method, params, allowWallet = false) => {
+  try { return await (await hopMod()).readRpc(chainRpc, C.rpcs || C.rpc, method, params); } catch (e) { if (!allowWallet) throw e; }
+  const j = await (await walletRpc(null, { body: JSON.stringify({ method, params }) })).json(); if (j.error || j.result === undefined) throw new Error((j.error && j.error.message) || "the wallet gave no result"); return j.result;
+};
+// a wallet whose own RPC is unreachable says its raw text; one plain message instead (nothing was sent, and nothing is retried here: money)
+const WALLET_NET_ERR = /RPC endpoint returned HTTP (client|server) error|could not fetch|network request failed/i;
+const walletSendErr = e => WALLET_NET_ERR.test(String((e && e.message) || e)) ? new Error("Your wallet could not reach the network (a temporary RPC error). Nothing was sent. Press the button again.") : e;
+const walletSend = tx => wallet("eth_sendTransaction", [tx]).catch(e => { throw walletSendErr(e); });
 // 1133 L-5: a rebuilt transfer has no original amount to check a quote against, so the user sees what was found, what is sent and what comes out, and confirms
 const confirmRebuiltQuote = q => { const dec = Number.isInteger(q.destDecimals) ? q.destDecimals : TOK.decimals, sym = q.destSymbol || SYM, f = v => dec > 6 ? fmtUnits(v, dec, 6) : (Number(v) / 10 ** dec).toFixed(2); return confirm("Found on the transfer wallet: " + zecText(q.zecFound) + " ZEC.\nThis payout sends " + zecText(q.amount) + " ZEC" + (q.zatsLeft > q.amount ? " (of " + zecText(q.zatsLeft) + " ZEC still to send)" : "") + " and pays out about " + f(q.amountOut) + " " + sym + " (≈ " + (Number(q.amountOut) / 10 ** dec / (Number(q.amount) / 1e8)).toFixed(dec > 6 ? 6 : 2) + " " + sym + " per ZEC) to " + q.recipient + ".\nThe network fee and swap fee are inside that figure. Pay out at this quote?"); };
 const confirmHopLoss = q => { const dec = Number.isInteger(q.destDecimals) ? q.destDecimals : TOK.decimals, sym = q.destSymbol || SYM, f = v => dec > 6 ? fmtUnits(v, dec, 6) : (Number(v) / 10 ** dec).toFixed(2), total = Number(q.amountOut) * Number(q.zatsLeft) / Number(q.amount);      // 1138 L-2: the PAYOUT token, not the connected chain's
@@ -568,7 +577,7 @@ const ethRpc = async (method, params) => {
   if (j.result === undefined) throw new Error("the chain RPC gave no result"); return j.result;
 };
 const ethApi = (f, priv) => ({ prepare: ({ to, value }) => ETH.prepareSend(ethRpc, { priv, chainId: C.chainId, from: f.stealth, to, value }), send: tx => ETH.sendRaw(ethRpc, tx), status: tx => ETH.txStatus(ethRpc, { from: f.stealth, hash: tx.hash, nonce: tx.nonce }), balance: async () => BigInt(await ethRpc("eth_getBalance", [f.stealth, "latest"])) });
-const rpcOne = async (method, params) => { const r = await chainRpc(C.rpc, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ jsonrpc: "2.0", id: 1, method, params }) }); const j = await r.json().catch(() => null); if (!r.ok || !j || j.error || j.result === undefined) throw new Error("the chain RPC did not answer"); return j.result; };      // 1181 I-1: chainRpc passes every answer through, so rpcOne keeps its old rule here (no usable result = "did not answer")
+const rpcOne = async (method, params) => { try { return await readChain(method, params); } catch { throw new Error("the chain RPC did not answer"); } };      // 1181 I-1: no usable result = "did not answer"; retry + fail-over over chain.rpcs, never the wallet (reads here may name a stealth address)
 const rpcBatch = async calls => { try { return await fetchBatch(fetch, C.rpc, calls); } catch { const out = []; for (let i = 0; i < calls.length; i += 10) out.push(...await Promise.all(calls.slice(i, i + 10).map(([m, p]) => rpcOne(m, p)))); return out; } };
 async function holdScreen() { try { return navigator.wakeLock ? await navigator.wakeLock.request("screen") : null; } catch { return null; } }
 document.addEventListener("visibilitychange", () => { for (const h of hops.values()) if (h.running) h.hidden = document.hidden; renderHops(); });
@@ -897,7 +906,7 @@ async function txOfLogs(filter, match) {
 /** audit 1161 M-1: a one-time address that StealthPay already marks used (someone paid or blocked it first) is refused by the contract. Checked right before the wallet is asked for anything. */
 class NotFreshError extends Error { constructor(m) { super(m); this.notFresh = true; } }
 async function requireFresh(stealth) {
-  let r = null; try { r = await wallet("eth_call", [{ to: STEALTHPAY, data: usedCall(stealth) }, "latest"]); } catch { return; }      // an unreadable answer is not a refusal: the contract and the relayer still check
+  let r = null; try { r = await readChain("eth_call", [{ to: STEALTHPAY, data: usedCall(stealth) }, "latest"], true); } catch { return; }      // an unreadable answer is not a refusal: the contract and the relayer still check
   if (isUsedAnswer(r)) throw new NotFreshError("This one-time address was already used.");
 }
 async function payStealth({ token, amount, raw: rawIn = null, d, own = false }) {
@@ -907,20 +916,20 @@ async function payStealth({ token, amount, raw: rawIn = null, d, own = false }) 
   if (token === "TOKEN") {
     const raw = rawIn ?? BigInt(Math.round(amount * TUNIT));
     await requireFresh(d.stealth);
-    const al = BigInt(await wallet("eth_call", [{ to: USDC, data: "0xdd62ed3e" + padAddr(acct) + padAddr(STEALTHPAY) }, "latest"]));
+    const al = BigInt(await readChain("eth_call", [{ to: USDC, data: "0xdd62ed3e" + padAddr(acct) + padAddr(STEALTHPAY) }, "latest"], true));
     if (al < raw) {
       say("send-hint", "Approve " + amount + " " + SYM + " for the pay contract (1 of 2)…");
-      const h = await wallet("eth_sendTransaction", [{ from: acct, to: USDC, data: "0x095ea7b3" + padAddr(STEALTHPAY) + pad(raw) }]);
+      const h = await walletSend({ from: acct, to: USDC, data: "0x095ea7b3" + padAddr(STEALTHPAY) + pad(raw) });
       if (!(await waitReceipt(h)).ok) throw new Error("approve reverted");
     }
     const data = sel("payToken(address,uint256,address,bytes,bytes1)") + padAddr(USDC) + pad(raw) + padAddr(d.stealth) + pad(160n) + tagWord + ephLen + ephData;
     say("send-hint", "Pay + announce (" + (al < raw ? "2 of 2" : "1 of 1") + ")…");
-    return wallet("eth_sendTransaction", [{ from: acct, to: STEALTHPAY, data }]).catch(e => { throw isNotFresh(e) ? new NotFreshError("This one-time address was already used.") : e; });
+    return walletSend({ from: acct, to: STEALTHPAY, data }).catch(e => { throw isNotFresh(e) ? new NotFreshError("This one-time address was already used.") : e; });
   }
   const wei = rawIn ?? BigInt(Math.round(amount * NUNIT));      // rawIn = exactly what leaves the wallet (18 decimals do not survive a float)
   const data = sel("payETH(address,bytes,bytes1)") + padAddr(d.stealth) + pad(96n) + tagWord + ephLen + ephData;
   await requireFresh(d.stealth);
-  return wallet("eth_sendTransaction", [{ from: acct, to: STEALTHPAY, value: "0x" + wei.toString(16), data }]).catch(e => { throw isNotFresh(e) ? new NotFreshError("This one-time address was already used.") : e; });
+  return walletSend({ from: acct, to: STEALTHPAY, value: "0x" + wei.toString(16), data }).catch(e => { throw isNotFresh(e) ? new NotFreshError("This one-time address was already used.") : e; });
 }
 /** Token payment with ONE signature and no gas for the payer: EIP-3009 ReceiveWithAuthorization bound (via the nonce) to this exact
  *  stealth address, key, tag, fee and fee recipient; our relayer submits StealthPay.payWithAuthorization and takes `fee` from the amount. */
@@ -933,11 +942,11 @@ async function payGasless({ amount, raw: rawIn = null, d, ephLen, ephData, tagWo
   if (!feeWithinCap(fee, raw, BigInt(TUNIT), bps ? PAY_BPS_CAP : 0)) throw new Error("The relayer asks " + fmtTok(fee) + " " + SYM + " in fees for a " + fmtTok(raw) + " " + SYM + " payment, which is more than this page accepts (max " + (bps ? "1.00 or " + PAY_BPS_CAP / 100 + "%" : "1.00") + " and half of the payment). Refusing.");   // audit 1086 L-1
   if (feeTo.toLowerCase() === d.stealth.toLowerCase()) throw new Error("The fee recipient equals the one-time address; refusing to sign.");      // audit 1161 L-1: the Paid event would announce only the net part
   await requireFresh(d.stealth);      // audit 1161 M-1: before the signature, which is bound to this address and dies with it
-  const bal = BigInt(await wallet("eth_call", [{ to: USDC, data: "0x70a08231" + padAddr(acct) }, "latest"]));
+  const bal = BigInt(await readChain("eth_call", [{ to: USDC, data: "0x70a08231" + padAddr(acct) }, "latest"], true));
   if (bal < raw) throw new Error("Your wallet holds less than " + amount + " " + SYM + ".");
   const args = { chainId: C.chainId, stealthPay: STEALTHPAY, token: USDC, stealth: d.stealth, eph: d.ephPub, viewTag: d.viewTag, fee, feeRecipient: feeTo };
   const nonce = paymentNonce(args);
-  const onchain = await wallet("eth_call", [{ to: STEALTHPAY, data: sel("paymentNonce(address,address,bytes,bytes1,uint256,address)") + padAddr(USDC) + padAddr(d.stealth) + pad(192n) + tagWord + pad(fee) + padAddr(feeTo) + ephLen + ephData }, "latest"]);
+  const onchain = await readChain("eth_call", [{ to: STEALTHPAY, data: sel("paymentNonce(address,address,bytes,bytes1,uint256,address)") + padAddr(USDC) + padAddr(d.stealth) + pad(192n) + tagWord + pad(fee) + padAddr(feeTo) + ephLen + ephData }, "latest"], true);
   if (String(onchain).toLowerCase() !== nonce.toLowerCase()) throw new Error("Payment nonce mismatch between this page and the contract; refusing to sign.");
   const msg = "You send " + fmtTok(raw) + " " + SYM + ". The receiver gets " + fmtTok(raw - fee) + " " + SYM + ". The relayer fee for the gas is " + fmtTok(fee) + " " + SYM + " (to " + feeTo + "). You pay no gas.";
   say("send-hint", msg + " Sign in your wallet…");

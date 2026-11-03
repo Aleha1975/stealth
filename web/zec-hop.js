@@ -270,6 +270,7 @@ const rpcCall = async (fetchFn, urls, method, params) => {
   let last; for (const url of [].concat(urls)) { try { return await rpcRetry(fetchFn, url, method, params); } catch (e) { if (!e.limited) throw e; last = e; } }
   throw last;
 };
+export const readRpc = rpcCall;      // one read with the same retry (3 tries, 400 ms then 1.2 s) and fail-over over chain.rpcs; used by the pay page for its preflight reads
 export const setRpcRetry = o => { RPC_RETRY = o; };
 const pad32 = h => String(h).replace(/^0x/, "").toLowerCase().padStart(64, "0");
 export const AUTH_STATE_SELECTOR = "0xe94a0102";                      // authorizationState(address,bytes32) of EIP-3009

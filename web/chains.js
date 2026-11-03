@@ -56,7 +56,7 @@ export function pickChain(search = (typeof location !== "undefined" ? location.s
   return CHAINS[q.get("chain")] || chainOfMeta(q.get("to") || "") || CHAINS[DEFAULT_CHAIN];
 }
 /** wallet_addEthereumChain parameters. */
-export const addChainParams = c => ({ chainId: c.chainHex, chainName: c.name, nativeCurrency: { name: c.native.name, symbol: c.native.symbol, decimals: c.native.decimals }, rpcUrls: [c.rpc], blockExplorerUrls: [c.explorer] });
+export const addChainParams = c => ({ chainId: c.chainHex, chainName: c.name, nativeCurrency: { name: c.native.name, symbol: c.native.symbol, decimals: c.native.decimals }, rpcUrls: [...new Set([c.rpc, ...(c.rpcs || [])])], blockExplorerUrls: [c.explorer] });
 
 /** The asset a send moves: "ETH" = the chain's native coin (only where chain.eth is set), anything else = the chain stablecoin. A record saved before ETH existed has no asset field and so means the stablecoin.
  *  -> { key: "TOKEN"|"ETH", symbol, decimals, assetId (1Click), native } */

@@ -802,8 +802,30 @@ print(json.dumps({"eth": m._real_payer(eth_rc, st), "none": m._real_payer({"from
       { const { chainRpc } = mkRpc(() => resp(500, { error: { message: "x" } })); const r = await chainRpc(E1, { method: "POST", body: "{}" }, true); t("1181 I-1 the wallet fallback (domain separator, allowWallet) keeps the old rule: no usable result -> the wallet answers", (await r.json()).result === "0xwallet");
         const rr = await chainRpc(E1, { method: "POST", body: "{}" }); t("1181 I-1 without allowWallet the 500 answer is passed through untouched", rr.status === 500); }
       { const rp = app.slice(app.indexOf("const rpcOne = async"), app.indexOf("\n", app.indexOf("const rpcOne = async")));
-        const run1 = ans => new Function("chainRpc", "C", rp + "\n; return rpcOne;")(async () => ans, { rpc: "x" })("m", []);
-        t("1181 I-1 rpcOne keeps its rule: a non-ok / error / no-result answer is 'did not answer', a result is returned", await run1(resp(200, { result: "0x1" })) === "0x1" && await run1(resp(500, { result: "0x1" })).then(() => false, e => /did not answer/.test(e.message)) && await run1(resp(200, { error: { message: "e" } })).then(() => false, e => /did not answer/.test(e.message))); } }
+        const run1 = f => new Function("readChain", rp + "\n; return rpcOne;")(f)("m", []);
+        t("1181 I-1 rpcOne keeps its rule: a failed read is 'did not answer', a result is returned", await run1(async () => "0x1") === "0x1" && await run1(async () => { throw new Error("rpc m failed: 500"); }).then(() => false, e => /did not answer/.test(e.message))); }
+      // wallet-free reads: the pay preflight goes through the page's own RPC helper (retry + fail-over), the wallet only when every direct endpoint failed; sends stay on the wallet and a raw RPC error becomes one plain message
+      { const rc = app.slice(app.indexOf("const readChain = async"), app.indexOf("// 1133 L-5"));
+        const U1 = "https://a.test", U2 = "https://b.test", HZ2 = await import("../web/zec-hop.js"); HZ2.setRpcRetry({ tries: 3, base: 1 });
+        const mk = (answer, walletLog = []) => { const log = [], fakeFetch = async (u, init) => { log.push(u); return answer(u, JSON.parse(init.body)); };
+          const wallet = async (m, p) => { walletLog.push(m); if (m === "eth_sendTransaction") throw new Error(mk.sendErr || "user rejected"); if (m === "eth_chainId") return "0x1"; return "0xwallet"; };
+          const f = new Function("hopMod", "chainRpc", "C", "walletRpc", "wallet", rc + "; return { readChain, walletSend, walletSendErr };")(async () => HZ2, async (u, i) => fakeFetch(u, i), { rpcs: [U1, U2] }, async (_u, init) => { const { method, params } = JSON.parse(init.body); return { ok: true, json: async () => ({ result: await wallet(method, params) }) }; }, wallet);
+          return { log, walletLog, ...f }; };
+        { const { log, walletLog, readChain } = mk((u, b) => resp(200, { result: "0xdirect" })), r = await readChain("eth_call", [{}, "latest"], true);
+          t("pay preflight read: a direct endpoint answers, the wallet's eth_call is NOT called", r === "0xdirect" && log.length === 1 && walletLog.length === 0); }
+        { let k = 0; const { log, walletLog, readChain } = mk(() => ++k === 1 ? resp(429, {}) : resp(200, { result: "0xok" })), r = await readChain("eth_call", [{}, "latest"], true);
+          t("pay preflight read: 429 then 200 is retried on the same endpoint, no wallet", r === "0xok" && log.length === 2 && log[0] === U1 && log[1] === U1 && walletLog.length === 0); }
+        { const { log, walletLog, readChain } = mk(() => resp(429, {})), r = await readChain("eth_call", [{}, "latest"], true);
+          t("pay preflight read: every direct endpoint failing falls back to the wallet (3 tries each, then the second endpoint)", r === "0xwallet" && log.filter(u => u === U1).length === 3 && log.filter(u => u === U2).length === 3 && walletLog.includes("eth_call")); }
+        { const { walletLog, readChain } = mk(() => resp(429, {})), e = await readChain("eth_call", [{}, "latest"]).then(() => null, e => e);
+          t("a read that does not allow the wallet fails closed when every direct endpoint failed", e && e.limited && !walletLog.includes("eth_call")); }
+        { mk.sendErr = "RPC endpoint returned HTTP client error."; const { walletLog, walletSend } = mk(() => resp(200, { result: "0x" })), e = await walletSend({ to: "0x1" }).then(() => null, e => e);
+          t("a wallet send error with the raw RPC text becomes the plain message; nothing is retried (one eth_sendTransaction)", e && e.message === "Your wallet could not reach the network (a temporary RPC error). Nothing was sent. Press the button again." && walletLog.filter(m => m === "eth_sendTransaction").length === 1);
+          mk.sendErr = "user rejected the request"; const w2 = mk(() => resp(200, { result: "0x" })), e2 = await w2.walletSend({}).then(() => null, e => e);
+          t("any other wallet send error is passed on unchanged", e2 && e2.message === "user rejected the request"); delete mk.sendErr; }
+        const pay = app.slice(app.indexOf("async function requireFresh"), app.indexOf("const doPayOnce"));
+        t("pay and withdraw reads: no eth_call goes through the wallet; every send uses walletSend; signing stays on the wallet", !/wallet\("eth_call"/.test(pay) && !/wallet\("eth_(getBalance|blockNumber|getTransactionCount|getTransactionReceipt)"/.test(app) && !/wallet\("eth_sendTransaction"/.test(app.replace(/const walletSend = [^\n]*/, "")) && (pay.match(/walletSend\(/g) || []).length === 3 && /wallet\("eth_signTypedData_v4"/.test(pay));
+        t("wallet_addEthereumChain gets every endpoint, primary first, without duplicates", JSON.stringify(addChainParams(CHAINS.base).rpcUrls) === JSON.stringify([CHAINS.base.rpc, ...CHAINS.base.rpcs.filter(u => u !== CHAINS.base.rpc)])); } }
   }
   HZ.setRpcRetry(prev); }
 // audit 1181 M-1: the lost-funds "checked" mark is per chain and address
