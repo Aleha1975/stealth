@@ -90,15 +90,15 @@ export async function sessionSignIn({ base = ONECLICK, priv, address, fetchFn = 
 
 // ---------------------------------------------------------------- 1Click quote / deposit / status
 /** Quote request. originAsset = the chain's own token, refundTo = the stealth address (never the user's main wallet). */
-export function buildQuoteRequest({ from, to, amount, recipient, refundTo, dry, asset, confidentiality = "public", now = Date.now(), deadlineMs = 3600_000, fees = privateFee }) {
+export function buildQuoteRequest({ from, to, amount, recipient, refundTo, dry, asset, confidentiality = "public", now = Date.now(), deadlineMs = 3600_000, fees = privateFee, route }) {
   if (asset === "ETH") { if (!from.eth || !to.eth) throw new Error("private withdraw of ETH is not available on " + (from.eth ? to.name : from.name)); }      // asset "ETH": the chain's native coin in and out (same coin on both sides); anything else = the chain stablecoin
   else if (!from.oneClick || !to.oneClick) throw new Error("private withdraw is not available on " + (from.oneClick ? to.name : from.name));
   if (!isAddr(recipient) || !isAddr(refundTo)) throw new Error("bad address");
   if (!(amount > 0n)) throw new Error("bad amount");
   const r = { dry: !!dry, swapType: "EXACT_INPUT", slippageTolerance: 100, originAsset: assetOf(from, asset).assetId, depositType: "ORIGIN_CHAIN",
     destinationAsset: assetOf(to, asset).assetId, amount: amount.toString(), refundTo, refundType: "ORIGIN_CHAIN", recipient, recipientType: "DESTINATION_CHAIN",
-    deadline: new Date(now + deadlineMs).toISOString(), confidentiality }, af = appFeesOf(fees);
-  if (af) r.appFees = af;      // service fee (chains.js privateFee, off by default); this one quote is the whole route, i.e. its first leg
+    deadline: new Date(now + deadlineMs).toISOString(), confidentiality }, af = appFeesOf(fees, route);
+  if (af) r.appFees = af;      // service fee (chains.js privateFee, off while no recipient is set); route "fast": this one quote is the whole route, i.e. its first leg
   return r;
 }
 async function call(fetchFn, url, init) {
@@ -121,6 +121,9 @@ export async function requestQuote({ base = ONECLICK, req, token, fetchFn = fetc
   if (q.amountIn !== req.amount) throw new Error("the quote changed the amount; refusing");
   if (String(e.recipient).toLowerCase() !== req.recipient.toLowerCase() || String(e.refundTo).toLowerCase() !== req.refundTo.toLowerCase()
     || e.originAsset !== req.originAsset || e.destinationAsset !== req.destinationAsset) throw new Error("the quote does not match the request; refusing");
+  { const own = String((req.appFees && req.appFees[0] && req.appFees[0].recipient) || privateFee.appFeeRecipient || "").trim().toLowerCase(), asked = req.appFees && req.appFees[0] ? req.appFees[0].fee : 0;      // 1Click adds an entry of its own (and echoes our share as half of the rate we ask), so only OUR recipient is checked: the fee we asked for must be echoed once with a rate up to the asked one; one we did not ask for must not appear
+    const mine = (Array.isArray(e.appFees) ? e.appFees : []).filter(x => own && String((x && x.recipient) || "").toLowerCase() === own);
+    if (asked ? mine.length !== 1 || !(Number(mine[0].fee) >= 1 && Number(mine[0].fee) <= asked) : mine.length) throw new Error("the quote's service fee does not match the request; refusing"); }
   if (!req.dry && !okDeposit(q.depositAddress)) throw new Error("the quote has no usable deposit address");
   // audit 1086 L-2: beyond the format, the deposit address must not be one of our own / the token or the zero address (a hijacked quote would point the signature at those)
   if (!req.dry) { const d = String(q.depositAddress).toLowerCase(); if ([req.refundTo, req.recipient, "0x0000000000000000000000000000000000000000"].some(a => String(a || "").toLowerCase() === d)) throw new Error("the quote's deposit address is not acceptable; refusing"); }
@@ -206,7 +209,7 @@ export async function runPart(ctx, amount, delayMs) {
   }
   const conf = ctx.token ? "basic" : "public";
   say("Requesting a " + conf + " quote…");
-  const req = buildQuoteRequest({ from: ctx.from, to: ctx.to, amount, recipient: ctx.recipient, refundTo: ctx.stealth, dry: false, asset: ctx.asset, confidentiality: conf });
+  const req = buildQuoteRequest({ from: ctx.from, to: ctx.to, amount, recipient: ctx.recipient, refundTo: ctx.stealth, dry: false, asset: ctx.asset, confidentiality: conf, route: "fast" });
   const j = await requestQuote({ base: ctx.base, req, token: ctx.token, fetchFn }); const q = j.quote;
   if (ctx.minRatio != null) {      // rate shown in the preview vs the real quote: abort BEFORE signing if it got worse
     const ratio = Number(BigInt(q.amountOut)) / Number(BigInt(q.amountIn));

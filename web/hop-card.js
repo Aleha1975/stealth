@@ -1,6 +1,6 @@
 /* Progress card of the private transfer (DOM only via createElement/textContent). Pure view of a hop record: no network, no keys.
    h = { st (hop state, see zec-hop.js), msg (last progress text), running (this tab is driving it) } */
-import { CHAINS, assetOf, assetKey, fmtUnits } from "./chains.js";
+import { CHAINS, assetOf, assetKey, fmtUnits, feeLine } from "./chains.js";
 import { remainingMs, STEPS, STEP_MIN, partsLabel, modeOf, partState } from "./zec-hop.js";
 
 export const STEP_UI = [   // one entry per zec-hop.js STEPS item, in order
@@ -100,6 +100,7 @@ export function hopView(h, now = Date.now()) {
     const wei = tok.decimals > 6 && tok.decimals === dtok.decimals ? { i: BigInt(st.amount || 0), o: BigInt(st.outTotal || (st.outQuote && st.outQuote.amountOut) || 0) } : null;      // 18 decimals: the cost is a BigInt difference, only its percentage is a float
     if (wei && wei.o && wei.i && !st.rebuilt) v.sum = "Sent " + amt(st.amount, tok.decimals) + " " + tok.symbol + " · received " + got + " " + dtok.symbol + " · cost " + (wei.i >= wei.o ? "" : "-") + fmtUnits(wei.i >= wei.o ? wei.i - wei.o : wei.o - wei.i, tok.decimals, 6) + " " + dtok.symbol + " (" + (Number((wei.i - wei.o) * 1000n / wei.i) / 10).toFixed(1) + "%)";
     else if (outN && inN && !st.rebuilt) v.sum = "Sent " + amt(st.amount, tok.decimals) + " " + tok.symbol + " · received " + got + " " + dtok.symbol + " · cost " + (inN - outN).toFixed(tok.decimals > 6 ? 6 : 2) + " " + dtok.symbol + " (" + ((inN - outN) / inN * 100).toFixed(1) + "%)";
+    if (v.sum && st.inQuote && st.inQuote.feeBps) v.sum += " · " + feeLine(st.inQuote.feeBps);      // only when the fee was on for this transfer
     v.line = "Total time " + v.elapsed + " (including any pause).";
     const mark = at => at && st.startedAt ? fmtElapsed(at - st.startedAt) : "", P = Array.isArray(st.parts) ? st.parts : [];
     if (P.length > 1 && P.every(x => x && x.sentAt && x.endAt)) v.timing = (st.shieldedAt ? "Shielded at " + mark(st.shieldedAt) + " · " : "") + P.map((x, i) => "payout " + (i + 1) + " sent at " + mark(x.sentAt) + ", arrived at " + mark(x.endAt)).join(" · ");

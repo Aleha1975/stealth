@@ -31,17 +31,19 @@ export const CHAINS = {
 };
 /** Zcash leg of the private withdraw (web/zec-hop.js). lightwalletd = gRPC-web proxy; change this ONE value to switch to our own proxy. */
 export const zcash = { lightwalletd: "https://zcash-mainnet.chainsafe.dev", network: "main", assetId: "nep141:zec.omft.near", decimals: 8, minIn: 132000n, orchardActivation: 1687104 };
-/** Private-withdraw service fee, paid through 1Click `appFees` (basis points of the swap input) on the FIRST leg of a private withdraw only. OFF by default: it is added to a quote request only when
- *  BOTH values are set. appFeeRecipient is a NEAR account that receives the fee (never invented here: empty until the owner names one). To turn it off or change it, edit these two values. */
-export const privateFee = { appFeeBps: 0, appFeeRecipient: "" };
-/** The `appFees` array for a first-leg quote request, or null when the fee is off (the request then stays exactly as it was). */
-export function appFeesOf(cfg = privateFee) {
-  const bps = cfg && cfg.appFeeBps, to = String((cfg && cfg.appFeeRecipient) || "").trim();
+/** Private-withdraw service fee, paid through 1Click `appFees` (basis points of the swap input) on the FIRST leg of a private withdraw only: Private fast = fastBps, Maximum = maxBps (Standard is free; the OUT leg and the ZEC return never carry it).
+ *  OFF while appFeeRecipient is empty. appFeeRecipient is the NEAR account that receives the fee (never invented here: empty until the owner names one) - PUT THE ACCOUNT NAME BETWEEN THE QUOTES BELOW. */
+export const privateFee = { fastBps: 20, maxBps: 30, appFeeRecipient: "" };
+/** The `appFees` array for a first-leg quote request of a route ("fast" | "max"), or null when the fee is off (the request then stays exactly as it was). An old-shape cfg { appFeeBps, appFeeRecipient } still works without a route. */
+export function appFeesOf(cfg = privateFee, route) {
+  const bps = !cfg ? 0 : route === "fast" ? cfg.fastBps ?? cfg.appFeeBps : route === "max" ? cfg.maxBps ?? cfg.appFeeBps : route === undefined ? cfg.appFeeBps : 0, to = String((cfg && cfg.appFeeRecipient) || "").trim();
   if (!bps || !to) return null;
   if (!Number.isInteger(bps) || bps < 1 || bps > 1000) throw new Error("bad appFeeBps (1..1000)");
   if (!/^[a-z0-9._-]{2,64}$/.test(to)) throw new Error("bad appFeeRecipient (a NEAR account)");
   return [{ recipient: to, fee: bps }];
 }
+/** The one short line that names the fee, for a bps value (20 -> "Loophole fee 0.2%"). */
+export const feeLine = bps => "Loophole fee " + bps / 100 + "%";
 /** Chain a meta-address was made for (st:<key>:0x...), or null if it has no prefix / unknown prefix. */
 export function chainOfMeta(s) {
   const m = String(s).trim().match(/^st:([a-z0-9]+):/);

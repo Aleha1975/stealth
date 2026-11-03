@@ -113,10 +113,10 @@ const reqOf = ({ originAsset, destAsset, amount, recipient, refundTo, dry, now =
 export const sharedFields = (a, b) => Object.keys(a).filter(k => k in b && JSON.stringify(a[k]) === JSON.stringify(b[k])).map(k => k + "=" + JSON.stringify(a[k]));
 export const CONSTANT_FIELDS = new Set(["dry", "swapType", "slippageTolerance", "depositType", "refundType", "recipientType", "confidentiality"]);
 /** In-leg: chain stablecoin (or ETH) -> ZEC paid to the hop's t-address; refund goes back to the stealth address. */
-export function reqIn({ chain, amount, tAddr, stealth, dry, now, rand, fees = privateFee, asset }) {
+export function reqIn({ chain, amount, tAddr, stealth, dry, now, rand, fees = privateFee, asset, route = "max" }) {
   if (!(asset === "ETH" ? chain.eth : chain.oneClick) || !isT(tAddr) || !isAddr(stealth)) throw new Error("bad address");      // asset "ETH" = the chain's native coin instead of its stablecoin
-  const r = reqOf({ originAsset: assetOf(chain, asset).assetId, destAsset: ZC.assetId, amount, recipient: tAddr, refundTo: stealth, dry, now, rand }), af = appFeesOf(fees);
-  if (af) r.appFees = af;      // the service fee (config in chains.js, off by default): FIRST leg only, so the legs still share nothing but protocol constants
+  const r = reqOf({ originAsset: assetOf(chain, asset).assetId, destAsset: ZC.assetId, amount, recipient: tAddr, refundTo: stealth, dry, now, rand }), af = appFeesOf(fees, route);
+  if (af) r.appFees = af;      // the service fee (config in chains.js, off while no recipient is set; Maximum rate): FIRST leg only, so the legs still share nothing but protocol constants
   return r;
 }
 /** Out-leg: ZEC -> stablecoin on `dest` to the final recipient; a ZEC-origin refund must be a Zcash t-address (a fresh one of the hop wallet). */
@@ -238,7 +238,7 @@ export function quoteInfoOf(j, req, { now = Date.now(), minLeft = QUOTE_MIN_LEFT
     if (!okAddr) throw new Halt("the quote has no valid deposit address");
     if (String(dep).toLowerCase() === String(req.refundTo).toLowerCase() || String(dep).toLowerCase() === String(req.recipient).toLowerCase()) throw new Halt("the quote's deposit address equals our own address; refusing");
   }
-  return { depositAddress: dep, amountIn: q.amountIn, amountOut: q.amountOut, minOut: mOut.toString(), deadlineMs: dl };
+  return { depositAddress: dep, amountIn: q.amountIn, amountOut: q.amountOut, minOut: mOut.toString(), deadlineMs: dl, ...(req.appFees && req.appFees[0] ? { feeBps: req.appFees[0].fee } : {}) };
 }
 /** Projected loss (0..1, negative = gain) of the whole transfer: value paid out so far + this quote's rate on the ZEC still to be sent, against the amount that left the stealth address. */
 export function projectedLoss({ amountIn, inDec, outDec, paidOut, rate, zatsLeft }) {

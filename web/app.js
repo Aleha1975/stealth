@@ -1,7 +1,7 @@
 import { keysFromSignature, keyRequestTypedData, metaAddress, parseMeta, deriveForPayment, checkAnnouncement, decodeMetadata, hex, unhex, keccak, signDigest, randomBytes32 } from "./stealth-crypto.js";
 import { postRelay } from "./relay-post.js";
 import { paymentNonce, receiveTypedData, splitSig, payAmounts as calcAmounts, feeWithinCap, payFeeFor, usedCall, isUsedAnswer, isNotFresh } from "./pay-auth.js";
-import { CHAINS, pickChain, chainOfMeta, addChainParams, appFeesOf, assetOf, assetKey, fmtUnits } from "./chains.js";
+import { CHAINS, pickChain, chainOfMeta, addChainParams, appFeesOf, feeLine, assetOf, assetKey, fmtUnits } from "./chains.js";
 import * as ETH from "./eth-send.js";
 import * as PW from "./private-withdraw.js";
 import { hopCard, hopView, statusLine } from "./hop-card.js";
@@ -608,17 +608,17 @@ async function runHop(f, hit, o, opts = {}) {
   if (st.step === "FAILED") try { const rec = (await HM.findHop(ctx.store, f.stealth, C.key)).rec; h.extra = (await HM.hopSummary(ctx, rec)).filter(x => x.transparent + x.orchard >= HM.HOLD_DUST).map(x => "Hop wallet account " + x.account + ": " + (Number(x.transparent) / 1e8) + " ZEC transparent, " + (Number(x.orchard) / 1e8) + " ZEC shielded").join("\n"); } catch (e) { h.extra = "Could not read the hop wallet: " + e.message; }
   renderHops(); render(); await refreshBalances().catch(() => {});
 }
-/** Quote preview: when the service fee is on (chains.js privateFee), say how much of the shown Fee is ours. Nothing is added while it is off. */
-function feeNote(box, value, asset = "TOKEN") {
-  const af = appFeesOf(); if (!af) return;
-  box.appendChild(el("div", "note", "Includes our service fee " + (af[0].fee / 100) + "% (≈ " + fmtAs(asset, value * BigInt(af[0].fee) / 10000n) + " " + symAs(asset) + "), charged on the first step."));
+/** Quote preview: when the service fee is on (chains.js privateFee), name it (it is already inside the shown Fee). Nothing is added while it is off. */
+function feeNote(box, route) {
+  const af = appFeesOf(undefined, route); if (!af) return;
+  box.appendChild(el("div", "note", feeLine(af[0].fee)));
 }
 async function privateWithdraw(to, value, hit, asset = "TOKEN") {
   const dest = CHAINS[$("wd-dest").value]; if (!dest || !(asset === "ETH" ? dest.eth : dest.oneClick)) throw new Error("pick a destination chain");
   const HM = await hopMod(), mode = HM.DEFAULT_MODE, key = [to.toLowerCase(), value, dest.key, mode, "max", ...(asset === "ETH" ? ["ETH"] : [])].join("|"), A = assetOf(C, asset), D = assetOf(dest, asset), dfmt = v => asset === "ETH" ? fmtUnits(v, D.decimals, 6) : (Number(v) / 10 ** D.decimals).toFixed(2);
   if (!pv || pv.key !== key) {                                    // step 1: show what it will cost, send nothing
     say("pay-hint", "Asking NEAR Intents for a quote…");
-    const q1 = await PW.previewQuote({ base: PW.ONECLICK, req: HM.reqIn({ chain: C, amount: value, tAddr: HM.DRY_T, stealth: wd.stealth, dry: true, asset }) }), zec = BigInt(q1.quote.amountOut);
+    const q1 = await PW.previewQuote({ base: PW.ONECLICK, req: HM.reqIn({ chain: C, amount: value, tAddr: HM.DRY_T, stealth: wd.stealth, dry: true, asset, route: "max" }) }), zec = BigInt(q1.quote.amountOut);
     if (!HM.okSize(zec)) throw new Error("Too small for the private route. Try a larger amount.");
     const q2 = await PW.previewQuote({ base: PW.ONECLICK, req: HM.reqOut({ dest, amount: HM.previewOut(zec, mode), recipient: to, refundT: HM.DRY_T, dry: true, asset }) });
     const out = BigInt(q2.quote.amountOut), loss = HM.previewLoss({ value, out, inDec: A.decimals, outDec: D.decimals }), fee = loss * Number(value), box = $("wd-quote"); box.textContent = "";      // 1139 I-1: same basis as the machine's projectedLoss (decimals of source and destination differ)
@@ -626,7 +626,7 @@ async function privateWithdraw(to, value, hit, asset = "TOKEN") {
     c1.appendChild(el("span", "note", "Recipient gets")); c1.appendChild(el("span", "big", "≈ " + dfmt(out) + " " + D.symbol));
     c2.appendChild(el("span", "note", "Fee")); c2.appendChild(el("span", "big", "≈ " + (asset === "ETH" ? fmtUnits(BigInt(Math.round(fee)), A.decimals, 6) : (fee / TUNIT).toFixed(2)) + " (" + pct + "%)"));
     const c3 = el("div"); c3.appendChild(el("span", "note", "Takes about")); c3.appendChild(el("span", "big", HM.etaLabel(mode)));
-    qt.appendChild(c1); qt.appendChild(c2); qt.appendChild(c3); box.appendChild(qt); feeNote(box, value, asset); if (asset === "ETH") box.appendChild(el("div", "note", "Not included: the network fee of the first transfer, about " + fmtEth(ethFeeFor.get(wd.stealth.toLowerCase()) || 0n) + " " + NAT + ", paid by the stealth address from its own ETH.")); box.appendChild(el("div", "note", "Takes about " + HM.etaLabel(mode) + " · keep this tab open (it can be resumed if you close it)"));
+    qt.appendChild(c1); qt.appendChild(c2); qt.appendChild(c3); box.appendChild(qt); feeNote(box, "max"); if (asset === "ETH") box.appendChild(el("div", "note", "Not included: the network fee of the first transfer, about " + fmtEth(ethFeeFor.get(wd.stealth.toLowerCase()) || 0n) + " " + NAT + ", paid by the stealth address from its own ETH.")); box.appendChild(el("div", "note", "Takes about " + HM.etaLabel(mode) + " · keep this tab open (it can be resumed if you close it)"));
     box.appendChild(el("div", "note", "Pressing Confirm private transfer accepts this total cost (about " + pct + "% Fee, " + dfmt(out) + " " + D.symbol + " out). The payouts are checked against it; the real rate can differ a little, and if a payout quote ends up clearly worse you are asked to review it in this tab."));
     if (loss > HM.MAX_LOSS) box.appendChild(el("div", "note", "Zcash fees are mostly fixed, so this route is expensive on small amounts. " + (asset === "ETH" ? "It is usually cheaper for larger amounts; Private fast is usually cheaper below that." : "It is usually cheaper from a few tens of " + TOK.symbol + "; Private fast is usually cheaper below that.")));
     box.hidden = false; pv = { key, loss }; $("btn-wd").textContent = "Confirm private transfer";
@@ -673,20 +673,20 @@ async function fastWithdraw(to, value, hit, asset = "TOKEN") {
   const eth = asset === "ETH", A = assetOf(C, asset), D = assetOf(dest, asset), key = [to.toLowerCase(), value, dest.key, "fast", ...(eth ? ["ETH"] : [])].join("|");
   if (!pv || pv.key !== key) {                                    // step 1: show what it will cost, send nothing
     say("pay-hint", "Asking NEAR Intents for a quote…");
-    const j = await PW.previewQuote({ base: PW.ONECLICK, req: PW.buildQuoteRequest({ from: C, to: dest, amount: value, recipient: to, refundTo: wd.stealth, dry: true, asset }) }), sm = PW.summarizeQuote(j, A.decimals, D.decimals);
+    const j = await PW.previewQuote({ base: PW.ONECLICK, req: PW.buildQuoteRequest({ from: C, to: dest, amount: value, recipient: to, refundTo: wd.stealth, dry: true, asset, route: "fast" }) }), sm = PW.summarizeQuote(j, A.decimals, D.decimals);
     const box = $("wd-quote"); box.textContent = "";
     const qt = el("div", "qt"), c1 = el("div"), c2 = el("div"), c3 = el("div");
     c1.appendChild(el("span", "note", "Recipient gets")); c1.appendChild(el("span", "big", "≈ " + sm.outText + " " + D.symbol));
     c2.appendChild(el("span", "note", "Fee")); c2.appendChild(el("span", "big", "≈ " + sm.feeText + " (" + sm.feePct + "%)"));
     c3.appendChild(el("span", "note", "Takes about")); c3.appendChild(el("span", "big", PW.fastEtaLabel()));
-    qt.appendChild(c1); qt.appendChild(c2); qt.appendChild(c3); box.appendChild(qt); feeNote(box, value, asset);
+    qt.appendChild(c1); qt.appendChild(c2); qt.appendChild(c3); box.appendChild(qt); feeNote(box, "fast");
     if (eth) box.appendChild(el("div", "note", "Not included: the network fee of the deposit transfer, about " + fmtEth(ethFeeFor.get(wd.stealth.toLowerCase()) || 0n) + " " + NAT + ", paid by the stealth address from its own ETH. ETH is sent in one part."));
     box.appendChild(el("div", "note", (eth ? "Sent in one part, after a random wait of up to " + PW.FAST.delayMaxMin + " min" : "Sent in 1–2 parts at random times, up to " + PW.FAST.delayMaxMin + " min apart") + " · keep this tab open. The link is broken by the swap, not by cryptography."));
     box.hidden = false; pv = { key, ratio: Number(sm.amountOut) / Number(sm.amountIn) }; $("btn-wd").textContent = "Confirm private withdraw";
     say("pay-hint", "Check the quote, then confirm.", "warn"); return;
   }
   const w = wd, k = w.stealth.toLowerCase(), plan = PW.fastPlan(value, Math.random, asset), ratio = pv.ratio;
-  const rec = { v: 1, stealth: k, chain: C.key, dest: dest.key, ...(eth ? { asset: "ETH" } : {}), startedAt: Date.now(), parts: plan };
+  const rec = { v: 1, stealth: k, chain: C.key, dest: dest.key, ...(eth ? { asset: "ETH" } : {}), startedAt: Date.now(), ...((af => af ? { feeBps: af[0].fee } : {})(appFeesOf(undefined, "fast"))), parts: plan };
   $("btn-wd").disabled = true; $("withdraw").hidden = true; fastBusy.add(k);
   const lock = await holdScreen(), fmt = v => fmtAs(asset, v);
   const save = r => { try { fastRecs.put(r); } catch (e) { say("pay-hint", e.message + " The withdraw continues, but if this tab is closed it cannot be followed.", "warn"); } };      // 1130 L-1: surfaced, never silent (the START is refused in fastClaim)
@@ -706,7 +706,7 @@ async function fastWithdraw(to, value, hit, asset = "TOKEN") {
     const sums = PW.fastSummary(rec, fmt, symAs(asset)), ok = rec.parts.every(p => p.state === "SUCCESS");
     if (PW.fastDone(rec)) fastRecs.del(k);
     noteIfNeeded(); settleGuard();
-    say("pay-hint", (ok ? "Done privately: " + fmtAs(asset, value) + " " + symAs(asset) + " sent through NEAR Intents to " + to.slice(0, 8) + "… on " + dest.name + "." : "Finished with problems:") + (ok && rec.parts.length < 2 ? "" : "\n" + sums.join("\n")), ok ? "ok" : "warn");
+    say("pay-hint", (ok ? "Done privately: " + fmtAs(asset, value) + " " + symAs(asset) + " sent through NEAR Intents to " + to.slice(0, 8) + "… on " + dest.name + "." : "Finished with problems:") + (ok && rec.feeBps ? "\n" + feeLine(rec.feeBps) : "") + (ok && rec.parts.length < 2 ? "" : "\n" + sums.join("\n")), ok ? "ok" : "warn");
   } catch (e) { say("pay-hint", (e.message || String(e)) + (e.config ? PW.CONFIG_NOTE + " Use Abandon below to clear this record." : "\n" + PW.fastSummary(rec, fmt, symAs(asset)).join("\n")), "bad");      // 1135 L-2: the true reason, the guard stays, Abandon is the way out
     if (PW.fastDone(rec) && fastRecs.read()[k] && fastRecs.read()[k].startedAt === rec.startedAt) fastRecs.del(k); noteIfNeeded(); settleGuard(); }
   finally { fastBusy.delete(k); showFastBox(); if (lock) lock.release().catch(() => {}); $("btn-wd").disabled = false; pvReset(); await refreshBalances().catch(() => {}); render(); }
