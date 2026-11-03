@@ -836,7 +836,7 @@ export async function runHop(ctx) {
           if (Date.now() - Math.max(p.sentAt, runAt) > 90 * 60_000) throw new Halt(partTag(i) + ": the swap has not finished after 90 min; check it later with deposit address " + p.quote.depositAddress + ". Press Continue to follow it again");
         }
         const i = o[0], errs = swapErrs.get(i) || 0, since = fmtMS(Date.now() - Math.max(st.parts[i].sentAt || t0, runAt));
-        say(errs >= 3 ? "Problem: cannot reach NEAR Intents · retrying · " + partTag(i) : "Waiting for " + partTag(i) + " to be delivered · NEAR Intents is processing the swap · " + since);      // a heartbeat on every round: the card never reads "no update" during a normal swap
+        say(errs >= 3 ? "Problem: cannot reach NEAR Intents · retrying · " + partTag(i) : "Waiting for " + partTag(i) + " to be delivered · The swap is processing · " + since);      // a heartbeat on every round: the card never reads "no update" during a normal swap
         await rawSleep(4000);
       }
     },

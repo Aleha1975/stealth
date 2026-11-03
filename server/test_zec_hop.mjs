@@ -845,7 +845,7 @@ const tAddrOf = async (n, a, i = 0) => ZRm.deriveT(await H.mnemonicSeed(await H.
     ok("31.10 A: the second ZEC send does not wait for the first swap (gap < 7 min while that swap took 13 min)", w.bo[1] - w.bo[0] < 7 * MN, Math.round((w.bo[1] - w.bo[0]) / 1000) + " s");
     ok("31.10 A: when part 2 was sent, part 1 was saved as awaiting, part 2 not yet", snap === H.AWAIT + ",", snap);
     ok("31.10 A: DONE only after the held swap ended (not before 13 min after the first send)", off >= w.bo[0] + 13 * MN && rec.st.doneAt && rec.st.payoutTxs !== undefined && rec.st.outTotal === P.reduce((x, p) => x + BigInt(p.quote.amountOut), 0n).toString());
-    const wsMsgs = msgs.filter(([, m]) => /NEAR Intents is processing the swap/.test(m)), gaps = wsMsgs.slice(1).map(([t], i) => t - wsMsgs[i][0]);
+    const wsMsgs = msgs.filter(([, m]) => /The swap is processing/.test(m)), gaps = wsMsgs.slice(1).map(([t], i) => t - wsMsgs[i][0]);
     ok("31.10 A: a heartbeat every few seconds while the swap is processed (card never reads 'No update')", wsMsgs.length > 50 && Math.max(...gaps) <= 10_000, wsMsgs.length + " beats, max gap " + Math.max(...gaps)); }
   // B: reload at every point: the swap status of each part is persisted; resume follows open parts and carries on with unsent ones; a part is never sent twice
   for (const n of [1, 2]) {
@@ -923,10 +923,10 @@ const tAddrOf = async (n, a, i = 0) => ZRm.deriveT(await H.mnemonicSeed(await H.
     ok("31.10 I: Return and the card's hide step never hide or empty-count a record with an open swap (openParts guard in returnZec and hideHop)", (src.match(/HM\.openParts\(/g) || []).length >= 2 && /A payout swap is still open/.test(src)); }
   // J: the card
   { const C = await import("../web/hop-card.js"), now = 900_000_000, M = 60_000; C.resetLeft();
-    const mk = (step, o = {}, st = {}) => ({ st: { step, chain: "rh", dest: "base", amount: "10000000", recipient: A, stealth: STEALTH, startedAt: now - 20 * M, stepAt: now - M, mode: "max", partIdx: 1, parts: [{ status: "SUCCESS", tx: "a", quote: { amountOut: "4040448" } }, { status: H.AWAIT, tx: "b", quote: { amountOut: "4374658" } }], ...st }, running: true, msg: "Waiting for Payout 2 of 2 to be delivered · NEAR Intents is processing the swap · 1:05", beatAt: now - 5000, ...o });
+    const mk = (step, o = {}, st = {}) => ({ st: { step, chain: "rh", dest: "base", amount: "10000000", recipient: A, stealth: STEALTH, startedAt: now - 20 * M, stepAt: now - M, mode: "max", partIdx: 1, parts: [{ status: "SUCCESS", tx: "a", quote: { amountOut: "4040448" } }, { status: H.AWAIT, tx: "b", quote: { amountOut: "4374658" } }], ...st }, running: true, msg: "Waiting for Payout 2 of 2 to be delivered · The swap is processing · 1:05", beatAt: now - 5000, ...o });
     const v = C.hopView(mk("WAIT_SWAPS"), now);
     ok("31.10 J1: WAIT_SWAPS is a running card (not done), step 7 of 7, rows: delivered / in swap with paid amounts", v.kind === "run" && v.idx === 6 && v.pct < 100 && v.parts[0].state === "delivered" && /delivered ≈ 4\.04/.test(v.parts[0].text) && v.parts[1].state === "swap" && /≈ 4\.37 .* expected/.test(v.parts[1].text) && /≈ 4\.04/.test(v.paid), JSON.stringify(v.parts) + v.pct);
-    ok("31.10 J2: a normal wait says NEAR Intents is processing the swap (normal, up to about 15 min) instead of 'No update'", /NEAR Intents is processing the swap \(normal, can take up to about 15 min\)/.test(v.note) && !/No update/.test(v.note));
+    ok("31.10 J2: a normal wait says The swap is processing (normal, up to about 15 min) instead of 'No update'", /The swap is processing \(normal, can take up to about 15 min\)/.test(v.note) && !/No update/.test(v.note));
     C.resetLeft(); const v2 = C.hopView(mk("WAIT_SWAPS", { beatAt: now - 200_000 }), now); ok("31.10 J3: after 200 s of real silence the card does warn", /No update for 200 s/.test(v2.note));
     C.resetLeft(); const rows = st => C.hopView(mk("QUOTE_OUT", {}, st), now).parts.map(r => r.state).join();
     ok("31.10 J4: part rows while part 2 is being quoted: part 1 in swap/delivered, part 2 sending", rows({ parts: [{ status: H.AWAIT, tx: "a", quote: { amountOut: "1" } }, { status: null }] }) === "swap,sending" && rows({ parts: [{ status: "SUCCESS", tx: "a", quote: { amountOut: "1" } }, { status: null }] }) === "delivered,sending");

@@ -513,7 +513,7 @@ try {
   ok("deposit/submit body {txHash, depositAddress}: the relayer tx that paid the deposit address", mock.submits.length === 1 && sub.depositAddress.toLowerCase() === dep1 && txRc && txRc.status === "0x1" && txRc.to.toLowerCase() === TOKEN.toLowerCase(), JSON.stringify(Object.keys(sub)));
   ok("status polled until SUCCESS (mock: PROCESSING then SUCCESS)", (mock.statusPolls[dep1] || 0) >= 2 && mock.deposits[dep1].state === "SUCCESS", "polls=" + mock.statusPolls[dep1]);
   ok("0 wallet prompts, 0 confirm() dialogs during the private withdraw", walletTotal(R) === w0 && R.dialogs.length === dl0, "prompts=" + (walletTotal(R) - w0));
-  ok("hint says Done privately: 4.95 USDG ... Robinhood Chain", /Done privately: 4\.95 USDG sent through NEAR Intents to 0x[0-9a-fA-F]{6}… on Robinhood Chain\./.test(await R.text("pay-hint")), (await R.text("pay-hint")).split("\n")[0]);
+  ok("hint says Done privately: 4.95 USDG ... Robinhood Chain", /Done privately: 4\.95 USDG sent privately to 0x[0-9a-fA-F]{6}… on Robinhood Chain\./.test(await R.text("pay-hint")), (await R.text("pay-hint")).split("\n")[0]);
   ok("after a confirmed deposit the double-send guard and the resume record are cleared (and the record never held the recipient)", await R.eval("(() => { const g = JSON.parse(localStorage.getItem('stealth-pending-wd') || '{}'); return Object.values(g).every(v => Number(v) < Date.now()) && !localStorage.getItem('stealth-fast-wd'); })()"));
   ok("/v0/auth/* was never called", !mock.log.some(l => /AUTH/.test(l)));
 
@@ -600,7 +600,7 @@ try {
   const rF = mock.quotes.filter(x => !x.dry).at(-1), depF = rF.originAsset === ETHA ? Object.keys(mock.deposits).at(-1) : null, hintF = await R.text("pay-hint");
   ok("ETH fast: the real quote is ETH <-> ETH, refund to the stealth address, recipient as typed, one deposit", rF.originAsset === ETHA && rF.destinationAsset === ETHA && rF.refundTo.toLowerCase() === ethFrom2.toLowerCase() && rF.recipient.toLowerCase() === destF.toLowerCase() && mock.submits.length === subF + 1);
   ok("ETH fast: the quote's deposit address received EXACTLY the quoted amount in ETH (a plain transfer from the stealth address), and the stealth address kept only dust", (await ethBal(depF)) === BigInt(rF.amount) && BigInt(rF.amount) < balF && balF - BigInt(rF.amount) < 10n ** 15n && (await ethBal(ethFrom2)) < 10n ** 15n);
-  ok("ETH fast: the answer says Done privately in ETH with 18-decimal text; 0 wallet prompts; the record and the guard are gone", /Done privately: 0\.0\d+ ETH sent through NEAR Intents/.test(hintF) && walletTotal(R) === w1 && await R.eval(`(() => { const k = ${JSON.stringify(ethFrom2.toLowerCase())}, g = JSON.parse(localStorage.getItem('stealth-pending-wd') || '{}'); return !(k in g) && localStorage.getItem('stealth-fast-wd:' + k) == null; })()`), hintF);
+  ok("ETH fast: the answer says Done privately in ETH with 18-decimal text; 0 wallet prompts; the record and the guard are gone", /Done privately: 0\.0\d+ ETH sent privately/.test(hintF) && walletTotal(R) === w1 && await R.eval(`(() => { const k = ${JSON.stringify(ethFrom2.toLowerCase())}, g = JSON.parse(localStorage.getItem('stealth-pending-wd') || '{}'); return !(k in g) && localStorage.getItem('stealth-fast-wd:' + k) == null; })()`), hintF);
   Y.allowTx = false;
 
   ok("no JS exceptions / console errors on either page", R.errors.length === 0 && Y.errors.length === 0 && R.console.length === 0 && Y.console.length === 0, [...R.errors, ...Y.errors, ...R.console, ...Y.console].join(" | ").slice(0, 300));

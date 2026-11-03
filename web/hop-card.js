@@ -13,7 +13,7 @@ export const STEP_UI = [   // one entry per zec-hop.js STEPS item, in order
   { name: "Sending to recipient", line: "Sending to the recipient", wait: "~" + Math.round(STEP_MIN.SEND_OUT) + " min" },
 ];
 const STEP_ORDER = ["QUOTE_IN", "DEPOSIT_IN", "WAIT_T", "SHIELD", "DELAY", "QUOTE_OUT", "SEND_OUT"];
-export const SWAP_NOTE = "NEAR Intents is processing the swap (normal, can take up to about 15 min).";      // shown while the last payouts are in their swaps instead of "No update for N s"
+export const SWAP_NOTE = "The swap is processing (normal, can take up to about 15 min).";      // shown while the last payouts are in their swaps instead of "No update for N s"
 const stepKey = st => st.step === "WAIT_SWAPS" ? "SEND_OUT" : st.step;      // WAIT_SWAPS (everything sent, swaps still open) is the tail of the last step
 /** raw 1Click status -> friendly word (the raw name never reaches the screen) */
 export const friendly = s => ({ SUCCESS: "done", REFUNDED: "refunded", FAILED: "failed" })[s] || "in progress";
